@@ -250,7 +250,8 @@ jobs:
             }
 
   ui-publish:
-    if: ${{ needs.publish.outputs.should_release == 'true' }}
+    # disabled: we only publish the github release, no hugging face upload
+    if: ${{ false && needs.publish.outputs.should_release == 'true' }}
 
     needs:
       - publish
