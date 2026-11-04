@@ -8,26 +8,27 @@ on:
         required: false
         default: ''
         type: string
-      dry_run:
-        description: 'Dry run - validate without creating the tag'
-        required: true
-        type: boolean
-        default: true
-      skip_apiabi_check:
-        description: 'Skip API/ABI compatibility check'
-        required: false
-        type: boolean
-        default: false
-      require_docker:
-        description: 'Require the Docker workflow to have completed successfully'
-        required: true
-        type: boolean
-        default: true
-      apiabi_compare_tag:
-        description: 'Tag to compare against for API/ABI check (default: latest release)'
-        required: false
-        type: string
-        default: ''
+      # disabled: this fork has no API/ABI check, no container images and no dry run
+      # dry_run:
+      #   description: 'Dry run - validate without creating the tag'
+      #   required: true
+      #   type: boolean
+      #   default: true
+      # skip_apiabi_check:
+      #   description: 'Skip API/ABI compatibility check'
+      #   required: false
+      #   type: boolean
+      #   default: false
+      # require_docker:
+      #   description: 'Require the Docker workflow to have completed successfully'
+      #   required: true
+      #   type: boolean
+      #   default: true
+      # apiabi_compare_tag:
+      #   description: 'Tag to compare against for API/ABI check (default: latest release)'
+      #   required: false
+      #   type: string
+      #   default: ''
 
 env:
   GH_TOKEN: ${{ github.token }}
@@ -35,7 +36,8 @@ env:
 cache-mode: none
 permissions:
   contents: write
-  packages: write
+  # disabled: no container images are pushed from this fork
+  # packages: write
 
 jobs:
   make-release:
@@ -49,31 +51,33 @@ jobs:
           ref: ${{ inputs.commit != '' && inputs.commit || github.ref_name }}
           fetch-depth: 0
 
-      - name: Install API/ABI check tools
-        if: ${{ github.event.inputs.skip_apiabi_check != 'true' }}
-        run: sudo apt-get install -y abi-compliance-checker abigail-tools
+      # disabled: no API/ABI check in this fork
+      # - name: Install API/ABI check tools
+      #   if: ${{ github.event.inputs.skip_apiabi_check != 'true' }}
+      #   run: sudo apt-get install -y abi-compliance-checker abigail-tools
 
       - name: Run release checks
         id: checks
-        run: bash scripts/make-release-checks.sh ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+        run: bash scripts/make-release-checks.sh
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           RELEASE_BRANCH: ${{ github.ref_name }}
-          SKIP_APIABI_CHECK: ${{ github.event.inputs.skip_apiabi_check }}
-          APIABI_COMPARE_TAG: ${{ github.event.inputs.apiabi_compare_tag }}
-          APIABI_REPORT_DIR: ${{ runner.temp }}/apiabi-reports
-          REQUIRE_DOCKER: ${{ github.event.inputs.require_docker }}
+          # this fork has no API/ABI check and no container images
+          SKIP_APIABI_CHECK: 'true'
+          REQUIRE_DOCKER: 'false'
+          # APIABI_COMPARE_TAG: ${{ github.event.inputs.apiabi_compare_tag }}
+          # APIABI_REPORT_DIR: ${{ runner.temp }}/apiabi-reports
 
-      - name: Upload API/ABI reports
-        if: ${{ always() && github.event.inputs.skip_apiabi_check != 'true' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: apiabi-reports
-          path: ${{ runner.temp }}/apiabi-reports
-          if-no-files-found: ignore
+      # disabled: no API/ABI check in this fork
+      # - name: Upload API/ABI reports
+      #   if: ${{ always() && github.event.inputs.skip_apiabi_check != 'true' }}
+      #   uses: actions/upload-artifact@v7
+      #   with:
+      #     name: apiabi-reports
+      #     path: ${{ runner.temp }}/apiabi-reports
+      #     if-no-files-found: ignore
 
       - name: Create release tag
-        if: ${{ github.event.inputs.dry_run == 'false' }}
         run: |
           VERSION="${{ steps.checks.outputs.version }}"
           git config user.name "github-actions[bot]"
@@ -104,7 +108,6 @@ jobs:
 
       - name: Create release
         id: create_release
-        if: ${{ github.event.inputs.dry_run == 'false' }}
         uses: ggml-org/action-create-release@v1
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -130,7 +133,7 @@ jobs:
             ${{ steps.desc.outputs.changelog }}
 
       - name: Upload nightly-tag.txt
-        if: ${{ github.event.inputs.dry_run == 'false' && steps.nightly_tag_file.outputs.create == 'true' }}
+        if: ${{ steps.nightly_tag_file.outputs.create == 'true' }}
         uses: actions/github-script@v8
         with:
           github-token: ${{secrets.GITHUB_TOKEN}}
@@ -146,48 +149,50 @@ jobs:
               data: await fs.readFileSync('./nightly-tag.txt')
             });
 
-      - name: Re-tag container images with release version
-        if: ${{ github.event.inputs.dry_run == 'false' && github.event.inputs.require_docker != 'false' && steps.desc.outputs.nightly_tag != '' }}
-        env:
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        run: |
-          VERSION="${{ steps.checks.outputs.version }}"
-          NIGHTLY_TAG="${{ steps.desc.outputs.nightly_tag }}"
-          REPO_OWNER="${GITHUB_REPOSITORY_OWNER,,}"
-          IMAGE_REPO="ghcr.io/${REPO_OWNER}/${{ github.event.repository.name }}"
+      # disabled: the fork publishes no container images
+      # - name: Re-tag container images with release version
+      #   if: ${{ github.event.inputs.dry_run == 'false' && github.event.inputs.require_docker != 'false' && steps.desc.outputs.nightly_tag != '' }}
+      #   env:
+      #     GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+      #   run: |
+      #     VERSION="${{ steps.checks.outputs.version }}"
+      #     NIGHTLY_TAG="${{ steps.desc.outputs.nightly_tag }}"
+      #     REPO_OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+      #     IMAGE_REPO="ghcr.io/${REPO_OWNER}/${{ github.event.repository.name }}"
+      #
+      #     echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      #
+      #     VARIANTS=("" "-cuda" "-cuda13" "-vulkan" "-rocm" "-intel" "-musa" "-openvino")
+      #     TYPES=("full" "light" "server")
+      #     # the release is already created at this point, so keep going on a
+      #     # missing image and report all of them at the end
+      #     MISSING=()
+      #     for type in "${TYPES[@]}"; do
+      #       for variant in "${VARIANTS[@]}"; do
+      #         src="${IMAGE_REPO}:${type}${variant}-${NIGHTLY_TAG}"
+      #         dst="${IMAGE_REPO}:${type}${variant}-${VERSION}"
+      #         echo "Tagging ${src} -> ${dst}"
+      #         if ! docker buildx imagetools create --tag "${dst}" "${src}"; then
+      #           MISSING+=("${type}${variant}")
+      #         fi
+      #       done
+      #     done
+      #     if [[ ${#MISSING[@]} -gt 0 ]]; then
+      #       echo "::error::failed to re-tag container images for ${NIGHTLY_TAG}:${MISSING[*]}"
+      #       exit 1
+      #     fi
 
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-          VARIANTS=("" "-cuda" "-cuda13" "-vulkan" "-rocm" "-intel" "-musa" "-openvino")
-          TYPES=("full" "light" "server")
-          # the release is already created at this point, so keep going on a
-          # missing image and report all of them at the end
-          MISSING=()
-          for type in "${TYPES[@]}"; do
-            for variant in "${VARIANTS[@]}"; do
-              src="${IMAGE_REPO}:${type}${variant}-${NIGHTLY_TAG}"
-              dst="${IMAGE_REPO}:${type}${variant}-${VERSION}"
-              echo "Tagging ${src} -> ${dst}"
-              if ! docker buildx imagetools create --tag "${dst}" "${src}"; then
-                MISSING+=("${type}${variant}")
-              fi
-            done
-          done
-          if [[ ${#MISSING[@]} -gt 0 ]]; then
-            echo "::error::failed to re-tag container images for ${NIGHTLY_TAG}:${MISSING[*]}"
-            exit 1
-          fi
-
-      - name: Dry run summary
-        if: ${{ github.event.inputs.dry_run == 'true' }}
-        run: |
-          if [[ "${{ steps.checks.outputs.checks_passed }}" == "true" ]]; then
-            echo "Dry run complete - all checks passed."
-            echo "Would have created tag: ${{ steps.checks.outputs.version }}"
-            if [[ -n "${{ steps.desc.outputs.nightly_tag }}" ]]; then
-              echo "Would have uploaded nightly-tag.txt: ${{ steps.desc.outputs.nightly_tag }}"
-            fi
-          else
-            echo "::error::Dry run found release check failures. A release tag would not be created."
-            exit 1
-          fi
+      # disabled: no dry run in this fork - a failed check aborts before the tag is created
+      # - name: Dry run summary
+      #   if: ${{ github.event.inputs.dry_run == 'true' }}
+      #   run: |
+      #     if [[ "${{ steps.checks.outputs.checks_passed }}" == "true" ]]; then
+      #       echo "Dry run complete - all checks passed."
+      #       echo "Would have created tag: ${{ steps.checks.outputs.version }}"
+      #       if [[ -n "${{ steps.desc.outputs.nightly_tag }}" ]]; then
+      #         echo "Would have uploaded nightly-tag.txt: ${{ steps.desc.outputs.nightly_tag }}"
+      #       fi
+      #     else
+      #       echo "::error::Dry run found release check failures. A release tag would not be created."
+      #       exit 1
+      #     fi
