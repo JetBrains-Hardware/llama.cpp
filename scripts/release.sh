@@ -120,8 +120,9 @@ prepare_release() {
     MAJOR=$(grep "set(LLAMA_VERSION_MAJOR" CMakeLists.txt | sed 's/.*MAJOR \([0-9]*\).*/\1/')
     MINOR=$(grep "set(LLAMA_VERSION_MINOR" CMakeLists.txt | sed 's/.*MINOR \([0-9]*\).*/\1/')
     PATCH=$(grep "set(LLAMA_VERSION_PATCH" CMakeLists.txt | sed 's/.*PATCH \([0-9]*\).*/\1/')
+    SUFFIX=$(grep "set(LLAMA_VERSION_SUFFIX" CMakeLists.txt | sed 's/.*SUFFIX "\([^"]*\)".*/\1/')
 
-    echo "Current version: $MAJOR.$MINOR.$PATCH"
+    echo "Current version: $MAJOR.$MINOR.$PATCH$SUFFIX"
 
     # Calculate new version
     case $VERSION_TYPE in
@@ -142,7 +143,7 @@ prepare_release() {
             ;;
     esac
 
-    NEW_VERSION="$NEW_MAJOR.$NEW_MINOR.$NEW_PATCH"
+    NEW_VERSION="$NEW_MAJOR.$NEW_MINOR.$NEW_PATCH$SUFFIX"
     RC_BRANCH="llama-rc-v$NEW_VERSION"
     echo "New release version: $NEW_VERSION"
     echo "Release candidate branch: $RC_BRANCH"

@@ -66,7 +66,7 @@ if [[ -n "${COMPARE_TAG}" ]]; then
         exit 1
     fi
 else
-    PREV_TAG=$(git -C "$REPO_ROOT" tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+    PREV_TAG=$(git -C "$REPO_ROOT" tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$' | head -n 1 || true)
     if [[ -z "${PREV_TAG}" ]]; then
         echo "Warning: no previous release tag found - skipping API/ABI check"
         exit 0
