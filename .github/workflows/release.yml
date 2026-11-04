@@ -96,7 +96,8 @@ jobs:
 
   macos-cpu:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    # disabled: we only ship linux/windows
+    if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
     strategy:
       matrix:
         include:
@@ -178,10 +179,11 @@ jobs:
             os: ubuntu-22.04
           - build: 'arm64'
             os: ubuntu-24.04-arm
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
-          - build: '26.04-s390x'
-            os: ubuntu-26.04-s390x
+          # disabled: we only ship linux/windows, x64 + arm64
+          #- build: 's390x'
+          #  os: ubuntu-24.04-s390x
+          #- build: '26.04-s390x'
+          #  os: ubuntu-26.04-s390x
 
     runs-on: ${{ matrix.os }}
 
@@ -348,6 +350,7 @@ jobs:
             cuda: '13.5.0'
             label: '13.5'
             defines: ''
+          # arm64 CUDA is needed for NVIDIA DGX Spark (GB10)
           - build: 'arm64'
             os: ubuntu-24.04-arm
             cuda: '13.5.0'
@@ -461,7 +464,8 @@ jobs:
 
   android-arm64:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    # disabled: we only ship linux/windows
+    if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-24.04
 
@@ -546,7 +550,8 @@ jobs:
 
   android-arm64-snapdragon:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    # disabled: we do not target snapdragon hardware
+    if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-24.04
     container: 'ghcr.io/snapdragon-toolchain/arm64-android:v0.8'
@@ -599,7 +604,8 @@ jobs:
 
   linux-arm64-snapdragon:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    # disabled: we do not target snapdragon hardware
+    if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-24.04
     container: 'ghcr.io/snapdragon-toolchain/arm64-linux:v0.8'
@@ -652,7 +658,8 @@ jobs:
 
   ubuntu-24-openvino:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    # disabled: intel GPUs are covered by the sycl and vulkan builds
+    if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-24.04
 
@@ -761,7 +768,8 @@ jobs:
   #       windows-cpu zip during the release "Merge artifacts" step
   windows-openvino:
     needs: [check-release]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    # disabled: intel GPUs are covered by the sycl and vulkan builds
+    if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
 
@@ -1127,10 +1135,11 @@ jobs:
             arch: 'arm64'
             defines: '-G "Ninja Multi-Config" -DGGML_VULKAN=ON -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake'
             target: 'ggml-vulkan'
-          - backend: 'opencl-adreno'
-            arch: 'arm64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DCMAKE_PREFIX_PATH="$env:RUNNER_TEMP/opencl-arm64-release" -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON'
-            target: 'ggml-opencl'
+          # disabled: we do not target snapdragon hardware
+          #- backend: 'opencl-adreno'
+          #  arch: 'arm64'
+          #  defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DCMAKE_PREFIX_PATH="$env:RUNNER_TEMP/opencl-arm64-release" -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON'
+          #  target: 'ggml-opencl'
 
     steps:
       - name: Clone
@@ -1642,7 +1651,8 @@ jobs:
 
   ubuntu-26-zdnn:
     needs: [check-release, ui-build]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    # disabled: we only ship x64 and arm64
+    if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: ubuntu-26.04-s390x
 
@@ -1696,7 +1706,8 @@ jobs:
 
   ios-xcode:
     needs: [check-release]
-    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    # disabled: we only ship linux/windows
+    if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
     runs-on: macos-26
 
     steps:
