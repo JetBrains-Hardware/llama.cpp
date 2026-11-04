@@ -37,7 +37,8 @@ jobs:
           major=$(grep -oE "set\(LLAMA_VERSION_MAJOR[[:space:]]+[0-9]+" CMakeLists.txt | grep -oE "[0-9]+$")
           minor=$(grep -oE "set\(LLAMA_VERSION_MINOR[[:space:]]+[0-9]+" CMakeLists.txt | grep -oE "[0-9]+$")
           patch=$(grep -oE "set\(LLAMA_VERSION_PATCH[[:space:]]+[0-9]+" CMakeLists.txt | grep -oE "[0-9]+$")
-          build_version="$major.$minor.$patch"
+          suffix=$(grep "set(LLAMA_VERSION_SUFFIX" CMakeLists.txt | sed 's/.*SUFFIX "\([^"]*\)".*/\1/')
+          build_version="$major.$minor.$patch$suffix"
 
           checks=("set\(LLAMA_VERSION[[:space:]]+$build_version\)"
                   "set\(LLAMA_BUILD_COMMIT[[:space:]]+$build_commit\)"

@@ -6,6 +6,11 @@ include(CheckIncludeFileCXX)
 set(LLAMA_VERSION_MAJOR 0)
 set(LLAMA_VERSION_MINOR 9)
 set(LLAMA_VERSION_PATCH 0)
+
+# custom build suffix, also used for the release tag (e.g. v0.9.0-junie-1)
+set(LLAMA_VERSION_SUFFIX "-junie-1")
+
+# must stay numeric - used as the shared library VERSION/SOVERSION
 set(LLAMA_VERSION_BASE "${LLAMA_VERSION_MAJOR}.${LLAMA_VERSION_MINOR}.${LLAMA_VERSION_PATCH}")
 
 # whether this is a development/nightly build
@@ -14,10 +19,10 @@ set(LLAMA_VERSION_BASE "${LLAMA_VERSION_MAJOR}.${LLAMA_VERSION_MINOR}.${LLAMA_VE
 option(LLAMA_BUILD_IS_DEV "llama: dev build" ON)
 
 if (LLAMA_BUILD_IS_DEV)
-    set(LLAMA_VERSION "${LLAMA_VERSION_BASE}-dev")
+    set(LLAMA_VERSION "${LLAMA_VERSION_BASE}${LLAMA_VERSION_SUFFIX}-dev")
 else()
     # TODO: check that the current commit is tagged correctly according to the version specified above
-    set(LLAMA_VERSION "${LLAMA_VERSION_BASE}")
+    set(LLAMA_VERSION "${LLAMA_VERSION_BASE}${LLAMA_VERSION_SUFFIX}")
 endif()
 
 message(STATUS "llama.cpp version: ${LLAMA_VERSION}")
