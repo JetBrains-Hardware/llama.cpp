@@ -27,10 +27,10 @@ fi
 VERSION="$1"
 
 # Accept the version with or without the leading v, reject anything else
-if [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+if [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
     VERSION="v${VERSION}"
-elif [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Error: invalid version '${VERSION}' (expected v<maj>.<min>.<pat>)"
+elif [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+    echo "Error: invalid version '${VERSION}' (expected v<maj>.<min>.<pat>[-suffix])"
     exit 1
 fi
 
@@ -56,7 +56,7 @@ fi
 echo "Release commit: $(git rev-parse --short "${RELEASE_COMMIT}")"
 
 PREV="$( { git tag --list; echo "${VERSION}"; } \
-    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$' \
     | sort -V \
     | awk -v cur="${VERSION}" '$0 == cur { exit } { prev = $0 } END { print prev }')"
 

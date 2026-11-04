@@ -27,7 +27,8 @@ done
 MAJOR=$(grep "set(LLAMA_VERSION_MAJOR" "$REPO_ROOT/CMakeLists.txt" | sed 's/.*MAJOR \([0-9]*\).*/\1/')
 MINOR=$(grep "set(LLAMA_VERSION_MINOR" "$REPO_ROOT/CMakeLists.txt" | sed 's/.*MINOR \([0-9]*\).*/\1/')
 PATCH=$(grep "set(LLAMA_VERSION_PATCH" "$REPO_ROOT/CMakeLists.txt" | sed 's/.*PATCH \([0-9]*\).*/\1/')
-VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+SUFFIX=$(grep "set(LLAMA_VERSION_SUFFIX" "$REPO_ROOT/CMakeLists.txt" | sed 's/.*SUFFIX "\([^"]*\)".*/\1/')
+VERSION="v${MAJOR}.${MINOR}.${PATCH}${SUFFIX}"
 echo "Determined version: ${VERSION}"
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
