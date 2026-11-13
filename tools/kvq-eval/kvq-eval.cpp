@@ -13,12 +13,20 @@
 //                  K metric = second moment of the queries at the last --kvq-qwin prefix positions
 //                  V metric = o_proj weight scaled by the mean sigmoid(gate) over the prefix
 //                  the first --kvq-sinks and the last --kvq-recent prefix positions stay exact
+//
+// --kvq-two-tier keeps two copies of the prefix K/V and attends with both (see llama_kvq_params):
+// the precise copy is --kvq-precise (aff8 or exact), the coarse copy is --kvq-variant
+//   all-precise    every prefix cell is precise
+//   all-coarse     every prefix cell is coarse
+//   none           the protected cells (the first --kvq-sinks and the last --kvq-protect prefix positions) are precise
+//   <N>            the protected cells and the top N cells of the coarse attention per kv head and query position
 
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "gguf.h"
 
 #include "../../src/llama-ext.h"
@@ -53,6 +61,7 @@ struct kvq_args {
     std::string tokens_path;
     std::string ref_out_path;
     std::string ref_in_path;
+    std::string ref2_in_path; // a second reference, compared after the first
     std::string csv_path;
     std::string tables_out_path;
     std::string tables_in_path;
@@ -67,7 +76,32 @@ struct kvq_args {
     int32_t recent = 0;
     int32_t q_win  = 2048;
     bool    stats  = false;
+
+    bool    two_tier        = false;
+    bool    tt_all_precise  = false;
+    bool    tt_all_coarse   = false;
+    int32_t tt_top          = 0;
+    int32_t tt_protect      = 512;
+    bool    tt_precise_aff8 = true;
+    bool    tt_stats        = false;
 };
+
+static bool kvq_parse_two_tier(const std::string & v, kvq_args & args) {
+    args.two_tier = true;
+    if (v == "all-precise") {
+        args.tt_all_precise = true;
+        return true;
+    }
+    if (v == "all-coarse") {
+        args.tt_all_coarse = true;
+        return true;
+    }
+    if (v == "none") {
+        return true;
+    }
+    char extra = 0;
+    return sscanf(v.c_str(), "%d%c", &args.tt_top, &extra) == 1 && args.tt_top > 0;
+}
 
 static bool kvq_parse_variant(const std::string & v, kvq_args & args) {
     if (v == "exact") {
@@ -123,6 +157,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.ref_out_path = argv[++i];
         } else if (a == "--kvq-ref" && has_val) {
             args.ref_in_path = argv[++i];
+        } else if (a == "--kvq-ref2" && has_val) {
+            args.ref2_in_path = argv[++i];
         } else if (a == "--kvq-csv" && has_val) {
             args.csv_path = argv[++i];
         } else if (a == "--kvq-variant" && has_val) {
@@ -142,6 +178,22 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.tables_in_path = argv[++i];
         } else if (a == "--kvq-stats") {
             args.stats = true;
+        } else if (a == "--kvq-two-tier" && has_val) {
+            if (!kvq_parse_two_tier(argv[++i], args)) {
+                LOG_ERR("%s: bad two-tier mode '%s'\n", __func__, argv[i]);
+                return false;
+            }
+        } else if (a == "--kvq-protect" && has_val) {
+            args.tt_protect = std::stoi(argv[++i]);
+        } else if (a == "--kvq-precise" && has_val) {
+            const std::string v = argv[++i];
+            if (v != "aff8" && v != "exact") {
+                LOG_ERR("%s: bad precise copy '%s'\n", __func__, v.c_str());
+                return false;
+            }
+            args.tt_precise_aff8 = v == "aff8";
+        } else if (a == "--kvq-tt-stats") {
+            args.tt_stats = true;
         } else if (a.rfind("--kvq-", 0) == 0) {
             LOG_ERR("%s: unknown or incomplete argument '%s'\n", __func__, a.c_str());
             return false;
@@ -152,9 +204,10 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
     argc = n;
 
     if (args.tokens_path.empty() || args.prefix_len < 0) {
-        LOG_ERR("usage: %s -m model.gguf --kvq-tokens ids.bin --kvq-prefix-len s [--kvq-chunk 64] [--kvq-save-ref ref.bin] [--kvq-ref ref.bin [--kvq-csv out.csv]]\n"
+        LOG_ERR("usage: %s -m model.gguf --kvq-tokens ids.bin --kvq-prefix-len s [--kvq-chunk 64] [--kvq-save-ref ref.bin] [--kvq-ref ref.bin [--kvq-csv out.csv] [--kvq-ref2 ref2.bin]]\n"
                 "       [--kvq-variant exact|q8_0|aff8|K<b>V<b>|K<b>|V<b>] [--kvq-sinks 4] [--kvq-recent 0] [--kvq-qwin 2048]\n"
-                "       [--kvq-save-tables tables.bin] [--kvq-load-tables tables.bin] [--kvq-stats] [common args]\n", argv[0]);
+                "       [--kvq-save-tables tables.bin] [--kvq-load-tables tables.bin] [--kvq-stats]\n"
+                "       [--kvq-two-tier all-precise|all-coarse|none|<N> [--kvq-protect 512] [--kvq-precise aff8|exact] [--kvq-tt-stats]] [common args]\n", argv[0]);
         return false;
     }
     if (args.chunk <= 0) {
@@ -167,6 +220,15 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
     }
     if ((!args.tables_out_path.empty() || !args.tables_in_path.empty() || args.stats) && args.variant != KVQ_VARIANT_CODEC) {
         LOG_ERR("%s: --kvq-save-tables, --kvq-load-tables and --kvq-stats need a codec variant\n", __func__);
+        return false;
+    }
+    // the coarse copy codes the whole prefix, the precise cells are chosen by --kvq-protect
+    if (args.two_tier && (args.variant == KVQ_VARIANT_NONE || args.recent != 0 || args.tt_protect < 0)) {
+        LOG_ERR("%s: --kvq-two-tier needs a --kvq-variant for the coarse copy, no --kvq-recent and --kvq-protect >= 0\n", __func__);
+        return false;
+    }
+    if (args.tt_stats && !args.two_tier) {
+        LOG_ERR("%s: --kvq-tt-stats needs --kvq-two-tier\n", __func__);
         return false;
     }
     return true;
@@ -254,9 +316,10 @@ static bool kvq_prefill(llama_context * ctx, const std::vector<llama_token> & id
     return true;
 }
 
-// feed ids[s:e] in chunks, call on_pos(i, logits) for each fed position i >= kvq_n_skip
-template <typename F>
-static bool kvq_score(llama_context * ctx, const std::vector<llama_token> & ids, int32_t s, int32_t chunk, F && on_pos) {
+// feed ids[s:e] in chunks, call on_chunk(i0, n) after each chunk of fed positions [i0, i0 + n)
+// and on_pos(i, logits) for each fed position i >= kvq_n_skip
+template <typename F, typename G>
+static bool kvq_score(llama_context * ctx, const std::vector<llama_token> & ids, int32_t s, int32_t chunk, F && on_pos, G && on_chunk) {
     const int32_t e = (int32_t) ids.size() - 1;
     common_batch batch(ctx);
     for (int32_t p = s; p < e; p += chunk) {
@@ -267,6 +330,9 @@ static bool kvq_score(llama_context * ctx, const std::vector<llama_token> & ids,
         }
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: decode failed at pos %d\n", __func__, p);
+            return false;
+        }
+        if (!on_chunk(p - s, n)) {
             return false;
         }
         for (int32_t j = 0; j < n; j++) {
@@ -294,8 +360,79 @@ struct kvq_capture {
     std::map<int32_t, std::vector<double>> gate_sum; // [n_head*n_embd_head], sum of sigmoid(gate) over the prefix
     std::map<int32_t, int64_t>             gate_n;
 
+    // two-tier statistics of the last chunk, tensor kvq_stats-<il> (see build_attn_kvq in src/models/qwen35.cpp)
+    bool tt_stats = false;
+    std::map<int32_t, std::vector<float>> tt;
+
     std::vector<float> buf;
 };
+
+// two-tier statistics of one layer, summed over the scored positions, each as a mean over the query heads
+struct kvq_tt_stat {
+    double c_pre  = 0.0; // coarse weight on the prefix
+    double c_cand = 0.0; // coarse weight on the prefix cells that are not protected
+    double c_top  = 0.0; // coarse weight on the chosen cells
+    double w_pre  = 0.0; // weight on the precise prefix cells
+    double w_resp = 0.0; // weight on the cells after the prefix (always precise)
+    int64_t n     = 0;
+};
+
+// adds the positions j >= j0 of the last chunk of n positions
+static bool kvq_tt_add(const kvq_capture & cap, std::map<int32_t, kvq_tt_stat> & acc, int32_t n, int32_t j0, bool has_top, int32_t n_head, int32_t n_head_kv) {
+    const int64_t n_c = (int64_t) n*n_head_kv;
+    const int64_t n_w = (int64_t) n*n_head;
+    for (const auto & it : cap.tt) {
+        const auto & v = it.second;
+        if ((int64_t) v.size() != (has_top ? 3 : 2)*n_c + 2*n_w) {
+            LOG_ERR("%s: layer %d: %zu stats values for a chunk of %d\n", __func__, it.first, v.size(), n);
+            return false;
+        }
+        const float * c_pre  = v.data();
+        const float * c_cand = c_pre + n_c;
+        const float * c_top  = has_top ? c_cand + n_c : nullptr;
+        const float * w_pre  = c_cand + (has_top ? 2 : 1)*n_c;
+        const float * w_resp = w_pre + n_w;
+
+        auto & a = acc[it.first];
+        // the index of position j and head h is j + n*h
+        for (int32_t j = j0; j < n; j++) {
+            for (int32_t g = 0; g < n_head_kv; g++) {
+                a.c_pre  += c_pre [j + n*g]/n_head;
+                a.c_cand += c_cand[j + n*g]/n_head;
+                a.c_top  += has_top ? c_top[j + n*g]/n_head : 0.0;
+            }
+            for (int32_t h = 0; h < n_head; h++) {
+                a.w_pre  += w_pre [j + n*h]/n_head;
+                a.w_resp += w_resp[j + n*h]/n_head;
+            }
+            a.n++;
+        }
+    }
+    return true;
+}
+
+static void kvq_tt_print(const std::map<int32_t, kvq_tt_stat> & acc, bool has_top) {
+    LOG("\n");
+    LOG("kvq: two-tier stats, means over the scored positions and the query heads:\n");
+    LOG("kvq:   c_pre = coarse weight on the prefix, c_miss = coarse weight on the coarse cells that are not protected\n");
+    LOG("kvq:   c_top = coarse weight on the chosen cells (share of the unprotected coarse weight), w_prec = weight on the precise cells (w_resp after the prefix)\n");
+    kvq_tt_stat tot;
+    for (const auto & it : acc) {
+        const auto & a = it.second;
+        const double n = (double) std::max<int64_t>(1, a.n);
+        LOG("kvq: tt layer %2d: c_pre %.4f  c_miss %.4f  c_top %.4f (%.4f)  w_prec %.4f  w_resp %.4f\n", it.first,
+                a.c_pre/n, (a.c_cand - a.c_top)/n, a.c_top/n, has_top && a.c_cand > 0 ? a.c_top/a.c_cand : NAN, (a.w_pre + a.w_resp)/n, a.w_resp/n);
+        tot.c_pre  += a.c_pre/n;
+        tot.c_cand += a.c_cand/n;
+        tot.c_top  += a.c_top/n;
+        tot.w_pre  += a.w_pre/n;
+        tot.w_resp += a.w_resp/n;
+        tot.n++;
+    }
+    const double n = (double) std::max<int64_t>(1, tot.n);
+    LOG("kvq: tt total   : c_pre %.4f  c_miss %.4f  c_top %.4f (%.4f)  w_prec %.4f  w_resp %.4f\n",
+            tot.c_pre/n, (tot.c_cand - tot.c_top)/n, tot.c_top/n, has_top && tot.c_cand > 0 ? tot.c_top/tot.c_cand : NAN, (tot.w_pre + tot.w_resp)/n, tot.w_resp/n);
+}
 
 static bool kvq_layer_of(const char * name, const char * prefix, int32_t & il) {
     const size_t n = strlen(prefix);
@@ -314,11 +451,22 @@ static bool kvq_layer_of(const char * name, const char * prefix, int32_t & il) {
 // uses the tensor names of the qwen35 attention layer: Qcur-<il> (after RoPE), gate_sigmoid-<il>
 static bool kvq_capture_cb(ggml_tensor * t, bool ask, void * user_data) {
     auto * cap = (kvq_capture *) user_data;
+
+    int32_t il = -1;
+    if (cap->tt_stats && kvq_layer_of(t->name, "kvq_stats-", il)) {
+        if (!ask) {
+            GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t));
+            auto & v = cap->tt[il];
+            v.resize(ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+        }
+        return true;
+    }
+
     if (!cap->enabled) {
         return !ask;
     }
 
-    int32_t il = -1;
     const bool is_q = t->op == GGML_OP_ROPE && t->ne[0] == cap->n_embd_head && t->ne[1] == cap->n_head && kvq_layer_of(t->name, "Qcur-", il);
     const bool is_g = !is_q && t->ne[0] == (int64_t) cap->n_head*cap->n_embd_head && kvq_layer_of(t->name, "gate_sigmoid-", il);
 
@@ -515,11 +663,30 @@ static bool kvq_apply(llama_context * ctx, const kvq_args & args, const kvq_capt
     rows[0].resize((size_t) s*n_gqa);
     rows[1].resize((size_t) s*n_gqa);
 
+    // two-tier: the variant goes to the coarse copy, both K and V of it are written
+    const bool do_rw[2] = { args.two_tier || do_kv[0], args.two_tier || do_kv[1] };
+
     for (int32_t il : layer_ids) {
         for (int kv = 0; kv < 2; kv++) {
-            if (do_kv[kv] && !llama_memory_kv_get_rows(mem, il, kv == 1, 0, 0, s, n_gqa, rows[kv].data())) {
+            if (do_rw[kv] && !llama_memory_kv_get_rows(mem, il, kv == 1, 0, 0, s, n_gqa, rows[kv].data())) {
                 LOG_ERR("%s: cannot read the %s cache of layer %d\n", __func__, kv ? "V" : "K", il);
                 return false;
+            }
+        }
+
+        // the precise copy stays in the attention cache
+        if (args.two_tier && args.tt_precise_aff8) {
+            for (int kv = 0; kv < 2; kv++) {
+                std::vector<float> prec = rows[kv];
+                kvq_parallel_rows(s, n_threads, [&](int64_t i0, int64_t i1) {
+                    for (int64_t r = i0; r < i1; r++) {
+                        kvq_fake_aff8(prec.data() + r*n_gqa, n_gqa);
+                    }
+                });
+                if (!llama_memory_kv_set_rows(mem, il, kv == 1, 0, 0, s, n_gqa, prec.data())) {
+                    LOG_ERR("%s: cannot write the %s cache of layer %d\n", __func__, kv ? "V" : "K", il);
+                    return false;
+                }
             }
         }
 
@@ -714,8 +881,11 @@ static bool kvq_apply(llama_context * ctx, const kvq_args & args, const kvq_capt
         }
 
         for (int kv = 0; kv < 2; kv++) {
-            if (do_kv[kv] && !llama_memory_kv_set_rows(mem, il, kv == 1, 0, 0, s, n_gqa, rows[kv].data())) {
-                LOG_ERR("%s: cannot write the %s cache of layer %d\n", __func__, kv ? "V" : "K", il);
+            const bool ok = !do_rw[kv] || (args.two_tier ?
+                llama_memory_kvq_set_coarse_rows(mem, il, kv == 1, 0, 0, s, n_gqa, rows[kv].data()) :
+                llama_memory_kv_set_rows        (mem, il, kv == 1, 0, 0, s, n_gqa, rows[kv].data()));
+            if (!ok) {
+                LOG_ERR("%s: cannot write the %s %s cache of layer %d\n", __func__, args.two_tier ? "coarse" : "", kv ? "V" : "K", il);
                 return false;
             }
         }
@@ -761,7 +931,7 @@ static bool kvq_open_ref(const std::string & path, int32_t n_vocab, int32_t s, c
     return true;
 }
 
-static void kvq_print_compare(const std::vector<kvq_pos_stat> & stats) {
+static void kvq_print_compare(const std::vector<kvq_pos_stat> & stats, const std::string & path) {
     const size_t n = stats.size();
     std::vector<double> kl(n);
     double kl_sum = 0.0, nll_ref = 0.0, nll_var = 0.0;
@@ -796,6 +966,7 @@ static void kvq_print_compare(const std::vector<kvq_pos_stat> & stats) {
     };
 
     LOG("\n");
+    LOG("kvq: reference         = %s\n", path.c_str());
     LOG("kvq: scored positions  = %zu\n", n);
     LOG("kvq: mean KL(ref||var) = %.6e  95%% CI [%.6e, %.6e]\n", kl_sum / n, pct(means, 0.025), pct(means, 0.975));
     LOG("kvq: p90 KL            = %.6e\n", pct(kl, 0.90));
@@ -838,7 +1009,7 @@ int main(int argc, char ** argv) {
 
     kvq_capture cap;
     const bool capture = args.variant == KVQ_VARIANT_EXACT || args.variant == KVQ_VARIANT_CODEC;
-    if (capture) {
+    if (capture || args.tt_stats) {
         params.cb_eval           = kvq_capture_cb;
         params.cb_eval_user_data = &cap;
     }
@@ -846,10 +1017,18 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    auto llama_init = common_init_from_params(params);
+    // two-tier: the memory must be created with the coarse copy, so the context is created here
+    auto llama_init = common_init_from_params(params, args.two_tier);
+
+    llama_context_ptr ctx_tt;
 
     auto * model = llama_init->model();
-    auto * ctx   = llama_init->context();
+    if (model != nullptr && args.two_tier) {
+        llama_model_set_kvq_two_tier(model, true);
+        ctx_tt.reset(llama_init_from_model(model, common_context_params_to_llama(params)));
+    }
+
+    auto * ctx = args.two_tier ? ctx_tt.get() : llama_init->context();
     if (model == nullptr || ctx == nullptr) {
         LOG_ERR("%s: failed to load model or create context\n", __func__);
         return 1;
@@ -883,6 +1062,11 @@ int main(int argc, char ** argv) {
 
     std::ifstream ref_in;
     if (!args.ref_in_path.empty() && !kvq_open_ref(args.ref_in_path, n_vocab, s, ids, ref_in)) {
+        return 1;
+    }
+    std::ifstream ref2_in;
+    if (!args.ref2_in_path.empty() && (!ref_in.is_open() || !kvq_open_ref(args.ref2_in_path, n_vocab, s, ids, ref2_in))) {
+        LOG_ERR("%s: --kvq-ref2 needs --kvq-ref and a valid reference\n", __func__);
         return 1;
     }
 
@@ -943,11 +1127,47 @@ int main(int argc, char ** argv) {
     }
     cap.q.clear();
 
+    if (args.two_tier) {
+        llama_kvq_params tp;
+        tp.enabled  = true;
+        tp.n_top    = args.tt_top;
+        tp.n_sink   = args.tt_all_coarse ? 0 : args.sinks;
+        tp.n_recent = args.tt_all_precise ? s : args.tt_all_coarse ? 0 : args.tt_protect;
+        tp.n_prefix = s;
+        tp.stats    = args.tt_stats;
+        if (tp.n_top > s - std::min(s, tp.n_sink + tp.n_recent)) {
+            LOG_ERR("%s: --kvq-two-tier %d is more than the unprotected prefix cells\n", __func__, tp.n_top);
+            return 1;
+        }
+        if (!llama_memory_kvq_set_params(llama_get_memory(ctx), tp)) {
+            LOG_ERR("%s: cannot switch to two-tier mode\n", __func__);
+            return 1;
+        }
+        LOG_INF("%s: two-tier: n_top = %d, protected: first %d and last %d prefix positions, precise copy %s\n", __func__,
+                tp.n_top, tp.n_sink, tp.n_recent, args.tt_precise_aff8 ? "aff8" : "exact");
+        cap.tt_stats = args.tt_stats;
+    }
+    std::map<int32_t, kvq_tt_stat> tt_acc;
+
     std::vector<float> lp(n_vocab);
     std::vector<float> lp_ref(n_vocab);
     std::vector<kvq_pos_stat> stats;
+    std::vector<kvq_pos_stat> stats2;
     stats.reserve(n_scored);
     double nll = 0.0;
+
+    const auto compare = [&](std::ifstream & f, int32_t top, llama_token target, std::vector<kvq_pos_stat> & out) {
+        if (!f.read((char *) lp_ref.data(), n_vocab * sizeof(float))) {
+            LOG_ERR("%s: reference file is truncated\n", __func__);
+            return false;
+        }
+        double kl = 0.0;
+        for (int32_t v = 0; v < n_vocab; v++) {
+            kl += std::exp((double) lp_ref[v]) * ((double) lp_ref[v] - lp[v]);
+        }
+        out.push_back({ kl, -lp_ref[target], -lp[target], kvq_argmax(lp_ref.data(), n_vocab) == top });
+        return true;
+    };
 
     const int64_t t_score_start = ggml_time_us();
     const bool ok = kvq_score(ctx, ids, s, args.chunk, [&](int32_t i, const float * logits) {
@@ -959,18 +1179,25 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s: failed to write reference\n", __func__);
             return false;
         }
-        if (ref_in.is_open()) {
-            if (!ref_in.read((char *) lp_ref.data(), n_vocab * sizeof(float))) {
-                LOG_ERR("%s: reference file is truncated\n", __func__);
-                return false;
-            }
-            double kl = 0.0;
-            for (int32_t v = 0; v < n_vocab; v++) {
-                kl += std::exp((double) lp_ref[v]) * ((double) lp_ref[v] - lp[v]);
-            }
-            stats.push_back({ kl, -lp_ref[target], -lp[target], kvq_argmax(lp_ref.data(), n_vocab) == top });
+        if (ref_in.is_open() && !compare(ref_in, top, target, stats)) {
+            return false;
+        }
+        if (ref2_in.is_open() && !compare(ref2_in, top, target, stats2)) {
+            return false;
         }
         return true;
+    }, [&](int32_t i0, int32_t n) {
+        if (!cap.tt_stats) {
+            return true;
+        }
+        llama_synchronize(ctx);
+        if (cap.tt.size() != layer_ids.size()) {
+            LOG_ERR("%s: two-tier stats of %zu layers, expected %zu\n", __func__, cap.tt.size(), layer_ids.size());
+            return false;
+        }
+        const bool ok = kvq_tt_add(cap, tt_acc, n, std::max(0, kvq_n_skip - i0), args.tt_top > 0, mi.n_head, mi.n_head_kv);
+        cap.tt.clear();
+        return ok;
     });
     if (!ok) {
         return 1;
@@ -989,8 +1216,15 @@ int main(int argc, char ** argv) {
         LOG("kvq: saved reference to %s\n", args.ref_out_path.c_str());
     }
 
+    if (args.tt_stats) {
+        kvq_tt_print(tt_acc, args.tt_top > 0);
+    }
+
     if (ref_in.is_open()) {
-        kvq_print_compare(stats);
+        kvq_print_compare(stats, args.ref_in_path);
+        if (ref2_in.is_open()) {
+            kvq_print_compare(stats2, args.ref2_in_path);
+        }
 
         if (!args.csv_path.empty()) {
             FILE * fcsv = fopen(args.csv_path.c_str(), "w");

@@ -83,6 +83,17 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+protected:
+    using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
+
+    // split the batch into ubatches and prepare both caches for them, false on failure
+    bool prepare_batch(
+            llama_batch_allocr & balloc,
+                      uint32_t   n_ubatch,
+                          bool   embd_all,
+     std::vector<llama_ubatch> & ubatches,
+               slot_info_vec_t & heads_attn);
+
 private:
     const llama_hparams & hparams;
 

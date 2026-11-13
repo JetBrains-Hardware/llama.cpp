@@ -17,6 +17,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-kvq.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -3395,6 +3396,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
+                    } else if (kvq_two_tier && arch == LLM_ARCH_QWEN35) {
+                        // a coarse copy of the attention K/V for two-tier attention
+                        res = new llama_memory_hybrid_kvq(
+                            /* model             */ *this,
+                            /* no_alloc          */ params.no_alloc,
+                            /* attn_type_k       */ params.type_k,
+                            /* attn_type_v       */ params.type_v,
+                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_swa_type     */ hparams.swa_type,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* offload           */ cparams.offload_kqv,
+                            /* unified           */ cparams.kv_unified,
+                            /* filter_attn       */ std::move(filter_attn),
+                            /* filter_recr       */ std::move(filter_recr));
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -4008,6 +4029,10 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
 
 void llama_model_set_attn_rot(struct llama_model * model, bool value) {
     model->attn_rot = value;
+}
+
+void llama_model_set_kvq_two_tier(struct llama_model * model, bool value) {
+    model->kvq_two_tier = value;
 }
 
 //

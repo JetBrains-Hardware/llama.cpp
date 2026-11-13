@@ -132,6 +132,32 @@ LLAMA_API bool llama_memory_kv_set_rows(llama_memory_t mem, int32_t il, bool is_
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
+//
+// two-tier attention (KV cache compression experiments)
+//
+
+// the contexts created from this model keep a coarse copy of the attention K/V next to the precise one (qwen35 only)
+LLAMA_API void llama_model_set_kvq_two_tier(struct llama_model * model, bool value);
+
+// cells with pos < n_prefix are the prefix, later cells hold exact K/V in both copies and are always precise
+// the protected cells (the first n_sink and the last n_recent of the prefix) are precise
+// of the other prefix cells, the n_top with the largest coarse attention are precise, per kv head and query position
+struct llama_kvq_params {
+    bool      enabled  = false;
+    int32_t   n_top    = 0;
+    int32_t   n_sink   = 4;
+    int32_t   n_recent = 512;
+    llama_pos n_prefix = 0;
+    bool      stats    = false; // per layer statistics in the graph, as tensor "kvq_stats-<il>"
+};
+
+// false if the memory has no coarse copy or does not support the parameters (single stream only)
+// the coarse copy is written only in two-tier mode: the caller sets the coarse rows of the cells that exist before the switch
+LLAMA_API bool llama_memory_kvq_set_params(llama_memory_t mem, const llama_kvq_params & params);
+
+// like llama_memory_kv_set_rows, for the coarse copy
+LLAMA_API bool llama_memory_kvq_set_coarse_rows(llama_memory_t mem, int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, const float * src);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

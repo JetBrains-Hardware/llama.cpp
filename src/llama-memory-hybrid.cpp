@@ -67,11 +67,26 @@ llama_memory_hybrid::llama_memory_hybrid(
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    std::vector<llama_ubatch> ubatches;
+    slot_info_vec_t heads_attn;
+
+    if (!prepare_batch(balloc, n_ubatch, embd_all, ubatches, heads_attn)) {
+        return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    return std::make_unique<llama_memory_hybrid_context>(this, std::move(heads_attn), std::move(ubatches));
+}
+
+bool llama_memory_hybrid::prepare_batch(
+        llama_batch_allocr & balloc,
+                  uint32_t   n_ubatch,
+                      bool   embd_all,
+ std::vector<llama_ubatch> & ubatches,
+           slot_info_vec_t & heads_attn) {
     do {
         balloc.split_reset();
 
         // follow the recurrent pattern for creating the ubatch splits
-        std::vector<llama_ubatch> ubatches;
 
         while (true) {
             llama_ubatch ubatch;
@@ -107,21 +122,20 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         if (!mem_recr->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
-            return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            return false;
         }
 
         // prepare the attention cache
-        auto heads_attn = mem_attn->prepare(ubatches);
+        heads_attn = mem_attn->prepare(ubatches);
         if (heads_attn.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
-            return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            return false;
         }
 
-        return std::make_unique<llama_memory_hybrid_context>(
-                this, std::move(heads_attn), std::move(ubatches));
+        return true;
     } while(false);
 
-    return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    return false;
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_full() {

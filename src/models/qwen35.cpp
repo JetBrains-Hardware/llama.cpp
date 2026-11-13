@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-memory-hybrid-kvq.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -156,6 +157,8 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
 
     auto * inp = build_inp_mem_hybrid();
 
+    auto * inp_kvq = build_inp_kvq();
+
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -176,7 +179,7 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
+            cur = build_layer_attn(inp->get_attn(), inp_kvq, cur, inp_pos, il);
         }
 
         if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
@@ -283,8 +286,236 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated_silu);
 }
 
+class llama_model_qwen35::llm_graph_input_kvq : public llm_graph_input_i {
+public:
+    llm_graph_input_kvq(const llama_memory_hybrid_kvq_context * mctx, bool causal_attn) :
+        mctx(mctx), params(mctx->get_params()), causal_attn(causal_attn) {}
+    virtual ~llm_graph_input_kvq() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        if (!params.enabled) {
+            return;
+        }
+
+        mctx->get_attn()->set_input_attn_mask(kq_mask, ubatch, causal_attn);
+        mctx->set_input_kvq(pre, prot, bias);
+    }
+
+    bool can_reuse(const llm_graph_params & gparams) override {
+        mctx = dynamic_cast<const llama_memory_hybrid_kvq_context *>(gparams.mctx);
+        if (mctx == nullptr) {
+            return false;
+        }
+
+        // these change the graph, the other parameters only the cell flags
+        const llama_kvq_params & p = mctx->get_params();
+
+        bool res = p.enabled == params.enabled && p.n_top == params.n_top && p.stats == params.stats;
+
+        if (res && params.enabled) {
+            res &= kq_mask.raw->ne[0] == mctx->get_attn()->get_n_kv();
+            res &= kq_mask.raw->ne[1] == gparams.ubatch.n_tokens;
+        }
+
+        params = p;
+
+        return res;
+    }
+
+    llm_attn_mask kq_mask;        // F32 [n_kv, n_tokens], over all cells
+    ggml_tensor * pre  = nullptr; // F32 [n_kv], see llama_memory_hybrid_kvq_context::set_input_kvq
+    ggml_tensor * prot = nullptr; // F32 [n_kv]
+    ggml_tensor * bias = nullptr; // F32 [n_kv]
+
+    const llama_memory_hybrid_kvq_context * mctx;
+
+    llama_kvq_params params;
+
+    const bool causal_attn;
+};
+
+llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_kvq() const {
+    const auto * mctx_kvq = dynamic_cast<const llama_memory_hybrid_kvq_context *>(mctx);
+    if (mctx_kvq == nullptr) {
+        return nullptr;
+    }
+
+    // added also when the mode is off, so that can_reuse sees a switch
+    auto inp = std::make_unique<llm_graph_input_kvq>(mctx_kvq, cparams.causal_attn);
+
+    if (inp->params.enabled) {
+        GGML_ASSERT(ubatch.n_seqs_unq == 1 && "two-tier attention supports a single sequence");
+
+        const int64_t n_kv = mctx_kvq->get_attn()->get_n_kv();
+        GGML_ASSERT(mctx_kvq->get_coarse()->get_n_kv() == n_kv);
+
+        inp->kq_mask.n_kv = n_kv;
+        inp->kq_mask.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, n_tokens);
+        ggml_set_input(inp->kq_mask.raw);
+        ggml_set_name(inp->kq_mask.raw, "kvq_kq_mask");
+
+        inp->pre  = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_kv);
+        inp->prot = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_kv);
+        inp->bias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_kv);
+        ggml_set_input(inp->pre);
+        ggml_set_input(inp->prot);
+        ggml_set_input(inp->bias);
+        ggml_set_name(inp->pre,  "kvq_pre");
+        ggml_set_name(inp->prot, "kvq_prot");
+        ggml_set_name(inp->bias, "kvq_bias");
+    }
+
+    return (llm_graph_input_kvq *) res->add_input(std::move(inp));
+}
+
+// two-tier attention: one softmax over the precise logits of the precise cells and the coarse logits of the others
+// the precise prefix cells are the protected ones and the n_top cells with the largest coarse attention
+// (summed over the query heads of a kv head), chosen per kv head and query position
+// the cells after the prefix hold the same exact K/V in both copies, so the coarse path computes them exactly
+ggml_tensor * llama_model_qwen35::graph::build_attn_kvq(
+        llm_graph_input_attn_kv * inp,
+        llm_graph_input_kvq *     inp_kvq,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        float                     kq_scale,
+        int                       il) {
+    const auto * mctx_attn   = inp->mctx;
+    const auto * mctx_coarse = inp_kvq->mctx->get_coarse();
+
+    // no rotation and no scales: both copies hold plain K/V
+    GGML_ASSERT(!inp->self_k_rot[il] && !inp->self_v_rot[il]);
+    GGML_ASSERT(!mctx_attn->get_k_scale(il) && !mctx_attn->get_v_scale(il));
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    for (const auto * mc : { mctx_attn, mctx_coarse }) {
+        ggml_build_forward_expand(gf, mc->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mc->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+    }
+
+    const llama_kvq_params & params = inp_kvq->params;
+
+    ggml_tensor * kq_mask = inp_kvq->kq_mask.raw;
+
+    const int64_t n_kv  = kq_mask->ne[0];
+    const int64_t n_rep = n_head/n_head_kv;
+    const int64_t n_row = n_tokens*n_head_kv;
+
+    // [n_embd_head, n_tokens, n_head]
+    ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+
+    // query head h reads kv head h/n_rep: [n_kv, n_tokens, n_rep, n_head_kv]
+    auto build_kq = [&](const llama_kv_cache_context * mc) {
+        ggml_tensor * k = ggml_permute(ctx0, mc->get_k(ctx0, il), 0, 2, 1, 3);
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        ggml_prec_set_acc(kq, GGML_PREC_F32);
+        return ggml_reshape_4d(ctx0, kq, n_kv, n_tokens, n_rep, n_head_kv);
+    };
+
+    ggml_tensor * kq_p = build_kq(mctx_attn);
+    ggml_tensor * kq_c = build_kq(mctx_coarse);
+    cb(kq_p, "kvq_kq_p", il);
+    cb(kq_c, "kvq_kq_c", il);
+
+    // precise prefix cells: [n_kv] or [n_kv, n_tokens, 1, n_head_kv]
+    ggml_tensor * selp = inp_kvq->prot;
+
+    ggml_tensor * c   = nullptr; // coarse weights summed over the query heads of a kv head, [n_kv, n_tokens, 1, n_head_kv]
+    ggml_tensor * sel = nullptr;
+
+    if (params.n_top > 0 || params.stats) {
+        ggml_tensor * wc = ggml_soft_max_ext(ctx0, kq_c, kq_mask, kq_scale, 0.0f);
+
+        c = ggml_cont(ctx0, ggml_view_4d(ctx0, wc, n_kv, n_tokens, 1, n_head_kv, wc->nb[1], wc->nb[2], wc->nb[3], 0));
+        for (int64_t r = 1; r < n_rep; ++r) {
+            c = ggml_add(ctx0, c, ggml_view_4d(ctx0, wc, n_kv, n_tokens, 1, n_head_kv, wc->nb[1], wc->nb[2], wc->nb[3], r*wc->nb[2]));
+        }
+        cb(c, "kvq_c", il);
+    }
+
+    if (params.n_top > 0) {
+        GGML_ASSERT(params.n_top <= n_kv);
+
+        ggml_tensor * score = ggml_reshape_2d(ctx0, ggml_add(ctx0, c, inp_kvq->bias), n_kv, n_row);
+
+        ggml_tensor * top_k = ggml_top_k(ctx0, score, params.n_top); // [n_top, n_row]
+        cb(top_k, "kvq_top_k", il);
+
+        // scatter ones for the chosen cells into a zero mask
+        ggml_tensor * ones = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, params.n_top, n_row), 1.0f);
+
+        sel = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_kv, n_row), 0.0f);
+        sel = ggml_set_rows(ctx0, sel, ones, top_k);
+        sel = ggml_reshape_4d(ctx0, sel, n_kv, n_tokens, 1, n_head_kv);
+        cb(sel, "kvq_sel", il);
+
+        // the candidates exclude the protected cells, so this stays 0 or 1
+        selp = ggml_add(ctx0, sel, inp_kvq->prot);
+    }
+
+    ggml_tensor * selc = ggml_scale_bias(ctx0, selp, -1.0f, 1.0f);
+
+    // products with 0 and 1 select exactly
+    ggml_tensor * kq = ggml_add(ctx0, ggml_mul(ctx0, kq_p, selp), ggml_mul(ctx0, kq_c, selc));
+    cb(kq, "kvq_kq", il);
+
+    ggml_tensor * w = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, 0.0f);
+    cb(w, "kvq_soft_max", il);
+
+    ggml_tensor * wp = ggml_mul(ctx0, w, selp);
+    ggml_tensor * wc = ggml_mul(ctx0, w, selc);
+
+    // [n_embd_head, n_tokens, n_head]
+    auto build_kqv = [&](const llama_kv_cache_context * mc, ggml_tensor * wx) {
+        ggml_tensor * v = ggml_cont(ctx0, ggml_permute(ctx0, mc->get_v(ctx0, il), 1, 2, 0, 3)); // [n_kv, n_embd_head, n_head_kv]
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, ggml_reshape_3d(ctx0, wx, n_kv, n_tokens, n_head));
+        ggml_prec_set_acc(kqv, GGML_PREC_F32);
+        return kqv;
+    };
+
+    ggml_tensor * kqv = ggml_add(ctx0, build_kqv(mctx_attn, wp), build_kqv(mctx_coarse, wc));
+    cb(kqv, "kvq_kqv", il);
+
+    ggml_tensor * cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+    cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]);
+    cb(cur, "kqv_out", il);
+
+    if (params.stats) {
+        // per query position and head, see kvq-eval:
+        //   coarse weight on the prefix, on the candidates, on the chosen cells (n_top > 0) [n_row each]
+        //   precise weight on the prefix, weight after the prefix [n_tokens*n_head each]
+        ggml_tensor * c2  = ggml_reshape_2d(ctx0, c, n_kv, n_row);
+        ggml_tensor * w2  = ggml_reshape_2d(ctx0, w, n_kv, n_tokens*n_head);
+        ggml_tensor * pre = ggml_reshape_2d(ctx0, inp_kvq->pre, n_kv, 1);
+
+        std::vector<ggml_tensor *> parts = {
+            ggml_mul_mat(ctx0, pre, c2),
+            ggml_mul_mat(ctx0, ggml_sub(ctx0, pre, ggml_reshape_2d(ctx0, inp_kvq->prot, n_kv, 1)), c2),
+        };
+        if (sel) {
+            parts.push_back(ggml_sum_rows(ctx0, ggml_mul(ctx0, sel, c)));
+        }
+        parts.push_back(ggml_sum_rows(ctx0, wp));
+        parts.push_back(ggml_mul_mat(ctx0, ggml_scale_bias(ctx0, pre, -1.0f, 1.0f), w2));
+
+        ggml_tensor * stats = nullptr;
+        for (ggml_tensor * t : parts) {
+            t = ggml_reshape_1d(ctx0, t, ggml_nelements(t));
+            stats = stats ? ggml_concat(ctx0, stats, t, 0) : t;
+        }
+        cb(stats, "kvq_stats", il);
+        ggml_build_forward_expand(gf, stats);
+    }
+
+    return cur;
+}
+
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
+        llm_graph_input_kvq *     inp_kvq,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int                       il) {
@@ -337,9 +568,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    if (inp_kvq && inp_kvq->params.enabled) {
+        cur = build_attn_kvq(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);

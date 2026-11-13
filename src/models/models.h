@@ -2556,13 +2556,29 @@ struct llama_model_qwen35 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // two-tier attention inputs on top of the hybrid input, see llama_memory_hybrid_kvq
+    class llm_graph_input_kvq;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
     private:
+        // nullptr unless the memory keeps a coarse copy of the K/V
+        llm_graph_input_kvq * build_inp_kvq() const;
+
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
+                            int   il);
+
+        ggml_tensor * build_attn_kvq(
+        llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                          float   kq_scale,
                             int   il);
 
         ggml_tensor * build_layer_attn_linear(

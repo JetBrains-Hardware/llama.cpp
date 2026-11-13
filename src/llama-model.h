@@ -782,6 +782,9 @@ struct llama_model {
     // see llama_model_set_attn_rot
     bool attn_rot = true;
 
+    // see llama_model_set_kvq_two_tier
+    bool kvq_two_tier = false;
+
     // for classifier models
     std::vector<std::string> classifier_labels;
     std::vector<std::string> decision_labels;
