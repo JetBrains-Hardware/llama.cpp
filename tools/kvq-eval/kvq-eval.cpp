@@ -35,6 +35,13 @@
 //   --kvq-all-resident (debug: every coarse row resident), --kvq-pk-stats (top-m counters with sync off)
 // --kvq-no-rot: attention rotation off (for references of the packed mode)
 // --kvq-perf: no logits processing, decode times per chunk only
+//
+// --kvq-lib vtab.bin: packed two-tier attention with the tables fitted by the library (llama_memory_kvq_fit_enable), during the prefill
+//   chunks of --kvq-fit-chunk (default 8192), K<b>V<b> of --kvq-variant (default K2V1), V tables from vtab.bin, --kvq-fit-threads 8,
+//   the packed options as for --kvq-packed; waits for the fitter after the prefill
+//   --kvq-lib-nowait: does not wait
+//   --kvq-lib-busy: the job of the last chunk of the prefix runs during the scoring, its chunk joins after it (decode times busy vs idle)
+//   --kvq-rm-test: functional check of clear and seq_rm on the first chunk, no scoring
 
 #include "arg.h"
 #include "common.h"
@@ -118,6 +125,14 @@ struct kvq_args {
 
     bool    no_rot          = false;
     bool    perf            = false;
+
+    std::string lib_vtab;
+    int32_t     lib_threads = 8;
+    bool        lib_nowait  = false;
+    bool        lib_busy    = false;
+    bool        rm_test     = false;
+
+    bool lib() const { return !lib_vtab.empty(); }
 };
 
 static bool kvq_parse_two_tier(const std::string & v, kvq_args & args) {
@@ -290,6 +305,16 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.no_rot = true;
         } else if (a == "--kvq-perf") {
             args.perf = true;
+        } else if (a == "--kvq-lib" && has_val) {
+            args.lib_vtab = argv[++i];
+        } else if (a == "--kvq-fit-threads" && has_val) {
+            args.lib_threads = std::stoi(argv[++i]);
+        } else if (a == "--kvq-lib-nowait") {
+            args.lib_nowait = true;
+        } else if (a == "--kvq-lib-busy") {
+            args.lib_busy = true;
+        } else if (a == "--kvq-rm-test") {
+            args.rm_test = true;
         } else if (a.rfind("--kvq-", 0) == 0) {
             LOG_ERR("%s: unknown or incomplete argument '%s'\n", __func__, a.c_str());
             return false;
@@ -305,19 +330,43 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
                 "       [--kvq-save-tables tables.bin] [--kvq-load-tables tables.bin [--kvq-load-only k|v] [--kvq-own-mean-k]] [--kvq-stats]\n"
                 "       [--kvq-two-tier all-precise|all-coarse|none|<N> [--kvq-protect 512] [--kvq-precise aff8|exact] [--kvq-tt-stats]]\n"
                 "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 1024] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
-                "                     [--kvq-all-resident] [--kvq-pk-stats]] [--kvq-no-rot] [--kvq-perf] [common args]\n", argv[0]);
+                "                     [--kvq-all-resident] [--kvq-pk-stats]] [--kvq-no-rot] [--kvq-perf]\n"
+                "       [--kvq-lib vtab.bin [--kvq-fit-threads 8] [--kvq-lib-nowait] [--kvq-lib-busy] [--kvq-rm-test]] [common args]\n", argv[0]);
         return false;
     }
     if (args.chunk <= 0) {
         LOG_ERR("%s: --kvq-chunk must be > 0\n", __func__);
         return false;
     }
+    if (args.lib()) {
+        if (args.variant == KVQ_VARIANT_NONE) {
+            args.variant = KVQ_VARIANT_CODEC;
+            args.k_bits  = 2;
+            args.v_bits  = 1;
+        }
+        if (args.fit_chunk == 0) {
+            args.fit_chunk = 8192;
+        }
+        if (args.packed || args.two_tier || args.variant != KVQ_VARIANT_CODEC || args.k_bits == 0 || args.v_bits == 0 || args.k_last ||
+            !args.tables_in_path.empty() || !args.tables_out_path.empty() || args.stats || args.recent != 0 || args.lib_threads < 1) {
+            LOG_ERR("%s: --kvq-lib needs a K<b>V<b> variant (or none), no --kvq-packed, --kvq-two-tier, table files, --kvq-stats or --kvq-recent\n", __func__);
+            return false;
+        }
+        args.packed = true;
+        return true;
+    }
+    if (args.lib_nowait || args.lib_busy || args.rm_test) {
+        LOG_ERR("%s: --kvq-lib-nowait, --kvq-lib-busy and --kvq-rm-test need --kvq-lib\n", __func__);
+        return false;
+    }
     if (args.sinks < 0 || args.recent < 0 || args.q_win <= 0 || args.fit_chunk < 0) {
         LOG_ERR("%s: bad --kvq-sinks, --kvq-recent, --kvq-qwin or --kvq-fit-chunk\n", __func__);
         return false;
     }
-    if (args.fit_chunk > 0 && (args.variant != KVQ_VARIANT_CODEC || !args.tables_out_path.empty() || !args.tables_in_path.empty())) {
-        LOG_ERR("%s: --kvq-fit-chunk needs a codec variant and no --kvq-save-tables or --kvq-load-tables\n", __func__);
+    // --kvq-load-only v: the loaded V tables are used for every chunk
+    const bool tables_in_k = !args.tables_in_path.empty() && args.load_kv != 1;
+    if (args.fit_chunk > 0 && (args.variant != KVQ_VARIANT_CODEC || !args.tables_out_path.empty() || tables_in_k)) {
+        LOG_ERR("%s: --kvq-fit-chunk needs a codec variant and no --kvq-save-tables or --kvq-load-tables (except with --kvq-load-only v)\n", __func__);
         return false;
     }
     if ((args.load_kv >= 0 || args.own_mu_k) && args.tables_in_path.empty()) {
@@ -338,7 +387,7 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
         return false;
     }
     if (args.packed && (args.two_tier || args.variant != KVQ_VARIANT_CODEC || args.k_bits == 0 || args.v_bits == 0 || args.fit_chunk <= 0 ||
-                        args.k_last || !args.tables_in_path.empty() || args.recent != 0)) {
+                        args.k_last || tables_in_k || args.recent != 0)) {
         LOG_ERR("%s: --kvq-packed needs a K<b>V<b> variant with --kvq-fit-chunk, the own K metric, no --kvq-recent, and no --kvq-two-tier\n", __func__);
         return false;
     }
@@ -410,13 +459,13 @@ static int32_t kvq_argmax(const float * x, int32_t n) {
     return (int32_t) (std::max_element(x, x + n) - x);
 }
 
-// fill the memory with ids[0:n_prefix], no logits
-static bool kvq_prefill(llama_context * ctx, const std::vector<llama_token> & ids, int32_t n_prefix, int32_t n_batch) {
+// fill the memory with ids[p_begin:n_prefix], no logits
+static bool kvq_prefill(llama_context * ctx, const std::vector<llama_token> & ids, int32_t n_prefix, int32_t n_batch, int32_t p_begin = 0) {
     common_batch batch(ctx);
     for (int32_t i = 0; i < n_prefix; i++) {
         batch.add(ids[i], i, 0, false);
     }
-    for (int32_t i = 0; i < n_prefix; i += n_batch) {
+    for (int32_t i = p_begin; i < n_prefix; i += n_batch) {
         const int32_t n = std::min(n_batch, n_prefix - i);
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(i, n))) {
             LOG_ERR("%s: decode failed at pos %d\n", __func__, i);
@@ -1270,6 +1319,143 @@ static void kvq_print_counters(const llama_kvq_counters_all & c, int64_t n_decod
     }
 }
 
+static void kvq_print_progress(llama_memory_t mem) {
+    llama_kvq_fit_progress pr;
+    if (!llama_memory_kvq_fit_get_progress(mem, pr)) {
+        return;
+    }
+    std::string tj;
+    for (size_t i = 0; i < pr.t_job.size(); i++) {
+        tj += string_format("%s%.2f/%.2f", i ? " " : "", pr.t_job[i], pr.t_wall[i]);
+    }
+    LOG("kvq: fit: coarse rows %d (%d chunks), running %d, ready %d, cancelled %d, dropped %d%s\n",
+            pr.n_coarse, pr.n_chunk, pr.n_running, pr.n_ready, pr.n_cancel, pr.n_drop, pr.failed ? ", FAILED" : "");
+    if (!pr.t_job.empty()) {
+        LOG("kvq: fit: %.2f s CPU per chunk; decode thread per chunk: readback %.1f ms (with the wait for the queued ubatches), install %.1f ms; "
+            "s per job run/with queue: %s\n",
+                pr.t_cpu/pr.t_job.size(), 1e3*pr.t_take/pr.t_job.size(), 1e3*pr.t_install/pr.t_job.size(), tj.c_str());
+    }
+}
+
+// logits of the last position of ids[p0:p1] at positions [p0, p1), as one batch
+static bool kvq_decode_last(llama_context * ctx, const std::vector<llama_token> & ids, int32_t p0, int32_t p1, int32_t n_vocab, std::vector<float> & out) {
+    common_batch batch(ctx);
+    for (int32_t p = p0; p < p1; p++) {
+        batch.add(ids[p], p, 0, p == p1 - 1);
+    }
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        LOG_ERR("%s: decode of [%d, %d) failed\n", __func__, p0, p1);
+        return false;
+    }
+    const float * l = llama_get_logits_ith(ctx, -1);
+    out.assign(l, l + n_vocab);
+    return true;
+}
+
+// KL(a || b) of the softmax of two logit vectors, and whether the argmax is the same
+static double kvq_kl_logits(const std::vector<float> & a, const std::vector<float> & b, bool & same_top) {
+    const int32_t n = (int32_t) a.size();
+    std::vector<float> la(n), lb(n);
+    same_top = kvq_log_softmax(a.data(), n, la.data()) == kvq_log_softmax(b.data(), n, lb.data());
+    double kl = 0.0;
+    for (int32_t v = 0; v < n; v++) {
+        kl += std::exp((double) la[v])*((double) la[v] - lb[v]);
+    }
+    return kl;
+}
+
+// clear and seq_rm in the fit mode around the end of the first chunk C: the memory is empty and in the fit mode
+static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & ids, int32_t C, int32_t n_vocab) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    const int32_t n_batch = (int32_t) llama_n_batch(ctx);
+    if ((int32_t) ids.size() < C + 16) {
+        LOG_ERR("%s: needs at least %d tokens\n", __func__, C + 16);
+        return false;
+    }
+
+    bool ok = true;
+    auto check = [&](bool cond, const char * what) {
+        LOG("kvq: rm-test: %-70s %s\n", what, cond ? "ok" : "FAILED");
+        ok = ok && cond;
+    };
+    auto coarse = [&]() {
+        llama_kvq_fit_progress pr;
+        llama_memory_kvq_fit_get_progress(mem, pr);
+        return pr;
+    };
+    auto compare = [&](const std::vector<float> & a, const std::vector<float> & b, const char * what) {
+        bool same = false;
+        const double kl = kvq_kl_logits(a, b, same);
+        LOG("kvq: rm-test: %s: KL %.3e, same top-1 %d\n", what, kl, same ? 1 : 0);
+    };
+
+    std::vector<float> la, lb, lc;
+
+    // a job in flight, then clear
+    if (!kvq_prefill(ctx, ids, C + 2, n_batch)) {
+        return false;
+    }
+    check(coarse().n_running + coarse().n_ready + coarse().n_chunk == 1, "prefill past the first chunk starts its job");
+    llama_memory_clear(mem, true);
+    check(coarse().n_coarse == 0 && coarse().n_running == 0 && coarse().n_cancel + coarse().n_drop == 1, "clear cancels or drops it");
+
+    // the first chunk is completed by a ubatch of 4 tokens [C - 2, C + 2)
+    if (!kvq_prefill(ctx, ids, C - 2, n_batch) || !kvq_decode_last(ctx, ids, C - 2, C + 2, n_vocab, la)) {
+        return false;
+    }
+    llama_memory_kvq_fit_wait(mem);
+    check(coarse().n_coarse == C, "after the wait the first chunk is coarse");
+
+    // into the fitted chunk: the recurrent state rolls back inside the last ubatch
+    check(llama_memory_seq_rm(mem, 0, C - 1, -1), "seq_rm(C - 1, end) into the coarse chunk succeeds");
+    check(coarse().n_coarse == 0 && coarse().n_drop == 1, "the chunk left the coarse region");
+    check(llama_memory_seq_pos_max(mem, 0) == C - 2, "last position is C - 2");
+    if (!kvq_decode_last(ctx, ids, C - 1, C + 2, n_vocab, lb)) {
+        return false;
+    }
+    compare(la, lb, "logits at C + 1 before and after the removal (both precise)");
+    llama_memory_kvq_fit_wait(mem);
+    check(coarse().n_coarse == C && coarse().n_chunk == 1, "the chunk is fitted again and coarse");
+
+    // the tail only: a ubatch of 4 after the coarse region, remove 3 of them, decode them again
+    if (!kvq_decode_last(ctx, ids, C + 2, C + 6, n_vocab, la)) {
+        return false;
+    }
+    const auto pr0 = coarse();
+    const int64_t t0 = ggml_time_us();
+    check(llama_memory_seq_rm(mem, 0, C + 3, -1), "seq_rm(C + 3, end) in the tail succeeds");
+    const double t_rm = (ggml_time_us() - t0)/1e3;
+    const auto pr1 = coarse();
+    check(pr1.n_coarse == C && pr1.n_cancel == pr0.n_cancel && pr1.n_drop == pr0.n_drop, "the coarse region is not changed");
+    LOG("kvq: rm-test: tail seq_rm took %.3f ms\n", t_rm);
+    check(llama_memory_seq_rm(mem, 0, C + 10, -1), "seq_rm of an empty range succeeds");
+    if (!kvq_decode_last(ctx, ids, C + 3, C + 6, n_vocab, lb)) {
+        return false;
+    }
+    compare(la, lb, "logits at C + 5 before and after the tail removal (packed path)");
+
+    // too far back for the recurrent state: fails, nothing changes
+    check(!llama_memory_seq_rm(mem, 0, 100, -1), "seq_rm(100, end) fails (no recurrent snapshot)");
+    check(coarse().n_coarse == C && llama_memory_seq_pos_max(mem, 0) == C + 5, "and changes nothing");
+
+    // all of the sequence, as the server's prompt clear (seq_id -1 fails in the recurrent memory)
+    check(llama_memory_seq_rm(mem, 0, -1, -1), "seq_rm(0, -1, -1) succeeds");
+    check(coarse().n_coarse == 0 && llama_memory_seq_pos_max(mem, 0) == -1, "the memory is empty, no coarse rows");
+
+    // comes up again
+    if (!kvq_prefill(ctx, ids, C + 8, n_batch) || !kvq_decode_last(ctx, ids, C + 8, C + 12, n_vocab, lc)) {
+        return false;
+    }
+    llama_memory_kvq_fit_wait(mem);
+    check(coarse().n_coarse == C && !coarse().failed, "a new prefill fits the chunk again");
+    if (!kvq_decode_last(ctx, ids, C + 12, C + 14, n_vocab, lc)) {
+        return false;
+    }
+    kvq_print_progress(mem);
+    LOG("kvq: rm-test: %s\n", ok ? "all checks passed" : "SOME CHECKS FAILED");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -1301,7 +1487,7 @@ int main(int argc, char ** argv) {
     params.n_batch    = std::max(params.n_batch, args.chunk);
 
     kvq_capture cap;
-    const bool capture = args.variant == KVQ_VARIANT_EXACT || args.variant == KVQ_VARIANT_CODEC;
+    const bool capture = !args.lib() && (args.variant == KVQ_VARIANT_EXACT || args.variant == KVQ_VARIANT_CODEC);
     if (capture || args.tt_stats) {
         params.cb_eval           = kvq_capture_cb;
         params.cb_eval_user_data = &cap;
@@ -1323,7 +1509,12 @@ int main(int argc, char ** argv) {
         if (args.packed || args.no_rot) {
             llama_model_set_attn_rot(model, false);
         }
-        ctx_tt.reset(llama_init_from_model(model, common_context_params_to_llama(params)));
+        llama_context_params cparams = common_context_params_to_llama(params);
+        if (args.rm_test) {
+            // recurrent snapshots for a seq_rm into the last ubatch
+            cparams.n_rs_seq = 4;
+        }
+        ctx_tt.reset(llama_init_from_model(model, cparams));
     }
 
     auto * ctx = own_ctx ? ctx_tt.get() : llama_init->context();
@@ -1404,14 +1595,62 @@ int main(int argc, char ** argv) {
 
     llama_memory_clear(llama_get_memory(ctx), true);
 
+    llama_kvq_params tp_packed;
+    tp_packed.enabled       = true;
+    tp_packed.packed        = true;
+    tp_packed.n_sink        = args.sinks;
+    tp_packed.stats         = args.pk_stats;
+    tp_packed.prefetch_n    = args.pk_pf_n;
+    tp_packed.resident_cap  = args.pk_cap;
+    tp_packed.lead          = args.pk_lead;
+    tp_packed.sync_mode     = args.pk_sync;
+    tp_packed.sync_m        = args.pk_sync_m;
+    tp_packed.sync_min_hits = args.pk_sync_hits;
+    tp_packed.all_resident  = args.pk_all_res;
+
+    if (args.lib()) {
+        llama_kvq_fit_params fp;
+        fp.chunk     = args.fit_chunk;
+        fp.bits_k    = args.k_bits;
+        fp.bits_v    = args.v_bits;
+        fp.v_tables  = args.lib_vtab;
+        fp.n_threads = args.lib_threads;
+        if (!llama_memory_kvq_fit_enable(llama_get_memory(ctx), fp, tp_packed)) {
+            LOG_ERR("%s: cannot enable the fit mode\n", __func__);
+            return 1;
+        }
+        if (args.rm_test) {
+            return kvq_rm_test(ctx, ids, args.fit_chunk, n_vocab) ? 0 : 1;
+        }
+    }
+
     const int64_t t_prefill_start = ggml_time_us();
     cap.enabled = capture;
-    if (!kvq_prefill(ctx, ids, s, params.n_batch)) {
+    if (args.lib_busy && s > args.fit_chunk) {
+        // the last chunk of the prefix is complete with the second part: its job starts there, and the chunk joins after the scoring
+        const int32_t s1 = (s/args.fit_chunk)*args.fit_chunk - 1;
+        if (!kvq_prefill(ctx, ids, s1, params.n_batch) || !llama_memory_kvq_fit_wait(llama_get_memory(ctx))) {
+            return 1;
+        }
+        llama_memory_kvq_fit_set_hold(llama_get_memory(ctx), true);
+        if (!kvq_prefill(ctx, ids, s, params.n_batch, s1)) {
+            return 1;
+        }
+    } else if (!kvq_prefill(ctx, ids, s, params.n_batch)) {
         return 1;
     }
     cap.enabled = false;
     const double t_prefill = (ggml_time_us() - t_prefill_start) / 1e6;
     LOG_INF("%s: prefill: %d tokens in %.2f s, %.1f t/s\n", __func__, s, t_prefill, s / t_prefill);
+
+    if (args.lib()) {
+        const int64_t t0 = ggml_time_us();
+        if (!args.lib_nowait && !args.lib_busy && !llama_memory_kvq_fit_wait(llama_get_memory(ctx))) {
+            return 1;
+        }
+        LOG_INF("%s: waited %.2f s for the fitter\n", __func__, (ggml_time_us() - t0)/1e6);
+        kvq_print_progress(llama_get_memory(ctx));
+    }
 
     if (capture) {
         bool ok = cap.pos_next == s && cap.q.size() == layer_ids.size() && cap.gate_sum.size() == layer_ids.size();
@@ -1425,7 +1664,7 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: captured queries of positions [%d, %d) and gates of %lld positions in %zu layers\n", __func__, cap.win0, cap.win1, (long long) cap.pos_next, cap.q.size());
     }
 
-    if (args.variant != KVQ_VARIANT_NONE && !kvq_apply(ctx, args, cap, mi, s)) {
+    if (args.variant != KVQ_VARIANT_NONE && !args.lib() && !kvq_apply(ctx, args, cap, mi, s)) {
         return 1;
     }
     cap.q.clear();
@@ -1451,19 +1690,7 @@ int main(int argc, char ** argv) {
         cap.tt_stats = args.tt_stats;
     }
     if (args.packed) {
-        llama_kvq_params tp;
-        tp.enabled       = true;
-        tp.packed        = true;
-        tp.n_sink        = args.sinks;
-        tp.stats         = args.pk_stats;
-        tp.prefetch_n    = args.pk_pf_n;
-        tp.resident_cap  = args.pk_cap;
-        tp.lead          = args.pk_lead;
-        tp.sync_mode     = args.pk_sync;
-        tp.sync_m        = args.pk_sync_m;
-        tp.sync_min_hits = args.pk_sync_hits;
-        tp.all_resident  = args.pk_all_res;
-        if (!llama_memory_kvq_set_params(llama_get_memory(ctx), tp)) {
+        if (!args.lib() && !llama_memory_kvq_set_params(llama_get_memory(ctx), tp_packed)) {
             LOG_ERR("%s: cannot switch to packed two-tier mode\n", __func__);
             return 1;
         }
@@ -1500,6 +1727,10 @@ int main(int argc, char ** argv) {
     };
 
     std::vector<double> t_chunks;
+    std::vector<int>    busy_chunks; // fit mode: a job was running at the start of the chunk
+    std::vector<int>    coarse_chunks;
+    int  busy   = 0;
+    int  coarse = 0;
     int32_t n_split_min = INT32_MAX;
     int32_t n_split_max = 0;
     int64_t t_chunk_start = 0;
@@ -1532,6 +1763,8 @@ int main(int argc, char ** argv) {
         // decode time only, the logits are processed after this
         llama_synchronize(ctx);
         t_chunks.push_back((ggml_time_us() - t_chunk_start)/1e3/n);
+        busy_chunks.push_back(busy);
+        coarse_chunks.push_back(coarse);
         if (!cap.tt_stats) {
             return true;
         }
@@ -1544,6 +1777,11 @@ int main(int argc, char ** argv) {
         cap.tt.clear();
         return ok;
     }, [&]() {
+        llama_kvq_fit_progress pr;
+        if (args.lib() && llama_memory_kvq_fit_get_progress(llama_get_memory(ctx), pr)) {
+            busy   = pr.n_running > 0;
+            coarse = pr.n_coarse;
+        }
         t_chunk_start = ggml_time_us();
     });
     if (!ok) {
@@ -1563,6 +1801,29 @@ int main(int argc, char ** argv) {
         std::sort(tc.begin(), tc.end());
         LOG("kvq: perf: chunk %d, %zu chunks (first %zu skipped), decode only: ms/token mean %.3f, median %.3f, p10 %.3f, p90 %.3f -> %.2f t/s\n",
                 args.chunk, tc.size(), n_skip, sum/tc.size(), tc[tc.size()/2], tc[tc.size()/10], tc[tc.size()*9/10], 1e3*tc.size()/sum);
+        if (args.lib()) {
+            // by fitter state and coarse region
+            std::map<std::pair<int, int>, std::vector<double>> by;
+            for (size_t i = n_skip; i < t_chunks.size(); i++) {
+                by[{ coarse_chunks[i], busy_chunks[i] }].push_back(t_chunks[i]);
+            }
+            for (auto & it : by) {
+                auto & v = it.second;
+                double sv = 0.0;
+                for (double x : v) {
+                    sv += x;
+                }
+                std::sort(v.begin(), v.end());
+                LOG("kvq: perf: coarse rows %d, fitter %s: %zu chunks, ms/token mean %.3f, median %.3f\n",
+                        it.first.first, it.first.second ? "busy" : "idle", v.size(), sv/v.size(), v[v.size()/2]);
+            }
+        }
+    }
+    if (args.lib()) {
+        if (args.lib_busy && !llama_memory_kvq_fit_wait(llama_get_memory(ctx))) {
+            return 1;
+        }
+        kvq_print_progress(llama_get_memory(ctx));
     }
     if (args.packed) {
         llama_kvq_counters_all kc;
