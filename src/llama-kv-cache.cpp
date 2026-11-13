@@ -1297,6 +1297,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -1316,7 +1322,8 @@ bool llama_kv_cache::copy_rows(int32_t il, bool is_v, llama_seq_id seq_id, llama
     }
 
     ggml_tensor * t = is_v ? layers[it->second].v : layers[it->second].k;
-    if (t == nullptr || t->ne[0] != n_embd || (is_v && v_trans) || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) {
+    if (t == nullptr || t->ne[0] != n_embd || (is_v && v_trans) ||
+        (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_Q8_0)) {
         return false;
     }
 
@@ -1367,11 +1374,19 @@ bool llama_kv_cache::copy_rows(int32_t il, bool is_v, llama_seq_id seq_id, llama
                     ggml_fp32_to_fp16_row(f32, (ggml_fp16_t *) buf.data(), n);
                 }
                 break;
-            default:
+            case GGML_TYPE_BF16:
                 if (dst) {
                     ggml_bf16_to_fp32_row((const ggml_bf16_t *) buf.data(), f32, n);
                 } else {
                     ggml_fp32_to_bf16_row(f32, (ggml_bf16_t *) buf.data(), n);
+                }
+                break;
+            default:
+                // Q8_0, the reference quantizer for writes
+                if (dst) {
+                    ggml_get_type_traits(t->type)->to_float(buf.data(), f32, n);
+                } else {
+                    ggml_get_type_traits(t->type)->from_float_ref(f32, buf.data(), n);
                 }
                 break;
         }
