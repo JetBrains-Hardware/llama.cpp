@@ -179,6 +179,13 @@ public:
     // only for F32/F16/BF16 storage and non-transposed V; each position must be in exactly one cell
     bool copy_rows(int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, float * dst, const float * src);
 
+    // ring mode (single stream): position p goes to cell p mod size, a slot fails if that cell is not empty
+    void set_ring(bool value) { ring = value; }
+    bool get_ring() const { return ring; }
+
+    // ring mode: positions [p0, p1) of seq_id into their cells, which must be empty; the caller writes their K/V
+    void ring_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
@@ -297,6 +304,9 @@ private:
     const uint32_t n_swa = 0;
 
     const bool is_indexer = false;
+
+    // see set_ring
+    bool ring = false;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;

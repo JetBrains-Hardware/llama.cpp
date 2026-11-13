@@ -1050,6 +1050,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (ring) {
+            GGML_ASSERT(n_stream == 1);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const llama_pos pos = ubatch.pos[i];
+                const uint32_t  idx = pos >= 0 ? (uint32_t) (pos % (llama_pos) cells.size()) : 0;
+                if (pos < 0 || !cells.is_empty(idx)) {
+                    return { };
+                }
+                res.idxs[s].push_back(idx);
+            }
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -1399,6 +1412,19 @@ bool llama_kv_cache::copy_rows(int32_t il, bool is_v, llama_seq_id seq_id, llama
     LLAMA_LOG_DEBUG("%s: il = %d, %s, pos [%d, %d): %u run(s) of cells, first cell %u\n", __func__, il, is_v ? "V" : "K", p0, p1, n_runs, idxs.empty() ? 0 : idxs[0]);
 
     return true;
+}
+
+void llama_kv_cache::ring_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    GGML_ASSERT(ring && n_stream == 1 && p0 >= 0 && seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (llama_pos p = p0; p < p1; ++p) {
+        const uint32_t idx = (uint32_t) (p % (llama_pos) cells.size());
+        GGML_ASSERT(cells.is_empty(idx));
+        cells.pos_set(idx, p);
+        cells.seq_add(idx, seq_id);
+    }
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {

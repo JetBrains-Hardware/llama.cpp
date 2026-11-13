@@ -368,7 +368,7 @@ static int kvq_popcount(uint64_t x) {
 
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
         int32_t resident_cap, bool all_resident, int32_t n_sink, bool fill, int32_t n_gate) :
-    n_coarse_(fill ? n_rows : 0), n_rows_(n_rows), filled(fill), n_crow(n_chunk_rows), all_res(all_resident) {
+    n_coarse_(fill ? n_rows : 0), n_rows_(n_rows), filled(fill), tail(kv.get_ring()), n_crow(n_chunk_rows), all_res(all_resident) {
     if (kv.get_n_stream() != 1) {
         throw std::runtime_error("packed two-tier mode needs a single KV stream");
     }
@@ -390,8 +390,11 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     GGML_ASSERT(!ids.empty());
 
     const auto & cells = kv.get_cells(0);
-    if ((int64_t) cells.size() < n_rows) {
+    if ((fill || !tail) && (int64_t) cells.size() < n_rows) {
         throw std::runtime_error("packed two-tier mode: the cache is smaller than the coarse region");
+    }
+    if (fill && tail) {
+        throw std::runtime_error("packed two-tier mode: the coarse region cannot be filled from a ring");
     }
     for (int32_t j = 0; j < n_coarse_; ++j) {
         if (cells.is_empty(j) || cells.pos_get(j) != j || !cells.seq_has(j, 0) || cells.seq_count(j) != 1) {
@@ -470,9 +473,9 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     bias    = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_rows);
     ggml_set_name(bias,    "kvq_bias");
 
-    // fit mode: the scratch of the large ubatches, one row per cache cell
+    // fit mode: the scratch of the large ubatches, one row per cache cell (tail: after the coarse rows)
     if (!fill) {
-        n_scr = cells.size();
+        n_scr = (tail ? n_rows : 0) + cells.size();
         scr   = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, D, 2, n_scr, G);
         ggml_set_name(scr, "kvq_scr");
     }

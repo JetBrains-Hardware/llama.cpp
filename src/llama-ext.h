@@ -186,6 +186,11 @@ struct llama_kvq_table; // src/llama-kvq-codec.h
 // packed mode: the contexts created from this model attend through ggml_kvq_attn, no coarse copy of the cache (qwen35 only)
 LLAMA_API void llama_model_set_kvq_packed(struct llama_model * model, bool value);
 
+// packed mode, tail: the attention cache of the contexts created from this model holds n_cells cells as a ring (position p in cell p mod n_cells),
+// 0: one cell per position of the context; for the fit mode (llama_memory_kvq_fit_enable), which removes the positions of the coarse region from it
+// the context size still limits the positions; the large ubatches attend over the scratch (needs pinned host memory)
+LLAMA_API void llama_model_set_kvq_tail(struct llama_model * model, uint32_t n_cells);
+
 // packed mode: the coarse region is the cells [0, n_coarse) of sequence 0, which must hold positions [0, n_coarse)
 // allocates the device tensors for codes of bits_k/bits_v bits per value and n_coarse/n_chunk_rows table sets,
 // and copies the q8_0 K/V rows of the region from the cache to the host store
@@ -255,14 +260,18 @@ LLAMA_API bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_me
 // packed mode, the library fits the codec tables (single sequence 0, positions from 0 without gaps):
 //   the graph sums q q^T of the queries (after q_norm and RoPE) per (attention layer, kv head) on the device;
 //   a ubatch counts for the chunk of its first position
-//   when the positions [c*chunk, (c+1)*chunk) are in the cache, the decode thread reads the sums and starts a job on CPU threads:
+//   when the positions [c*chunk, (c+1)*chunk) are in the cache, the decode thread reads the sums; max(64, max_batch) positions later
+//   (a draft rollback does not reach the chunk) it reads the rows of the chunk and starts a job on CPU threads:
 //   K table fitted on the chunk's rows with the metric of the chunk's queries, V table fitted on the chunk's rows with the o_proj
 //   columns scaled by the chunk's mean sigmoid(gate) (also summed on the device), or one offline V table set for every chunk;
 //   K and V rows coded, packed, and the q8_0 rows copied to the host store
 //   a finished chunk joins the coarse region on the decode thread before the next ubatch (the chunks in order)
 //   the positions after the coarse region attend precisely (the q8_0 cache)
+//   tail (llama_model_set_kvq_tail): the positions of a chunk leave the ring when it joins; a batch that does not fit the ring
+//   waits for the fitter in llama_decode, an error if no job can free the room
 // memory operations: clear and seq_rm of the end of the sequence; a seq_rm into the coarse region or into a chunk that
-// is fitting drops these chunks, they are fitted again; the other ones abort
+// is fitting drops these chunks, they are fitted again (tail: their positions before the removal go back to the ring from the
+// host store); the other ones abort
 struct llama_kvq_fit_params {
     int32_t     chunk     = 8192;
     int32_t     bits_k    = 2;
@@ -288,6 +297,8 @@ struct llama_kvq_fit_progress {
     double  t_cpu     = 0.0;    // CPU seconds of the tasks of these jobs
     double  t_take    = 0.0;    // decode thread seconds of the readbacks of the statistics (with the wait for the queued ubatches)
     double  t_install = 0.0;    // decode thread seconds of the installs
+    int32_t n_tail_wait = 0;    // tail mode: batches that waited for the fitter before they fit the ring
+    double  t_tail_wait = 0.0;  // decode thread seconds of these waits
 };
 
 LLAMA_API bool llama_memory_kvq_fit_get_progress(llama_memory_t mem, llama_kvq_fit_progress & out);

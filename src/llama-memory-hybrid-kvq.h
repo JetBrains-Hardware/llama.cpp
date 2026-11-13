@@ -16,6 +16,7 @@
 // the coarse cache shares the cells of the attention cache, so cell j is one token in both
 // the attention cache holds the precise copy; in two-tier mode the graph writes the new tokens to both copies
 // packed: no coarse cache, the packed state (llama_kvq_store) is created by llama_memory_kvq_packed_alloc or llama_memory_kvq_fit_enable
+// tail (packed, fit mode): the attention cache is a ring of tail cells, the positions of the coarse region are removed from it
 
 class llama_memory_hybrid_kvq : public llama_memory_hybrid {
 public:
@@ -41,7 +42,8 @@ public:
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-                     bool   packed);
+                     bool   packed,
+                 uint32_t   n_tail = 0);
 
     ~llama_memory_hybrid_kvq() = default;
 
@@ -64,6 +66,7 @@ public:
 
     // packed: the coarse region cannot be removed
     // fit mode: the end of the sequence only, see llama_kvq_fit_params
+    // tail: the positions of the removed coarse chunks before p0 go back to the ring from the host store
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
     // two-tier mode: abort (seq_keep: unless it keeps sequence 0)
@@ -118,6 +121,24 @@ private:
 
     const bool packed;
 
+    const uint32_t n_ctx_max; // positions of the context
+    const bool     tail;
+
+    // tail: the positions [0, n_released) are not in the ring (the coarse region)
+    llama_pos n_released = 0;
+
+    int32_t n_tail_wait = 0;
+    double  t_tail_wait = 0.0;
+
+    // tail: removes the new coarse rows from the ring
+    void tail_release();
+
+    // tail: positions [n_coarse, min(p0, n_released)) back into the ring, after the coarse region shrank
+    void tail_restore(llama_pos p0);
+
+    // tail: before the batch is placed, waits for the fitter until its positions fit the ring
+    bool tail_wait(const llama_batch_allocr & balloc);
+
     const std::unique_ptr<llama_kv_cache> mem_coarse;
 
     std::vector<ggml_backend_t> backends;
@@ -168,6 +189,13 @@ public:
 
     // packed: early = mask (F16 [n_kv, n_tokens]) with -inf at the cells of the positions of the ubatch and later
     void set_input_kvq_early(ggml_tensor * early, const ggml_tensor * mask, const llama_ubatch * ubatch) const;
+
+    // tail: mask F16 [n_coarse + n_kv, n_tokens] over the coarse rows (kept) and the ring cells (causal by position)
+    // early (if not null): the same without the positions of the ubatch and later
+    void set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, int32_t n_coarse) const;
+
+    // tail: mask F16 [n_rows, n_tokens] over the scratch rows, row r = position r: the coarse rows kept, the others causal if the ring has them
+    void set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_coarse) const;
 
 private:
     const llama_kv_cache * kv_attn = nullptr;

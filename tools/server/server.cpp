@@ -174,7 +174,7 @@ static bool server_kvq_prepare_params(common_params & params) {
         params.speculative.draft.n_max = kvq_max_batch - 1;
     }
     if (common_speculative_n_max(&params.speculative) > kvq_max_batch - 1) {
-        SRV_WRN("--kvq: drafts of more than %d tokens are verified with the full attention over the q8_0 cache\n", kvq_max_batch - 1);
+        SRV_WRN("--kvq: drafts of more than %d tokens are verified with the flash attention over the scratch\n", kvq_max_batch - 1);
     }
     if (params.kvq.prefetch_n > params.kvq.resident_cap) {
         SRV_WRN("--kvq: the prefetch must fit the resident rows, setting --kvq-resident-cap %d (was %d)\n", params.kvq.prefetch_n, params.kvq.resident_cap);
@@ -184,7 +184,7 @@ static bool server_kvq_prepare_params(common_params & params) {
         SRV_WRN("%s", "--kvq: without context checkpoints a changed conversation is processed again from the start\n");
     }
     if (params.fit_params) {
-        SRV_WRN("%s", "--kvq: --fit does not count the memory of the two-tier cache (about 3/8 of the q8_0 K/V on the device)\n");
+        SRV_WRN("%s", "--kvq: --fit does not count the memory of the two-tier cache (coarse rows, tables and scratch, about 1/4 of a full q8_0 K/V on the device)\n");
     }
     return true;
 }

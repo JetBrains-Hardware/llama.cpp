@@ -3416,7 +3416,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* packed            */ kvq_packed);
+                            /* packed            */ kvq_packed,
+                            /* tail              */ kvq_packed ? kvq_tail : 0);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -4038,6 +4039,10 @@ void llama_model_set_kvq_two_tier(struct llama_model * model, bool value) {
 
 void llama_model_set_kvq_packed(struct llama_model * model, bool value) {
     model->kvq_packed = value;
+}
+
+void llama_model_set_kvq_tail(struct llama_model * model, uint32_t n_cells) {
+    model->kvq_tail = n_cells;
 }
 
 //

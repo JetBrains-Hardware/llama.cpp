@@ -1393,6 +1393,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
         llama_model_set_kvq_packed(model, true);
         llama_model_set_attn_rot(model, false);
+
+        // the device cache holds the chunk being fitted, the chunk being filled and a batch
+        const int32_t chunk = llama_kvq_fit_params().chunk;
+        const int32_t tail  = params.kvq.tail >= 0 ? params.kvq.tail : GGML_PAD(2*chunk + params.n_batch + 256, 256);
+        llama_model_set_kvq_tail(model, (uint32_t) tail);
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);

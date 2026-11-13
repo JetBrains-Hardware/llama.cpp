@@ -617,6 +617,7 @@ struct common_params {
         int32_t     prefetch_n   = 1024; // rows per (kv head, position) of the early query
         int32_t     resident_cap = 1024; // resident rows per (layer, kv head)
         int32_t     lead         = 2;    // layers between the early query and its attention
+        int32_t     tail         = -1;   // cells of the device cache (a ring), 0: one per position, -1: 2*chunk + n_batch + 256
     } kvq;
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers

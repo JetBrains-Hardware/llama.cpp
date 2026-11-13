@@ -44,7 +44,8 @@
 //   --kvq-lib-busy: the job of the last chunk of the prefix runs during the scoring, its chunk joins after it (decode times busy vs idle)
 //   --kvq-rm-test: functional check of clear and seq_rm on the first chunk, no scoring
 //   --kvq-scr-check N: after the prefill and the fit, the logits of the last of N more positions (one batch) twice over the scratch
-//                      and once over the cache (llama_kvq_params::scratch), the recurrent state restored in between, no scoring
+//                      and once over the cache (llama_kvq_params::scratch, needs --kvq-lib-full), the recurrent state restored in between, no scoring
+//   --kvq-lib-full: one cache cell per position, else the device cache is a ring of 2*chunk + batch + 256 cells (llama_model_set_kvq_tail)
 
 #include "arg.h"
 #include "common.h"
@@ -136,6 +137,7 @@ struct kvq_args {
     bool        lib_busy    = false;
     bool        rm_test     = false;
     int32_t     scr_check   = 0;
+    bool        lib_full    = false;
 
     bool lib() const { return lib_on; }
 };
@@ -324,6 +326,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.rm_test = true;
         } else if (a == "--kvq-scr-check" && has_val) {
             args.scr_check = std::stoi(argv[++i]);
+        } else if (a == "--kvq-lib-full") {
+            args.lib_full = true;
         } else if (a.rfind("--kvq-", 0) == 0) {
             LOG_ERR("%s: unknown or incomplete argument '%s'\n", __func__, a.c_str());
             return false;
@@ -364,8 +368,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
         args.packed = true;
         return true;
     }
-    if (args.lib_nowait || args.lib_busy || args.rm_test || args.scr_check > 0 || !args.lib_vtab.empty()) {
-        LOG_ERR("%s: --kvq-lib-vtab, --kvq-lib-nowait, --kvq-lib-busy, --kvq-rm-test and --kvq-scr-check need --kvq-lib\n", __func__);
+    if (args.lib_nowait || args.lib_busy || args.rm_test || args.scr_check > 0 || args.lib_full || !args.lib_vtab.empty()) {
+        LOG_ERR("%s: --kvq-lib-vtab, --kvq-lib-nowait, --kvq-lib-busy, --kvq-rm-test, --kvq-scr-check and --kvq-lib-full need --kvq-lib\n", __func__);
         return false;
     }
     if (args.sinks < 0 || args.recent < 0 || args.q_win <= 0 || args.fit_chunk < 0) {
@@ -1356,6 +1360,9 @@ static void kvq_print_progress(llama_memory_t mem) {
     }
     LOG("kvq: fit: coarse rows %d (%d chunks), running %d, ready %d, cancelled %d, dropped %d%s\n",
             pr.n_coarse, pr.n_chunk, pr.n_running, pr.n_ready, pr.n_cancel, pr.n_drop, pr.failed ? ", FAILED" : "");
+    if (pr.n_tail_wait > 0) {
+        LOG("kvq: fit: %d batches waited %.2f s for the fitter before they fit the ring of the tail\n", pr.n_tail_wait, pr.t_tail_wait);
+    }
     if (!pr.t_job.empty()) {
         LOG("kvq: fit: %.2f s CPU per chunk; decode thread per chunk: readback %.1f ms (with the wait for the queued ubatches), install %.1f ms; "
             "s per job run/with queue: %s\n",
@@ -1437,8 +1444,8 @@ static bool kvq_scr_check(llama_context * ctx, const std::vector<llama_token> & 
 static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & ids, int32_t C, int32_t n_vocab) {
     llama_memory_t mem = llama_get_memory(ctx);
     const int32_t n_batch = (int32_t) llama_n_batch(ctx);
-    if ((int32_t) ids.size() < C + 16) {
-        LOG_ERR("%s: needs at least %d tokens\n", __func__, C + 16);
+    if ((int32_t) ids.size() < C + 72) {
+        LOG_ERR("%s: needs at least %d tokens\n", __func__, C + 72);
         return false;
     }
 
@@ -1460,8 +1467,8 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
 
     std::vector<float> la, lb, lc;
 
-    // a job in flight, then clear
-    if (!kvq_prefill(ctx, ids, C + 2, n_batch)) {
+    // a job in flight, then clear; a chunk is taken 64 positions after its end, at the next ubatch
+    if (!kvq_prefill(ctx, ids, C + 70, n_batch) || !kvq_decode_last(ctx, ids, C + 70, C + 71, n_vocab, lc)) {
         return false;
     }
     check(coarse().n_running + coarse().n_ready + coarse().n_chunk == 1, "prefill past the first chunk starts its job");
@@ -1578,6 +1585,7 @@ int main(int argc, char ** argv) {
         if (args.packed || args.no_rot) {
             llama_model_set_attn_rot(model, false);
         }
+        llama_model_set_kvq_tail(model, args.lib() && !args.lib_full ? GGML_PAD(2*args.fit_chunk + params.n_batch + 256, 256) : 0);
         llama_context_params cparams = common_context_params_to_llama(params);
         if (args.rm_test) {
             // recurrent snapshots for a seq_rm into the last ubatch

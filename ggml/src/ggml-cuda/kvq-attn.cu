@@ -786,6 +786,23 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_precise(const kvq_arg
     const int r0 = bx*KVQ_PROWS;
     const int r1 = min(src.n_rows, r0 + KVQ_PROWS);
 
+    // tail rows that are masked for every position (e.g. the free cells of a ring cache): an empty partial, no loads
+    if (!src.res && a.mask) {
+        bool live = false;
+        for (int e = tid; e < (r1 - r0)*a.L; e += KVQ_NTHREADS) {
+            const int64_t row = a.n_coarse + r0 + e / a.L;
+            live = live || __half2float(a.mask[row + (int64_t) (e % a.L)*a.mask_nb1]) != -INFINITY;
+        }
+        if (!__syncthreads_or(live)) {
+            const int64_t ip = (int64_t) g*a.n_part + part0 + bx;
+            if (tid < N) {
+                a.pm[ip*N + tid] = -INFINITY;
+                a.pz[ip*N + tid] = 0.0f;
+            }
+            return;
+        }
+    }
+
     extern __shared__ __align__(16) char kvq_smem[];
     half  * s_q    = (half *) kvq_smem;             // [N][LDT]
     half  * s_tile = s_q + N*KVQ_LDT;               // [T][LDT]
@@ -1184,7 +1201,11 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a) {
             }
 #pragma unroll 4
             for (int p = a.n_cblk; p < a.n_part; ++p) {
-                acc += kvq_exp2(a.pm[(ip0 + p)*N + n] - mx)*a.po[((ip0 + p)*N + n)*KVQ_D + tid];
+                // an empty partial does not write po
+                const float mp = a.pm[(ip0 + p)*N + n];
+                if (mp > -INFINITY) {
+                    acc += kvq_exp2(mp - mx)*a.po[((ip0 + p)*N + n)*KVQ_D + tid];
+                }
             }
         }
         const int h = g*a.n_rep + n % a.n_rep;

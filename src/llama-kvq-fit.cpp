@@ -64,8 +64,8 @@ struct llama_kvq_fitter::job {
 };
 
 llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_params & fparams, const std::vector<llama_kvq_table> & v_tabs,
-        const std::vector<const ggml_tensor *> & wo, int32_t n_head) :
-    store(store), fparams(fparams), layer_ids(store.layer_ids()), v_fit(v_tabs.empty()), n_head(n_head), wo(wo) {
+        const std::vector<const ggml_tensor *> & wo, int32_t n_head, int32_t margin) :
+    store(store), fparams(fparams), margin(margin), layer_ids(store.layer_ids()), v_fit(v_tabs.empty()), n_head(n_head), wo(wo) {
     const int32_t G     = store.n_head_kv();
     const int32_t nwv   = store.n_words(true);
     const int32_t n_chk = store.n_rows()/store.n_chunk_rows();
@@ -325,11 +325,36 @@ void llama_kvq_fitter::run(job & jb, int32_t i) {
 }
 
 // decode thread
+// decode thread, when the chunk is complete: the sums of the ubatches of this chunk are computed, then they start again from 0
+void llama_kvq_fitter::snapshot() {
+    const size_t nn = (size_t) KVQ_D*KVQ_D*store.n_head_kv();
+
+    snap sn;
+    sn.c = n_snap;
+    sn.gram.resize(nn*layer_ids.size());
+    sn.gsum.resize(v_fit ? (size_t) n_head*KVQ_D*layer_ids.size() : 0);
+
+    store.synchronize();
+    for (size_t li = 0; li < layer_ids.size(); ++li) {
+        ggml_tensor * acc = store.get_layer(layer_ids[li]).qacc;
+        ggml_backend_tensor_get(acc, sn.gram.data() + li*nn, 0, ggml_nbytes(acc));
+        if (v_fit) {
+            ggml_tensor * gacc = store.get_layer(layer_ids[li]).gacc;
+            ggml_backend_tensor_get(gacc, sn.gsum.data() + li*gacc->ne[0], 0, ggml_nbytes(gacc));
+        }
+    }
+    set_stats(nullptr, nullptr);
+
+    snaps.push_back(std::move(sn));
+    n_snap++;
+}
+
+// decode thread, the margin after the chunk: its rows and statistics to a new job
 void llama_kvq_fitter::take(const llama_kv_cache & kv) {
     const int32_t c  = n_taken;
     const int32_t C  = store.n_chunk_rows();
     const int32_t G  = store.n_head_kv();
-    const size_t  nn = (size_t) KVQ_D*KVQ_D*G;
+    GGML_ASSERT(!snaps.empty() && snaps.front().c == c);
 
     // position p is in cell p mod size (one cell per position up to n_ctx, or the ring of the tail)
     const auto & cells = kv.get_cells(0);
@@ -344,23 +369,13 @@ void llama_kvq_fitter::take(const llama_kv_cache & kv) {
     }
 
     auto jb = std::make_unique<job>();
-    jb->c = c;
-    jb->gram.resize(nn*layer_ids.size());
-    jb->gsum.resize(v_fit ? (size_t) n_head*KVQ_D*layer_ids.size() : 0);
-
-    // the sums of the ubatches of this chunk are computed, then they start again from 0
-    store.synchronize();
-    for (size_t li = 0; li < layer_ids.size(); ++li) {
-        ggml_tensor * acc = store.get_layer(layer_ids[li]).qacc;
-        ggml_backend_tensor_get(acc, jb->gram.data() + li*nn, 0, ggml_nbytes(acc));
-        if (v_fit) {
-            ggml_tensor * gacc = store.get_layer(layer_ids[li]).gacc;
-            ggml_backend_tensor_get(gacc, jb->gsum.data() + li*gacc->ne[0], 0, ggml_nbytes(gacc));
-        }
-    }
-    set_stats(nullptr, nullptr);
+    jb->c    = c;
+    jb->gram = std::move(snaps.front().gram);
+    jb->gsum = std::move(snaps.front().gsum);
+    snaps.pop_front();
 
     // the rows of the chunk while the device is idle: a read from a pool thread waits behind the queued uploads of the copy stream
+    store.synchronize();
     const size_t nb1 = (size_t) G*KVQ_ROW;
     const size_t n_b = layer_ids.size()*2*C*nb1;
     if (!free_bufs.empty()) {
@@ -466,11 +481,16 @@ void llama_kvq_fitter::install(bool all) {
     }
 }
 
-void llama_kvq_fitter::poll(const llama_kv_cache & kv) {
+void llama_kvq_fitter::poll(const llama_kv_cache & kv, int32_t m) {
     const int32_t C = store.n_chunk_rows();
     const double  t0 = kvq_fit_now();
+    const llama_pos pos_max = kv.seq_pos_max(0);
     bool took = false;
-    while (!failed && (int64_t) (n_taken + 1)*C <= store.n_rows() && kv.seq_pos_max(0) >= (n_taken + 1)*C - 1) {
+    while (!failed && (int64_t) (n_snap + 1)*C <= store.n_rows() && pos_max >= (n_snap + 1)*C - 1) {
+        snapshot();
+        took = true;
+    }
+    while (!failed && n_taken < n_snap && pos_max >= (n_taken + 1)*C - 1 + m) {
         take(kv);
         took = true;
     }
@@ -480,8 +500,33 @@ void llama_kvq_fitter::poll(const llama_kv_cache & kv) {
     install(false);
 }
 
+bool llama_kvq_fitter::jobs_empty() const {
+    std::lock_guard<std::mutex> lk(m);
+    return jobs.empty();
+}
+
+bool llama_kvq_fitter::wait_front(const llama_kv_cache & kv) {
+    const int32_t n0 = n_coarse_chunks;
+    poll(kv, margin);
+    if (n_coarse_chunks == n0 && jobs_empty()) {
+        poll(kv, 0);
+    }
+    if (n_coarse_chunks > n0) {
+        return true;
+    }
+    {
+        std::unique_lock<std::mutex> lk(m);
+        if (failed || jobs.empty()) {
+            return false;
+        }
+        cv_done.wait(lk, [&]() { return jobs.front()->n_left == 0; });
+    }
+    install(true);
+    return n_coarse_chunks > n0;
+}
+
 void llama_kvq_fitter::wait(const llama_kv_cache & kv) {
-    poll(kv);
+    poll(kv, 0);
     {
         std::unique_lock<std::mutex> lk(m);
         cv_done.wait(lk, [&]() {
@@ -496,8 +541,8 @@ void llama_kvq_fitter::remove(llama_pos p0) {
     const int32_t c0 = p0 / C;
 
     // the removal is in the chunk that collects statistics: they keep the removed queries, unless all of them go
-    if (n_taken <= c0) {
-        if (p0 == (llama_pos) c0*C && n_taken == c0) {
+    if (n_snap <= c0) {
+        if (p0 == (llama_pos) c0*C && n_snap == c0) {
             store.synchronize();
             set_stats(nullptr, nullptr);
         }
@@ -514,15 +559,19 @@ void llama_kvq_fitter::remove(llama_pos p0) {
         gram_c0 = std::move(grams[c0]);
         gsum_c0 = std::move(gsums[c0]);
     }
+    // complete chunks without a job
+    while (!snaps.empty() && snaps.back().c >= c0) {
+        if (snaps.back().c == c0) {
+            gram_c0 = std::move(snaps.back().gram);
+            gsum_c0 = std::move(snaps.back().gsum);
+        }
+        snaps.pop_back();
+    }
     {
         std::unique_lock<std::mutex> lk(m);
         for (auto & jb : jobs) {
             if (jb->c >= c0) {
                 jb->cancel = true;
-                if (jb->c == c0) {
-                    gram_c0 = std::move(jb->gram);
-                    gsum_c0 = std::move(jb->gsum);
-                }
             }
         }
         // the queued tasks of these jobs are dropped, the running ones stop at their next check
@@ -537,8 +586,13 @@ void llama_kvq_fitter::remove(llama_pos p0) {
         cv_done.wait(lk, [&]() {
             return std::all_of(jobs.begin(), jobs.end(), [](const std::unique_ptr<job> & jb) { return !jb->cancel || jb->n_run == 0; });
         });
+        // the running tasks read the statistics of their job until here
         for (auto it = jobs.begin(); it != jobs.end();) {
             if ((*it)->cancel) {
+                if ((*it)->c == c0) {
+                    gram_c0 = std::move((*it)->gram);
+                    gsum_c0 = std::move((*it)->gsum);
+                }
                 n_cancel++;
                 release(**it);
                 it = jobs.erase(it);
@@ -564,7 +618,8 @@ void llama_kvq_fitter::remove(llama_pos p0) {
     } else {
         set_stats(nullptr, nullptr);
     }
-    n_taken = c0;
+    n_taken = std::min(n_taken, c0);
+    n_snap  = c0;
     // a failed chunk before c0 still blocks the later ones
     if (c0 == 0) {
         failed = false;

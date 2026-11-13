@@ -25,15 +25,19 @@ class llama_kvq_fitter {
 public:
     // v_tabs: one V table per (attention layer, kv head), used for every chunk
     // or empty: V is fitted per chunk, wo = o_proj weight per attention layer (store with gate statistics), n_head query heads
+    // margin: a chunk is taken when the sequence is this many positions past its end (poll)
     llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_params & fparams, const std::vector<llama_kvq_table> & v_tabs,
-            const std::vector<const ggml_tensor *> & wo, int32_t n_head);
+            const std::vector<const ggml_tensor *> & wo, int32_t n_head, int32_t margin);
     ~llama_kvq_fitter();
 
     // before each ubatch: starts the jobs of the complete chunks, adds the finished ones (unless hold)
-    void poll(const llama_kv_cache & kv);
+    void poll(const llama_kv_cache & kv) { poll(kv, margin); }
 
-    // poll, then waits for all jobs and adds their chunks
+    // starts the jobs of all complete chunks, waits for them and adds their chunks
     void wait(const llama_kv_cache & kv);
+
+    // adds at least one more chunk to the coarse region (waits for the first job), false if there is no job to wait for
+    bool wait_front(const llama_kv_cache & kv);
 
     // the positions [p0, inf) were removed: cancels the jobs and drops the coarse chunks at or after the chunk of p0
     void remove(llama_pos p0);
@@ -49,6 +53,8 @@ private:
 
     const llama_kvq_fit_params fparams;
 
+    const int32_t margin;
+
     std::vector<int32_t> layer_ids;
 
     // offline V tables, per (layer index, kv head)
@@ -62,7 +68,16 @@ private:
     std::vector<std::vector<float>>   wo_gram; // [n_rep][D*D]
     std::unique_ptr<std::once_flag[]> wo_once;
 
-    int32_t n_taken = 0; // chunks whose statistics were read
+    int32_t n_taken = 0; // chunks whose jobs were started
+    int32_t n_snap  = 0; // chunks whose statistics were read
+
+    // statistics of the complete chunks whose jobs did not start yet (the margin), in chunk order
+    struct snap {
+        int32_t c;
+        std::vector<float> gram;
+        std::vector<float> gsum;
+    };
+    std::deque<snap> snaps;
     int32_t n_coarse_chunks = 0;
     bool    failed  = false;
     bool    hold    = false;
@@ -89,6 +104,9 @@ private:
     double t_take    = 0.0;
     double t_install = 0.0;
 
+    void poll(const llama_kv_cache & kv, int32_t margin);
+    bool jobs_empty() const;
+    void snapshot();
     void take(const llama_kv_cache & kv);
     void install(bool all);
     void run(job & jb, int32_t i);

@@ -35,16 +35,19 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-                     bool   packed) :
+                     bool   packed,
+                 uint32_t   n_tail) :
     llama_memory_hybrid(
         model,
         no_alloc,
-        type_k, type_v, v_trans, kv_size, n_swa, swa_type,
+        type_k, type_v, v_trans, n_tail > 0 ? std::min(n_tail, kv_size) : kv_size, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
     model(model),
     packed(packed),
+    n_ctx_max(kv_size),
+    tail(packed && n_tail > 0 && n_tail < kv_size),
     mem_coarse([&]() -> llama_kv_cache * {
         if (packed) {
             return nullptr;
@@ -60,17 +63,106 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
             nullptr, nullptr, "kvq_");
     }()) {
     GGML_ASSERT(packed || mem_coarse->get_layer_ids() == get_mem_attn()->get_layer_ids());
+
+    if (tail) {
+        get_mem_attn()->set_ring(true);
+        LLAMA_LOG_INFO("%s: tail: the attention cache is a ring of %u cells for %u positions\n", "llama_memory_hybrid_kvq", get_mem_attn()->get_size(), n_ctx_max);
+    }
 }
 
 llama_memory_context_ptr llama_memory_hybrid_kvq::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     std::vector<llama_ubatch> ubatches;
     slot_info_vec_t heads_attn;
 
+    // the slots of the whole batch are placed here, so the ring needs the room for all of it now
+    if (tail && fitter && !tail_wait(balloc)) {
+        return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
     if (!prepare_batch(balloc, n_ubatch, embd_all, ubatches, heads_attn)) {
         return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
     return std::make_unique<llama_memory_hybrid_kvq_context>(this, std::move(heads_attn), std::move(ubatches));
+}
+
+bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
+    const llama_pos p_end = balloc.seq_pos_max(0);
+    const int64_t   size  = get_mem_attn()->get_size();
+    if (p_end < 0) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    bool waited = false;
+    while (p_end + 1 - (int64_t) store->n_coarse() > size) {
+        if (!fitter->wait_front(*get_mem_attn())) {
+            llama_kvq_fit_progress pr;
+            fitter->get_progress(pr);
+            LLAMA_LOG_ERROR("%s: the ring of %lld cells cannot hold the positions [%d, %d] of the batch: %s\n", __func__,
+                    (long long) size, store->n_coarse(), p_end, pr.failed ? "the fit failed" : "the batch is too large for the ring (see llama_model_set_kvq_tail)");
+            return false;
+        }
+        tail_release();
+        waited = true;
+    }
+    if (waited) {
+        n_tail_wait++;
+        t_tail_wait += (ggml_time_us() - t0)*1e-6;
+    }
+    return true;
+}
+
+void llama_memory_hybrid_kvq::tail_release() {
+    if (!tail || !store) {
+        return;
+    }
+    const llama_pos n = store->n_coarse();
+    if (n > n_released) {
+        get_mem_attn()->seq_rm(0, n_released, n);
+    }
+    n_released = n;
+}
+
+void llama_memory_hybrid_kvq::tail_restore(llama_pos p0) {
+    if (!tail || !store) {
+        return;
+    }
+    const llama_pos p_lo = store->n_coarse();
+    const llama_pos p_hi = std::min(p0, n_released);
+    n_released = p_lo;
+    if (p_hi <= p_lo) {
+        return;
+    }
+
+    // host store [head][row][K, V] -> cache [cell][head][ROW], cell = position mod size, in at most two runs
+    llama_kv_cache * kv = get_mem_attn();
+    const int64_t size = kv->get_size();
+    const int64_t n    = p_hi - p_lo;
+    const int64_t G    = store->n_head_kv();
+    const size_t  ROW  = llama_kvq_store::ROW;
+    const size_t  nb1  = G*ROW;
+    const int64_t j0   = p_lo % size;
+    const int64_t n0   = std::min<int64_t>(n, size - j0);
+
+    store->synchronize();
+    std::vector<uint8_t> buf(n*nb1);
+    for (int32_t il : store->layer_ids()) {
+        const uint8_t * src = store->host_rows(il);
+        for (int is_v = 0; is_v < 2; ++is_v) {
+            for (int64_t r = 0; r < n; ++r) {
+                for (int64_t g = 0; g < G; ++g) {
+                    memcpy(buf.data() + r*nb1 + g*ROW, src + ((size_t) g*store->n_rows() + p_lo + r)*2*ROW + is_v*ROW, ROW);
+                }
+            }
+            ggml_tensor * t = store->get_cache(il, is_v);
+            ggml_backend_tensor_set(t, buf.data(), j0*nb1, n0*nb1);
+            if (n0 < n) {
+                ggml_backend_tensor_set(t, buf.data() + n0*nb1, 0, (n - n0)*nb1);
+            }
+        }
+    }
+    kv->ring_add(0, p_lo, p_hi);
+    LLAMA_LOG_INFO("%s: positions [%d, %d) back in the ring from the host store\n", __func__, p_lo, p_hi);
 }
 
 llama_memory_context_ptr llama_memory_hybrid_kvq::init_full() {
@@ -91,6 +183,7 @@ void llama_memory_hybrid_kvq::clear(bool data) {
 
     if (fitter) {
         fitter->remove(0);
+        n_released = 0;
         return;
     }
 
@@ -116,6 +209,7 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
             return false;
         }
         fitter->remove(q0);
+        tail_restore(q0);
         return true;
     }
 
@@ -254,8 +348,10 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         LLAMA_LOG_ERROR("%s: the fit mode needs an empty memory with a single KV stream\n", __func__);
         return false;
     }
-    if (fp.chunk <= p.n_sink || fp.n_threads < 1 || (int64_t) kv->get_size() < fp.chunk) {
-        LLAMA_LOG_ERROR("%s: bad chunk (%d, cache of %u cells) or thread count\n", __func__, fp.chunk, kv->get_size());
+    // drafts are rolled back by up to max_batch - 1 positions: a chunk is taken this far behind the last position
+    const int32_t margin = std::max(64, p.max_batch);
+    if (fp.chunk <= p.n_sink || fp.n_threads < 1 || (int64_t) n_ctx_max < fp.chunk || (tail && (int64_t) kv->get_size() < fp.chunk + margin + p.max_batch)) {
+        LLAMA_LOG_ERROR("%s: bad chunk (%d, %u positions, cache of %u cells) or thread count\n", __func__, fp.chunk, n_ctx_max, kv->get_size());
         return false;
     }
     if (backends.empty()) {
@@ -287,11 +383,14 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
     fitter.reset();
     store.reset();
     try {
-        const int32_t n_rows = (int32_t) (kv->get_size()/fp.chunk)*fp.chunk;
+        const int32_t n_rows = (int32_t) (n_ctx_max/fp.chunk)*fp.chunk;
         const int32_t n_gate = v_tabs.empty() ? n_head*(int32_t) llama_kvq_store::D : 0;
         store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, p.resident_cap, false, p.n_sink, false, n_gate);
         store->set_backend(backends);
-        fitter = std::make_unique<llama_kvq_fitter>(*store, fp, v_tabs, wo, n_head);
+        if (tail && !store->scratch_ok()) {
+            throw std::runtime_error("the tail mode needs the scratch attention (pinned host memory, LLAMA_KVQ_SCRATCH not 0)");
+        }
+        fitter = std::make_unique<llama_kvq_fitter>(*store, fp, v_tabs, wo, n_head, margin);
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
         fitter.reset();
@@ -303,6 +402,9 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         store.reset();
         return false;
     }
+    n_released  = 0;
+    n_tail_wait = 0;
+    t_tail_wait = 0.0;
     return true;
 }
 
@@ -316,6 +418,7 @@ int32_t llama_memory_hybrid_kvq::fit_graph_kind() const {
 void llama_memory_hybrid_kvq::fit_poll() {
     if (fitter) {
         fitter->poll(*get_mem_attn());
+        tail_release();
     }
 }
 
@@ -324,6 +427,7 @@ bool llama_memory_hybrid_kvq::fit_wait() {
         return false;
     }
     fitter->wait(*get_mem_attn());
+    tail_release();
     return true;
 }
 
@@ -332,6 +436,8 @@ bool llama_memory_hybrid_kvq::fit_get_progress(llama_kvq_fit_progress & out) con
         return false;
     }
     fitter->get_progress(out);
+    out.n_tail_wait = n_tail_wait;
+    out.t_tail_wait = t_tail_wait;
     return true;
 }
 
@@ -513,6 +619,113 @@ void llama_memory_hybrid_kvq_context::set_input_kvq(ggml_tensor * pre, ggml_tens
                 case 1: data[j] = is_prot; break;
                 case 2: data[j] = is_pre && !is_prot ? 0.0f : -INFINITY; break;
             }
+        }
+    }
+}
+
+void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, int32_t n_coarse) const {
+    if (mask == nullptr || mask->buffer == nullptr) {
+        return;
+    }
+    GGML_ASSERT(kv_attn->get_n_stream() == 1 && ggml_backend_buffer_is_host(mask->buffer));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_coarse && mask->ne[1] == ubatch->n_tokens);
+    GGML_ASSERT(early == nullptr || (ggml_backend_buffer_is_host(early->buffer) && ggml_are_same_shape(early, mask) && ggml_is_contiguous(early)));
+
+    const auto & cells = kv_attn->get_cells(0);
+
+    const int64_t n_kv  = mask->ne[0] - n_coarse;
+    const int64_t n_tok = mask->ne[1];
+    GGML_ASSERT(n_kv <= (int64_t) cells.size());
+
+    llama_pos p_min = ubatch->pos[0];
+    for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
+        p_min = std::min(p_min, ubatch->pos[i]);
+    }
+
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+
+    // the positions before the ubatch, and the cells at or after it
+    std::vector<ggml_fp16_t> row(mask->ne[0], ninf);
+    std::fill(row.begin(), row.begin() + n_coarse, zero);
+    std::vector<std::pair<int64_t, llama_pos>> late;
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (cells.is_empty(j) || !cells.seq_has(j, 0)) {
+            continue;
+        }
+        const llama_pos p = cells.pos_get(j);
+        if (p < p_min) {
+            row[n_coarse + j] = zero;
+        } else {
+            late.push_back({ n_coarse + j, p });
+        }
+    }
+
+    ggml_fp16_t * dst = (ggml_fp16_t *) mask->data;
+    for (int64_t i = 0; i < n_tok; ++i) {
+        ggml_fp16_t * d = dst + i*mask->ne[0];
+        memcpy(d, row.data(), row.size()*sizeof(ggml_fp16_t));
+        for (const auto & c : late) {
+            if (c.second <= ubatch->pos[i]) {
+                d[c.first] = zero;
+            }
+        }
+        if (early) {
+            memcpy((ggml_fp16_t *) early->data + i*mask->ne[0], row.data(), row.size()*sizeof(ggml_fp16_t));
+        }
+    }
+}
+
+void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_coarse) const {
+    if (mask == nullptr || mask->buffer == nullptr) {
+        return;
+    }
+    GGML_ASSERT(kv_attn->get_n_stream() == 1 && ggml_backend_buffer_is_host(mask->buffer));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_coarse && mask->ne[1] == ubatch->n_tokens);
+
+    const auto & cells = kv_attn->get_cells(0);
+
+    const int64_t n_rows = mask->ne[0];
+    const int64_t size   = cells.size();
+    GGML_ASSERT(n_rows - n_coarse <= size);
+
+    llama_pos p_min = ubatch->pos[0];
+    for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
+        p_min = std::min(p_min, ubatch->pos[i]);
+    }
+
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+
+    auto has = [&](int64_t r) {
+        const int64_t j = r % size;
+        return !cells.is_empty(j) && cells.seq_has(j, 0) && cells.pos_get(j) == r;
+    };
+
+    // the rows of the positions before the ubatch, then per token the positions of the ubatch up to its own
+    std::vector<ggml_fp16_t> row(n_rows, ninf);
+    std::fill(row.begin(), row.begin() + n_coarse, zero);
+    for (int64_t r = n_coarse; r < std::min<int64_t>(p_min, n_rows); ++r) {
+        if (has(r)) {
+            row[r] = zero;
+        }
+    }
+    std::vector<int64_t> late;
+    for (int64_t r = std::max<int64_t>(n_coarse, p_min); r < n_rows; ++r) {
+        if (has(r)) {
+            late.push_back(r);
+        }
+    }
+
+    ggml_fp16_t * dst = (ggml_fp16_t *) mask->data;
+    for (int64_t i = 0; i < mask->ne[1]; ++i) {
+        ggml_fp16_t * d = dst + i*n_rows;
+        memcpy(d, row.data(), n_rows*sizeof(ggml_fp16_t));
+        for (const int64_t r : late) {
+            if (r > ubatch->pos[i]) {
+                break;
+            }
+            d[r] = zero;
         }
     }
 }

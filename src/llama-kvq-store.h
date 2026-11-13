@@ -34,6 +34,7 @@ class llama_kv_cache;
 //
 // fit mode, scratch attention of the large ubatches (prefill): one device scratch holds the q8_0 K/V rows that flash attention reads,
 // the coarse region [0, n_coarse) uploaded from the host store per layer, the rest copied on the device from the cache
+// (the cells after the coarse region, or in tail mode the whole ring after the coarse rows)
 //   scratch up:   after the attention of the previous attention layer (or at the graph start), the copy stream waits for the main
 //                 stream and uploads the rows of layer il, one copy per kv head
 //   scratch join: before the attention of layer il, the main stream waits for the uploads
@@ -147,6 +148,8 @@ public:
     int32_t n_words(bool is_v) const { return is_v ? nwv : nwk; }
     bool    all_resident() const { return all_res; }
     bool    fit_mode()     const { return !filled; }
+    bool    tail_mode()    const { return tail; }
+    int64_t n_ring()       const { return tail ? n_scr - n_rows_ : 0; } // cells of the ring cache
 
     std::vector<int32_t> layer_ids() const;
 
@@ -165,6 +168,7 @@ private:
     int32_t n_coarse_ = 0;
     int32_t n_rows_   = 0; // allocated rows, the stride of the per-row host arrays
     bool    filled    = false;
+    bool    tail      = false; // the cache is a ring (llama_kv_cache::get_ring), the scratch holds the coarse region and then the ring
     int32_t n_crow    = 0;
     int32_t n_chunk   = 0;
     int32_t G         = 0;

@@ -845,14 +845,28 @@ struct server_slot {
         if (!llama_memory_kvq_fit_get_progress(mem, fp)) {
             return;
         }
-        SLT_INF(*this, "kvq: coarse rows = %d (%d chunks), jobs running = %d, ready = %d, cancelled = %d, chunks dropped = %d, failed = %d, fit CPU = %.1f s\n",
-                fp.n_coarse, fp.n_chunk, fp.n_running, fp.n_ready, fp.n_cancel, fp.n_drop, fp.failed, fp.t_cpu);
+        SLT_INF(*this, "kvq: coarse rows = %d (%d chunks), jobs running = %d, ready = %d, cancelled = %d, chunks dropped = %d, failed = %d, fit CPU = %.1f s, "
+                "batches waiting for the fit = %d (%.2f s)\n",
+                fp.n_coarse, fp.n_chunk, fp.n_running, fp.n_ready, fp.n_cancel, fp.n_drop, fp.failed, fp.t_cpu, fp.n_tail_wait, fp.t_tail_wait);
 
         llama_kvq_counters_all ca;
-        if (!llama_memory_kvq_get_counters(mem, ca) || ca.n_ubatch == 0) {
+        if (!llama_memory_kvq_get_counters(mem, ca)) {
             return;
         }
         llama_kvq_counters s;
+        for (const auto & l : ca.layers) {
+            s.n_scr      += l.n_scr;
+            s.scr_bytes  += l.scr_bytes;
+            s.t_scr_wait += l.t_scr_wait;
+        }
+        if (s.n_scr > 0) {
+            SLT_INF(*this, "kvq: scratch attention: %" PRId64 " layer uploads, %.2f GiB, GPU wait at the joins %.3f s (LLAMA_KVQ_IDLE_PROBE)\n",
+                    s.n_scr, s.scr_bytes/1073741824.0, s.t_scr_wait);
+        }
+        if (ca.n_ubatch == 0) {
+            llama_memory_kvq_reset_counters(mem);
+            return;
+        }
         for (const auto & l : ca.layers) {
             s.n_pf     += l.n_pf;
             s.pf_req   += l.pf_req;

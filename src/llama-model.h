@@ -788,6 +788,9 @@ struct llama_model {
     // see llama_model_set_kvq_packed
     bool kvq_packed = false;
 
+    // see llama_model_set_kvq_tail
+    uint32_t kvq_tail = 0;
+
     // for classifier models
     std::vector<std::string> classifier_labels;
     std::vector<std::string> decision_labels;
