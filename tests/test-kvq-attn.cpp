@@ -711,11 +711,17 @@ static void wait_idle() {
     }
 }
 
-// minimum over 7 runs, after a wait for an idle GPU
+// minimum over 7 runs, after a wait for an idle GPU and a warmup
 static double time_graph(ggml_backend_t backend, ggml_cgraph * gf, int reps) {
     GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
     ggml_backend_synchronize(backend);
     wait_idle();
+    // 300 ms of work first, so that the clocks are up
+    for (auto t0 = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count() < 300.0; ) {
+        ggml_backend_graph_compute(backend, gf);
+        ggml_backend_synchronize(backend);
+    }
     std::vector<double> ts;
     for (int i = 0; i < 7; ++i) {
         const auto t0 = std::chrono::high_resolution_clock::now();
