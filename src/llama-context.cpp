@@ -541,6 +541,12 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // the packed two-tier graphs build their attention masks over the cells, not over kv_rows
+        if (dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()) != nullptr) {
+            cparams.auto_fkvr     = false;
+            cparams.fused_kv_rows = false;
+        }
     }
 
     // init backends

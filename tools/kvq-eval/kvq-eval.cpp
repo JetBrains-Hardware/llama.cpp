@@ -43,6 +43,8 @@
 //   --kvq-lib-nowait: does not wait
 //   --kvq-lib-busy: the job of the last chunk of the prefix runs during the scoring, its chunk joins after it (decode times busy vs idle)
 //   --kvq-rm-test: functional check of clear and seq_rm on the first chunk, no scoring
+//   --kvq-scr-check N: after the prefill and the fit, the logits of the last of N more positions (one batch) twice over the scratch
+//                      and once over the cache (llama_kvq_params::scratch), the recurrent state restored in between, no scoring
 
 #include "arg.h"
 #include "common.h"
@@ -133,6 +135,7 @@ struct kvq_args {
     bool        lib_nowait  = false;
     bool        lib_busy    = false;
     bool        rm_test     = false;
+    int32_t     scr_check   = 0;
 
     bool lib() const { return lib_on; }
 };
@@ -319,6 +322,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.lib_busy = true;
         } else if (a == "--kvq-rm-test") {
             args.rm_test = true;
+        } else if (a == "--kvq-scr-check" && has_val) {
+            args.scr_check = std::stoi(argv[++i]);
         } else if (a.rfind("--kvq-", 0) == 0) {
             LOG_ERR("%s: unknown or incomplete argument '%s'\n", __func__, a.c_str());
             return false;
@@ -359,8 +364,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
         args.packed = true;
         return true;
     }
-    if (args.lib_nowait || args.lib_busy || args.rm_test || !args.lib_vtab.empty()) {
-        LOG_ERR("%s: --kvq-lib-vtab, --kvq-lib-nowait, --kvq-lib-busy and --kvq-rm-test need --kvq-lib\n", __func__);
+    if (args.lib_nowait || args.lib_busy || args.rm_test || args.scr_check > 0 || !args.lib_vtab.empty()) {
+        LOG_ERR("%s: --kvq-lib-vtab, --kvq-lib-nowait, --kvq-lib-busy, --kvq-rm-test and --kvq-scr-check need --kvq-lib\n", __func__);
         return false;
     }
     if (args.sinks < 0 || args.recent < 0 || args.q_win <= 0 || args.fit_chunk < 0) {
@@ -1323,6 +1328,23 @@ static void kvq_print_counters(const llama_kvq_counters_all & c, int64_t n_decod
     }
 }
 
+// the scratch attention of the large ubatches, summed over the layers
+static void kvq_print_scratch(llama_memory_t mem) {
+    llama_kvq_counters_all kc;
+    if (!llama_memory_kvq_get_counters(mem, kc)) {
+        return;
+    }
+    llama_kvq_counters t;
+    for (const auto & c : kc.layers) {
+        t.n_scr      += c.n_scr;
+        t.scr_bytes  += c.scr_bytes;
+        t.t_scr      += c.t_scr;
+        t.t_scr_wait += c.t_scr_wait;
+    }
+    LOG("kvq: scratch: %lld layer uploads, %.2f GiB, %.3f s in the callbacks, GPU wait at the joins %.3f s (LLAMA_KVQ_IDLE_PROBE)\n",
+            (long long) t.n_scr, t.scr_bytes/1073741824.0, t.t_scr, t.t_scr_wait);
+}
+
 static void kvq_print_progress(llama_memory_t mem) {
     llama_kvq_fit_progress pr;
     if (!llama_memory_kvq_fit_get_progress(mem, pr)) {
@@ -1366,6 +1388,49 @@ static double kvq_kl_logits(const std::vector<float> & a, const std::vector<floa
         kl += std::exp((double) la[v])*((double) la[v] - lb[v]);
     }
     return kl;
+}
+
+// the last logits of ids[s:s + n] over the scratch (twice) and over the cache, from the same state; float differences, bit for bit
+static bool kvq_scr_check(llama_context * ctx, const std::vector<llama_token> & ids, int32_t s, int32_t n, int32_t n_vocab, llama_kvq_params kp) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (s + n > (int32_t) ids.size()) {
+        LOG_ERR("%s: needs %d tokens\n", __func__, s + n);
+        return false;
+    }
+    const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    std::vector<uint8_t> st(llama_state_seq_get_size_ext(ctx, 0, fl));
+    if (st.empty() || llama_state_seq_get_data_ext(ctx, st.data(), st.size(), 0, fl) != st.size()) {
+        LOG_ERR("%s: cannot save the recurrent state\n", __func__);
+        return false;
+    }
+    auto restore = [&]() {
+        return llama_state_seq_set_data_ext(ctx, st.data(), st.size(), 0, fl) == st.size() && llama_memory_seq_rm(mem, 0, s, -1);
+    };
+    std::vector<std::vector<float>> out(3);
+    for (int r = 0; r < 3; ++r) {
+        kp.scratch = r < 2;
+        if (!llama_memory_kvq_set_params(mem, kp)) {
+            return false;
+        }
+        if ((r > 0 && !restore()) || !kvq_decode_last(ctx, ids, s, s + n, n_vocab, out[r])) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        kvq_print_scratch(mem);
+    }
+    for (int r = 1; r < 3; ++r) {
+        int64_t n_diff = 0;
+        double  d_max  = 0.0;
+        for (int32_t v = 0; v < n_vocab; ++v) {
+            n_diff += out[0][v] != out[r][v];
+            d_max   = std::max(d_max, (double) std::fabs(out[0][v] - out[r][v]));
+        }
+        bool same = false;
+        const double kl = kvq_kl_logits(out[0], out[r], same);
+        LOG("kvq: scr-check: run 0 (scratch) vs run %d (%s): %lld of %d logits differ, max |diff| %.3e, KL %.3e, same top-1 %d\n",
+                r, r < 2 ? "scratch" : "cache", (long long) n_diff, n_vocab, d_max, kl, same ? 1 : 0);
+    }
+    return true;
 }
 
 // clear and seq_rm in the fit mode around the end of the first chunk C: the memory is empty and in the fit mode
@@ -1646,6 +1711,9 @@ int main(int argc, char ** argv) {
     cap.enabled = false;
     const double t_prefill = (ggml_time_us() - t_prefill_start) / 1e6;
     LOG_INF("%s: prefill: %d tokens in %.2f s, %.1f t/s\n", __func__, s, t_prefill, s / t_prefill);
+    if (args.lib()) {
+        kvq_print_scratch(llama_get_memory(ctx));
+    }
 
     if (args.lib()) {
         const int64_t t0 = ggml_time_us();
@@ -1654,6 +1722,9 @@ int main(int argc, char ** argv) {
         }
         LOG_INF("%s: waited %.2f s for the fitter\n", __func__, (ggml_time_us() - t0)/1e6);
         kvq_print_progress(llama_get_memory(ctx));
+        if (args.scr_check > 0) {
+            return kvq_scr_check(ctx, ids, s, args.scr_check, n_vocab, tp_packed) ? 0 : 1;
+        }
     }
 
     if (capture) {

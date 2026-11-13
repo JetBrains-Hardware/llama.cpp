@@ -87,6 +87,16 @@ struct llama_kvq_store::layer {
     double t_reach    = 0.0;
     double t_end      = 0.0;
 
+    // scratch: main stream at the scratch up, end of the uploads
+    ggml_backend_event_ptr ev_su;
+    ggml_backend_event_ptr ev_sd;
+    // LLAMA_KVQ_IDLE_PROBE: end of the uploads and main stream at the scratch join, recorded only when the probe is idle
+    ggml_backend_event_ptr ev_sp;
+    ggml_backend_event_ptr ev_sr;
+    bool   scr_armed  = false; // probe mutex
+    bool   scr_busy   = false;
+    double t_scr_wait = 0.0;
+
     llama_kvq_counters cnt;
 
     void touch(int32_t g, int32_t s, float v, int32_t cap_tot, int32_t n_sink) {
@@ -224,7 +234,7 @@ struct llama_kvq_store::worker {
 
     std::mutex              m_probe;
     std::condition_variable cv_probe;
-    std::deque<layer *>     probes;
+    std::deque<std::pair<layer *, bool>> probes; // layer, scratch probe
     std::thread             th_probe;
 
     explicit worker(llama_kvq_store & st, bool probe) : st(st), th([this]() { loop(); }) {
@@ -254,15 +264,48 @@ struct llama_kvq_store::worker {
             if (probes.empty()) {
                 return;
             }
-            layer * l = probes.front();
+            layer * l = probes.front().first;
+            const bool scr = probes.front().second;
             probes.pop_front();
             lk.unlock();
+            if (scr) {
+                ggml_backend_event_synchronize(l->ev_sr.get());
+                const double t1 = kvq_now();
+                ggml_backend_event_synchronize(l->ev_sp.get());
+                const double t2 = kvq_now();
+                lk.lock();
+                l->t_scr_wait += std::max(0.0, t2 - t1);
+                l->scr_busy    = false;
+                continue;
+            }
             ggml_backend_event_synchronize(l->ev_join.get());
             const double t = kvq_now();
             lk.lock();
             l->t_reach    = t;
             l->probe_busy = false;
         }
+    }
+
+    // scratch up: the end of the uploads, unless the probe of the layer is still waiting
+    void scr_up(layer & l, ggml_backend_t cp) {
+        std::lock_guard<std::mutex> lk(m_probe);
+        if (!l.scr_busy) {
+            ggml_backend_event_record(l.ev_sp.get(), cp);
+            l.scr_armed = true;
+        }
+    }
+
+    // scratch join: before the main stream waits for the uploads
+    void scr_join(layer & l, ggml_backend_t backend) {
+        std::lock_guard<std::mutex> lk(m_probe);
+        if (!l.scr_armed) {
+            return;
+        }
+        ggml_backend_event_record(l.ev_sr.get(), backend);
+        l.scr_armed = false;
+        l.scr_busy  = true;
+        probes.push_back({ &l, true });
+        cv_probe.notify_one();
     }
 
     // GPU idle of the previous probe of the layer, then a new probe at the current position of the stream
@@ -278,7 +321,7 @@ struct llama_kvq_store::worker {
         ggml_backend_event_record(l.ev_join.get(), backend);
         l.t_reach    = 0.0;
         l.probe_busy = true;
-        probes.push_back(&l);
+        probes.push_back({ &l, false });
         cv_probe.notify_one();
         return idle;
     }
@@ -392,9 +435,9 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         }
         return res;
     };
-    ctx_dev   = init_ctx(layers.size()*8 + 3);
-    ctx_alias = init_ctx(layers.size());
-    ctx_host  = init_ctx(layers.size()*3);
+    ctx_dev   = init_ctx(layers.size()*8 + 4);
+    ctx_alias = init_ctx(layers.size()*3 + 1);
+    ctx_host  = init_ctx(layers.size()*KIND_COUNT);
 
     for (auto & l : layers) {
         layer_tensors & t = l.t;
@@ -418,7 +461,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
                 ggml_format_name(t.gacc, "kvq_gacc-%d", l.il);
             }
         }
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < KIND_COUNT; ++k) {
             t.trig[k] = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, 1);
             ggml_format_name(t.trig[k], "kvq_trig%d-%d", k, l.il);
             trig_of[t.trig[k]] = { (size_t) (&l - layers.data()), k };
@@ -426,6 +469,13 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
     bias    = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_rows);
     ggml_set_name(bias,    "kvq_bias");
+
+    // fit mode: the scratch of the large ubatches, one row per cache cell
+    if (!fill) {
+        n_scr = cells.size();
+        scr   = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, D, 2, n_scr, G);
+        ggml_set_name(scr, "kvq_scr");
+    }
 
     buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), buft));
     if (!buf_dev) {
@@ -443,6 +493,28 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         ggml_format_name(l.t.rkv_h, "kvq_rkv_h-%d", l.il);
         if (ggml_backend_tensor_alloc(buf_dev.get(), l.t.rkv_h, l.t.rkv->data) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("failed to alias the resident rows");
+        }
+    }
+
+    // the CUDA copy has no strided q8_0 to q8_0 copy, so the scratch rows are copied as f16 pairs of bytes too
+    if (scr) {
+        scr_h = ggml_new_tensor_4d(ctx_alias.get(), GGML_TYPE_F16, ROW/2, 2, n_scr, G);
+        ggml_set_name(scr_h, "kvq_scr_h");
+        GGML_ASSERT(ggml_nbytes(scr_h) == ggml_nbytes(scr));
+        if (ggml_backend_tensor_alloc(buf_dev.get(), scr_h, scr->data) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("failed to alias the scratch");
+        }
+        for (auto & l : layers) {
+            for (int kv = 0; kv < 2; ++kv) {
+                ggml_tensor * c = kv ? l.v_cache : l.k_cache;
+                ggml_tensor * h = ggml_new_tensor_3d(ctx_alias.get(), GGML_TYPE_F16, ROW/2, G, c->ne[1]);
+                ggml_format_name(h, "kvq_%s_h-%d", kv ? "v" : "k", l.il);
+                GGML_ASSERT(ggml_nbytes(h) == ggml_nbytes(c));
+                if (ggml_backend_tensor_alloc(c->buffer, h, c->data) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("failed to alias the cache");
+                }
+                (kv ? l.t.v_h : l.t.k_h) = h;
+            }
         }
     }
 
@@ -516,7 +588,11 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         l.ev_sel.reset(ggml_backend_event_new(dev));
         l.ev_read.reset(ggml_backend_event_new(dev));
         l.ev_up.reset(ggml_backend_event_new(dev));
-        if (!l.ev_sel || !l.ev_read || !l.ev_up) {
+        l.ev_su.reset(ggml_backend_event_new(dev));
+        l.ev_sd.reset(ggml_backend_event_new(dev));
+        l.ev_sp.reset(ggml_backend_event_new(dev));
+        l.ev_sr.reset(ggml_backend_event_new(dev));
+        if (!l.ev_sel || !l.ev_read || !l.ev_up || !l.ev_su || !l.ev_sd || !l.ev_sp || !l.ev_sr) {
             throw std::runtime_error("packed two-tier mode needs backend events");
         }
     }
@@ -540,11 +616,21 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
 
     const llama_kvq_memory_info mi = memory_info();
+
+    // the scratch attention reads the host store with async copies
+    if (scr) {
+        const char * env = getenv("LLAMA_KVQ_SCRATCH");
+        scr_ok = mi.pinned && (env == nullptr || atoi(env) != 0);
+        if (!mi.pinned) {
+            LLAMA_LOG_WARN("%s: the host store is not pinned, the large ubatches attend over the cache\n", __func__);
+        }
+    }
+
     LLAMA_LOG_INFO("%s: n_coarse = %d of %d rows, %d chunks of %d rows, K %d / V %d bits (%d / %d words), resident slots %d + %d sinks%s\n", __func__,
             n_coarse_, n_rows, n_chunk, n_crow, bits_k, bits_v, nwk, nwv, cap, n_sink, all_res ? " (all resident)" : "");
-    LLAMA_LOG_INFO("%s: device: codes %.1f MiB, tables %.1f MiB, resident %.1f MiB, other %.1f MiB; host: store %.1f MiB (%s), other %.1f MiB\n", __func__,
-            mi.codes/1048576.0, mi.tables/1048576.0, mi.resident/1048576.0, mi.other_dev/1048576.0, mi.host_store/1048576.0,
-            mi.pinned ? "pinned" : "pageable", mi.host_other/1048576.0);
+    LLAMA_LOG_INFO("%s: device: codes %.1f MiB, tables %.1f MiB, resident %.1f MiB, scratch %.1f MiB (%s), other %.1f MiB; host: store %.1f MiB (%s), other %.1f MiB\n", __func__,
+            mi.codes/1048576.0, mi.tables/1048576.0, mi.resident/1048576.0, mi.scratch/1048576.0, scr_ok ? "used" : "not used", mi.other_dev/1048576.0,
+            mi.host_store/1048576.0, mi.pinned ? "pinned" : "pageable", mi.host_other/1048576.0);
 }
 
 llama_kvq_store::~llama_kvq_store() {
@@ -920,6 +1006,38 @@ void llama_kvq_store::build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_back
     kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(KIND_PREFETCH, n_top, L), KIND_JOIN, il);
 }
 
+static void kvq_build_trigger(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_dev_t dev,
+        ggml_tensor * src, ggml_tensor * trig, int k, int32_t il) {
+    ggml_tensor * t = ggml_add(ctx, ggml_view_1d(ctx, src, 1, 0), trig);
+    ggml_format_name(t, "kvq_trig%d-%d", k, il);
+    ggml_backend_sched_set_tensor_backend(sched, t, kvq_backend(sched, dev));
+    ggml_build_forward_expand(gf, t);
+}
+
+void llama_kvq_store::build_scr_up(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const {
+    GGML_ASSERT(scr_ok);
+    kvq_build_trigger(ctx, gf, sched, dev, bias, get_layer(il).trig[KIND_SCR_UP], KIND_SCR_UP, il);
+}
+
+void llama_kvq_store::build_scr_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const {
+    GGML_ASSERT(scr_ok);
+    kvq_build_trigger(ctx, gf, sched, dev, bias, get_layer(il).trig[KIND_SCR_JOIN], KIND_SCR_JOIN, il);
+}
+
+ggml_tensor * llama_kvq_store::get_scr(ggml_context * ctx, bool is_v, int64_t n) const {
+    GGML_ASSERT(scr && n <= n_scr);
+    return ggml_view_4d(ctx, scr, D, G, n, 1, scr->nb[3], scr->nb[2], scr->nb[3]*G, is_v ? scr->nb[1] : 0);
+}
+
+ggml_tensor * llama_kvq_store::build_scr_copy(ggml_context * ctx, int32_t il, bool is_v, int64_t c0, int64_t n, int64_t r0) const {
+    const layer_tensors & t = get_layer(il);
+    ggml_tensor * h = is_v ? t.v_h : t.k_h;
+    GGML_ASSERT(h && c0 >= 0 && c0 + n <= h->ne[2] && r0 >= 0 && r0 + n <= n_scr);
+    ggml_tensor * src = ggml_view_3d(ctx, h, ROW/2, G, n, h->nb[1], h->nb[2], c0*h->nb[2]);
+    ggml_tensor * dst = ggml_view_3d(ctx, scr_h, ROW/2, G, n, scr_h->nb[3], scr_h->nb[2], r0*scr_h->nb[2] + (is_v ? scr_h->nb[1] : 0));
+    return ggml_cpy(ctx, src, dst);
+}
+
 void llama_kvq_store::select(const layer & l, const ggml_tensor * dst, ggml_cgraph * graph, const ggml_tensor ** ids, const ggml_tensor ** vals) const {
     // trig = add(view(vals), trigger), vals = get_rows(scores, ids)
     ggml_cgraph * gr = graph;
@@ -1174,6 +1292,34 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
     // the time since the previous callback of this ubatch: GPU work if the scheduler waits for it, else launches
     const double t0    = kvq_now();
+
+    if (kind == KIND_SCR_UP) {
+        // after the readers of the scratch on the main stream, the rows of the coarse region, per kv head
+        ggml_backend_t cp = backend_cp.get();
+        ggml_backend_event_record(l.ev_su.get(), backend);
+        ggml_backend_event_wait(cp, l.ev_su.get());
+        const size_t n = (size_t) n_coarse_*2*ROW;
+        for (int32_t g = 0; g < G && n > 0; ++g) {
+            ggml_backend_tensor_set_async(cp, scr, l.store + (size_t) g*n_rows_*2*ROW, g*scr->nb[3], n);
+        }
+        ggml_backend_event_record(l.ev_sd.get(), cp);
+        if (probe) {
+            work->scr_up(l, cp);
+        }
+        cnt.n_scr++;
+        cnt.scr_bytes += (int64_t) G*n;
+        cnt.t_scr     += kvq_now() - t0;
+        return true;
+    }
+    if (kind == KIND_SCR_JOIN) {
+        if (probe) {
+            work->scr_join(l, backend);
+        }
+        ggml_backend_event_wait(backend, l.ev_sd.get());
+        cnt.t_scr += kvq_now() - t0;
+        return true;
+    }
+
     const double t_gap = cb_ubatch == n_ubatch ? t0 - cb_end : 0.0;
 
     if (kind == KIND_JOIN) {
@@ -1252,8 +1398,12 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 void llama_kvq_store::get_counters(llama_kvq_counters_all & out) {
     flush_ubatch();
     out.layers.clear();
-    for (const auto & l : layers) {
+    for (auto & l : layers) {
         out.layers.push_back(l.cnt);
+        if (work) {
+            std::lock_guard<std::mutex> lk(work->m_probe);
+            out.layers.back().t_scr_wait = l.t_scr_wait;
+        }
     }
     out.n_ubatch = n_ubatch;
     out.n_tokens = n_tokens;
@@ -1264,6 +1414,10 @@ void llama_kvq_store::reset_counters() {
     for (auto & l : layers) {
         l.cnt = {};
         l.cnt.il = l.il;
+        if (work) {
+            std::lock_guard<std::mutex> lk(work->m_probe);
+            l.t_scr_wait = 0.0;
+        }
     }
     ub_tokens = 0;
     ub_fired  = 0;
@@ -1284,6 +1438,7 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
                          (l.slot_stamp.size() + l.slot_val.size() + l.prev.size() + l.next.size())*sizeof(int32_t);
     }
     mi.other_dev += ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
+    mi.scratch    = scr ? ggml_nbytes(scr) : 0;
     mi.host_other += buf_pin ? ggml_backend_buffer_get_size(buf_pin.get()) : 0;
     mi.pinned = !buf_store.empty() && ggml_backend_buffer_get_type(buf_store[0].get()) != ggml_backend_cpu_buffer_type();
     return mi;

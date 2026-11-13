@@ -2591,6 +2591,16 @@ struct llama_model_qwen35 : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
+        // fit mode, large ubatch: flash attention over the scratch rows (coarse region from the host store, the rest from the cache)
+        ggml_tensor * build_attn_kvq_scratch(
+        llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                          float   kq_scale,
+                            int   il);
+
         // the early query of attention layer il from the hidden state x, and the prefetch of its top rows
         void build_kvq_prefetch(
         llm_graph_input_attn_kv * inp_attn,

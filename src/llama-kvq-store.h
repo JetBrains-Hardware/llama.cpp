@@ -31,6 +31,12 @@ class llama_kv_cache;
 //   main: ev_sel at the prefetch trigger -> copy: readback, ev_read (worker) ... join: uploads, ev_up -> main waits ev_up
 // a memcpy between two graphs on the main stream costs a GPU stall of about 50 us (measured, Windows), events do not
 // the trigger tensors are not written: the trigger node is an add whose result is not used
+//
+// fit mode, scratch attention of the large ubatches (prefill): one device scratch holds the q8_0 K/V rows that flash attention reads,
+// the coarse region [0, n_coarse) uploaded from the host store per layer, the rest copied on the device from the cache
+//   scratch up:   after the attention of the previous attention layer (or at the graph start), the copy stream waits for the main
+//                 stream and uploads the rows of layer il, one copy per kv head
+//   scratch join: before the attention of layer il, the main stream waits for the uploads
 class llama_kvq_store {
 public:
     static constexpr int64_t D   = 256;
@@ -40,6 +46,9 @@ public:
         KIND_PREFETCH = 0,
         KIND_TOPUP    = 1,
         KIND_JOIN     = 2,
+        KIND_SCR_UP   = 3,
+        KIND_SCR_JOIN = 4,
+        KIND_COUNT    = 5,
     };
 
     struct layer_tensors {
@@ -52,9 +61,11 @@ public:
         ggml_tensor * ridx  = nullptr; // i32 [cap_tot, G + 1], column G holds the flag of ggml_kvq_attn_cond
         ggml_tensor * stage = nullptr; // f16 [ROW/2, n_stage], rows to scatter (set by enable)
         ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest is the trash slot
-        ggml_tensor * trig[3] = {};    // host f32 [1], per kind
+        ggml_tensor * trig[KIND_COUNT] = {}; // host f32 [1], per kind
         ggml_tensor * qacc  = nullptr; // f32 [D, D, G], sum of q q^T over the query heads of each kv head (fit mode)
         ggml_tensor * gacc  = nullptr; // f32 [n_gate], sum of sigmoid(gate) over the tokens (fit mode with n_gate > 0)
+        ggml_tensor * k_h   = nullptr; // f16 [ROW/2, G, kv_size], alias of the K cache (fit mode)
+        ggml_tensor * v_h   = nullptr; // f16 [ROW/2, G, kv_size], alias of the V cache (fit mode)
     };
 
     // the tensors hold n_rows coarse rows (a multiple of n_chunk_rows)
@@ -88,6 +99,9 @@ public:
     // the q8_0 K or V cache tensor of layer il
     ggml_tensor * get_cache(int32_t il, bool is_v) const;
 
+    // pinned host memory of the device, or the CPU buffer type
+    ggml_backend_buffer_type_t host_buft() const { return buft_host; }
+
     // checks the parameters against the allocation and resets the resident slots and the counters
     bool enable(const llama_kvq_params & params);
 
@@ -105,6 +119,19 @@ public:
     void build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int64_t n_top, int64_t L) const;
 
     const layer_tensors & get_layer(int32_t il) const;
+
+    // fit mode: the scratch attention can be used (scratch allocated, pinned host store, LLAMA_KVQ_SCRATCH is not 0)
+    bool scratch_ok() const { return scr_ok; }
+
+    // the scratch triggers of layer il, see the class comment
+    void build_scr_up  (ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
+    void build_scr_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
+
+    // K or V of scratch rows [0, n): [D, G, n, 1], like a cache view
+    ggml_tensor * get_scr(ggml_context * ctx, bool is_v, int64_t n) const;
+
+    // copies cache rows [c0, c0 + n) of layer il to scratch rows [r0, r0 + n), K or V
+    ggml_tensor * build_scr_copy(ggml_context * ctx, int32_t il, bool is_v, int64_t c0, int64_t n, int64_t r0) const;
 
     // ridx without the flag column
     ggml_tensor * get_ridx(ggml_context * ctx, int32_t il) const;
@@ -173,6 +200,11 @@ private:
 
     ggml_tensor * bias    = nullptr; // f32 [n_coarse], -inf for the sinks
     int64_t       n_stage = 0;       // rows of the staging tensors
+
+    ggml_tensor * scr    = nullptr; // q8_0 [D, 2, n_scr, G], K and V row of each scratch row (fit mode)
+    ggml_tensor * scr_h  = nullptr; // f16 [ROW/2, 2, n_scr, G], alias of scr
+    int64_t       n_scr  = 0;
+    bool          scr_ok = false;
 
 
     // fired positions of the current ubatch, for the clean token count

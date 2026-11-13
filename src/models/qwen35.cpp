@@ -148,6 +148,11 @@ static bool kvq_use_packed(const llama_kvq_params & p, uint32_t n_tokens, int32_
     return p.enabled && n_tokens <= (uint32_t) p.max_batch && n_coarse > 0 && (p.max_tail <= 0 || n_kv - n_coarse <= p.max_tail);
 }
 
+// fit mode, the other ubatches with coarse rows: flash attention over the scratch, see llama_kvq_store
+static bool kvq_use_scratch(const llama_kvq_params & p, const llama_kvq_store * store, bool packed_small, int32_t n_coarse) {
+    return p.enabled && p.packed && p.scratch && store != nullptr && store->fit_mode() && store->scratch_ok() && !packed_small && n_coarse > 0;
+}
+
 class llama_model_qwen35::llm_graph_input_kvq : public llm_graph_input_i {
 public:
     llm_graph_input_kvq(const llama_memory_hybrid_kvq_context * mctx, bool causal_attn) :
@@ -190,6 +195,7 @@ public:
             res &= store == mctx->get_store();
             res &= store != nullptr && n_coarse == store->n_coarse();
             res &= packed_small == kvq_use_packed(p, gparams.ubatch.n_tokens, n_coarse, mctx->get_attn()->get_n_kv());
+            res &= scratch == kvq_use_scratch(p, store, packed_small, n_coarse);
             if (res && packed_small) {
                 res &= mask_attn.raw->ne[0] == mctx->get_attn()->get_n_kv();
                 res &= mask_attn.raw->ne[1] == gparams.ubatch.n_tokens;
@@ -220,6 +226,9 @@ public:
     int32_t n_coarse = 0;
     bool    fit      = false;
 
+    // fit mode, large ubatch: the attention reads the scratch
+    bool    scratch  = false;
+
     const llama_memory_hybrid_kvq_context * mctx;
 
     llama_kvq_params params;
@@ -249,6 +258,16 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
 
     // packed two-tier attention: the attention layer ila prefetches at the input of layer max(0, ila - lead)
     const int kvq_lead = inp_kvq && inp_kvq->packed_small && !inp_kvq->params.all_resident ? inp_kvq->params.lead : 0;
+
+    // scratch attention: the upload of the first attention layer starts with the graph, the others after the previous attention
+    if (inp_kvq && inp_kvq->scratch) {
+        for (int il = 0; il < n_layer; ++il) {
+            if (!hparams.is_recr(il)) {
+                inp_kvq->store->build_scr_up(ctx0, gf, sched, il);
+                break;
+            }
+        }
+    }
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
@@ -398,6 +417,7 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
         inp->n_coarse     = inp->store->n_coarse();
         inp->fit          = inp->store->fit_mode();
         inp->packed_small = kvq_use_packed(inp->params, n_tokens, inp->n_coarse, mctx_kvq->get_attn()->get_n_kv());
+        inp->scratch      = kvq_use_scratch(inp->params, inp->store, inp->packed_small, inp->n_coarse);
 
         if (inp->packed_small) {
             const int64_t n_kv = mctx_kvq->get_attn()->get_n_kv();
@@ -752,6 +772,64 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
     return cur;
 }
 
+// the K/V of this ubatch go to the cache, the cells after the coarse region are copied to the scratch after them
+// the copy stream uploads the coarse region (scratch up of the previous attention layer), the main stream joins it here
+ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
+        llm_graph_input_attn_kv * inp,
+        llm_graph_input_kvq *     inp_kvq,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        float                     kq_scale,
+        int                       il) {
+    const auto * mctx_attn = inp->mctx;
+    const auto * store     = inp_kvq->store;
+
+    GGML_ASSERT(!inp->self_k_rot[il] && !inp->self_v_rot[il]);
+    GGML_ASSERT(!mctx_attn->get_k_scale(il) && !mctx_attn->get_v_scale(il));
+    GGML_ASSERT(inp->self_attn_mask.rows == nullptr);
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    ggml_build_forward_expand(gf, mctx_attn->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_attn->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+
+    const int64_t n_coarse = inp_kvq->n_coarse;
+    const int64_t n_kv     = mctx_attn->get_n_kv();
+    GGML_ASSERT(n_coarse == store->n_coarse() && n_kv > n_coarse);
+
+    ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, false, n_coarse, n_kv - n_coarse, n_coarse));
+    ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, true,  n_coarse, n_kv - n_coarse, n_coarse));
+
+    store->build_scr_join(ctx0, gf, sched, il);
+
+    // the scratch is head-major, so its V view looks transposed to build_attn_mha: the flash attention part of it
+    GGML_ASSERT(cparams.flash_attn);
+    ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+    ggml_tensor * k = ggml_permute(ctx0, store->get_scr(ctx0, false, n_kv), 0, 2, 1, 3);
+    ggml_tensor * v = ggml_permute(ctx0, store->get_scr(ctx0, true,  n_kv), 0, 2, 1, 3);
+
+    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k, v, inp->self_attn_mask.raw, kq_scale, hparams.f_max_alibi_bias,
+            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+    ggml_prec_set_acc(cur, GGML_PREC_F32);
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    ggml_build_forward_expand(gf, cur);
+    cb(cur, "kqv_out", il);
+
+    // the scratch is free for the next attention layer
+    for (int ila = il + 1; ila < n_layer; ++ila) {
+        if (!hparams.is_recr(ila)) {
+            store->build_scr_up(ctx0, gf, sched, ila);
+            break;
+        }
+    }
+
+    return cur;
+}
+
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
         llm_graph_input_kvq *     inp_kvq,
@@ -813,6 +891,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     if (inp_kvq && inp_kvq->packed_small) {
         cur = build_attn_kvq_packed(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
+    } else if (inp_kvq && inp_kvq->scratch) {
+        cur = build_attn_kvq_scratch(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
     } else if (inp_kvq && inp_kvq->params.enabled && !inp_kvq->params.packed) {
         cur = build_attn_kvq(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
     } else {

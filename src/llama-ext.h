@@ -171,6 +171,7 @@ struct llama_kvq_params {
     int32_t sync_m        = 64;
     int32_t sync_min_hits = 48;
     bool    all_resident  = false; // debug: every coarse row resident, no prefetch and no top-up
+    bool    scratch       = true;  // fit mode: the other ubatches attend over the scratch (coarse region from the host store), false: over the cache
 };
 
 // false if the memory has no coarse copy or does not support the parameters (single stream only)
@@ -221,6 +222,10 @@ struct llama_kvq_counters {
     double  t_join     = 0.0; // decode thread blocked on the worker
     double  t_idle     = 0.0; // LLAMA_KVQ_IDLE_PROBE: GPU at the join before the decode thread queued the upload (estimate)
     double  t_upload   = 0.0;
+    int64_t n_scr      = 0;   // scratch attention: uploads of the coarse region (fit mode, large ubatches)
+    int64_t scr_bytes  = 0;
+    double  t_scr      = 0.0; // decode thread time in the scratch callbacks
+    double  t_scr_wait = 0.0; // LLAMA_KVQ_IDLE_PROBE: GPU at the scratch join before the uploads ended (estimate)
 };
 
 struct llama_kvq_counters_all {
@@ -239,6 +244,7 @@ struct llama_kvq_memory_info {
     size_t tables     = 0;
     size_t resident   = 0; // rkv and ridx
     size_t other_dev  = 0; // bias, staging and slot lists
+    size_t scratch    = 0; // fit mode: K/V rows of the large ubatches
     size_t host_store = 0;
     size_t host_other = 0;
     bool   pinned     = false;

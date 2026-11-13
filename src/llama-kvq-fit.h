@@ -3,6 +3,8 @@
 #include "llama-ext.h"
 #include "llama-kvq-codec.h"
 
+#include "ggml-cpp.h"
+
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -15,7 +17,8 @@ class llama_kvq_store;
 
 // fits and codes the chunks of the coarse region of a packed store in fit mode (see llama_kvq_fit_params)
 // a job is one chunk, its tasks are the (attention layer, kv head, K or V) triples, run in order by a pool of CPU threads
-// a task reads the q8_0 K or V rows of its kv head from the cache, writes them to the host store, fits the table
+// the decode thread reads the q8_0 rows of the chunk from the cache when it starts the job
+// a task takes the K or V rows of its kv head, writes them to the host store, fits the table
 // (K: metric of the chunk's queries; V: o_proj columns scaled by the chunk's mean sigmoid(gate)), codes and packs the rows
 // the decode thread (poll, wait, remove) reads the statistics, starts the jobs and adds the finished chunks to the store
 class llama_kvq_fitter {
@@ -74,6 +77,7 @@ private:
     std::deque<std::pair<job *, int32_t>> tasks;
     std::deque<std::unique_ptr<job>>      jobs; // in chunk order
     std::vector<std::thread> threads;
+    std::vector<ggml_backend_buffer_ptr> free_bufs; // rows buffers of finished jobs
     bool stop = false;
 
     // progress
@@ -88,6 +92,7 @@ private:
     void take(const llama_kv_cache & kv);
     void install(bool all);
     void run(job & jb, int32_t i);
+    void release(job & jb);
     void compute_wo_gram(int32_t p);
     void metric_v(const job & jb, int32_t p, std::vector<double> & m);
     void set_stats(const std::vector<float> * gram, const std::vector<float> * gsum);

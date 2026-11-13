@@ -68,6 +68,19 @@ set_target_properties(llama PROPERTIES
 set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
+# the two-tier KV cache fits its codec tables on the CPU threads during the prefill: vector flags for its loops, as for ggml-cpu
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i686|x86)$")
+    if (MSVC)
+        if (GGML_NATIVE OR GGML_AVX2 OR GGML_AVX512)
+            set_source_files_properties(llama-kvq-codec.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        endif()
+    elseif (GGML_NATIVE)
+        set_source_files_properties(llama-kvq-codec.cpp PROPERTIES COMPILE_OPTIONS "-march=native")
+    elseif (GGML_AVX2)
+        set_source_files_properties(llama-kvq-codec.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    endif()
+endif()
+
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
