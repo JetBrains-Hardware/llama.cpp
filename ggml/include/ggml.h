@@ -2525,24 +2525,29 @@ extern "C" {
     // the coarse rows are split in chunks of n_chunk_rows, chunk t = rows [t*n_chunk_rows, (t+1)*n_chunk_rows)
     // each (chunk, kv head) has its own codec tables for K and for V
     //
-    // q:       [D, n_head, L]                  f32, D == 256 and L <= 8 on CUDA, n_head % G == 0, head h reads kv head h/(n_head/G)
-    // kc:      [nwk, n_coarse, G]              i32, packed K row of each (row, kv head), rows contiguous; NULL: n_coarse = 0
+    // q:       [D, n_head, L]                  f32, n_head % G == 0, head h reads kv head h/(n_head/G), rows contiguous
+    // kc:      [nwk, n_coarse, G]              i32, packed K row of each (row, kv head), any nb1/nb2; NULL: n_coarse = 0
     // vc:      [nwv + 1, n_coarse, G]          i32, packed V row in words [0, nwv), V gain in the low 16 bits (f16) of word nwv
-    // tab_inv: [D, D, 2*G, >= n_chunk]         f16, inverse transforms, (K, V) of kv head g at i2 = 2*g + (0, 1)
+    // tab_inv: [D, D, 2*G, >= n_chunk]         f16, inverse transforms, (K, V) of kv head g at i2 = 2*g + (0, 1), chunk t at i3 = t
     //            K: element [c, i] = inv[c][i] (i0 = component), V: element [i, c] = inv[c][i] (i0 = dim)
-    // tab_aux: [D, 3, 2*G, >= n_chunk]         f32, i1 = 0: step[c], 1: mu[i], 2: bits[c] (0..8, as float)
-    // k, v:    [D, n_tail, G]                  f16 or q8_0 (same type), tail K/V, v not transposed; n_tail >= 1
+    // tab_aux: [D, 3, 2*G, >= n_chunk]         f32, i1 = 0: step[c], 1: mu[i], 2: bits[c] (0..8, as float), same i2/i3
+    // k, v:    [D, n_tail, G]                  f16 or q8_0 (same type), tail K/V (any nb1/nb2, e.g. a permuted cache view),
+    //                                          v not transposed; n_tail >= 1, tail row r is cache row n_coarse + r
     // rkv:     [D, cap, G, 2]                  f16 or q8_0, resident precise K (i3 = 0) and V (i3 = 1); NULL: no resident rows
     // ridx:    [cap, G]                        i32, coarse row held by each resident slot, -1 (or any row outside [0, n_coarse)) = empty
-    // mask:    [>= n_kv, >= L]                 f16, added to the scaled logits, row index = cache row; NULL: no mask
+    // mask:    [>= n_kv, >= L]                 f16, added to the scaled logits, element [row, l] for cache row row and position l,
+    //                                          a resident slot uses the mask of its row; NULL: no mask
     //
     // packed rows: component c of a table holds bits[c] bits, sum(bits) <= 32*nwk (K) or 32*nwv (V)
     //   the field u of component c is bits [o_c, o_c + bits[c]) of the row, o_c = sum of bits[c'] for c' < c,
     //   row bit b = bit (b % 32) of word b/32; the code is u - 2^(bits[c]-1), components with 0 bits are not stored
-    //   decoded K row: x[i] = sum_c (code_c + 0.5)*step[c]*inv[c][i] + mu[i]; decoded V row: same with step[c]*gain
+    //   decoded K row: x[i] = sum_c (code_c + 0.5)*step[c]*inv[c][i] + mu[i] over the components with bits[c] > 0;
+    //   decoded V row: the same with step[c]*gain; the components may be in any order (src/llama-kvq-pack.h sorts by bits)
     //
     // logits: s = scale*(q . k) + mask[row, l], for a coarse row with the decoded K row
     // a resident slot overrides its coarse row for the attention of its kv head; slots of a kv head must hold distinct rows
+    //
+    // CUDA (Ampere or newer): D == 256, L <= 8, (n_head/G)*L <= 48, nwk <= 32, nwv <= 32, k/v/rkv row strides multiple of 16 bytes
     //
     // mode GGML_KVQ_ATTN:  res [D, n_head, L] f32 = sum_j w_j v_j, w = softmax over the non-resident coarse rows (coarse K/V),
     //                      the resident slots (precise K/V) and the tail rows (precise K/V)

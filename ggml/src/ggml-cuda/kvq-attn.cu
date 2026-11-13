@@ -6,7 +6,7 @@
 // two-tier attention, see ggml_kvq_attn
 //
 // kernels, per call:
-//   prep:     per (chunk, kv head): qt = (inv q)*step, q . mu, max |qt| per query, unpack fields
+//   prep:     per (chunk, kv head): qt = (inv q)*step, q . mu, max |qt| per query, unpack fields, resident bitmap
 //   coarse:   per (block of rows of one chunk, kv head): logits in the code domain with mma (codes x qt, f16 with a
 //             power-of-2 scale per query), online softmax, V accumulated in the code domain with mma (codes^T x P),
 //             partial (m, z, O^T)
@@ -47,7 +47,7 @@ struct kvq_args {
     const half  * mask; int64_t mask_nb1;           // in elements
 
     float    * qtf;   // [n_chunk*G][N][D] qt in f32
-    uint32_t * kmax;  // [n_chunk*G][N] max |qt| as f32 bits
+    float    * kmax;  // [n_chunk*G][D/32][N] max |qt| per slice of 32 components
     float    * kmu;   // [n_chunk*G][N] q . mu
     uint4    * kpair; // [n_chunk*G][D/2] per component pair: word*LDR, shift | bits of the first << 8, masks, offsets (half2)
     uint2    * vfld;  // [n_chunk*G][D] per component: word*LDR | shift << 16 | mask << 24, offset (half2)
@@ -74,8 +74,12 @@ struct kvq_src {
 };
 
 // f16 scale of the qt of one column: max |qt| to [2^14, 2^15)
-static __device__ __forceinline__ float kvq_qscale(const uint32_t mx_bits) {
-    const float mx = __uint_as_float(mx_bits);
+static __device__ __forceinline__ float kvq_qscale(const float * kmax, const int N) {
+    float mx = 0.0f;
+#pragma unroll
+    for (int sl = 0; sl < KVQ_D/32; ++sl) {
+        mx = fmaxf(mx, kmax[sl*N]);
+    }
     int e = 0;
     frexpf(mx, &e);
     return mx > 0.0f ? ldexpf(1.0f, 15 - e) : 1.0f;
@@ -289,7 +293,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
             a.qtf[((int64_t) tab*N + n)*KVQ_D + c] = qt;
             const float mx = warp_reduce_max(fabsf(qt));
             if (lane == 0) {
-                atomicMax(&a.kmax[tab*N + n], __float_as_uint(mx));
+                a.kmax[((int64_t) tab*(KVQ_D/WARP_SIZE) + slice)*N + n] = mx;
             }
         }
     }
@@ -303,6 +307,20 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
             sm = warp_reduce_sum(sm);
             if (lane == 0) {
                 a.kmu[tab*N + n] = sm;
+            }
+        }
+    }
+
+    if (slice == 2 && t == 0 && attn && a.cap > 0) {
+        uint32_t * rm = a.resmap + (int64_t) g*a.nres_words;
+        for (int i = tid; i < a.nres_words; i += KVQ_D) {
+            rm[i] = 0;
+        }
+        __syncthreads();
+        for (int sl = tid; sl < a.cap; sl += KVQ_D) {
+            const int32_t idx = a.ridx[sl + g*a.ridx_nb1];
+            if (idx >= 0 && idx < a.n_coarse) {
+                atomicOr(&rm[idx/32], 1u << (idx % 32));
             }
         }
     }
@@ -477,7 +495,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
     for (int e = tid; e < N*(KVQ_D/2); e += KVQ_NTHREADS) {
         const int n = e / (KVQ_D/2);
         const int i = e % (KVQ_D/2);
-        const float  qs = kvq_qscale(a.kmax[tab*N + n]);
+        const float  qs = kvq_qscale(a.kmax + (int64_t) tab*(KVQ_D/WARP_SIZE)*N + n, N);
         const float2 qt = ((const float2 *) a.qtf)[((int64_t) tab*N + n)*(KVQ_D/2) + i];
         *(half2 *) (s_qt + n*KVQ_LDT + 2*i) = __floats2half2_rn(qt.x*qs, qt.y*qs);
     }
@@ -504,7 +522,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
         for (int c = 0; c < 2; ++c) {
             const int n = 8*j + 2*t4 + c;
             ln[j][c]   = n < a.cols ? n / a.n_rep : -1;
-            kinv[j][c] = a.scale2/kvq_qscale(a.kmax[tab*N + n]);
+            kinv[j][c] = a.scale2/kvq_qscale(a.kmax + (int64_t) tab*(KVQ_D/WARP_SIZE)*N + n, N);
             kmu[j][c]  = a.scale2*a.kmu[tab*N + n];
         }
     }
@@ -1204,18 +1222,6 @@ static __global__ void kvq_score(const kvq_args a) {
     }
 }
 
-static __global__ void kvq_resmap(const kvq_args a) {
-    const int s = blockIdx.x*blockDim.x + threadIdx.x;
-    const int g = blockIdx.y;
-    if (s >= a.cap) {
-        return;
-    }
-    const int32_t idx = a.ridx[s + g*a.ridx_nb1];
-    if (idx >= 0 && idx < a.n_coarse) {
-        atomicOr(&a.resmap[g*a.nres_words + idx/32], 1u << (idx % 32));
-    }
-}
-
 static int kvq_rows_per_block() {
     static const int rows = [] {
         const char * env = getenv("GGML_KVQ_ROWS_PER_BLOCK");
@@ -1286,7 +1292,6 @@ static void kvq_launch(const kvq_args & a, const bool attn, const bool score,
     CUDA_CHECK(cudaEventRecord(ev_join[id], side));
 
     if (a.n_chunk > 0) {
-        CUDA_CHECK(cudaMemsetAsync(a.kmax, 0, (size_t) a.n_chunk*a.G*N*sizeof(uint32_t), stream));
         kvq_set_smem<kvq_prep<N>>();
         kvq_prep<N><<<dim3(a.n_chunk*a.G, KVQ_D/WARP_SIZE), KVQ_D, (N*KVQ_D + N*WARP_SIZE)*sizeof(float), stream>>>(a, attn);
 
@@ -1395,7 +1400,7 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int nc = std::max(1, a.n_chunk);
 
     ggml_cuda_pool_alloc<float>    qtf_a(pool, (size_t) nc*G*N*KVQ_D);
-    ggml_cuda_pool_alloc<uint32_t> kmax_a(pool, (size_t) nc*G*N);
+    ggml_cuda_pool_alloc<float>    kmax_a(pool, (size_t) nc*G*(KVQ_D/WARP_SIZE)*N);
     ggml_cuda_pool_alloc<float>    kmu_a(pool, (size_t) nc*G*N);
     ggml_cuda_pool_alloc<uint4>    kpair_a(pool, (size_t) nc*G*KVQ_D/2);
     ggml_cuda_pool_alloc<uint2>    vfld_a(pool, (size_t) nc*G*KVQ_D);
@@ -1425,11 +1430,6 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float * dst_d = (float *) dst->data;
     a.dst_attn  = attn ? dst_d : nullptr;
     a.dst_score = score ? dst_d + (attn ? (int64_t) KVQ_D*a.n_head*a.L : 0) : nullptr;
-
-    if (a.cap > 0 && a.n_coarse > 0) {
-        CUDA_CHECK(cudaMemsetAsync(a.resmap, 0, (size_t) G*a.nres_words*sizeof(uint32_t), stream));
-        kvq_resmap<<<dim3((a.cap + 255)/256, G), 256, 0, stream>>>(a);
-    }
 
     kvq_src src_res = {};
     if (a.cap > 0) {
