@@ -31,7 +31,7 @@
 //   coarse region = the full chunks of C rows that end at or before s - --kvq-protect, coded from the q8_0 rows (sinks included)
 //   the q8_0 cache is not changed, its rows of the coarse region are copied to the host store
 //   ubatches of up to 8 tokens attend through the packed path, larger ones through flash attention over the q8_0 cache
-//   --kvq-pf-n 1024, --kvq-cap 4096, --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
+//   --kvq-pf-n 1024, --kvq-cap 1024, --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
 //   --kvq-all-resident (debug: every coarse row resident), --kvq-pk-stats (top-m counters with sync off)
 // --kvq-no-rot: attention rotation off (for references of the packed mode)
 // --kvq-perf: no logits processing, decode times per chunk only
@@ -108,7 +108,7 @@ struct kvq_args {
 
     bool    packed          = false;
     int32_t pk_pf_n         = 1024;
-    int32_t pk_cap          = 4096;
+    int32_t pk_cap          = 1024;
     int32_t pk_lead         = 2;
     int32_t pk_sync         = LLAMA_KVQ_SYNC_OFF;
     int32_t pk_sync_m       = 64;
@@ -304,7 +304,7 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
                 "       [--kvq-variant exact|q8_0|aff8|K<b>V<b>|K<b>|V<b>] [--kvq-sinks 4] [--kvq-recent 0] [--kvq-qwin 2048] [--kvq-fit-chunk 0 [--kvq-kmetric own|last]]\n"
                 "       [--kvq-save-tables tables.bin] [--kvq-load-tables tables.bin [--kvq-load-only k|v] [--kvq-own-mean-k]] [--kvq-stats]\n"
                 "       [--kvq-two-tier all-precise|all-coarse|none|<N> [--kvq-protect 512] [--kvq-precise aff8|exact] [--kvq-tt-stats]]\n"
-                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 4096] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
+                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 1024] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
                 "                     [--kvq-all-resident] [--kvq-pk-stats]] [--kvq-no-rot] [--kvq-perf] [common args]\n", argv[0]);
         return false;
     }

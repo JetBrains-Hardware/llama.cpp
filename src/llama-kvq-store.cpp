@@ -22,6 +22,11 @@ struct kvq_fetch {
     int32_t row;
 };
 
+struct kvq_seen {
+    uint32_t mark; // stamp of the last request that listed the row
+    int32_t  upos; // index in the union of that request
+};
+
 struct kvq_cand {
     int32_t row;
     int32_t slot;
@@ -42,8 +47,7 @@ struct llama_kvq_store::layer {
 
     std::vector<int32_t>  ridx;       // [G + 1][cap_tot], mirror of t.ridx
     std::vector<int32_t>  row_slot;   // [G][n_coarse], -1 if not resident
-    std::vector<uint32_t> row_mark;   // [G][n_coarse], stamp of the last request that listed the row
-    std::vector<int32_t>  row_upos;   // [G][n_coarse], index in the union of that request
+    std::vector<kvq_seen> row_seen;   // [G][n_coarse], one load per row for the union
     std::vector<uint32_t> slot_stamp; // [G][cap_tot], stamp of the last selection
     std::vector<float>    slot_val;   // [G][cap_tot], score of the last selection
     std::vector<int32_t>  prev;       // [G][cap_tot], LRU list of the evictable slots, -1 at the ends
@@ -490,8 +494,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, in
     for (auto & l : layers) {
         l.ridx.assign((size_t) (G + 1)*cap_tot, -1);
         l.row_slot.assign((size_t) G*n_coarse, -1);
-        l.row_mark.assign((size_t) G*n_coarse, 0);
-        l.row_upos.assign((size_t) G*n_coarse, 0);
+        l.row_seen.assign((size_t) G*n_coarse, { 0, 0 });
         l.slot_stamp.assign((size_t) G*cap_tot, 0);
         l.slot_val.assign((size_t) G*cap_tot, 0.0f);
         l.prev.assign((size_t) G*cap_tot, -1);
@@ -664,7 +667,7 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
     for (auto & l : layers) {
         std::fill(l.ridx.begin(), l.ridx.end(), -1);
         std::fill(l.row_slot.begin(), l.row_slot.end(), -1);
-        std::fill(l.row_mark.begin(), l.row_mark.end(), 0);
+        std::fill(l.row_seen.begin(), l.row_seen.end(), kvq_seen{ 0, 0 });
         std::fill(l.slot_stamp.begin(), l.slot_stamp.end(), 0);
         std::fill(l.slot_val.begin(), l.slot_val.end(), 0.0f);
         l.stamp    = 0;
@@ -852,13 +855,12 @@ void llama_kvq_store::plan_prefetch(layer & l) {
                     u.push_back({ row, -1, l.h_val[o + i] });
                     continue;
                 }
-                const size_t ir = (size_t) g*n_coarse_ + row;
-                if (l.row_mark[ir] != now) {
-                    l.row_mark[ir] = now;
-                    l.row_upos[ir] = (int32_t) u.size();
+                kvq_seen & e = l.row_seen[(size_t) g*n_coarse_ + row];
+                if (e.mark != now) {
+                    e = { now, (int32_t) u.size() };
                     u.push_back({ row, -1, l.h_val[o + i] });
                 } else {
-                    u[l.row_upos[ir]].val = std::max(u[l.row_upos[ir]].val, l.h_val[o + i]);
+                    u[e.upos].val = std::max(u[e.upos].val, l.h_val[o + i]);
                 }
             }
         }
@@ -869,8 +871,12 @@ void llama_kvq_store::plan_prefetch(layer & l) {
         cnt.pf_req += u.size();
 
         // the resident rows first, so that the victims of the missing ones are older than this request
+        // independent loads first, the cache misses overlap
+        const int32_t * rs = l.row_slot.data() + (size_t) g*n_coarse_;
         for (auto & c : u) {
-            c.slot = l.row_slot[(size_t) g*n_coarse_ + c.row];
+            c.slot = rs[c.row];
+        }
+        for (const auto & c : u) {
             if (c.slot >= 0) {
                 l.touch(g, c.slot, c.val, cap_tot, n_sink);
             }
@@ -981,8 +987,7 @@ void llama_kvq_store::gather(layer & l, int64_t n_rows) {
         l.up_rec = false;
     }
 
-    // in store order
-    std::sort(l.fetch.begin(), l.fetch.end(), [](const kvq_fetch & a, const kvq_fetch & b) { return a.g != b.g ? a.g < b.g : a.row < b.row; });
+    // sorting the rows by address does not make the copy faster (measured)
     pool->run(l.fetch.data(), n, l.h_stage, l.store, n_coarse_);
 
     for (int64_t i = 0; i < n; ++i) {
@@ -1160,7 +1165,7 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
         mi.tables     += ggml_nbytes(l.t.tinv) + ggml_nbytes(l.t.taux);
         mi.resident   += ggml_nbytes(l.t.rkv) + ggml_nbytes(l.t.ridx);
         mi.host_store += (size_t) G*n_coarse_*2*ROW;
-        mi.host_other += l.ridx.size()*sizeof(int32_t) + (l.row_slot.size() + l.row_mark.size() + l.row_upos.size())*sizeof(int32_t) +
+        mi.host_other += l.ridx.size()*sizeof(int32_t) + l.row_slot.size()*sizeof(int32_t) + l.row_seen.size()*sizeof(kvq_seen) +
                          (l.slot_stamp.size() + l.slot_val.size() + l.prev.size() + l.next.size())*sizeof(int32_t);
     }
     mi.other_dev  = ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
