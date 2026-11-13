@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-kvq.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -3159,6 +3160,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return true;
     }
 
+    // the triggers of the packed two-tier attention
+    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(lctx->memory.get()); kvq && kvq->sched_copy(backend, src, dst, graph)) {
+        return true;
+    }
+
     auto & st = lctx->copy_experts;
 
     // the ids must be computed before the split starts, so only the first node of the split is considered
@@ -5178,6 +5184,19 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+int32_t llama_context_n_splits(const struct llama_context * ctx) {
+    return ggml_backend_sched_get_n_splits(ctx->get_sched());
+}
+
+void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb, void * user_data) {
+    cparams.cb_eval           = cb;
+    cparams.cb_eval_user_data = user_data;
+}
+
+void llama_context_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data) {
+    ctx->set_eval_callback(cb, user_data);
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

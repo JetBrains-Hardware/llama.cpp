@@ -285,6 +285,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // used from the next graph build on
+    void set_eval_callback(ggml_backend_sched_eval_callback cb, void * user_data);
+
 private:
     llm_graph_result * get_gf_res_prev();
 

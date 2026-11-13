@@ -142,6 +142,80 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
     return std::make_unique<graph>(params);
 }
 
+class llama_model_qwen35::llm_graph_input_kvq : public llm_graph_input_i {
+public:
+    llm_graph_input_kvq(const llama_memory_hybrid_kvq_context * mctx, bool causal_attn) :
+        mctx(mctx), params(mctx->get_params()), causal_attn(causal_attn) {}
+    virtual ~llm_graph_input_kvq() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        if (!params.enabled) {
+            return;
+        }
+
+        if (params.packed) {
+            if (packed_small) {
+                mctx->get_attn()->set_input_attn_mask(mask_attn, ubatch, causal_attn);
+                mctx->set_input_kvq_early(mask_early.raw, mask_attn.raw, ubatch);
+                mctx->get_store()->begin_ubatch(ubatch->n_tokens);
+            }
+            return;
+        }
+
+        mctx->get_attn()->set_input_attn_mask(kq_mask, ubatch, causal_attn);
+        mctx->set_input_kvq(pre, prot, bias);
+    }
+
+    bool can_reuse(const llm_graph_params & gparams) override {
+        mctx = dynamic_cast<const llama_memory_hybrid_kvq_context *>(gparams.mctx);
+        if (mctx == nullptr) {
+            return false;
+        }
+
+        // these change the graph, the other parameters only the cell flags
+        const llama_kvq_params & p = mctx->get_params();
+
+        bool res = p.enabled == params.enabled && p.n_top == params.n_top && p.stats == params.stats;
+
+        res &= p.packed == params.packed && p.max_batch == params.max_batch && p.prefetch_n == params.prefetch_n && p.lead == params.lead &&
+               p.sync_mode == params.sync_mode && p.sync_m == params.sync_m && p.all_resident == params.all_resident;
+
+        if (res && params.enabled && params.packed) {
+            res &= packed_small == (p.enabled && gparams.ubatch.n_tokens <= (uint32_t) p.max_batch);
+            res &= store == mctx->get_store();
+            if (res && packed_small) {
+                res &= mask_attn.raw->ne[0] == mctx->get_attn()->get_n_kv();
+                res &= mask_attn.raw->ne[1] == gparams.ubatch.n_tokens;
+            }
+        } else if (res && params.enabled) {
+            res &= kq_mask.raw->ne[0] == mctx->get_attn()->get_n_kv();
+            res &= kq_mask.raw->ne[1] == gparams.ubatch.n_tokens;
+        }
+
+        params = p;
+
+        return res;
+    }
+
+    llm_attn_mask kq_mask;        // F32 [n_kv, n_tokens], over all cells
+    ggml_tensor * pre  = nullptr; // F32 [n_kv], see llama_memory_hybrid_kvq_context::set_input_kvq
+    ggml_tensor * prot = nullptr; // F32 [n_kv]
+    ggml_tensor * bias = nullptr; // F32 [n_kv]
+
+    // packed mode, ubatch of at most max_batch tokens
+    bool          packed_small = false;
+    llm_attn_mask mask_attn;  // F16 [n_kv, n_tokens], over all cells
+    llm_attn_mask mask_early; // F16 [n_kv, n_tokens], without the cells of the ubatch (their K/V are not written yet)
+
+    const llama_kvq_store * store = nullptr;
+
+    const llama_memory_hybrid_kvq_context * mctx;
+
+    llama_kvq_params params;
+
+    const bool causal_attn;
+};
+
 llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     llm_build_delta_net_base(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -162,9 +236,18 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // packed two-tier attention: the attention layer ila prefetches at the input of layer max(0, ila - lead)
+    const int kvq_lead = inp_kvq && inp_kvq->packed_small && !inp_kvq->params.all_resident ? inp_kvq->params.lead : 0;
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
+
+        for (int ila = il; kvq_lead > 0 && ila <= il + kvq_lead && ila < n_layer; ++ila) {
+            if (!hparams.is_recr(ila) && std::max(0, ila - kvq_lead) == il) {
+                build_kvq_prefetch(inp->get_attn(), inp_kvq, inpL, inp_pos, ila);
+            }
+        }
 
         ggml_tensor * inpSA = inpL;
 
@@ -286,53 +369,6 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated_silu);
 }
 
-class llama_model_qwen35::llm_graph_input_kvq : public llm_graph_input_i {
-public:
-    llm_graph_input_kvq(const llama_memory_hybrid_kvq_context * mctx, bool causal_attn) :
-        mctx(mctx), params(mctx->get_params()), causal_attn(causal_attn) {}
-    virtual ~llm_graph_input_kvq() = default;
-
-    void set_input(const llama_ubatch * ubatch) override {
-        if (!params.enabled) {
-            return;
-        }
-
-        mctx->get_attn()->set_input_attn_mask(kq_mask, ubatch, causal_attn);
-        mctx->set_input_kvq(pre, prot, bias);
-    }
-
-    bool can_reuse(const llm_graph_params & gparams) override {
-        mctx = dynamic_cast<const llama_memory_hybrid_kvq_context *>(gparams.mctx);
-        if (mctx == nullptr) {
-            return false;
-        }
-
-        // these change the graph, the other parameters only the cell flags
-        const llama_kvq_params & p = mctx->get_params();
-
-        bool res = p.enabled == params.enabled && p.n_top == params.n_top && p.stats == params.stats;
-
-        if (res && params.enabled) {
-            res &= kq_mask.raw->ne[0] == mctx->get_attn()->get_n_kv();
-            res &= kq_mask.raw->ne[1] == gparams.ubatch.n_tokens;
-        }
-
-        params = p;
-
-        return res;
-    }
-
-    llm_attn_mask kq_mask;        // F32 [n_kv, n_tokens], over all cells
-    ggml_tensor * pre  = nullptr; // F32 [n_kv], see llama_memory_hybrid_kvq_context::set_input_kvq
-    ggml_tensor * prot = nullptr; // F32 [n_kv]
-    ggml_tensor * bias = nullptr; // F32 [n_kv]
-
-    const llama_memory_hybrid_kvq_context * mctx;
-
-    llama_kvq_params params;
-
-    const bool causal_attn;
-};
 
 llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_kvq() const {
     const auto * mctx_kvq = dynamic_cast<const llama_memory_hybrid_kvq_context *>(mctx);
@@ -343,7 +379,27 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
     // added also when the mode is off, so that can_reuse sees a switch
     auto inp = std::make_unique<llm_graph_input_kvq>(mctx_kvq, cparams.causal_attn);
 
-    if (inp->params.enabled) {
+    if (inp->params.enabled && inp->params.packed) {
+        GGML_ASSERT(ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == 0 && "two-tier attention supports a single sequence");
+        GGML_ASSERT(mctx_kvq->get_store() != nullptr);
+
+        inp->store        = mctx_kvq->get_store();
+        inp->packed_small = n_tokens <= inp->params.max_batch;
+
+        if (inp->packed_small) {
+            const int64_t n_kv = mctx_kvq->get_attn()->get_n_kv();
+            GGML_ASSERT(n_kv > inp->store->n_coarse());
+
+            inp->mask_attn.n_kv  = n_kv;
+            inp->mask_attn.raw   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, n_tokens);
+            inp->mask_early.n_kv = n_kv;
+            inp->mask_early.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, n_tokens);
+            ggml_set_input(inp->mask_attn.raw);
+            ggml_set_input(inp->mask_early.raw);
+            ggml_set_name(inp->mask_attn.raw,  "kvq_mask_attn");
+            ggml_set_name(inp->mask_early.raw, "kvq_mask_early");
+        }
+    } else if (inp->params.enabled) {
         GGML_ASSERT(ubatch.n_seqs_unq == 1 && "two-tier attention supports a single sequence");
 
         const int64_t n_kv = mctx_kvq->get_attn()->get_n_kv();
@@ -513,6 +569,129 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq(
     return cur;
 }
 
+// tail rows [n_coarse, n_kv) of the K or V cache of layer il: [n_embd_head, n_tail, n_head_kv]
+static ggml_tensor * kvq_tail(ggml_context * ctx, ggml_tensor * kv, int64_t n_coarse) {
+    // kv: [n_embd_head, n_head_kv, n_kv, 1]
+    return ggml_view_3d(ctx, kv, kv->ne[0], kv->ne[2] - n_coarse, kv->ne[1], kv->nb[2], kv->nb[1], n_coarse*kv->nb[2]);
+}
+
+void llama_model_qwen35::graph::build_kvq_prefetch(
+        llm_graph_input_attn_kv * inp,
+        llm_graph_input_kvq *     inp_kvq,
+        ggml_tensor *             x,
+        ggml_tensor *             inp_pos,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const auto &  layer       = model.layers[il];
+    const auto *  store       = inp_kvq->store;
+    const auto &  t           = store->get_layer(il);
+
+    // layer il's query path on an earlier hidden state: input norm, query half of the q projection, q norm, RoPE
+    ggml_tensor * cur = build_norm(x, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "kvq_eq_norm", il);
+
+    ggml_tensor * qg   = nullptr;
+    int64_t       nb_t = 0; // bytes per token of qg
+    if (layer.wq) {
+        qg = build_lora_mm(layer.wq, cur, layer.wq_s);
+        if (layer.wq_b) {
+            qg = ggml_add(ctx0, qg, layer.wq_b);
+        }
+    } else {
+        GGML_ASSERT(layer.wqkv && !layer.wqkv_b);
+        qg = build_lora_mm(layer.wqkv, cur, layer.wqkv_s);
+    }
+    nb_t = qg->nb[1];
+    cb(qg, "kvq_eq_proj", il);
+
+    ggml_tensor * q = ggml_view_3d(ctx0, qg, n_embd_head, n_head, n_tokens,
+            ggml_element_size(qg)*n_embd_head*2, nb_t, 0);
+    q = build_norm(q, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
+    q = build_rope(q, inp_pos, il);
+    cb(q, "kvq_eq", il);
+
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    ggml_tensor * k = kvq_tail(ctx0, inp->mctx->get_k(ctx0, il), store->n_coarse());
+
+    ggml_tensor * score = ggml_kvq_attn(ctx0, q, t.kc, nullptr, t.tinv, t.taux, k, nullptr, nullptr, nullptr,
+            inp_kvq->mask_early.raw, kq_scale, store->n_chunk_rows(), GGML_KVQ_SCORE);
+    cb(score, "kvq_eq_score", il);
+
+    store->build_fetch(ctx0, gf, sched, il, llama_kvq_store::KIND_PREFETCH, score, inp_kvq->params.prefetch_n);
+}
+
+// packed two-tier attention: the coarse region through the packed rows, its resident slots precise, the tail precise from the cache
+// sync off: one attention with the resident slots as they are
+// count/always: attention and true-query score in one pass, the top-up trigger, then ggml_kvq_attn_cond, which runs only if the top-up fetched rows
+ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
+        llm_graph_input_attn_kv * inp,
+        llm_graph_input_kvq *     inp_kvq,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             k_cur,
+        ggml_tensor *             v_cur,
+        float                     kq_scale,
+        int                       il) {
+    const auto * mctx_attn = inp->mctx;
+    const auto * store     = inp_kvq->store;
+    const auto & t         = store->get_layer(il);
+    const auto & params    = inp_kvq->params;
+
+    // the precise rows are the plain q8_0 cache rows
+    GGML_ASSERT(!inp->self_k_rot[il] && !inp->self_v_rot[il]);
+    GGML_ASSERT(!mctx_attn->get_k_scale(il) && !mctx_attn->get_v_scale(il));
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    ggml_build_forward_expand(gf, mctx_attn->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_attn->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+
+    const int64_t n_coarse = store->n_coarse();
+    const int64_t n_crow   = store->n_chunk_rows();
+    const int64_t G        = store->n_head_kv();
+
+    ggml_tensor * k    = kvq_tail(ctx0, mctx_attn->get_k(ctx0, il), n_coarse);
+    ggml_tensor * v    = kvq_tail(ctx0, mctx_attn->get_v(ctx0, il), n_coarse);
+    ggml_tensor * ridx = store->get_ridx(ctx0, il);
+    ggml_tensor * mask = inp_kvq->mask_attn.raw;
+
+    const bool sync  = params.sync_mode != LLAMA_KVQ_SYNC_OFF && !params.all_resident;
+    const bool check = (sync || params.stats) && !params.all_resident;
+
+    ggml_tensor * out = nullptr;
+    if (!check) {
+        out = ggml_kvq_attn(ctx0, q_cur, t.kc, t.vc, t.tinv, t.taux, k, v, t.rkv, ridx, mask, kq_scale, n_crow, GGML_KVQ_ATTN);
+        cb(out, "kvq_attn", il);
+    } else {
+        ggml_tensor * both = ggml_kvq_attn(ctx0, q_cur, t.kc, t.vc, t.tinv, t.taux, k, v, t.rkv, ridx, mask, kq_scale, n_crow,
+                GGML_KVQ_ATTN | GGML_KVQ_SCORE);
+        cb(both, "kvq_attn_score", il);
+
+        const int64_t n_embd_head = hparams.n_embd_head_k();
+        const int64_t n_att       = n_embd_head*n_head*n_tokens;
+        ggml_tensor * att   = ggml_view_3d(ctx0, both, n_embd_head, n_head, n_tokens,
+                both->nb[0]*n_embd_head, both->nb[0]*n_embd_head*n_head, 0);
+        ggml_tensor * score = ggml_view_3d(ctx0, both, n_coarse, G, n_tokens,
+                both->nb[0]*n_coarse, both->nb[0]*n_coarse*G, both->nb[0]*n_att);
+
+        store->build_fetch(ctx0, gf, sched, il, llama_kvq_store::KIND_TOPUP, score, params.sync_m);
+
+        if (sync) {
+            out = ggml_kvq_attn_cond(ctx0, att, q_cur, t.kc, t.vc, t.tinv, t.taux, k, v, t.rkv, t.ridx, mask, kq_scale, n_crow);
+            cb(out, "kvq_attn_cond", il);
+        } else {
+            out = att;
+        }
+    }
+
+    ggml_tensor * cur = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]);
+    cb(cur, "kqv_out", il);
+
+    return cur;
+}
+
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         llm_graph_input_attn_kv * inp,
         llm_graph_input_kvq *     inp_kvq,
@@ -568,7 +747,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (inp_kvq && inp_kvq->params.enabled) {
+    if (inp_kvq && inp_kvq->packed_small) {
+        cur = build_attn_kvq_packed(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
+    } else if (inp_kvq && inp_kvq->params.enabled && !inp_kvq->params.packed) {
         cur = build_attn_kvq(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
     } else {
         cur = build_attn(inp,

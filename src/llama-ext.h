@@ -123,7 +123,7 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 LLAMA_API std::vector<int32_t> llama_memory_kv_layer_ids(llama_memory_t mem);
 
 // copy the K (is_v = false) or V rows of layer il for positions [p0, p1) of seq_id, as F32 (p1 - p0) x n_embd
-// the rows are found through the cells of the sequence; F32/F16/BF16 caches only, V must not be transposed (flash attention)
+// the rows are found through the cells of the sequence; F32/F16/BF16/Q8_0 caches only, V must not be transposed (flash attention)
 // fails if n_embd is not the row size of the cache (n_embd_k_gqa or n_embd_v_gqa)
 LLAMA_API bool llama_memory_kv_get_rows(llama_memory_t mem, int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, float * dst);
 LLAMA_API bool llama_memory_kv_set_rows(llama_memory_t mem, int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, const float * src);
@@ -142,13 +142,34 @@ LLAMA_API void llama_model_set_kvq_two_tier(struct llama_model * model, bool val
 // cells with pos < n_prefix are the prefix, later cells hold exact K/V in both copies and are always precise
 // the protected cells (the first n_sink and the last n_recent of the prefix) are precise
 // of the other prefix cells, the n_top with the largest coarse attention are precise, per kv head and query position
+//
+// packed mode (llama_model_set_kvq_packed, ggml_kvq_attn): the coarse region is set by llama_memory_kvq_packed_alloc,
+// the precise rows of the coarse region come from a host store into a resident cache per (layer, kv head)
+// ubatches of up to max_batch tokens attend through ggml_kvq_attn, larger ones through the normal attention
+// the first n_sink rows are always resident; n_top, n_recent and n_prefix are not used
+enum llama_kvq_sync {
+    LLAMA_KVQ_SYNC_OFF    = 0, // attend with the resident rows as they are
+    LLAMA_KVQ_SYNC_COUNT  = 1, // fetch the missing rows of the true top sync_m if fewer than sync_min_hits are resident
+    LLAMA_KVQ_SYNC_ALWAYS = 2, // fetch every missing row of the true top sync_m
+};
+
 struct llama_kvq_params {
     bool      enabled  = false;
     int32_t   n_top    = 0;
     int32_t   n_sink   = 4;
     int32_t   n_recent = 512;
     llama_pos n_prefix = 0;
-    bool      stats    = false; // per layer statistics in the graph, as tensor "kvq_stats-<il>"
+    bool      stats    = false; // per layer statistics in the graph, as tensor "kvq_stats-<il>"; packed: top-m counters with sync off
+
+    bool    packed        = false;
+    int32_t max_batch     = 8;
+    int32_t prefetch_n    = 1024; // rows per (kv head, position) requested by the early query
+    int32_t resident_cap  = 1024; // evictable resident slots per (layer, kv head), the sinks have their own
+    int32_t lead          = 2;    // the early query of layer il runs at the input of layer il - lead, 0: no prefetch
+    int32_t sync_mode     = LLAMA_KVQ_SYNC_COUNT;
+    int32_t sync_m        = 64;
+    int32_t sync_min_hits = 48;
+    bool    all_resident  = false; // debug: every coarse row resident, no prefetch and no top-up
 };
 
 // false if the memory has no coarse copy or does not support the parameters (single stream only)
@@ -157,6 +178,74 @@ LLAMA_API bool llama_memory_kvq_set_params(llama_memory_t mem, const llama_kvq_p
 
 // like llama_memory_kv_set_rows, for the coarse copy
 LLAMA_API bool llama_memory_kvq_set_coarse_rows(llama_memory_t mem, int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, const float * src);
+
+struct llama_kvq_table; // src/llama-kvq-codec.h
+
+// packed mode: the contexts created from this model attend through ggml_kvq_attn, no coarse copy of the cache (qwen35 only)
+LLAMA_API void llama_model_set_kvq_packed(struct llama_model * model, bool value);
+
+// packed mode: the coarse region is the cells [0, n_coarse) of sequence 0, which must hold positions [0, n_coarse)
+// allocates the device tensors for codes of bits_k/bits_v bits per value and n_coarse/n_chunk_rows table sets,
+// and copies the q8_0 K/V rows of the region from the cache to the host store
+// resident_cap and all_resident size the resident cache, the other parameters are read by llama_memory_kvq_set_params
+LLAMA_API bool llama_memory_kvq_packed_alloc(llama_memory_t mem, int32_t n_coarse, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
+        int32_t resident_cap, bool all_resident, int32_t n_sink);
+
+// packed mode: the codec tables (one per chunk) and the codes [n_coarse][n] (llama_kvq_encode) of layer il, kv head g, K or V
+LLAMA_API bool llama_memory_kvq_packed_set(llama_memory_t mem, int32_t il, int32_t g, bool is_v, const std::vector<llama_kvq_table> & tabs,
+        const int8_t * codes, const float * gain);
+
+// packed mode counters, per attention layer; times in seconds
+struct llama_kvq_counters {
+    int32_t il = -1;
+    int64_t n_pf       = 0; // prefetch calls
+    int64_t pf_req     = 0; // rows requested (union over the positions, per kv head)
+    int64_t pf_fetch   = 0; // rows fetched (not resident)
+    int64_t n_tu       = 0; // top-up calls
+    int64_t n_pos      = 0; // (layer, position) executions with a top-up check
+    int64_t tu_check   = 0; // (kv head, position) checks
+    int64_t tu_fire    = 0; // (kv head, position) firings
+    int64_t tu_stall   = 0; // (layer, position) with at least one firing kv head
+    int64_t tu_redo    = 0; // calls that ran the second attention
+    int64_t tu_fetch   = 0; // rows fetched by the top-up
+    int64_t top_hit    = 0; // rows of the true top sync_m resident before the top-up
+    int64_t top_n      = 0;
+    int64_t evict      = 0;
+    int64_t bytes      = 0; // host -> device, rows and slot lists
+    double  t_wait     = 0.0; // since the previous callback of the ubatch: GPU work and launches
+    double  t_read     = 0.0;
+    double  t_gather   = 0.0;
+    double  t_upload   = 0.0;
+};
+
+struct llama_kvq_counters_all {
+    std::vector<llama_kvq_counters> layers;
+    int64_t n_ubatch   = 0; // ubatches through the packed path
+    int64_t n_tokens   = 0;
+    int64_t n_clean    = 0; // positions with no top-up firing in any layer
+};
+
+LLAMA_API bool llama_memory_kvq_get_counters(llama_memory_t mem, llama_kvq_counters_all & out);
+LLAMA_API void llama_memory_kvq_reset_counters(llama_memory_t mem);
+
+// device and host memory of the packed state, bytes
+struct llama_kvq_memory_info {
+    size_t codes      = 0; // packed coarse rows
+    size_t tables     = 0;
+    size_t resident   = 0; // rkv and ridx
+    size_t other_dev  = 0; // bias, staging and slot lists
+    size_t host_store = 0;
+    size_t host_other = 0;
+    bool   pinned     = false;
+};
+
+LLAMA_API bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_memory_info & out);
+
+// scheduler splits of the last graph
+LLAMA_API int32_t llama_context_n_splits(const struct llama_context * ctx);
+
+// replace the eval callback, used from the next graph build on
+LLAMA_API void llama_context_set_eval_callback(struct llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data);
 
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details

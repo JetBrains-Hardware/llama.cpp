@@ -3396,8 +3396,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
-                    } else if (kvq_two_tier && arch == LLM_ARCH_QWEN35) {
-                        // a coarse copy of the attention K/V for two-tier attention
+                    } else if ((kvq_two_tier || kvq_packed) && arch == LLM_ARCH_QWEN35) {
+                        // a coarse copy of the attention K/V for two-tier attention, or the packed two-tier state
                         res = new llama_memory_hybrid_kvq(
                             /* model             */ *this,
                             /* no_alloc          */ params.no_alloc,
@@ -3415,7 +3415,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* packed            */ kvq_packed);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -4033,6 +4034,10 @@ void llama_model_set_attn_rot(struct llama_model * model, bool value) {
 
 void llama_model_set_kvq_two_tier(struct llama_model * model, bool value) {
     model->kvq_two_tier = value;
+}
+
+void llama_model_set_kvq_packed(struct llama_model * model, bool value) {
+    model->kvq_packed = value;
 }
 
 //

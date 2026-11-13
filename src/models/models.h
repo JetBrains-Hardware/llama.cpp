@@ -2581,6 +2581,24 @@ struct llama_model_qwen35 : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
+        // packed two-tier attention of a small ubatch through ggml_kvq_attn
+        ggml_tensor * build_attn_kvq_packed(
+        llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                          float   kq_scale,
+                            int   il);
+
+        // the early query of attention layer il from the hidden state x, and the prefetch of its top rows
+        void build_kvq_prefetch(
+        llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * x,
+                    ggml_tensor * inp_pos,
+                            int   il);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,
