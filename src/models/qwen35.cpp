@@ -142,6 +142,12 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
     return std::make_unique<graph>(params);
 }
 
+// packed mode: a ubatch of up to max_batch tokens attends through ggml_kvq_attn
+// fit mode: no coarse rows yet, or more than max_tail cells after them, the normal attention
+static bool kvq_use_packed(const llama_kvq_params & p, uint32_t n_tokens, int32_t n_coarse, int64_t n_kv) {
+    return p.enabled && n_tokens <= (uint32_t) p.max_batch && n_coarse > 0 && (p.max_tail <= 0 || n_kv - n_coarse <= p.max_tail);
+}
+
 class llama_model_qwen35::llm_graph_input_kvq : public llm_graph_input_i {
 public:
     llm_graph_input_kvq(const llama_memory_hybrid_kvq_context * mctx, bool causal_attn) :
@@ -183,7 +189,7 @@ public:
         if (res && params.enabled && params.packed) {
             res &= store == mctx->get_store();
             res &= store != nullptr && n_coarse == store->n_coarse();
-            res &= packed_small == (p.enabled && gparams.ubatch.n_tokens <= (uint32_t) p.max_batch && n_coarse > 0);
+            res &= packed_small == kvq_use_packed(p, gparams.ubatch.n_tokens, n_coarse, mctx->get_attn()->get_n_kv());
             if (res && packed_small) {
                 res &= mask_attn.raw->ne[0] == mctx->get_attn()->get_n_kv();
                 res &= mask_attn.raw->ne[1] == gparams.ubatch.n_tokens;
@@ -391,8 +397,7 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
         inp->store        = mctx_kvq->get_store();
         inp->n_coarse     = inp->store->n_coarse();
         inp->fit          = inp->store->fit_mode();
-        // fit mode: no coarse rows yet, the normal attention
-        inp->packed_small = n_tokens <= inp->params.max_batch && inp->n_coarse > 0;
+        inp->packed_small = kvq_use_packed(inp->params, n_tokens, inp->n_coarse, mctx_kvq->get_attn()->get_n_kv());
 
         if (inp->packed_small) {
             const int64_t n_kv = mctx_kvq->get_attn()->get_n_kv();

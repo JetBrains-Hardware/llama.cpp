@@ -1383,10 +1383,45 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // two-tier KV cache: the memory of the context is created in packed mode, without the attention rotation
+    // the flags are per model, so a later context (e.g. MTP) loses the rotation too
+    if (params.kvq.enabled) {
+        char arch[64] = {};
+        if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) <= 0 || std::string(arch) != "qwen35") {
+            COM_ERR("%s: --kvq needs a qwen35 model (this one is '%s')\n", __func__, arch);
+            return;
+        }
+        llama_model_set_kvq_packed(model, true);
+        llama_model_set_attn_rot(model, false);
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
+    }
+
+    if (params.kvq.enabled) {
+        llama_kvq_fit_params fp;
+        fp.v_tables  = params.kvq.v_tables;
+        fp.n_threads = params.kvq.n_threads > 0 ? params.kvq.n_threads : common_cpu_get_num_math();
+
+        llama_kvq_params kp;
+        kp.enabled      = true;
+        kp.packed       = true;
+        kp.prefetch_n   = params.kvq.prefetch_n;
+        kp.resident_cap = params.kvq.resident_cap;
+        kp.lead         = params.kvq.lead;
+        // while the fit lags by a chunk, the normal attention is faster than the packed one over the precise rows
+        kp.max_tail     = fp.chunk;
+
+        if (!llama_memory_kvq_fit_enable(llama_get_memory(lctx), fp, kp)) {
+            COM_ERR("%s: cannot enable the two-tier KV cache\n", __func__);
+            llama_free(lctx);
+            return;
+        }
+        COM_INF("%s: two-tier KV cache: chunks of %d rows, K%dV%d, %d fit threads, prefetch_n = %d, resident_cap = %d, lead = %d\n", __func__,
+                fp.chunk, fp.bits_k, fp.bits_v, fp.n_threads, kp.prefetch_n, kp.resident_cap, kp.lead);
     }
 
     pimpl->context.reset(lctx);

@@ -23,6 +23,8 @@
 #include "mtmd-helper.h"
 #include "base64.hpp"
 
+#include "../../src/llama-ext.h" // staging API: two-tier KV cache progress and counters
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -255,6 +257,29 @@ struct server_batch {
         }
     }
 };
+
+// LLAMA_SERVER_GEN_TIMES: where the time of the generation batches goes, printed with the slot timings
+struct server_gen_times {
+    bool enabled = getenv("LLAMA_SERVER_GEN_TIMES") != nullptr;
+
+    int64_t n_draft  = 0; // draft calls
+    int64_t n_decode = 0; // decodes of batches without prompt tokens
+    double  t_draft  = 0.0;
+    double  t_decode = 0.0; // main context, with the sync
+    double  t_spec   = 0.0; // the draft context processes the batch
+    double  t_sample = 0.0; // sampling and verification of the drafts
+
+    void print(const char * prefix) {
+        if (!enabled || n_decode == 0) {
+            return;
+        }
+        SRV_INF("%s: gen batches = %" PRId64 ", per batch: decode %.2f ms, draft %.2f ms (%" PRId64 " calls), draft ctx process %.2f ms, sample %.2f ms\n",
+                prefix, n_decode, 1e3*t_decode/n_decode, n_draft > 0 ? 1e3*t_draft/n_draft : 0.0, n_draft, 1e3*t_spec/n_decode, 1e3*t_sample/n_decode);
+        *this = server_gen_times();
+    }
+};
+
+static server_gen_times g_gen_times;
 
 struct server_slot {
     int id;
@@ -806,6 +831,46 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        g_gen_times.print("gen times");
+
+        print_timings_kvq();
+    }
+
+    // --kvq: the fitted chunks and the packed attention counters since the previous print
+    void print_timings_kvq() const {
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+        llama_kvq_fit_progress fp;
+        if (!llama_memory_kvq_fit_get_progress(mem, fp)) {
+            return;
+        }
+        SLT_INF(*this, "kvq: coarse rows = %d (%d chunks), jobs running = %d, ready = %d, cancelled = %d, chunks dropped = %d, failed = %d, fit CPU = %.1f s\n",
+                fp.n_coarse, fp.n_chunk, fp.n_running, fp.n_ready, fp.n_cancel, fp.n_drop, fp.failed, fp.t_cpu);
+
+        llama_kvq_counters_all ca;
+        if (!llama_memory_kvq_get_counters(mem, ca) || ca.n_ubatch == 0) {
+            return;
+        }
+        llama_kvq_counters s;
+        for (const auto & l : ca.layers) {
+            s.n_pf     += l.n_pf;
+            s.pf_req   += l.pf_req;
+            s.pf_fetch += l.pf_fetch;
+            s.bytes    += l.bytes;
+            s.t_wait   += l.t_wait;
+            s.t_plan   += l.t_plan;
+            s.t_gather += l.t_gather;
+            s.t_join   += l.t_join;
+            s.t_upload += l.t_upload;
+            s.t_idle   += l.t_idle;
+        }
+        SLT_INF(*this, "kvq: packed ubatches = %" PRId64 " (%" PRId64 " tokens), rows requested = %" PRId64 ", fetched = %" PRId64 ", %.1f MiB uploaded\n",
+                ca.n_ubatch, ca.n_tokens, s.pf_req, s.pf_fetch, s.bytes/1048576.0);
+        SLT_INF(*this, "kvq: per packed ubatch: wait %.2f ms, join %.2f ms, upload %.2f ms (decode thread); plan %.2f ms, gather %.2f ms (worker); GPU idle at the joins %.2f ms (LLAMA_KVQ_IDLE_PROBE)\n",
+                1e3*s.t_wait/ca.n_ubatch, 1e3*s.t_join/ca.n_ubatch, 1e3*s.t_upload/ca.n_ubatch, 1e3*s.t_plan/ca.n_ubatch, 1e3*s.t_gather/ca.n_ubatch,
+                1e3*s.t_idle/ca.n_ubatch);
+        llama_memory_kvq_reset_counters(mem);
     }
 
     json to_json(bool only_metrics = false) const {
@@ -1089,6 +1154,33 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+
+    // --kvq: progress of the fitter at the previous log
+    int32_t kvq_n_chunk_last = 0;
+    int32_t kvq_n_drop_last  = 0;
+    bool    kvq_failed_last  = false;
+
+    // --kvq: a log line when chunks join or leave the coarse region (cheap, no sync)
+    void kvq_log_progress() {
+        llama_kvq_fit_progress fp;
+        if (!llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), fp)) {
+            return;
+        }
+        if (fp.n_drop != kvq_n_drop_last) {
+            SRV_INF("kvq: %d chunks dropped from the coarse region, %d rows left (%d chunks dropped so far)\n",
+                    fp.n_drop - kvq_n_drop_last, fp.n_coarse, fp.n_drop);
+        }
+        if (fp.n_chunk > kvq_n_chunk_last - (fp.n_drop - kvq_n_drop_last) && !fp.t_job.empty()) {
+            SRV_INF("kvq: coarse region = %d rows (%d chunks), last job %.2f s (%.2f s since its statistics), %d jobs running\n",
+                    fp.n_coarse, fp.n_chunk, fp.t_job.back(), fp.t_wall.back(), fp.n_running);
+        }
+        if (fp.failed && !kvq_failed_last) {
+            SRV_WRN("%s", "kvq: the fit failed, the coarse region does not grow\n");
+        }
+        kvq_n_chunk_last = fp.n_chunk;
+        kvq_n_drop_last  = fp.n_drop;
+        kvq_failed_last  = fp.failed;
+    }
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -3928,9 +4020,12 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t0 = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            g_gen_times.t_draft += (ggml_time_us() - t0)*1e-6;
+            g_gen_times.n_draft++;
         }
 
         // make checkpoints if needed
@@ -4706,19 +4801,28 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt |= batch.tokens[i].is_prompt;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_decode_start = ggml_time_us();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (!has_prompt) {
+            g_gen_times.t_decode += (ggml_time_us() - t_decode_start)*1e-6;
+            g_gen_times.n_decode++;
+        }
+
+        kvq_log_progress();
 
         if (ret != 0) {
             {
@@ -4778,9 +4882,13 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_spec_start = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            if (!has_prompt) {
+                g_gen_times.t_spec += (ggml_time_us() - t_spec_start)*1e-6;
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4955,6 +5063,8 @@ private:
 
             // verify and try to accept the draft
             {
+                const int64_t t_sample_start = ggml_time_us();
+
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
@@ -4979,6 +5089,8 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                g_gen_times.t_sample += (ggml_time_us() - t_sample_start)*1e-6;
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

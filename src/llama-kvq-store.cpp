@@ -687,8 +687,8 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         LLAMA_LOG_ERROR("%s: n_sink, resident_cap and all_resident must match the allocation (%d, %d, %d)\n", __func__, n_sink, cap, all_res);
         return false;
     }
-    if (p.max_batch < 1 || p.max_batch > 8 || p.lead < 0 || p.sync_mode < LLAMA_KVQ_SYNC_OFF || p.sync_mode > LLAMA_KVQ_SYNC_ALWAYS) {
-        LLAMA_LOG_ERROR("%s: bad max_batch, lead or sync_mode\n", __func__);
+    if (p.max_batch < 1 || p.max_batch > 8 || p.max_tail < 0 || p.lead < 0 || p.sync_mode < LLAMA_KVQ_SYNC_OFF || p.sync_mode > LLAMA_KVQ_SYNC_ALWAYS) {
+        LLAMA_LOG_ERROR("%s: bad max_batch, max_tail, lead or sync_mode\n", __func__);
         return false;
     }
     // fit mode: the smallest coarse region is one chunk

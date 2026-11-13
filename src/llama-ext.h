@@ -163,6 +163,7 @@ struct llama_kvq_params {
 
     bool    packed        = false;
     int32_t max_batch     = 8;
+    int32_t max_tail      = 0;    // more cells than this after the coarse region (fit mode: the fit lags): the normal attention, 0: no limit
     int32_t prefetch_n    = 1024; // rows per (kv head, position) requested by the early query
     int32_t resident_cap  = 1024; // evictable resident slots per (layer, kv head), the sinks have their own, least recently selected eviction; more slots cost attention time
     int32_t lead          = 2;    // the early query of layer il runs at the input of layer il - lead, 0: no prefetch

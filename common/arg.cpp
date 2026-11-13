@@ -2432,6 +2432,62 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--kvq"},
+        "two-tier KV cache (qwen35 only): small batches attend through packed K/V codes and a resident set of q8_0 rows,\n"
+        "the K tables are fitted per 8k chunk in the background; needs --kvq-v-tables and forces 1 slot, q8_0 K/V,\n"
+        "flash attention, no RAM prompt cache, no slot save, no context shift, no cache reuse (default: disabled)",
+        [](common_params & params) {
+            params.kvq.enabled = true;
+        }
+    ).set_env("LLAMA_ARG_KVQ").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-v-tables"}, "FNAME",
+        "two-tier KV cache: file with the V table of each (attention layer, kv head)",
+        [](common_params & params, const std::string & value) {
+            params.kvq.v_tables = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_V_TABLES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-threads"}, "N",
+        "two-tier KV cache: CPU threads that fit the chunks, at a low priority (default: the physical cores)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.n_threads = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_THREADS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-prefetch-n"}, "N",
+        string_format("two-tier KV cache: rows per (kv head, position) prefetched to the resident set (default: %d)", params.kvq.prefetch_n),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.prefetch_n = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_PREFETCH_N").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-resident-cap"}, "N",
+        string_format("two-tier KV cache: resident q8_0 rows per (attention layer, kv head) (default: %d)", params.kvq.resident_cap),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.resident_cap = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_RESIDENT_CAP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-lead"}, "N",
+        string_format("two-tier KV cache: the prefetch of an attention layer starts N layers earlier, 0 = no prefetch (default: %d)", params.kvq.lead),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.lead = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_LEAD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

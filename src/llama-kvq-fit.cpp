@@ -10,8 +10,28 @@
 #include <cstring>
 #include <stdexcept>
 
+#if defined(_WIN32)
+    #define WIN32_LEAN_AND_MEAN
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+#elif defined(__linux__)
+    #include <sys/resource.h>
+#endif
+
 static constexpr int64_t KVQ_D   = llama_kvq_store::D;
 static constexpr size_t  KVQ_ROW = llama_kvq_store::ROW;
+
+// the pool runs behind the decode thread and the prefetch worker
+static void kvq_fit_lower_priority() {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#elif defined(__linux__)
+    // per thread on Linux
+    setpriority(PRIO_PROCESS, 0, 10);
+#endif
+}
 
 static double kvq_fit_now() {
     return ggml_time_us()*1e-6;
@@ -94,6 +114,7 @@ llama_kvq_fitter::~llama_kvq_fitter() {
 }
 
 void llama_kvq_fitter::loop() {
+    kvq_fit_lower_priority();
     std::unique_lock<std::mutex> lk(m);
     while (true) {
         cv_work.wait(lk, [&]() { return stop || !tasks.empty(); });
@@ -291,8 +312,8 @@ void llama_kvq_fitter::install(bool all) {
         t_wall.push_back(jb->t_end - jb->t_take);
         t_cpu     += jb->t_cpu;
         t_install += kvq_fit_now() - t0;
-        LLAMA_LOG_DEBUG("%s: chunk %d joined the coarse region (%d rows), job %.2f s, %.2f s CPU\n", __func__,
-                jb->c, store.n_coarse(), jb->t_end - jb->t_start, jb->t_cpu);
+        LLAMA_LOG_INFO("%s: chunk %d joined the coarse region (%d rows), job %.2f s, %.2f s CPU, %.2f s since the statistics\n", __func__,
+                jb->c, store.n_coarse(), jb->t_end - jb->t_start, jb->t_cpu, jb->t_end - jb->t_take);
     }
 }
 
@@ -378,6 +399,8 @@ void llama_kvq_fitter::remove(llama_pos p0) {
     }
 
     if (n_coarse_chunks > c0) {
+        LLAMA_LOG_INFO("%s: the removal from position %d drops %d chunks of the coarse region, %d rows left\n", __func__,
+                p0, n_coarse_chunks - c0, c0*C);
         n_drop += n_coarse_chunks - c0;
         n_coarse_chunks = c0;
         store.set_n_coarse(c0*C);
