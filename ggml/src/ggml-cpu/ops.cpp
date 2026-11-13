@@ -11611,6 +11611,275 @@ void ggml_compute_forward_top_k_mask(
     }
 }
 
+// ggml_compute_forward_kvq_attn
+
+// field of nb bits at bit offset o of a packed row
+static int32_t kvq_field(const int32_t * row, int32_t o, int32_t nb) {
+    const uint32_t lo = (uint32_t) row[o/32];
+    const uint32_t hi = (o % 32) + nb > 32 ? (uint32_t) row[o/32 + 1] : 0;
+    const uint64_t w  = ((uint64_t) hi << 32 | lo) >> (o % 32);
+    return (int32_t) (w & ((1u << nb) - 1));
+}
+
+// reference implementation: one task per (kv head, query position), code-domain math in double
+void ggml_compute_forward_kvq_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * kc   = dst->src[1];
+    const ggml_tensor * vc   = dst->src[2];
+    const ggml_tensor * tinv = dst->src[3];
+    const ggml_tensor * taux = dst->src[4];
+    const ggml_tensor * k    = dst->src[5];
+    const ggml_tensor * v    = dst->src[6];
+    const ggml_tensor * rkv  = dst->src[7];
+    const ggml_tensor * ridx = dst->src[8];
+    const ggml_tensor * mask = dst->src[9];
+
+    const float   scale  = ggml_get_op_params_f32(dst, 0);
+    const int32_t n_crow = ggml_get_op_params_i32(dst, 1);
+    const int32_t mode   = ggml_get_op_params_i32(dst, 2);
+
+    const bool do_attn  = mode & GGML_KVQ_ATTN;
+    const bool do_score = mode & GGML_KVQ_SCORE;
+
+    const int64_t D        = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t L        = q->ne[2];
+    const int64_t G        = k->ne[2];
+    const int64_t n_rep    = n_head/G;
+    const int64_t n_tail   = k->ne[1];
+    const int64_t n_coarse = kc ? kc->ne[1] : 0;
+    const int64_t n_chunk  = kc ? (n_coarse + n_crow - 1)/n_crow : 0;
+    const int64_t cap      = rkv ? rkv->ne[1] : 0;
+
+    float * out_attn  = do_attn  ? (float *) dst->data : nullptr;
+    float * out_score = do_score ? (float *) dst->data + (do_attn ? D*n_head*L : 0) : nullptr;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    auto mask_at = [&](int64_t row, int64_t l) -> double {
+        return mask ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) mask->data + row*mask->nb[0] + l*mask->nb[1])) : 0.0;
+    };
+    auto aux_at = [&](int64_t i, int64_t r, int64_t m, int64_t t) -> float {
+        return *(const float *) ((const char *) taux->data + i*taux->nb[0] + r*taux->nb[1] + m*taux->nb[2] + t*taux->nb[3]);
+    };
+    // inverse transform entry inv[c][i] of table m of chunk t
+    auto inv_at = [&](int64_t c, int64_t i, int64_t m, int64_t t) -> float {
+        const int64_t i0 = m % 2 == 0 ? c : i;
+        const int64_t i1 = m % 2 == 0 ? i : c;
+        return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) tinv->data + i0*tinv->nb[0] + i1*tinv->nb[1] + m*tinv->nb[2] + t*tinv->nb[3]));
+    };
+    auto row_f32 = [&](const ggml_tensor * t, int64_t i1, int64_t i2, int64_t i3, float * y) {
+        ggml_get_type_traits(t->type)->to_float((const char *) t->data + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3], y, D);
+    };
+
+    std::vector<float>  tmp(D);
+    std::vector<double> qv(D), qt(D), acc(D), lc(n_coarse), lp(cap), lt(n_tail);
+    std::vector<char>   is_res(n_coarse);
+    std::vector<int32_t> bits(D), offs(D);
+
+    // bit widths and offsets of table m of chunk t
+    auto load_bits = [&](int64_t m, int64_t t) {
+        int32_t o = 0;
+        for (int64_t c = 0; c < D; c++) {
+            bits[c] = (int32_t) aux_at(c, 2, m, t);
+            offs[c] = o;
+            o += bits[c];
+        }
+    };
+
+    for (int64_t task = ith; task < G*L; task += nth) {
+        const int64_t g = task % G;
+        const int64_t l = task / G;
+
+        std::fill(is_res.begin(), is_res.end(), 0);
+        for (int64_t s = 0; s < cap && do_attn; s++) {
+            const int32_t r = *(const int32_t *) ((const char *) ridx->data + s*ridx->nb[0] + g*ridx->nb[1]);
+            if (r >= 0 && r < n_coarse) {
+                is_res[r] = 1;
+            }
+        }
+
+        if (do_score) {
+            for (int64_t j = 0; j < n_coarse; j++) {
+                out_score[j + n_coarse*(g + G*l)] = 0.0f;
+            }
+        }
+
+        for (int64_t h = g*n_rep; h < (g + 1)*n_rep; h++) {
+            const float * qh = (const float *) ((const char *) q->data + h*q->nb[1] + l*q->nb[2]);
+            for (int64_t i = 0; i < D; i++) {
+                qv[i] = qh[i];
+            }
+
+            // coarse logits in the code domain: q . x = sum_c (code_c + 0.5)*qt_c + q . mu
+            for (int64_t t = 0; t < n_chunk; t++) {
+                const int64_t m = 2*g;
+                load_bits(m, t);
+                double qmu = 0.0;
+                for (int64_t i = 0; i < D; i++) {
+                    qmu += qv[i]*aux_at(i, 1, m, t);
+                }
+                for (int64_t c = 0; c < D; c++) {
+                    double s = 0.0;
+                    if (bits[c] > 0) {
+                        for (int64_t i = 0; i < D; i++) {
+                            s += (double) inv_at(c, i, m, t)*qv[i];
+                        }
+                    }
+                    qt[c] = s*aux_at(c, 0, m, t);
+                }
+                const int64_t j1 = std::min(n_coarse, (t + 1)*n_crow);
+                for (int64_t j = t*n_crow; j < j1; j++) {
+                    const int32_t * row = (const int32_t *) ((const char *) kc->data + j*kc->nb[1] + g*kc->nb[2]);
+                    double s = qmu;
+                    for (int64_t c = 0; c < D; c++) {
+                        if (bits[c] > 0) {
+                            const int32_t code = kvq_field(row, offs[c], bits[c]) - (1 << (bits[c] - 1));
+                            s += (code + 0.5)*qt[c];
+                        }
+                    }
+                    lc[j] = scale*s + mask_at(j, l);
+                }
+            }
+
+            for (int64_t s = 0; s < cap && do_attn; s++) {
+                const int32_t r = *(const int32_t *) ((const char *) ridx->data + s*ridx->nb[0] + g*ridx->nb[1]);
+                lp[s] = -INFINITY;
+                if (r >= 0 && r < n_coarse) {
+                    row_f32(rkv, s, g, 0, tmp.data());
+                    double d = 0.0;
+                    for (int64_t i = 0; i < D; i++) {
+                        d += qv[i]*tmp[i];
+                    }
+                    lp[s] = scale*d + mask_at(r, l);
+                }
+            }
+
+            for (int64_t r = 0; r < n_tail; r++) {
+                row_f32(k, r, g, 0, tmp.data());
+                double d = 0.0;
+                for (int64_t i = 0; i < D; i++) {
+                    d += qv[i]*tmp[i];
+                }
+                lt[r] = scale*d + mask_at(n_coarse + r, l);
+            }
+
+            double mt = -INFINITY;
+            for (int64_t r = 0; r < n_tail; r++) {
+                mt = std::max(mt, lt[r]);
+            }
+
+            if (do_score) {
+                double mx = mt;
+                for (int64_t j = 0; j < n_coarse; j++) {
+                    mx = std::max(mx, lc[j]);
+                }
+                if (mx > -INFINITY) {
+                    double z = 0.0;
+                    for (int64_t j = 0; j < n_coarse; j++) {
+                        z += std::exp(lc[j] - mx);
+                    }
+                    for (int64_t r = 0; r < n_tail; r++) {
+                        z += std::exp(lt[r] - mx);
+                    }
+                    for (int64_t j = 0; j < n_coarse; j++) {
+                        out_score[j + n_coarse*(g + G*l)] += (float) (std::exp(lc[j] - mx)/z);
+                    }
+                }
+            }
+
+            if (!do_attn) {
+                continue;
+            }
+
+            double mx = mt;
+            for (int64_t j = 0; j < n_coarse; j++) {
+                if (!is_res[j]) {
+                    mx = std::max(mx, lc[j]);
+                }
+            }
+            for (int64_t s = 0; s < cap; s++) {
+                mx = std::max(mx, lp[s]);
+            }
+
+            float * oh = out_attn + D*(h + n_head*l);
+            if (!(mx > -INFINITY)) {
+                std::fill(oh, oh + D, 0.0f);
+                continue;
+            }
+
+            double z = 0.0;
+            std::fill(acc.begin(), acc.end(), 0.0);
+
+            for (int64_t s = 0; s < cap; s++) {
+                const double w = std::exp(lp[s] - mx);
+                if (w > 0.0) {
+                    z += w;
+                    row_f32(rkv, s, g, 1, tmp.data());
+                    for (int64_t i = 0; i < D; i++) {
+                        acc[i] += w*tmp[i];
+                    }
+                }
+            }
+            for (int64_t r = 0; r < n_tail; r++) {
+                const double w = std::exp(lt[r] - mx);
+                if (w > 0.0) {
+                    z += w;
+                    row_f32(v, r, g, 0, tmp.data());
+                    for (int64_t i = 0; i < D; i++) {
+                        acc[i] += w*tmp[i];
+                    }
+                }
+            }
+
+            // coarse V in the code domain: sum_j w_j v_j = ((sum_j w_j g_j (code_j + 0.5))*step) inv + (sum_j w_j) mu
+            const int64_t nwv = vc ? vc->ne[0] - 1 : 0;
+            for (int64_t t = 0; t < n_chunk; t++) {
+                const int64_t m = 2*g + 1;
+                load_bits(m, t);
+                std::fill(qt.begin(), qt.end(), 0.0);
+                double wsum = 0.0;
+                const int64_t j1 = std::min(n_coarse, (t + 1)*n_crow);
+                for (int64_t j = t*n_crow; j < j1; j++) {
+                    const double w = is_res[j] ? 0.0 : std::exp(lc[j] - mx);
+                    if (w == 0.0) {
+                        continue;
+                    }
+                    const int32_t * row  = (const int32_t *) ((const char *) vc->data + j*vc->nb[1] + g*vc->nb[2]);
+                    const double    gain = GGML_CPU_FP16_TO_FP32((ggml_fp16_t) (row[nwv] & 0xFFFF));
+                    wsum += w;
+                    for (int64_t c = 0; c < D; c++) {
+                        if (bits[c] > 0) {
+                            const int32_t code = kvq_field(row, offs[c], bits[c]) - (1 << (bits[c] - 1));
+                            qt[c] += w*gain*(code + 0.5);
+                        }
+                    }
+                }
+                z += wsum;
+                for (int64_t c = 0; c < D; c++) {
+                    if (bits[c] == 0 || qt[c] == 0.0) {
+                        continue;
+                    }
+                    const double y = qt[c]*aux_at(c, 0, m, t);
+                    for (int64_t i = 0; i < D; i++) {
+                        acc[i] += y*inv_at(c, i, m, t);
+                    }
+                }
+                for (int64_t i = 0; i < D; i++) {
+                    acc[i] += wsum*aux_at(i, 1, m, t);
+                }
+            }
+
+            for (int64_t i = 0; i < D; i++) {
+                oh[i] = (float) (acc[i]/z);
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

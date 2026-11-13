@@ -413,6 +413,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_KVQ_ATTN,
 
         GGML_OP_UNARY,
 
@@ -2517,6 +2518,61 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // two-tier attention: packed low-bit ("coarse") K/V rows, attended in the code domain, plus precise rows
+    //
+    // the cache rows (tokens) of a layer are [0, n_coarse) coarse and [n_coarse, n_kv) tail, n_kv = n_coarse + n_tail
+    // the coarse rows are split in chunks of n_chunk_rows, chunk t = rows [t*n_chunk_rows, (t+1)*n_chunk_rows)
+    // each (chunk, kv head) has its own codec tables for K and for V
+    //
+    // q:       [D, n_head, L]                  f32, D == 256 and L <= 8 on CUDA, n_head % G == 0, head h reads kv head h/(n_head/G)
+    // kc:      [nwk, n_coarse, G]              i32, packed K row of each (row, kv head), rows contiguous; NULL: n_coarse = 0
+    // vc:      [nwv + 1, n_coarse, G]          i32, packed V row in words [0, nwv), V gain in the low 16 bits (f16) of word nwv
+    // tab_inv: [D, D, 2*G, >= n_chunk]         f16, inverse transforms, (K, V) of kv head g at i2 = 2*g + (0, 1)
+    //            K: element [c, i] = inv[c][i] (i0 = component), V: element [i, c] = inv[c][i] (i0 = dim)
+    // tab_aux: [D, 3, 2*G, >= n_chunk]         f32, i1 = 0: step[c], 1: mu[i], 2: bits[c] (0..8, as float)
+    // k, v:    [D, n_tail, G]                  f16 or q8_0 (same type), tail K/V, v not transposed; n_tail >= 1
+    // rkv:     [D, cap, G, 2]                  f16 or q8_0, resident precise K (i3 = 0) and V (i3 = 1); NULL: no resident rows
+    // ridx:    [cap, G]                        i32, coarse row held by each resident slot, -1 (or any row outside [0, n_coarse)) = empty
+    // mask:    [>= n_kv, >= L]                 f16, added to the scaled logits, row index = cache row; NULL: no mask
+    //
+    // packed rows: component c of a table holds bits[c] bits, sum(bits) <= 32*nwk (K) or 32*nwv (V)
+    //   the field u of component c is bits [o_c, o_c + bits[c]) of the row, o_c = sum of bits[c'] for c' < c,
+    //   row bit b = bit (b % 32) of word b/32; the code is u - 2^(bits[c]-1), components with 0 bits are not stored
+    //   decoded K row: x[i] = sum_c (code_c + 0.5)*step[c]*inv[c][i] + mu[i]; decoded V row: same with step[c]*gain
+    //
+    // logits: s = scale*(q . k) + mask[row, l], for a coarse row with the decoded K row
+    // a resident slot overrides its coarse row for the attention of its kv head; slots of a kv head must hold distinct rows
+    //
+    // mode GGML_KVQ_ATTN:  res [D, n_head, L] f32 = sum_j w_j v_j, w = softmax over the non-resident coarse rows (coarse K/V),
+    //                      the resident slots (precise K/V) and the tail rows (precise K/V)
+    // mode GGML_KVQ_SCORE: res [n_coarse, G, L] f32, sum over the query heads of kv head g of softmax over all coarse rows
+    //                      (coarse K, resident or not) and the tail rows (precise K), at the coarse rows; needs kc,
+    //                      vc, v, rkv, ridx are unused
+    // mode GGML_KVQ_ATTN | GGML_KVQ_SCORE: res [D*n_head*L + n_coarse*G*L] f32, both results in this order
+    //
+    // an all -inf row of weights gives 0
+    //
+    enum ggml_kvq_mode {
+        GGML_KVQ_ATTN  = 1,
+        GGML_KVQ_SCORE = 2,
+    };
+
+    GGML_API struct ggml_tensor * ggml_kvq_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kc,
+            struct ggml_tensor  * vc,
+            struct ggml_tensor  * tab_inv,
+            struct ggml_tensor  * tab_aux,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * rkv,
+            struct ggml_tensor  * ridx,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            int                   n_chunk_rows,
+            int                   mode);
 
     // custom operators
 
