@@ -9861,6 +9861,202 @@ struct test_top_k_mask : public test_case {
     }
 };
 
+// GGML_OP_KVQ_ATTN
+struct test_kvq_attn : public test_case {
+    const int64_t   n_chunk;  // chunks of the coarse region, 0: no coarse rows
+    const int64_t   n_crow;   // rows per chunk
+    const int64_t   n_tail;
+    const int64_t   L;        // query positions
+    const int64_t   cap;      // resident slots per kv head, 0: no resident table
+    const int64_t   n_res;    // filled slots
+    const ggml_type type_tail;
+    const ggml_type type_res;
+    const bool      masked;   // masked coarse rows
+    const int       mode;
+    const int64_t   G     = 4;
+    const int64_t   n_rep = 6;
+    const int64_t   D     = 256;
+    const int64_t   nwk   = 16; // 2 bits per K value
+    const int64_t   nwv   = 8;  // 1 bit per V value
+
+    std::string vars() override {
+        return VARS_TO_STR10(n_chunk, n_crow, n_tail, L, cap, n_res, type_tail, type_res, masked, mode);
+    }
+
+    // f16 qt and f16 weights in the mma of the CUDA kernels against the double reference of the CPU, observed <= 1e-7
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_kvq_attn(int64_t n_chunk = 2, int64_t n_crow = 512, int64_t n_tail = 100, int64_t L = 1, int64_t cap = 256, int64_t n_res = 100,
+            ggml_type type_tail = GGML_TYPE_Q8_0, ggml_type type_res = GGML_TYPE_Q8_0, bool masked = false, int mode = GGML_KVQ_ATTN)
+        : n_chunk(n_chunk), n_crow(n_crow), n_tail(n_tail), L(L), cap(cap), n_res(n_res), type_tail(type_tail), type_res(type_res),
+          masked(masked), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_coarse = n_chunk*n_crow;
+        const bool    attn     = mode & GGML_KVQ_ATTN;
+
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, G*n_rep, L);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * kc = nullptr, * vc = nullptr, * tinv = nullptr, * taux = nullptr;
+        if (n_coarse > 0) {
+            kc = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nwk, n_coarse, G);
+            ggml_set_name(kc, "kc");
+            if (attn) {
+                vc = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nwv + 1, n_coarse, G);
+                ggml_set_name(vc, "vc");
+            }
+            tinv = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, D, 2*G, n_chunk);
+            taux = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 3, 2*G, n_chunk);
+            ggml_set_name(tinv, "tinv");
+            ggml_set_name(taux, "taux");
+        }
+
+        // tail K/V in the cache layout [D, G, n_tail], viewed as [D, n_tail, G]
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_tail, D, G, n_tail);
+        ggml_set_name(k, "k");
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+        ggml_tensor * v = nullptr;
+        if (attn) {
+            v = ggml_new_tensor_3d(ctx, type_tail, D, G, n_tail);
+            ggml_set_name(v, "v");
+            v = ggml_permute(ctx, v, 0, 2, 1, 3);
+        }
+
+        ggml_tensor * rkv = nullptr, * ridx = nullptr;
+        if (attn && cap > 0) {
+            rkv  = ggml_new_tensor_4d(ctx, type_res, D, cap, G, 2);
+            ridx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cap, G);
+            ggml_set_name(rkv, "rkv");
+            ggml_set_name(ridx, "ridx");
+        }
+
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_coarse + n_tail, L);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_kvq_attn(ctx, q, kc, vc, tinv, taux, k, v, rkv, ridx, mask, 1.0f/16.0f, (int) n_crow, mode);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x4B56);
+        std::uniform_int_distribution<uint32_t> ud;
+        std::uniform_real_distribution<float>   uf(-1.0f, 1.0f);
+
+        const int64_t n_coarse = n_chunk*n_crow;
+        const int64_t n_kv     = n_coarse + n_tail;
+
+        // bits of each table: random in 0..8 with 0 and 8 present, summing to 32*nw, in random order
+        auto random_bits = [&](int64_t nw) {
+            std::vector<int> b(D, 0);
+            int64_t left = 32*nw - 8;
+            b[0] = 8;
+            while (left > 0) {
+                const int64_t c = 2 + ud(gen) % (D - 2);
+                if (b[c] < 8) {
+                    b[c]++;
+                    left--;
+                }
+            }
+            std::shuffle(b.begin(), b.end(), gen);
+            return b;
+        };
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "kc") == 0) {
+                std::vector<uint32_t> data(ggml_nelements(t));
+                for (auto & w : data) {
+                    w = ud(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "vc") == 0) {
+                // the last word of a row holds the f16 gain
+                std::vector<uint32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = i % (nwv + 1) == (size_t) nwv ? ggml_fp32_to_fp16(1.0f + 0.5f*uf(gen)) : ud(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "tinv") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (auto & x : data) {
+                    x = ggml_fp32_to_fp16(uf(gen)/8.0f);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "taux") == 0) {
+                // step so that (code + 0.5)*step is in [-1, 1], 0 for 0-bit components
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t m = 0; m < n_chunk*2*G; ++m) {
+                    const std::vector<int> b = random_bits(m % 2 ? nwv : nwk);
+                    float * aux = data.data() + m*3*D;
+                    for (int64_t c = 0; c < D; ++c) {
+                        aux[c]       = b[c] ? (1.5f + 0.5f*uf(gen))/(float) (1 << (b[c] - 1)) : 0.0f;
+                        aux[D + c]   = 0.5f*uf(gen);
+                        aux[2*D + c] = (float) b[c];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "ridx") == 0) {
+                // n_res distinct coarse rows per kv head at random slots, rows at the chunk boundaries first
+                std::vector<int32_t> data(ggml_nelements(t), -1);
+                for (int64_t g = 0; g < G; ++g) {
+                    std::vector<int32_t> rows;
+                    for (int64_t c = 0; c < n_chunk; ++c) {
+                        if (c > 0) {
+                            rows.push_back((int32_t) (c*n_crow - 1));
+                        }
+                        rows.push_back((int32_t) (c*n_crow));
+                    }
+                    if (n_coarse > 0) {
+                        rows.push_back((int32_t) (n_coarse - 1));
+                    }
+                    std::vector<int32_t> rest;
+                    for (int64_t r = 0; r < n_coarse; ++r) {
+                        if (std::find(rows.begin(), rows.end(), (int32_t) r) == rows.end()) {
+                            rest.push_back((int32_t) r);
+                        }
+                    }
+                    std::shuffle(rest.begin(), rest.end(), gen);
+                    rows.insert(rows.end(), rest.begin(), rest.end());
+
+                    std::vector<int64_t> slots(cap);
+                    for (int64_t i = 0; i < cap; ++i) {
+                        slots[i] = i;
+                    }
+                    std::shuffle(slots.begin(), slots.end(), gen);
+                    for (int64_t i = 0; i < std::min<int64_t>(n_res, (int64_t) rows.size()); ++i) {
+                        data[g*cap + slots[i]] = rows[i];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                // causal over the tail, every 7th coarse row masked when masked
+                std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                for (int64_t l = 0; l < L; ++l) {
+                    for (int64_t r = 0; r < n_tail; ++r) {
+                        if (r > n_tail - L + l) {
+                            data[l*n_kv + n_coarse + r] = ggml_fp32_to_fp16(-INFINITY);
+                        }
+                    }
+                    for (int64_t j = 0; j < n_coarse && masked; ++j) {
+                        if (j % 7 == 3 || j == n_crow) {
+                            data[l*n_kv + j] = ggml_fp32_to_fp16(-INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "k") == 0 || strcmp(t->name, "rkv") == 0) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -10678,6 +10874,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7, 1, 1, false, true));
         test_cases.emplace_back(new test_top_k_mask(type, 512, 8, 16, 32, 7, true, 5, 1, 4, false, true));
     }
+
+    // two-tier attention: n_chunk, n_crow, n_tail, L, cap, n_res, precise types, masked coarse rows, mode
+    for (ggml_type tp : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t L : {1, 4}) {
+            test_cases.emplace_back(new test_kvq_attn(0, 512,  37, L,    0,    0, tp, tp));        // no coarse rows
+            test_cases.emplace_back(new test_kvq_attn(2, 512, 100, L,  256,    0, tp, tp));        // empty resident table
+            test_cases.emplace_back(new test_kvq_attn(2, 512, 100, L,  256,  100, tp, tp, true));  // partial, masked rows
+            test_cases.emplace_back(new test_kvq_attn(3, 384,  70, L, 1024, 1024, tp, tp));        // full
+            test_cases.emplace_back(new test_kvq_attn(5, 1024, 300, L, 4096, 4096, tp, tp, true)); // full, cap 4096
+            for (int mode : {(int) GGML_KVQ_SCORE, GGML_KVQ_ATTN | GGML_KVQ_SCORE}) {
+                test_cases.emplace_back(new test_kvq_attn(3, 512, 50, L, 1024, 600, tp, tp, true, mode));
+            }
+        }
+        test_cases.emplace_back(new test_kvq_attn(2, 512, 1, 1, 64, 64, tp, tp)); // a single tail row
+    }
+    // chunk sizes that are not a multiple of the tile, mixed precise types, default chunk size, 8 positions
+    test_cases.emplace_back(new test_kvq_attn(2,  700,  65, 4, 1024,  900, GGML_TYPE_F16,  GGML_TYPE_Q8_0, true));
+    test_cases.emplace_back(new test_kvq_attn(2,  700,  65, 4, 1024,  900, GGML_TYPE_Q8_0, GGML_TYPE_F16, false, GGML_KVQ_ATTN | GGML_KVQ_SCORE));
+    test_cases.emplace_back(new test_kvq_attn(2, 8192, 600, 1, 1024, 1000, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_kvq_attn(2,  512, 100, 8,  256,  100, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, GGML_KVQ_ATTN | GGML_KVQ_SCORE));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
