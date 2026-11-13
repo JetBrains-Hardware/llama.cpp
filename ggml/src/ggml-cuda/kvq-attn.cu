@@ -1222,12 +1222,20 @@ static __global__ void kvq_score(const kvq_args a) {
     }
 }
 
-static int kvq_rows_per_block() {
-    static const int rows = [] {
+// coarse rows per block: 1024, halved down to 256 while the grid has fewer than 2 blocks per SM
+static int kvq_rows_per_block(const int n_coarse, const int G, const int nsm) {
+    static const int rows_env = [] {
         const char * env = getenv("GGML_KVQ_ROWS_PER_BLOCK");
-        const int r = env ? atoi(env) : 1024;
-        return r >= KVQ_T && r % KVQ_T == 0 ? r : 1024;
+        const int r = env ? atoi(env) : 0;
+        return r >= KVQ_T && r % KVQ_T == 0 ? r : 0;
     }();
+    if (rows_env > 0) {
+        return rows_env;
+    }
+    int rows = 1024;
+    while (rows > 256 && (int64_t) n_coarse*G/rows < 2*nsm) {
+        rows /= 2;
+    }
     return rows;
 }
 
@@ -1360,7 +1368,7 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     a.n_coarse = kc ? (int) kc->ne[1] : 0;
     a.n_crow   = ggml_get_op_params_i32(dst, 1);
     a.n_chunk  = kc ? (a.n_coarse + a.n_crow - 1)/a.n_crow : 0;
-    a.rows_blk = kvq_rows_per_block();
+    a.rows_blk = kvq_rows_per_block(a.n_coarse, a.G, ggml_cuda_info().devices[ctx.device].nsm);
     a.n_cbpc   = a.n_chunk > 0 ? (std::min(a.n_crow, a.n_coarse) + a.rows_blk - 1)/a.rows_blk : 0;
     a.n_tiles_blk = a.rows_blk/KVQ_T;
     a.n_cblk   = a.n_chunk*a.n_cbpc;
