@@ -131,6 +131,21 @@ Sizes are for ctx 230000 as allocated today.
 4. Reuse the prefill buffers during generation. The scratch (519 MiB) and the flash attention F16 copies in the compute buffer (most of 1642 MiB) are only used by large ubatches and sit idle during generation. Candidates to live there: the not yet fitted rows of item 3, a larger resident set, or the ring itself, so that this memory is allocated once and used by both phases.
 5. From the bottleneck list: chunked flash attention to shrink the F16 copies, a compressed or q8_0 cache for the MTP context, lower fetch traffic for multi-token verify batches.
 
+## Gaps before this can replace production
+
+- Quality is measured on few traces: the final library path on one 100k trace, earlier stages on four (12k to 100k). Nothing was run at 150k or above, which is the target length. A wider check over more traces and lengths is needed.
+- Speed of the final build was measured only at 100k. Not measured at 24k / 50k and at 150k+.
+- Slot save and the RAM prompt cache do not work (full state save aborts). The production launch passes `--slot-save-path`, so saving and restoring a session is lost with `--kvq`.
+- Output is not reproducible from run to run (the coarse region depends on fitter timing). A deterministic install rule would be needed for exact comparisons.
+- CUDA only. The attention op has a CPU reference and a CUDA kernel, nothing for Metal or Vulkan. The fitter wants many cores (about 56 CPU-seconds per 8k chunk).
+- Host memory: 7.6 GB of pinned RAM at ctx 230000, per sequence.
+- Deferred tuning: resident capacity (1024 vs 4096), top-up rules and thresholds, lead, prefetch size.
+- No automated tests for the store, the fitter, the ring cache or the server flows; only the codec and the kernel have tests. The session flows were checked by hand once.
+- No long session was run (hours, many rollbacks and refits).
+- The code was written by agents and reviewed only at the level of reports, diffs of the scheduler change and test results. It needs a real review before anyone depends on it.
+- `--fit` and the memory estimate do not know about the kvq memory. What to do with the freed VRAM (longer context, larger model quantization) is not decided.
+- The branch sits on ggml-org/master 951d465f5 and changes ggml (new op, scheduler callback order, CUDA kernel); rebases will conflict there.
+
 ## Not exercised
 
 - Two-tier without MTP, drafts of 7 tokens on the packed path, model reload after sleep, a chat-endpoint conversation with user-message checkpoints.
