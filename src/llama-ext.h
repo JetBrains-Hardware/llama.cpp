@@ -143,7 +143,7 @@ LLAMA_API void llama_model_set_kvq_two_tier(struct llama_model * model, bool val
 // the protected cells (the first n_sink and the last n_recent of the prefix) are precise
 // of the other prefix cells, the n_top with the largest coarse attention are precise, per kv head and query position
 //
-// packed mode (llama_model_set_kvq_packed, ggml_kvq_attn): the coarse region is set by llama_memory_kvq_packed_alloc,
+// packed mode (llama_model_set_kvq_packed, ggml_kvq_attn): the coarse region is set by llama_memory_kvq_packed_alloc (or grows, llama_memory_kvq_fit_enable),
 // the precise rows of the coarse region come from a host store into a resident cache per (layer, kv head)
 // ubatches of up to max_batch tokens attend through ggml_kvq_attn, larger ones through the normal attention
 // the first n_sink rows are always resident; n_top, n_recent and n_prefix are not used
@@ -244,6 +244,52 @@ struct llama_kvq_memory_info {
 };
 
 LLAMA_API bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_memory_info & out);
+
+// packed mode, the library fits the codec tables (single sequence 0, positions from 0 without gaps):
+//   the graph sums q q^T of the queries (after q_norm and RoPE) per (attention layer, kv head) on the device;
+//   a ubatch counts for the chunk of its first position
+//   when the positions [c*chunk, (c+1)*chunk) are in the cache, the decode thread reads the sums and starts a job on CPU threads:
+//   K table fitted on the chunk's rows with the metric of the chunk's queries, K and V rows coded (V: one offline table set),
+//   packed, and the q8_0 rows copied to the host store
+//   a finished chunk joins the coarse region on the decode thread before the next ubatch (the chunks in order)
+//   the positions after the coarse region attend precisely (the q8_0 cache)
+// memory operations: clear and seq_rm of the end of the sequence; a seq_rm into the coarse region or into a chunk that
+// is fitting drops these chunks, they are fitted again; the other ones abort
+struct llama_kvq_fit_params {
+    int32_t     chunk     = 8192;
+    int32_t     bits_k    = 2;
+    int32_t     bits_v    = 1;
+    std::string v_tables;      // llama_kvq_save file with a V table for each (attention layer, kv head), used for every chunk
+    int32_t     n_threads = 8; // CPU threads of the jobs, the chunks are fitted in order
+};
+
+// the memory must be empty and created in packed mode; params as for llama_memory_kvq_set_params (packed = true)
+// the coarse region can grow to the full chunks of the cache; enabled until the memory is freed, clear() keeps it
+LLAMA_API bool llama_memory_kvq_fit_enable(llama_memory_t mem, const llama_kvq_fit_params & fparams, const llama_kvq_params & params);
+
+struct llama_kvq_fit_progress {
+    int32_t n_coarse  = 0; // rows of the coarse region
+    int32_t n_chunk   = 0; // chunks in the coarse region
+    int32_t n_running = 0; // jobs queued or running
+    int32_t n_ready   = 0; // jobs done, not yet in the coarse region
+    int32_t n_cancel  = 0; // jobs cancelled by seq_rm or clear
+    int32_t n_drop    = 0; // chunks removed from the coarse region by seq_rm or clear
+    bool    failed    = false; // a job failed, no more chunks join the coarse region
+    std::vector<double> t_job;  // seconds per job that joined the coarse region: from the start of the job to its end
+    std::vector<double> t_wall; // seconds per job that joined: from the readback of the statistics to its end (with the queue)
+    double  t_cpu     = 0.0;    // CPU seconds of the tasks of these jobs
+    double  t_take    = 0.0;    // decode thread seconds of the readbacks of the statistics (with the wait for the queued ubatches)
+    double  t_install = 0.0;    // decode thread seconds of the installs
+};
+
+LLAMA_API bool llama_memory_kvq_fit_get_progress(llama_memory_t mem, llama_kvq_fit_progress & out);
+
+// starts the job of a complete chunk whose statistics were not read yet, waits for all jobs and adds their chunks to the coarse region
+// call it between decodes, from the decode thread
+LLAMA_API bool llama_memory_kvq_fit_wait(llama_memory_t mem);
+
+// debug: hold = true: finished chunks join the coarse region only in llama_memory_kvq_fit_wait
+LLAMA_API bool llama_memory_kvq_fit_set_hold(llama_memory_t mem, bool hold);
 
 // scheduler splits of the last graph
 LLAMA_API int32_t llama_context_n_splits(const struct llama_context * ctx);

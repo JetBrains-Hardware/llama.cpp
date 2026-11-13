@@ -2599,6 +2599,12 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * inp_pos,
                             int   il);
 
+        // fit mode: adds the query statistics of the ubatch to the store
+        void build_kvq_qstat(
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * q,
+                            int   il);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-ext.h"
+#include "llama-kvq-fit.h"
 #include "llama-kvq-store.h"
 #include "llama-memory-hybrid.h"
 
@@ -14,7 +15,7 @@
 // llama_memory_hybrid plus a coarse copy of the attention K/V, for two-tier attention (see llama_kvq_params)
 // the coarse cache shares the cells of the attention cache, so cell j is one token in both
 // the attention cache holds the precise copy; in two-tier mode the graph writes the new tokens to both copies
-// packed: no coarse cache, the packed state (llama_kvq_store) is created by llama_memory_kvq_packed_alloc
+// packed: no coarse cache, the packed state (llama_kvq_store) is created by llama_memory_kvq_packed_alloc or llama_memory_kvq_fit_enable
 
 class llama_memory_hybrid_kvq : public llama_memory_hybrid {
 public:
@@ -55,20 +56,25 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // a K-shift would rotate the precise copy only
     bool get_can_shift() const override;
 
+    // fit mode: the fitted chunks are dropped, the mode stays on
     void clear(bool data) override;
 
     // packed: the coarse region cannot be removed
+    // fit mode: the end of the sequence only, see llama_kvq_fit_params
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
-    // a K-shift would rotate the precise copy only
-    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;
-    void seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override;
+    // two-tier mode: abort (seq_keep: unless it keeps sequence 0)
+    void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    void seq_keep(llama_seq_id seq_id) override;
+    void seq_add (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;
+    void seq_div (llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
-    // the coarse copy is not saved, so a state write or read in two-tier mode throws
+    // the coarse copy is not saved: in two-tier mode a state write or read aborts, unless it is of the partial state only (recurrent)
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
@@ -87,8 +93,19 @@ public:
 
     bool packed_alloc(int32_t n_coarse, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v, int32_t resident_cap, bool all_resident, int32_t n_sink);
 
-    // nullptr before packed_alloc
+    bool fit_enable(const llama_kvq_fit_params & fparams, const llama_kvq_params & params);
+
+    // fit mode, the decode thread before each ubatch (see llama_kvq_fitter::poll)
+    void fit_poll();
+    bool fit_wait();
+    bool fit_get_progress(llama_kvq_fit_progress & out) const;
+    bool fit_set_hold(bool hold);
+
+    // nullptr before packed_alloc or fit_enable
     llama_kvq_store * get_store() const { return store.get(); }
+
+    // the backends of the context
+    void set_backends(const std::vector<ggml_backend_t> & backends);
 
     // ggml_backend_sched copy callback, see llama_kvq_store::copy
     bool sched_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
@@ -98,7 +115,11 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_coarse;
 
-    std::unique_ptr<llama_kvq_store> store;
+    std::vector<ggml_backend_t> backends;
+
+    // the fitter uses the store
+    std::unique_ptr<llama_kvq_store>  store;
+    std::unique_ptr<llama_kvq_fitter> fitter;
 
     llama_kvq_params params;
 };
@@ -145,6 +166,9 @@ public:
 
 private:
     const llama_kv_cache * kv_attn = nullptr;
+
+    // batch processing context only
+    llama_memory_hybrid_kvq * mem_kvq = nullptr;
 
     const llama_memory_context_ptr ctx_coarse;
 

@@ -784,6 +784,9 @@ void llama_context::sched_new(const sched_params & params) {
 
     // the triggers of the packed two-tier attention do not wait for the GPU (LLAMA_KVQ_SCHED_SYNC: debug, they do)
     sched_copy_early = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()) != nullptr && getenv("LLAMA_KVQ_SCHED_SYNC") == nullptr;
+    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get())) {
+        kvq->set_backends(backend_ptrs);
+    }
     ggml_backend_sched_set_copy_callback_early(sched.get(), sched_copy_early);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 

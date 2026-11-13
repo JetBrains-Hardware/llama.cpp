@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 //
@@ -76,7 +77,7 @@ llama_memory_context_ptr llama_memory_hybrid_kvq::init_full() {
 }
 
 bool llama_memory_hybrid_kvq::get_can_shift() const {
-    return !params.enabled && llama_memory_hybrid::get_can_shift();
+    return false;
 }
 
 void llama_memory_hybrid_kvq::clear(bool data) {
@@ -87,16 +88,57 @@ void llama_memory_hybrid_kvq::clear(bool data) {
         mem_coarse->clear(data);
     }
 
+    if (fitter) {
+        fitter->remove(0);
+        return;
+    }
+
     store.reset();
     params.enabled = false;
 }
 
 bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (fitter) {
+        if (seq_id > 0) {
+            GGML_ABORT("seq_rm of sequence %d: the fit mode supports sequence 0 only", seq_id);
+        }
+        const llama_pos pos_max = get_mem_attn()->seq_pos_max(0);
+        const llama_pos q0      = std::max<llama_pos>(p0, 0);
+        const llama_pos q1      = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+        if (q0 >= q1 || q0 > pos_max) {
+            return llama_memory_hybrid::seq_rm(seq_id, p0, p1);
+        }
+        if (q1 <= pos_max) {
+            GGML_ABORT("seq_rm of positions [%d, %d): the fit mode can remove the end of the sequence only (last position %d)", p0, p1, pos_max);
+        }
+        if (!llama_memory_hybrid::seq_rm(seq_id, p0, p1)) {
+            return false;
+        }
+        fitter->remove(q0);
+        return true;
+    }
+
     if (store && (p1 < 0 || p1 > 0) && (p0 < 0 || p0 < store->n_coarse())) {
         GGML_ABORT("seq_rm of positions [%d, %d) would remove the packed coarse region [0, %d)", p0, p1, store->n_coarse());
     }
 
     return llama_memory_hybrid::seq_rm(seq_id, p0, p1);
+}
+
+void llama_memory_hybrid_kvq::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (params.enabled || store) {
+        GGML_ABORT("seq_cp is not supported in two-tier mode");
+    }
+
+    llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+void llama_memory_hybrid_kvq::seq_keep(llama_seq_id seq_id) {
+    if ((params.enabled || store) && seq_id != 0) {
+        GGML_ABORT("seq_keep of sequence %d: two-tier mode supports sequence 0 only", seq_id);
+    }
+
+    llama_memory_hybrid::seq_keep(seq_id);
 }
 
 void llama_memory_hybrid_kvq::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -132,17 +174,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_kvq::memory_bre
     return mb;
 }
 
+// the partial state is the recurrent one, the attention cache writes nothing for it
+// a failed state write looks like an empty state to the caller, so the other cases abort
 void llama_memory_hybrid_kvq::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if (params.enabled || store) {
-        throw std::runtime_error("state write is not supported in two-tier mode");
+    if ((params.enabled || store) && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+        GGML_ABORT("state write of the K/V is not supported in two-tier mode");
     }
 
     llama_memory_hybrid::state_write(io, seq_id, flags);
 }
 
 void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (params.enabled || store) {
-        throw std::runtime_error("state read is not supported in two-tier mode");
+    if ((params.enabled || store) && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+        GGML_ABORT("state read of the K/V is not supported in two-tier mode");
     }
 
     llama_memory_hybrid::state_read(io, seq_id, flags);
@@ -187,14 +231,99 @@ bool llama_memory_hybrid_kvq::packed_alloc(int32_t n_coarse, int32_t n_chunk_row
         return false;
     }
     params.enabled = false;
+    fitter.reset();
     store.reset();
     try {
-        store = std::make_unique<llama_kvq_store>(*get_mem_attn(), n_coarse, n_chunk_rows, bits_k, bits_v, resident_cap, all_resident, n_sink);
+        store = std::make_unique<llama_kvq_store>(*get_mem_attn(), n_coarse, n_chunk_rows, bits_k, bits_v, resident_cap, all_resident, n_sink, true);
+        store->set_backend(backends);
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
         return false;
     }
     return true;
+}
+
+bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const llama_kvq_params & p) {
+    if (!packed || !p.enabled || !p.packed || p.all_resident) {
+        LLAMA_LOG_ERROR("%s: the fit mode needs a memory created in packed mode and enabled packed parameters without all_resident\n", __func__);
+        return false;
+    }
+    const llama_kv_cache * kv = get_mem_attn();
+    if (kv->get_n_stream() != 1 || kv->seq_pos_max(0) >= 0) {
+        LLAMA_LOG_ERROR("%s: the fit mode needs an empty memory with a single KV stream\n", __func__);
+        return false;
+    }
+    if (fp.chunk <= p.n_sink || fp.n_threads < 1 || (int64_t) kv->get_size() < fp.chunk) {
+        LLAMA_LOG_ERROR("%s: bad chunk (%d, cache of %u cells) or thread count\n", __func__, fp.chunk, kv->get_size());
+        return false;
+    }
+    if (backends.empty()) {
+        LLAMA_LOG_ERROR("%s: the memory has no backends\n", __func__);
+        return false;
+    }
+
+    std::vector<llama_kvq_table> v_tabs;
+    if (!llama_kvq_load(fp.v_tables, v_tabs)) {
+        return false;
+    }
+
+    params.enabled = false;
+    fitter.reset();
+    store.reset();
+    try {
+        const int32_t n_rows = (int32_t) (kv->get_size()/fp.chunk)*fp.chunk;
+        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, p.resident_cap, false, p.n_sink, false);
+        store->set_backend(backends);
+        fitter = std::make_unique<llama_kvq_fitter>(*store, fp, v_tabs);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        fitter.reset();
+        store.reset();
+        return false;
+    }
+    if (!set_params(p)) {
+        fitter.reset();
+        store.reset();
+        return false;
+    }
+    return true;
+}
+
+void llama_memory_hybrid_kvq::fit_poll() {
+    if (fitter) {
+        fitter->poll(*get_mem_attn());
+    }
+}
+
+bool llama_memory_hybrid_kvq::fit_wait() {
+    if (!fitter) {
+        return false;
+    }
+    fitter->wait(*get_mem_attn());
+    return true;
+}
+
+bool llama_memory_hybrid_kvq::fit_get_progress(llama_kvq_fit_progress & out) const {
+    if (!fitter) {
+        return false;
+    }
+    fitter->get_progress(out);
+    return true;
+}
+
+bool llama_memory_hybrid_kvq::fit_set_hold(bool hold) {
+    if (!fitter) {
+        return false;
+    }
+    fitter->set_hold(hold);
+    return true;
+}
+
+void llama_memory_hybrid_kvq::set_backends(const std::vector<ggml_backend_t> & b) {
+    backends = b;
+    if (store) {
+        store->set_backend(backends);
+    }
 }
 
 bool llama_memory_hybrid_kvq::sched_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -221,6 +350,26 @@ bool llama_memory_kvq_packed_set(llama_memory_t mem, int32_t il, int32_t g, bool
         const int8_t * codes, const float * gain) {
     auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(mem);
     return kvq && kvq->get_store() && kvq->get_store()->set_codes(il, g, is_v, tabs, codes, gain);
+}
+
+bool llama_memory_kvq_fit_enable(llama_memory_t mem, const llama_kvq_fit_params & fparams, const llama_kvq_params & params) {
+    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(mem);
+    return kvq && kvq->fit_enable(fparams, params);
+}
+
+bool llama_memory_kvq_fit_get_progress(llama_memory_t mem, llama_kvq_fit_progress & out) {
+    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(mem);
+    return kvq && kvq->fit_get_progress(out);
+}
+
+bool llama_memory_kvq_fit_wait(llama_memory_t mem) {
+    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(mem);
+    return kvq && kvq->fit_wait();
+}
+
+bool llama_memory_kvq_fit_set_hold(llama_memory_t mem, bool hold) {
+    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(mem);
+    return kvq && kvq->fit_set_hold(hold);
 }
 
 bool llama_memory_kvq_get_counters(llama_memory_t mem, llama_kvq_counters_all & out) {
@@ -269,6 +418,7 @@ llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(
       std::vector<llama_ubatch>   ubatches) :
     llama_memory_hybrid_context(mem, sinfos_attn, ubatches),
     kv_attn(mem->get_mem_attn()),
+    mem_kvq(mem),
     // same slots as the attention cache, the cells are shared
     ctx_coarse(mem->get_mem_coarse() ? new llama_kv_cache_context(mem->get_mem_coarse(), std::move(sinfos_attn), std::move(ubatches)) : nullptr),
     params(mem->get_params()),
@@ -285,6 +435,11 @@ bool llama_memory_hybrid_kvq_context::next() {
 }
 
 bool llama_memory_hybrid_kvq_context::apply() {
+    // the previous ubatches are queued: the fit mode can start a job or move the coarse boundary now
+    if (mem_kvq) {
+        mem_kvq->fit_poll();
+    }
+
     // the attention cache updates the shared cells first, then the coarse context reads n_kv from them
     bool res = llama_memory_hybrid_context::apply();
 

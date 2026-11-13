@@ -17,6 +17,7 @@ class llama_kv_cache;
 // packed two-tier state of the attention layers of one sequence (see llama_kvq_params::packed)
 //   device: packed coarse rows and tables of the coarse region, resident precise rows (rkv, ridx) per layer, top-k bias
 //   host:   precise store (the q8_0 K/V rows of the coarse region), LRU state of the resident slots
+// the tensors and host arrays are allocated for n_rows coarse rows, the coarse region is [0, n_coarse)
 //
 // resident slots of a (layer, kv head): [0, n_sink) hold the sinks, then cap evictable slots, then one trash slot
 // the host fills the slots in the scheduler copy callbacks of host trigger tensors, each read by a get_rows:
@@ -42,8 +43,8 @@ public:
     };
 
     struct layer_tensors {
-        ggml_tensor * kc    = nullptr; // i32 [nwk, n_coarse, G]
-        ggml_tensor * vc    = nullptr; // i32 [nwv + 1, n_coarse, G]
+        ggml_tensor * kc    = nullptr; // i32 [nwk, n_rows, G]
+        ggml_tensor * vc    = nullptr; // i32 [nwv + 1, n_rows, G]
         ggml_tensor * tinv  = nullptr; // f16 [D, D, 2*G, n_chunk]
         ggml_tensor * taux  = nullptr; // f32 [D, 3, 2*G, n_chunk]
         ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2]
@@ -52,13 +53,38 @@ public:
         ggml_tensor * stage = nullptr; // f16 [ROW/2, n_stage], rows to scatter (set by enable)
         ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest is the trash slot
         ggml_tensor * trig[3] = {};    // host f32 [1], per kind
+        ggml_tensor * qacc  = nullptr; // f32 [D, D, G], sum of q q^T over the query heads of each kv head (fit mode)
     };
 
-    llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-            int32_t resident_cap, bool all_resident, int32_t n_sink);
+    // the tensors hold n_rows coarse rows (a multiple of n_chunk_rows)
+    // fill: the coarse region is [0, n_rows), its q8_0 rows are copied from the cache now (llama_memory_kvq_packed_alloc)
+    // else: fit mode, the region starts empty and grows by chunks (set_n_coarse), the query statistics tensors are allocated
+    llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
+            int32_t resident_cap, bool all_resident, int32_t n_sink, bool fill);
     ~llama_kvq_store();
 
     bool set_codes(int32_t il, int32_t g, bool is_v, const std::vector<llama_kvq_table> & tabs, const int8_t * codes, const float * gain);
+
+    // fit mode: the rows (llama_kvq_pack_rows) and the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
+    // only for chunks at or after the coarse region; the decode thread, between graphs
+    void set_chunk_rows (int32_t il, int32_t g, bool is_v, int32_t c, const int32_t * rows);
+    void set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const ggml_fp16_t * inv, const float * aux);
+
+    // fit mode: the coarse region becomes [0, n), n a multiple of n_chunk_rows; new chunks must have rows, tables and host rows set
+    // the resident rows at or after n are dropped; the decode thread, between graphs
+    void set_n_coarse(int32_t n);
+
+    // the main backend of the device (one of the backends of the context)
+    void set_backend(const std::vector<ggml_backend_t> & backends);
+
+    // waits for the main stream and the copy stream
+    void synchronize();
+
+    // host precise store of layer il: [G][n_rows][2*ROW], K row then V row
+    uint8_t * host_rows(int32_t il) const;
+
+    // the q8_0 K or V cache tensor of layer il
+    ggml_tensor * get_cache(int32_t il, bool is_v) const;
 
     // checks the parameters against the allocation and resets the resident slots and the counters
     bool enable(const llama_kvq_params & params);
@@ -81,10 +107,19 @@ public:
     // ridx without the flag column
     ggml_tensor * get_ridx(ggml_context * ctx, int32_t il) const;
 
+    // kc and vc of the current coarse region
+    ggml_tensor * get_kc(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_vc(ggml_context * ctx, int32_t il) const;
+
     int32_t n_coarse()     const { return n_coarse_; }
+    int32_t n_rows()       const { return n_rows_; }
     int32_t n_chunk_rows() const { return n_crow; }
     int32_t n_head_kv()    const { return G; }
+    int32_t n_words(bool is_v) const { return is_v ? nwv : nwk; }
     bool    all_resident() const { return all_res; }
+    bool    fit_mode()     const { return !filled; }
+
+    std::vector<int32_t> layer_ids() const;
 
     void get_counters(llama_kvq_counters_all & out);
     void reset_counters();
@@ -99,6 +134,8 @@ private:
     struct worker;
 
     int32_t n_coarse_ = 0;
+    int32_t n_rows_   = 0; // allocated rows, the stride of the per-row host arrays
+    bool    filled    = false;
     int32_t n_crow    = 0;
     int32_t n_chunk   = 0;
     int32_t G         = 0;
@@ -129,6 +166,7 @@ private:
     ggml_context_ptr        ctx_stage;
     ggml_backend_buffer_ptr buf_stage; // device staging rows and slot lists of the layers
     ggml_backend_ptr        backend_cp; // copy stream
+    ggml_backend_t          backend_main = nullptr;
     std::vector<ggml_backend_buffer_ptr> buf_store; // precise store, one per layer
 
     ggml_tensor * bias    = nullptr; // f32 [n_coarse], -inf for the sinks
@@ -164,4 +202,6 @@ private:
     void run_prefetch(layer & l);
     void wait(layer & l);
     void drop(layer & l);
+    void drop_pending();
+    void upload_pinned(layer & l, int32_t n_pin);
 };
