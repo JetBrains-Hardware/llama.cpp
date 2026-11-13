@@ -11653,6 +11653,10 @@ void ggml_compute_forward_kvq_attn(
     const int64_t n_chunk  = kc ? (n_coarse + n_crow - 1)/n_crow : 0;
     const int64_t cap      = rkv ? rkv->ne[1] : 0;
 
+    if ((mode & GGML_KVQ_COND) && *(const int32_t *) ((const char *) ridx->data + G*ridx->nb[1]) == 0) {
+        return;
+    }
+
     float * out_attn  = do_attn  ? (float *) dst->data : nullptr;
     float * out_score = do_score ? (float *) dst->data + (do_attn ? D*n_head*L : 0) : nullptr;
 

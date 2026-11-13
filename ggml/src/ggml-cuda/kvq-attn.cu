@@ -45,6 +45,7 @@ struct kvq_args {
     const float * taux; int64_t taux_nb2, taux_nb3; // in elements
     const int32_t * ridx; int64_t ridx_nb1;         // in elements
     const half  * mask; int64_t mask_nb1;           // in elements
+    const int32_t * run;                            // GGML_KVQ_COND: the kernels return at once if *run == 0
 
     float    * qtf;   // [n_chunk*G][N][D] qt in f32
     float    * kmax;  // [n_chunk*G][D/32][N] max |qt| per slice of 32 components
@@ -87,6 +88,10 @@ static __device__ __forceinline__ float kvq_qscale(const float * kmax, const int
 
 static __device__ __forceinline__ float kvq_exp2(const float x) {
     return x == -INFINITY ? 0.0f : exp2f(x);
+}
+
+static __device__ __forceinline__ bool kvq_skip(const kvq_args & a) {
+    return a.run != nullptr && *a.run == 0;
 }
 
 #ifdef AMPERE_MMA_AVAILABLE
@@ -228,6 +233,9 @@ static __device__ __forceinline__ void kvq_write_mz(const float (&m)[NT][2], con
 // slice 0 also q . mu, slice 1 the unpack fields; grid (n_chunk*G, D/32), D threads, warp w sums dims [32w, 32w + 32)
 template <int N>
 static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const bool attn) {
+    if (kvq_skip(a)) {
+        return;
+    }
     const int tab   = blockIdx.x;
     const int t     = tab / a.G;
     const int g     = tab % a.G;
@@ -378,6 +386,9 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
 // staging of a tile: packed rows word-major, word i of row r at [i*LDR + r], so that rows r and r + 8 share the address computation
 template <int N, bool ATTN, bool SCORE>
 static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args a) {
+    if (kvq_skip(a)) {
+        return;
+    }
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int NT = N/8;
 
@@ -758,6 +769,9 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
 // precise rows: resident slots or tail rows; grid (n_blocks, G)
 template <int N, ggml_type type, bool ATTN>
 static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_precise(const kvq_args a, const kvq_src src, const int part0) {
+    if (kvq_skip(a)) {
+        return;
+    }
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int NT = N/8;
 
@@ -1006,6 +1020,9 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_precise(const kvq_arg
 // merge the coarse partials of a chunk: y = O*step, per column the max and the sum of weights
 // grid (n_chunk*G, N), D threads (component)
 static __global__ void __launch_bounds__(KVQ_D) kvq_merge(const kvq_args a) {
+    if (kvq_skip(a)) {
+        return;
+    }
     const int tab = blockIdx.x;
     const int t   = tab / a.G;
     const int g   = tab % a.G;
@@ -1039,6 +1056,9 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_merge(const kvq_args a) {
 // out = y inv + z mu per chunk; grid (n_chunk*G, D/32), D threads: lane = dim of the slice, warp w sums components [32w, 32w + 32)
 template <int N>
 static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
+    if (kvq_skip(a)) {
+        return;
+    }
     const int tab   = blockIdx.x;
     const int t     = tab / a.G;
     const int g     = tab % a.G;
@@ -1124,6 +1144,9 @@ static __device__ __forceinline__ float kvq_block_sum(float x, float * s_r) {
 // sources of the output: the chunks (m, z, out in cm, cz, co) and the precise partials (pm, pz, po from n_cblk on)
 template <bool ATTN, bool SCORE>
 static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a) {
+    if (kvq_skip(a)) {
+        return;
+    }
     const int n   = blockIdx.x;
     const int g   = blockIdx.y;
     const int tid = threadIdx.x;
@@ -1353,6 +1376,7 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int  mode  = ggml_get_op_params_i32(dst, 2);
     const bool attn  = mode & GGML_KVQ_ATTN;
     const bool score = mode & GGML_KVQ_SCORE;
+    const bool cond  = mode & GGML_KVQ_COND;
 
     cudaStream_t stream = ctx.stream();
     cudaStream_t side   = ctx.stream(ctx.device, GGML_CUDA_MAX_STREAMS - 1);
@@ -1397,6 +1421,9 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (a.cap > 0) {
         a.ridx = (const int32_t *) ridx->data;
         a.ridx_nb1 = ridx->nb[1]/sizeof(int32_t);
+    }
+    if (cond) {
+        a.run = a.ridx + a.G*a.ridx_nb1;
     }
     if (mask) {
         a.mask = (const half *) mask->data;

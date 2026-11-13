@@ -2558,9 +2558,13 @@ extern "C" {
     //
     // an all -inf row of weights gives 0
     //
+    // ggml_kvq_attn_cond: mode GGML_KVQ_ATTN in place on a [D, n_head, L] f32, run only if ridx[0, G] != 0, else a is not changed;
+    //                     ridx is [cap, G + 1] here, column G holds the flag (e.g. set by the host when the resident slots change)
+    //
     enum ggml_kvq_mode {
         GGML_KVQ_ATTN  = 1,
         GGML_KVQ_SCORE = 2,
+        GGML_KVQ_COND  = 4, // set by ggml_kvq_attn_cond
     };
 
     GGML_API struct ggml_tensor * ggml_kvq_attn(
@@ -2578,6 +2582,22 @@ extern "C" {
             float                 scale,
             int                   n_chunk_rows,
             int                   mode);
+
+    GGML_API struct ggml_tensor * ggml_kvq_attn_cond(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kc,
+            struct ggml_tensor  * vc,
+            struct ggml_tensor  * tab_inv,
+            struct ggml_tensor  * tab_aux,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * rkv,
+            struct ggml_tensor  * ridx,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            int                   n_chunk_rows);
 
     // custom operators
 

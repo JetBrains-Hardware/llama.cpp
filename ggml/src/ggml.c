@@ -6591,8 +6591,9 @@ struct ggml_tensor * ggml_top_k_mask(
 
 // ggml_kvq_attn
 
-struct ggml_tensor * ggml_kvq_attn(
+static struct ggml_tensor * ggml_kvq_attn_impl(
         struct ggml_context * ctx,
+        struct ggml_tensor  * a,
         struct ggml_tensor  * q,
         struct ggml_tensor  * kc,
         struct ggml_tensor  * vc,
@@ -6608,8 +6609,10 @@ struct ggml_tensor * ggml_kvq_attn(
         int                   mode) {
     const bool attn  = mode & GGML_KVQ_ATTN;
     const bool score = mode & GGML_KVQ_SCORE;
-    GGML_ASSERT((attn || score) && (mode & ~(GGML_KVQ_ATTN | GGML_KVQ_SCORE)) == 0);
+    const bool cond  = mode & GGML_KVQ_COND;
+    GGML_ASSERT((attn || score) && (mode & ~(GGML_KVQ_ATTN | GGML_KVQ_SCORE | GGML_KVQ_COND)) == 0);
     GGML_ASSERT(!score || kc);
+    GGML_ASSERT(!cond || (attn && !score && a && rkv));
 
     const int64_t D      = q->ne[0];
     const int64_t n_head = q->ne[1];
@@ -6648,7 +6651,7 @@ struct ggml_tensor * ggml_kvq_attn(
     if (attn && rkv) {
         GGML_ASSERT(rkv->type == GGML_TYPE_F16 || rkv->type == GGML_TYPE_Q8_0);
         GGML_ASSERT(rkv->ne[0] == D && rkv->ne[2] == G && rkv->ne[3] == 2);
-        GGML_ASSERT(ridx && ridx->type == GGML_TYPE_I32 && ridx->ne[0] == rkv->ne[1] && ridx->ne[1] == G);
+        GGML_ASSERT(ridx && ridx->type == GGML_TYPE_I32 && ridx->ne[0] == rkv->ne[1] && ridx->ne[1] == G + (cond ? 1 : 0));
     }
 
     if (mask) {
@@ -6657,7 +6660,11 @@ struct ggml_tensor * ggml_kvq_attn(
     }
 
     struct ggml_tensor * result;
-    if (attn && score) {
+    if (cond) {
+        GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+        GGML_ASSERT(a->ne[0] == D && a->ne[1] == n_head && a->ne[2] == L && a->ne[3] == 1);
+        result = ggml_view_tensor(ctx, a);
+    } else if (attn && score) {
         result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D*n_head*L + n_coarse*G*L);
     } else if (attn) {
         result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_head, L);
@@ -6682,6 +6689,43 @@ struct ggml_tensor * ggml_kvq_attn(
     result->src[9] = mask;
 
     return result;
+}
+
+struct ggml_tensor * ggml_kvq_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kc,
+        struct ggml_tensor  * vc,
+        struct ggml_tensor  * tab_inv,
+        struct ggml_tensor  * tab_aux,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * rkv,
+        struct ggml_tensor  * ridx,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        int                   n_chunk_rows,
+        int                   mode) {
+    GGML_ASSERT((mode & GGML_KVQ_COND) == 0);
+    return ggml_kvq_attn_impl(ctx, NULL, q, kc, vc, tab_inv, tab_aux, k, v, rkv, ridx, mask, scale, n_chunk_rows, mode);
+}
+
+struct ggml_tensor * ggml_kvq_attn_cond(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kc,
+        struct ggml_tensor  * vc,
+        struct ggml_tensor  * tab_inv,
+        struct ggml_tensor  * tab_aux,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * rkv,
+        struct ggml_tensor  * ridx,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        int                   n_chunk_rows) {
+    return ggml_kvq_attn_impl(ctx, a, q, kc, vc, tab_inv, tab_aux, k, v, rkv, ridx, mask, scale, n_chunk_rows, GGML_KVQ_ATTN | GGML_KVQ_COND);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

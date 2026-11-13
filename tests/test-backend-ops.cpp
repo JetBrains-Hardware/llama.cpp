@@ -9872,7 +9872,8 @@ struct test_kvq_attn : public test_case {
     const ggml_type type_tail;
     const ggml_type type_res;
     const bool      masked;   // masked coarse rows
-    const int       mode;
+    const int       mode;     // GGML_KVQ_COND: ggml_kvq_attn_cond with the flag run
+    const int       run;
     const int64_t   G     = 4;
     const int64_t   n_rep = 6;
     const int64_t   D     = 256;
@@ -9880,7 +9881,7 @@ struct test_kvq_attn : public test_case {
     const int64_t   nwv   = 8;  // 1 bit per V value
 
     std::string vars() override {
-        return VARS_TO_STR10(n_chunk, n_crow, n_tail, L, cap, n_res, type_tail, type_res, masked, mode);
+        return VARS_TO_STR11(n_chunk, n_crow, n_tail, L, cap, n_res, type_tail, type_res, masked, mode, run);
     }
 
     // f16 qt and f16 weights in the mma of the CUDA kernels against the double reference of the CPU, observed <= 1e-7
@@ -9889,9 +9890,9 @@ struct test_kvq_attn : public test_case {
     }
 
     test_kvq_attn(int64_t n_chunk = 2, int64_t n_crow = 512, int64_t n_tail = 100, int64_t L = 1, int64_t cap = 256, int64_t n_res = 100,
-            ggml_type type_tail = GGML_TYPE_Q8_0, ggml_type type_res = GGML_TYPE_Q8_0, bool masked = false, int mode = GGML_KVQ_ATTN)
+            ggml_type type_tail = GGML_TYPE_Q8_0, ggml_type type_res = GGML_TYPE_Q8_0, bool masked = false, int mode = GGML_KVQ_ATTN, int run = 1)
         : n_chunk(n_chunk), n_crow(n_crow), n_tail(n_tail), L(L), cap(cap), n_res(n_res), type_tail(type_tail), type_res(type_res),
-          masked(masked), mode(mode) {}
+          masked(masked), mode(mode), run(run) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_coarse = n_chunk*n_crow;
@@ -9928,7 +9929,7 @@ struct test_kvq_attn : public test_case {
         ggml_tensor * rkv = nullptr, * ridx = nullptr;
         if (attn && cap > 0) {
             rkv  = ggml_new_tensor_4d(ctx, type_res, D, cap, G, 2);
-            ridx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cap, G);
+            ridx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cap, G + (mode & GGML_KVQ_COND ? 1 : 0));
             ggml_set_name(rkv, "rkv");
             ggml_set_name(ridx, "ridx");
         }
@@ -9936,7 +9937,14 @@ struct test_kvq_attn : public test_case {
         ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_coarse + n_tail, L);
         ggml_set_name(mask, "mask");
 
-        ggml_tensor * out = ggml_kvq_attn(ctx, q, kc, vc, tinv, taux, k, v, rkv, ridx, mask, 1.0f/16.0f, (int) n_crow, mode);
+        ggml_tensor * out;
+        if (mode & GGML_KVQ_COND) {
+            ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, G*n_rep, L);
+            ggml_set_name(a, "a");
+            out = ggml_kvq_attn_cond(ctx, a, q, kc, vc, tinv, taux, k, v, rkv, ridx, mask, 1.0f/16.0f, (int) n_crow);
+        } else {
+            out = ggml_kvq_attn(ctx, q, kc, vc, tinv, taux, k, v, rkv, ridx, mask, 1.0f/16.0f, (int) n_crow, mode);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -10030,6 +10038,9 @@ struct test_kvq_attn : public test_case {
                     for (int64_t i = 0; i < std::min<int64_t>(n_res, (int64_t) rows.size()); ++i) {
                         data[g*cap + slots[i]] = rows[i];
                     }
+                }
+                if (mode & GGML_KVQ_COND) {
+                    data[G*cap] = run;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "mask") == 0) {
@@ -10894,6 +10905,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kvq_attn(2,  700,  65, 4, 1024,  900, GGML_TYPE_Q8_0, GGML_TYPE_F16, false, GGML_KVQ_ATTN | GGML_KVQ_SCORE));
     test_cases.emplace_back(new test_kvq_attn(2, 8192, 600, 1, 1024, 1000, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_kvq_attn(2,  512, 100, 8,  256,  100, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, GGML_KVQ_ATTN | GGML_KVQ_SCORE));
+    for (int run : {0, 1}) {
+        test_cases.emplace_back(new test_kvq_attn(2, 512, 100, 4, 256, 100, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, GGML_KVQ_ATTN | GGML_KVQ_COND, run));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
