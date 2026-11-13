@@ -1,0 +1,7 @@
+set(TARGET llama-kvq-eval)
+add_executable(${TARGET} kvq-eval.cpp)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
+target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
