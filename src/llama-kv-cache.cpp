@@ -1309,6 +1309,83 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
+bool llama_kv_cache::copy_rows(int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, float * dst, const float * src) {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end() || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || p0 > p1 || (dst == nullptr) == (src == nullptr)) {
+        return false;
+    }
+
+    ggml_tensor * t = is_v ? layers[it->second].v : layers[it->second].k;
+    if (t == nullptr || t->ne[0] != n_embd || (is_v && v_trans) || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) {
+        return false;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    const auto & sp = v_cells[strm].seq_pos_get(seq_id);
+
+    std::vector<uint32_t> idxs;
+    idxs.reserve(p1 - p0);
+    auto ic = sp.lower_bound({ p0, 0 });
+    for (llama_pos p = p0; p < p1; p++) {
+        if (ic == sp.end() || ic->first != p) {
+            return false;
+        }
+        idxs.push_back(ic->second);
+        if (++ic != sp.end() && ic->first == p) {
+            return false;
+        }
+    }
+
+    const size_t row = ggml_row_size(t->type, n_embd);
+
+    // one transfer per run of consecutive cells
+    std::vector<uint8_t> buf;
+    uint32_t n_runs = 0;
+    for (size_t i0 = 0, i1; i0 < idxs.size(); i0 = i1) {
+        for (i1 = i0 + 1; i1 < idxs.size() && idxs[i1] == idxs[i1 - 1] + 1; i1++) {
+        }
+        const int64_t n      = (i1 - i0)*n_embd;
+        const size_t  offset = strm*t->nb[2] + idxs[i0]*t->nb[1];
+        float * f32 = dst ? dst + i0*n_embd : const_cast<float *>(src + i0*n_embd);
+
+        buf.resize((i1 - i0)*row);
+        if (dst) {
+            ggml_backend_tensor_get(t, buf.data(), offset, buf.size());
+        }
+        switch (t->type) {
+            case GGML_TYPE_F32:
+                if (dst) {
+                    memcpy(f32, buf.data(), buf.size());
+                } else {
+                    memcpy(buf.data(), f32, buf.size());
+                }
+                break;
+            case GGML_TYPE_F16:
+                if (dst) {
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) buf.data(), f32, n);
+                } else {
+                    ggml_fp32_to_fp16_row(f32, (ggml_fp16_t *) buf.data(), n);
+                }
+                break;
+            default:
+                if (dst) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) buf.data(), f32, n);
+                } else {
+                    ggml_fp32_to_bf16_row(f32, (ggml_bf16_t *) buf.data(), n);
+                }
+                break;
+        }
+        if (src) {
+            ggml_backend_tensor_set(t, buf.data(), offset, buf.size());
+        }
+        n_runs++;
+    }
+
+    LLAMA_LOG_DEBUG("%s: il = %d, %s, pos [%d, %d): %u run(s) of cells, first cell %u\n", __func__, il, is_v ? "V" : "K", p0, p1, n_runs, idxs.empty() ? 0 : idxs[0]);
+
+    return true;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 

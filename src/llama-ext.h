@@ -119,6 +119,15 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
+// layers of the attention KV cache of a plain or hybrid memory, empty if there is none
+LLAMA_API std::vector<int32_t> llama_memory_kv_layer_ids(llama_memory_t mem);
+
+// copy the K (is_v = false) or V rows of layer il for positions [p0, p1) of seq_id, as F32 (p1 - p0) x n_embd
+// the rows are found through the cells of the sequence; F32/F16/BF16 caches only, V must not be transposed (flash attention)
+// fails if n_embd is not the row size of the cache (n_embd_k_gqa or n_embd_v_gqa)
+LLAMA_API bool llama_memory_kv_get_rows(llama_memory_t mem, int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, float * dst);
+LLAMA_API bool llama_memory_kv_set_rows(llama_memory_t mem, int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, const float * src);
+
 // Turn the KV cache attention rotation on or off for the contexts created from this model.
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);

@@ -1,5 +1,6 @@
 #include "llama-memory-hybrid.h"
 
+#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-context.h"
@@ -212,6 +213,37 @@ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
 
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
+}
+
+// the attention cache of a plain or hybrid memory
+static llama_kv_cache * llama_memory_kv_cache(llama_memory_t mem) {
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv;
+    }
+    if (auto * hy = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hy->get_mem_attn();
+    }
+    return nullptr;
+}
+
+std::vector<int32_t> llama_memory_kv_layer_ids(llama_memory_t mem) {
+    std::vector<int32_t> res;
+    if (const auto * kv = llama_memory_kv_cache(mem)) {
+        for (uint32_t il : kv->get_layer_ids()) {
+            res.push_back((int32_t) il);
+        }
+    }
+    return res;
+}
+
+bool llama_memory_kv_get_rows(llama_memory_t mem, int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, float * dst) {
+    auto * kv = llama_memory_kv_cache(mem);
+    return kv && dst && kv->copy_rows(il, is_v, seq_id, p0, p1, n_embd, dst, nullptr);
+}
+
+bool llama_memory_kv_set_rows(llama_memory_t mem, int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, const float * src) {
+    auto * kv = llama_memory_kv_cache(mem);
+    return kv && src && kv->copy_rows(il, is_v, seq_id, p0, p1, n_embd, nullptr, src);
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}

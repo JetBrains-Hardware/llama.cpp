@@ -174,6 +174,10 @@ public:
     // The stream holding seq_id's cells.
     uint32_t get_stream(llama_seq_id seq_id) const;
 
+    // copy the K or V rows of positions [p0, p1) of seq_id to dst, or from src, as F32 (p1 - p0) x n_embd
+    // only for F32/F16/BF16 storage and non-transposed V; each position must be in exactly one cell
+    bool copy_rows(int32_t il, bool is_v, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int64_t n_embd, float * dst, const float * src);
+
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
