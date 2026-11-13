@@ -121,6 +121,16 @@ Per format at 150k, main model only (arithmetic): f16 9.16 GiB, q8_0 4.86 GiB, q
 5. No speed gain from the packed path at 100k: a 4-token verify fetches 43k - 48k rows (65 - 73% of the request misses the resident set), GPU idle at the joins 1.7 - 2.2 ms per round.
 6. Tables: 16k chunks would halve them.
 
+## Optimisation ideas (not started, nothing measured)
+
+Sizes are for ctx 230000 as allocated today.
+
+1. 16k chunks. Halves the tables (459 -> about 230 MiB); chunk size 4k to 16k made no quality difference. Catch: the ring is sized 2 chunks + n_batch, so with the current rule it grows from 689 to about 1230 MiB and the net result is worse. It only pays off together with a ring that does not scale with the chunk (item 3), or by fitting 8k chunks first and merging two of them into one 16k table in the background later.
+2. 8-bit tables instead of fp16. Halves the tables again. Needs a quality check, the K inverse transform goes straight into the logits.
+3. Do not wait for the fitter. Today prefill stops when the ring is full (about 3.4 s on a 100k prompt). Idea: rows that do not fit in the ring go to the host store uncompressed, prefill reads them through the scratch like the installed region, and the fitter replaces the full version by the compressed one during generation. Open point: generation needs those rows precise in VRAM until their chunk is fitted (a per-token upload is too expensive), so they need a place there; item 4 is the candidate. The backlog on 16 threads is about one chunk, 285 MB of rows.
+4. Reuse the prefill buffers during generation. The scratch (519 MiB) and the flash attention F16 copies in the compute buffer (most of 1642 MiB) are only used by large ubatches and sit idle during generation. Candidates to live there: the not yet fitted rows of item 3, a larger resident set, or the ring itself, so that this memory is allocated once and used by both phases.
+5. From the bottleneck list: chunked flash attention to shrink the F16 copies, a compressed or q8_0 cache for the MTP context, lower fetch traffic for multi-token verify batches.
+
 ## Not exercised
 
 - Two-tier without MTP, drafts of 7 tokens on the packed path, model reload after sleep, a chat-endpoint conversation with user-message checkpoints.
