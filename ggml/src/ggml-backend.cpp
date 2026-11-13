@@ -1229,6 +1229,7 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
+    bool   callback_copy_early;
 
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
@@ -2121,6 +2122,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    const bool use_callback = sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input);
+
+    // early callback: it runs before the wait below and synchronizes by itself if it needs to
+    if (use_callback && sched->callback_copy_early &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -2128,7 +2137,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         ggml_backend_synchronize(split_backend);
     }
 
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+    if (use_callback && !sched->callback_copy_early &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
         return;
     }
@@ -2507,6 +2516,11 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_copy_callback_early(ggml_backend_sched_t sched, bool early) {
+    GGML_ASSERT(sched);
+    sched->callback_copy_early = early;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {

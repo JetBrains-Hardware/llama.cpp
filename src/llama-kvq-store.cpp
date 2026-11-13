@@ -6,11 +6,29 @@
 #include "llama-kvq-pack.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
+
+namespace {
+
+struct kvq_fetch {
+    int32_t g;
+    int32_t slot;
+    int32_t row;
+};
+
+struct kvq_cand {
+    int32_t row;
+    int32_t slot;
+    float   val;
+};
+
+}
 
 struct llama_kvq_store::layer {
     int32_t il = -1;
@@ -33,46 +51,99 @@ struct llama_kvq_store::layer {
     std::vector<int32_t>  head;       // [G], least recently selected
     std::vector<int32_t>  tail;       // [G]
 
+    uint32_t stamp    = 0; // selection clock
     uint32_t pf_stamp = 0; // stamp of the last prefetch
 
+    // pinned host buffers
+    uint8_t * h_stage = nullptr; // [2*n][ROW], K and V row of each fetch
+    int32_t * h_sel   = nullptr; // selection readback
+    float   * h_val   = nullptr;
+    int32_t * h_ridx  = nullptr; // [G + 1][cap_tot]
+    int32_t * h_slots = nullptr; // [n_stage]
+
+    int64_t slots_hi = 0; // entries of the device slot list that are not trash
+
+    std::vector<kvq_fetch> fetch; // of the last request
+
+    // request of the selection in h_sel
+    int64_t n_top = 0;
+    int64_t n_pos = 0;
+
+    bool pending = false; // decode thread: a prefetch was handed to the worker and is not joined yet
+    bool done    = false; // worker mutex
+
+    ggml_backend_event_ptr ev_sel;  // main stream at the prefetch trigger
+    ggml_backend_event_ptr ev_read; // readback of the selection
+    ggml_backend_event_ptr ev_up;   // upload from the host buffers
+    bool up_rec = false;
+
+    // LLAMA_KVQ_IDLE_PROBE: the time the GPU reached the join and the end of the join, for the GPU idle estimate
+    ggml_backend_event_ptr ev_join;
+    bool   probe_busy = false; // probe mutex
+    double t_reach    = 0.0;
+    double t_end      = 0.0;
+
     llama_kvq_counters cnt;
+
+    void touch(int32_t g, int32_t s, float v, int32_t cap_tot, int32_t n_sink) {
+        const size_t o = (size_t) g*cap_tot;
+        slot_stamp[o + s] = stamp;
+        slot_val[o + s]   = v;
+        if (s < n_sink || s == tail[g]) {
+            return;
+        }
+        // unlink, then append at the tail
+        if (prev[o + s] >= 0) {
+            next[o + prev[o + s]] = next[o + s];
+        } else {
+            head[g] = next[o + s];
+        }
+        prev[o + next[o + s]] = prev[o + s];
+        prev[o + s] = tail[g];
+        next[o + s] = -1;
+        next[o + tail[g]] = s;
+        tail[g] = s;
+    }
+
+    void assign(int32_t g, int32_t s, int32_t row, float v, int32_t cap_tot, int32_t n_sink, int32_t n_coarse) {
+        const size_t o = (size_t) g*cap_tot;
+        const int32_t old = ridx[o + s];
+        if (old >= 0) {
+            row_slot[(size_t) g*n_coarse + old] = -1;
+            cnt.evict++;
+        }
+        ridx[o + s] = row;
+        row_slot[(size_t) g*n_coarse + row] = s;
+        touch(g, s, v, cap_tot, n_sink);
+        fetch.push_back({ g, s, row });
+    }
 };
-
-namespace {
-
-struct kvq_fetch {
-    int32_t g;
-    int32_t slot;
-    int32_t row;
-};
-
-struct kvq_cand {
-    int32_t row;
-    float   val;
-};
-
-}
 
 static double kvq_now() {
     return ggml_time_us()*1e-6;
 }
 
-// LLAMA_KVQ_GATHER_THREADS > 1: the gather is split over spinning worker threads (experiment)
+// the gather of one request over n_th threads, the helpers sleep on a condition variable
 struct llama_kvq_store::gather_pool {
     std::vector<std::thread> threads;
-    std::atomic<int>  gen  = 0;
-    std::atomic<int>  done = 0;
-    std::atomic<bool> stop = false;
-    const kvq_fetch * fetch = nullptr;
-    int64_t   n     = 0;
-    uint8_t * dst   = nullptr;
-    const uint8_t * store = nullptr;
-    int64_t   n_coarse = 0;
-    int       n_th  = 1;
+    std::mutex              m;
+    std::mutex              m_run; // one gather at a time
+    std::condition_variable cv_work;
+    std::condition_variable cv_done;
+    uint64_t gen    = 0;
+    int      n_left = 0;
+    bool     stop   = false;
 
-    void part(int ith) {
-        const int64_t i0 = n*ith/n_th;
-        const int64_t i1 = n*(ith + 1)/n_th;
+    const kvq_fetch * fetch    = nullptr;
+    int64_t           n        = 0;
+    uint8_t *         dst      = nullptr;
+    const uint8_t *   store    = nullptr;
+    int64_t           n_coarse = 0;
+    const int         n_th;
+
+    void part(int ith, int nth) const {
+        const int64_t i0 = n*ith/nth;
+        const int64_t i1 = n*(ith + 1)/nth;
         for (int64_t i = i0; i < i1; ++i) {
             memcpy(dst + 2*i*ROW, store + ((size_t) fetch[i].g*n_coarse + fetch[i].row)*2*ROW, 2*ROW);
         }
@@ -81,35 +152,162 @@ struct llama_kvq_store::gather_pool {
     explicit gather_pool(int n_th) : n_th(n_th) {
         for (int ith = 1; ith < n_th; ++ith) {
             threads.emplace_back([this, ith]() {
-                int seen = 0;
-                while (!stop.load(std::memory_order_acquire)) {
-                    const int g = gen.load(std::memory_order_acquire);
-                    if (g == seen) {
-                        std::this_thread::yield();
-                        continue;
+                uint64_t seen = 0;
+                std::unique_lock<std::mutex> lk(m);
+                while (true) {
+                    cv_work.wait(lk, [&]() { return stop || gen != seen; });
+                    if (stop) {
+                        return;
                     }
-                    seen = g;
-                    part(ith);
-                    done.fetch_add(1, std::memory_order_acq_rel);
+                    seen = gen;
+                    lk.unlock();
+                    part(ith, this->n_th);
+                    lk.lock();
+                    if (--n_left == 0) {
+                        cv_done.notify_one();
+                    }
                 }
             });
         }
     }
 
     ~gather_pool() {
-        stop = true;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop = true;
+        }
+        cv_work.notify_all();
         for (auto & t : threads) {
             t.join();
         }
     }
 
-    void run() {
-        done = 0;
-        gen.fetch_add(1, std::memory_order_acq_rel);
-        part(0);
-        while (done.load(std::memory_order_acquire) < n_th - 1) {
-            std::this_thread::yield();
+    void run(const kvq_fetch * f, int64_t n_f, uint8_t * d, const uint8_t * st, int64_t n_c) {
+        std::lock_guard<std::mutex> lr(m_run);
+        fetch    = f;
+        n        = n_f;
+        dst      = d;
+        store    = st;
+        n_coarse = n_c;
+        // waking the helpers costs more than a small copy
+        if (n_th == 1 || n < 256) {
+            part(0, 1);
+            return;
         }
+        {
+            std::lock_guard<std::mutex> lk(m);
+            n_left = n_th - 1;
+            gen++;
+        }
+        cv_work.notify_all();
+        part(0, n_th);
+        std::unique_lock<std::mutex> lk(m);
+        cv_done.wait(lk, [&]() { return n_left == 0; });
+    }
+};
+
+// runs the prefetch requests (plan and gather) off the decode thread, in order
+// the probe thread (LLAMA_KVQ_IDLE_PROBE) waits for the join events in order and notes when the GPU reached them
+struct llama_kvq_store::worker {
+    llama_kvq_store & st;
+
+    std::mutex              m;
+    std::condition_variable cv_job;
+    std::condition_variable cv_done;
+    std::deque<layer *>     jobs;
+    bool                    stop = false;
+    std::thread             th;
+
+    std::mutex              m_probe;
+    std::condition_variable cv_probe;
+    std::deque<layer *>     probes;
+    std::thread             th_probe;
+
+    explicit worker(llama_kvq_store & st, bool probe) : st(st), th([this]() { loop(); }) {
+        if (probe) {
+            th_probe = std::thread([this]() { loop_probe(); });
+        }
+    }
+
+    ~worker() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            std::lock_guard<std::mutex> lp(m_probe);
+            stop = true;
+        }
+        cv_job.notify_one();
+        cv_probe.notify_one();
+        th.join();
+        if (th_probe.joinable()) {
+            th_probe.join();
+        }
+    }
+
+    void loop_probe() {
+        std::unique_lock<std::mutex> lk(m_probe);
+        while (true) {
+            cv_probe.wait(lk, [&]() { return stop || !probes.empty(); });
+            if (probes.empty()) {
+                return;
+            }
+            layer * l = probes.front();
+            probes.pop_front();
+            lk.unlock();
+            ggml_backend_event_synchronize(l->ev_join.get());
+            const double t = kvq_now();
+            lk.lock();
+            l->t_reach    = t;
+            l->probe_busy = false;
+        }
+    }
+
+    // GPU idle of the previous probe of the layer, then a new probe at the current position of the stream
+    double probe(layer & l, ggml_backend_t backend) {
+        double idle = 0.0;
+        std::lock_guard<std::mutex> lk(m_probe);
+        if (l.probe_busy) {
+            return idle;
+        }
+        if (l.t_reach > 0.0) {
+            idle = std::max(0.0, l.t_end - l.t_reach);
+        }
+        ggml_backend_event_record(l.ev_join.get(), backend);
+        l.t_reach    = 0.0;
+        l.probe_busy = true;
+        probes.push_back(&l);
+        cv_probe.notify_one();
+        return idle;
+    }
+
+    void loop() {
+        std::unique_lock<std::mutex> lk(m);
+        while (true) {
+            cv_job.wait(lk, [&]() { return stop || !jobs.empty(); });
+            if (jobs.empty()) {
+                return;
+            }
+            layer * l = jobs.front();
+            jobs.pop_front();
+            lk.unlock();
+            st.run_prefetch(*l);
+            lk.lock();
+            l->done = true;
+            cv_done.notify_all();
+        }
+    }
+
+    void submit(layer & l) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            l.done = false;
+            jobs.push_back(&l);
+        }
+        cv_job.notify_one();
+    }
+
+    void wait(layer & l) {
+        std::unique_lock<std::mutex> lk(m);
+        cv_done.wait(lk, [&]() { return l.done; });
     }
 };
 
@@ -181,7 +379,6 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, in
         buft_host = ggml_backend_cpu_buffer_type();
     }
 
-    n_stage = all_res ? 2 : 2*(int64_t) G*cap;
 
     auto init_ctx = [](size_t n) {
         ggml_init_params ip = { n*ggml_tensor_overhead(), nullptr, true };
@@ -193,7 +390,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, in
     };
     ctx_dev   = init_ctx(layers.size()*6 + 3);
     ctx_alias = init_ctx(layers.size());
-    ctx_host  = init_ctx(layers.size()*2);
+    ctx_host  = init_ctx(layers.size()*3);
 
     for (auto & l : layers) {
         layer_tensors & t = l.t;
@@ -209,18 +406,14 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, in
         ggml_format_name(t.taux, "kvq_taux-%d", l.il);
         ggml_format_name(t.rkv,  "kvq_rkv-%d",  l.il);
         ggml_format_name(t.ridx, "kvq_ridx-%d", l.il);
-        for (int k = 0; k < 2; ++k) {
-            t.trig[k] = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_I32, 1);
+        for (int k = 0; k < 3; ++k) {
+            t.trig[k] = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, 1);
             ggml_format_name(t.trig[k], "kvq_trig%d-%d", k, l.il);
             trig_of[t.trig[k]] = { (size_t) (&l - layers.data()), k };
         }
     }
     bias    = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_coarse);
-    staging = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_F16, ROW/2, n_stage);
-    slots   = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_I32, n_stage);
     ggml_set_name(bias,    "kvq_bias");
-    ggml_set_name(staging, "kvq_staging");
-    ggml_set_name(slots,   "kvq_slots");
 
     buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), buft));
     if (!buf_dev) {
@@ -246,12 +439,6 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, in
     }
     ggml_backend_buffer_clear(buf_host.get(), 0);
     ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    buf_stage.reset(ggml_backend_buft_alloc_buffer(buft_host, n_stage*ROW));
-    if (!buf_stage) {
-        throw std::runtime_error("failed to allocate the packed two-tier staging buffer");
-    }
-    stage_host = (uint8_t *) ggml_backend_buffer_get_base(buf_stage.get());
 
     // precise store, one buffer per layer (a single pinned CUDA buffer is limited to 4 GB)
     const size_t store_size = (size_t) G*n_coarse*2*ROW;
@@ -311,12 +498,30 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, in
         l.next.assign((size_t) G*cap_tot, -1);
         l.head.assign(G, -1);
         l.tail.assign(G, -1);
+        l.ev_sel.reset(ggml_backend_event_new(dev));
+        l.ev_read.reset(ggml_backend_event_new(dev));
+        l.ev_up.reset(ggml_backend_event_new(dev));
+        if (!l.ev_sel || !l.ev_read || !l.ev_up) {
+            throw std::runtime_error("packed two-tier mode needs backend events");
+        }
     }
-    slots_host.assign(n_stage, 0);
 
-    if (const char * env = getenv("LLAMA_KVQ_GATHER_THREADS"); env != nullptr && atoi(env) > 1) {
-        pool = std::make_unique<gather_pool>(atoi(env));
-        LLAMA_LOG_INFO("%s: gather on %d threads\n", __func__, atoi(env));
+    if (!all_res) {
+        const char * env  = getenv("LLAMA_KVQ_GATHER_THREADS");
+        const int    n_th = env != nullptr && atoi(env) > 0 ? atoi(env) : 4;
+        backend_cp.reset(ggml_backend_dev_init(dev, nullptr));
+        if (!backend_cp) {
+            throw std::runtime_error("failed to create the copy backend of the packed two-tier mode");
+        }
+        pool = std::make_unique<gather_pool>(n_th);
+        probe = getenv("LLAMA_KVQ_IDLE_PROBE") != nullptr;
+        for (auto & l : layers) {
+            if (probe) {
+                l.ev_join.reset(ggml_backend_event_new(dev));
+            }
+        }
+        work = std::make_unique<worker>(*this, probe);
+        LLAMA_LOG_INFO("%s: gather on %d threads, events %s\n", __func__, n_th, layers[0].ev_up ? "yes" : "no");
     }
 
     const llama_kvq_memory_info mi = memory_info();
@@ -327,7 +532,14 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, in
             mi.pinned ? "pinned" : "pageable", mi.host_other/1048576.0);
 }
 
-llama_kvq_store::~llama_kvq_store() = default;
+llama_kvq_store::~llama_kvq_store() {
+    // the worker uses the layers
+    work.reset();
+    pool.reset();
+    if (backend_cp) {
+        ggml_backend_synchronize(backend_cp.get());
+    }
+}
 
 const llama_kvq_store::layer_tensors & llama_kvq_store::get_layer(int32_t il) const {
     return layers.at(layer_of_il.at(il)).t;
@@ -384,16 +596,80 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         LLAMA_LOG_ERROR("%s: bad prefetch_n or sync_m/sync_min_hits for %d slots and %d candidates\n", __func__, cap, n_coarse_ - n_sink);
         return false;
     }
+    for (auto & l : layers) {
+        if (l.pending) {
+            drop(l);
+        }
+    }
     params = p;
 
-    stamp = 0;
+    // pinned host buffers of each layer, for the largest request of these parameters
+    if (backend_cp) {
+        ggml_backend_synchronize(backend_cp.get());
+    }
+    buf_pin.reset();
+    if (!all_res) {
+        const int64_t n_rows = 2*G*std::max(n_req(KIND_PREFETCH, p.prefetch_n, p.max_batch), n_req(KIND_TOPUP, p.sync_m, p.max_batch));
+        const int64_t n_sel  = (int64_t) std::max(p.prefetch_n, p.sync_m)*G*p.max_batch;
+
+        // a graph that is reused keeps the tensors, so they change only with the parameters that change the graph
+        if (!buf_stage || n_rows != n_stage) {
+            n_stage = n_rows;
+            buf_stage.reset();
+            ggml_init_params ip = { layers.size()*2*ggml_tensor_overhead(), nullptr, true };
+            ctx_stage.reset(ggml_init(ip));
+            for (auto & l : layers) {
+                l.t.stage = ggml_new_tensor_2d(ctx_stage.get(), GGML_TYPE_F16, ROW/2, n_stage);
+                l.t.slots = ggml_new_tensor_1d(ctx_stage.get(), GGML_TYPE_I32, n_stage);
+                ggml_format_name(l.t.stage, "kvq_stage-%d", l.il);
+                ggml_format_name(l.t.slots, "kvq_slots-%d", l.il);
+            }
+            buf_stage.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_stage.get(), buft));
+            if (!buf_stage) {
+                LLAMA_LOG_ERROR("%s: failed to allocate the staging tensors\n", __func__);
+                return false;
+            }
+            ggml_backend_buffer_set_usage(buf_stage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        // the trash entry: slot cap_tot - 1 of kv head 0, K
+        std::vector<int32_t> trash(n_stage, cap_tot - 1);
+        for (auto & l : layers) {
+            ggml_backend_tensor_set(l.t.slots, trash.data(), 0, ggml_nbytes(l.t.slots));
+            l.slots_hi = 0;
+        }
+        auto pad = [](size_t n) { return GGML_PAD(n, 64); };
+        const size_t sz_stage = pad(n_rows*ROW);
+        const size_t sz_sel   = pad(n_sel*sizeof(int32_t));
+        const size_t sz_ridx  = pad((size_t) (G + 1)*cap_tot*sizeof(int32_t));
+        const size_t sz_slots = pad(n_stage*sizeof(int32_t));
+        const size_t sz_layer = sz_stage + 2*sz_sel + sz_ridx + sz_slots;
+        buf_pin.reset(ggml_backend_buft_alloc_buffer(buft_host, sz_layer*layers.size()));
+        if (!buf_pin) {
+            LLAMA_LOG_ERROR("%s: failed to allocate %.1f MiB of pinned host buffers\n", __func__, sz_layer*layers.size()/1048576.0);
+            return false;
+        }
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf_pin.get());
+        for (size_t i = 0; i < layers.size(); ++i) {
+            layer & l = layers[i];
+            uint8_t * b = base + i*sz_layer;
+            l.h_stage = b;                                        b += sz_stage;
+            l.h_sel   = (int32_t *) b;                            b += sz_sel;
+            l.h_val   = (float *) b;                              b += sz_sel;
+            l.h_ridx  = (int32_t *) b;                            b += sz_ridx;
+            l.h_slots = (int32_t *) b;
+            l.up_rec  = false;
+        }
+    }
+
     for (auto & l : layers) {
         std::fill(l.ridx.begin(), l.ridx.end(), -1);
         std::fill(l.row_slot.begin(), l.row_slot.end(), -1);
         std::fill(l.row_mark.begin(), l.row_mark.end(), 0);
         std::fill(l.slot_stamp.begin(), l.slot_stamp.end(), 0);
         std::fill(l.slot_val.begin(), l.slot_val.end(), 0.0f);
+        l.stamp    = 0;
         l.pf_stamp = 0;
+        l.fetch.clear();
 
         // pinned rows: the sinks, or every row
         const int32_t n_pin = all_res ? n_coarse_ : n_sink;
@@ -425,16 +701,16 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         }
     }
 
-    // the trash entry: slot cap_tot - 1 of kv head 0, K
-    std::fill(slots_host.begin(), slots_host.end(), cap_tot - 1);
-    ggml_backend_tensor_set(slots, slots_host.data(), 0, ggml_nbytes(slots));
-    slots_hi = 0;
-
     reset_counters();
 
-    LLAMA_LOG_INFO("%s: max_batch = %d, prefetch_n = %d, lead = %d, sync = %d (m = %d, min hits = %d), stats = %d, all resident = %d\n", __func__,
-            p.max_batch, p.prefetch_n, p.lead, p.sync_mode, p.sync_m, p.sync_min_hits, p.stats, p.all_resident);
+    LLAMA_LOG_INFO("%s: max_batch = %d, prefetch_n = %d, resident = %d, lead = %d, sync = %d (m = %d, min hits = %d), stats = %d, all resident = %d\n", __func__,
+            p.max_batch, p.prefetch_n, cap, p.lead, p.sync_mode, p.sync_m, p.sync_min_hits, p.stats, p.all_resident);
     return true;
+}
+
+int64_t llama_kvq_store::n_req(int k, int64_t n_top, int64_t L) const {
+    // prefetch: the union over the positions is cut at two requests, the other slots keep older rows
+    return std::min<int64_t>(cap, k == KIND_TOPUP ? n_top*L : n_top*std::min<int64_t>(L, 2));
 }
 
 void llama_kvq_store::flush_ubatch() {
@@ -448,12 +724,42 @@ void llama_kvq_store::flush_ubatch() {
 
 void llama_kvq_store::begin_ubatch(int64_t n) {
     GGML_ASSERT(n <= 64);
+    // a prefetch without its join, e.g. after a failed graph compute
+    for (auto & l : layers) {
+        if (l.pending) {
+            LLAMA_LOG_WARN("%s: dropping the prefetch of layer %d\n", __func__, l.il);
+            drop(l);
+        }
+    }
     flush_ubatch();
     ub_tokens = n;
     n_ubatch++;
 }
 
+static ggml_backend_t kvq_backend(ggml_backend_sched_t sched, ggml_backend_dev_t dev) {
+    ggml_backend_t backend = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(b) == dev) {
+            backend = b;
+        }
+    }
+    GGML_ASSERT(backend != nullptr);
+    return backend;
+}
+
+// the callback of the trigger fills rows [0, n) of the staging tensor and the slot list, the rest of the list is the trash slot
+static void kvq_build_scatter(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * rkv_h, ggml_tensor * staging, ggml_tensor * slots, int64_t n_rows, int k, int32_t il) {
+    GGML_ASSERT(staging != nullptr && n_rows <= staging->ne[1]);
+    ggml_tensor * src = ggml_view_2d(ctx, staging, staging->ne[0], n_rows, staging->nb[1], 0);
+    ggml_tensor * idx = ggml_view_1d(ctx, slots, n_rows, 0);
+    ggml_tensor * scatter = ggml_set_rows(ctx, rkv_h, src, idx);
+    ggml_format_name(scatter, "kvq_scatter%d-%d", k, il);
+    ggml_build_forward_expand(gf, scatter);
+}
+
 void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, kind k, ggml_tensor * score, int64_t n_top) const {
+    GGML_ASSERT(k == KIND_PREFETCH || k == KIND_TOPUP);
     const layer_tensors & t = get_layer(il);
 
     const int64_t L = score->ne[2];
@@ -472,28 +778,270 @@ void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_bac
     ggml_tensor * vals = ggml_get_rows(ctx, ggml_reshape_3d(ctx, sc, 1, n_coarse_, G*L), ids); // [1, n_top, G*L]
     ggml_format_name(vals, "kvq_vals%d-%d", (int) k, il);
 
-    ggml_tensor * trig = ggml_get_rows(ctx, ggml_reshape_2d(ctx, vals, n_top*G*L, 1), t.trig[k]);
-    ggml_format_name(trig, "kvq_trig%d-%d", (int) k, il);
+    // read back from a copy stream after the trigger, so they are outputs
+    ggml_set_output(vals);
 
-    ggml_backend_t backend = nullptr;
-    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
-        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
-        if (ggml_backend_get_device(b) == dev) {
-            backend = b;
-        }
-    }
-    GGML_ASSERT(backend != nullptr);
-    ggml_backend_sched_set_tensor_backend(sched, trig, backend);
+    // the trigger value is not set, the result is not used
+    ggml_tensor * trig = ggml_add(ctx, ggml_view_1d(ctx, vals, 1, 0), t.trig[k]);
+    ggml_format_name(trig, "kvq_trig%d-%d", (int) k, il);
+    ggml_backend_sched_set_tensor_backend(sched, trig, kvq_backend(sched, dev));
     ggml_build_forward_expand(gf, trig);
 
-    // the callback of the trigger fills rows [0, n) of the staging tensor and the slot list, the rest of the list is the trash slot
-    const int64_t n_rows = 2*G*std::min<int64_t>(cap, n_top*L);
-    GGML_ASSERT(n_rows <= n_stage);
-    ggml_tensor * src = ggml_view_2d(ctx, staging, staging->ne[0], n_rows, staging->nb[1], 0);
-    ggml_tensor * idx = ggml_view_1d(ctx, slots, n_rows, 0);
-    ggml_tensor * scatter = ggml_set_rows(ctx, t.rkv_h, src, idx);
-    ggml_format_name(scatter, "kvq_scatter%d-%d", (int) k, il);
-    ggml_build_forward_expand(gf, scatter);
+    if (k == KIND_TOPUP) {
+        kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(k, n_top, L), k, il);
+    }
+}
+
+void llama_kvq_store::build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int64_t n_top, int64_t L) const {
+    const layer_tensors & t = get_layer(il);
+
+    ggml_tensor * trig = ggml_add(ctx, ggml_view_1d(ctx, bias, 1, 0), t.trig[KIND_JOIN]);
+    ggml_format_name(trig, "kvq_trig%d-%d", (int) KIND_JOIN, il);
+    ggml_backend_sched_set_tensor_backend(sched, trig, kvq_backend(sched, dev));
+    ggml_build_forward_expand(gf, trig);
+
+    kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(KIND_PREFETCH, n_top, L), KIND_JOIN, il);
+}
+
+void llama_kvq_store::select(const layer & l, const ggml_tensor * dst, ggml_cgraph * graph, const ggml_tensor ** ids, const ggml_tensor ** vals) const {
+    // trig = add(view(vals), trigger), vals = get_rows(scores, ids)
+    ggml_cgraph * gr = graph;
+    const int n_nodes = ggml_graph_n_nodes(gr);
+    const ggml_tensor * trig = nullptr;
+    for (int i = 0; i < n_nodes && trig == nullptr; ++i) {
+        const ggml_tensor * node = ggml_graph_node(gr, i);
+        if (node->op == GGML_OP_ADD && node->src[1] == dst) {
+            trig = node;
+        }
+    }
+    GGML_ASSERT(trig != nullptr);
+    *vals = trig->src[0]->view_src;
+    GGML_ASSERT(*vals != nullptr && (*vals)->op == GGML_OP_GET_ROWS);
+    *ids = (*vals)->src[1];
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(gr, i);
+        if (node == *vals || node == *ids) {
+            GGML_ABORT("the selection of layer %d is computed in the same split as its trigger", l.il);
+        }
+    }
+    GGML_ASSERT(ggml_is_contiguous(*ids) && ggml_is_contiguous(*vals) && (*ids)->type == GGML_TYPE_I32 && (*vals)->type == GGML_TYPE_F32);
+}
+
+void llama_kvq_store::plan_prefetch(layer & l) {
+    llama_kvq_counters & cnt = l.cnt;
+
+    const int64_t n_top = l.n_top;
+    const int64_t L     = l.n_pos;
+    const int64_t n_u   = n_req(KIND_PREFETCH, n_top, L);
+
+    const uint32_t now = ++l.stamp;
+    l.fetch.clear();
+
+    cnt.n_pf++;
+    l.pf_stamp = now;
+    std::vector<kvq_cand> u;
+    for (int32_t g = 0; g < G; ++g) {
+        // union over the positions, the max score of a row; the rows of one position are distinct
+        u.clear();
+        for (int64_t p = 0; p < L; ++p) {
+            const int64_t o = (g + G*p)*n_top;
+            for (int64_t i = 0; i < n_top; ++i) {
+                const int32_t row = l.h_sel[o + i];
+                GGML_ASSERT(row >= n_sink && row < n_coarse_);
+                if (L == 1) {
+                    u.push_back({ row, -1, l.h_val[o + i] });
+                    continue;
+                }
+                const size_t ir = (size_t) g*n_coarse_ + row;
+                if (l.row_mark[ir] != now) {
+                    l.row_mark[ir] = now;
+                    l.row_upos[ir] = (int32_t) u.size();
+                    u.push_back({ row, -1, l.h_val[o + i] });
+                } else {
+                    u[l.row_upos[ir]].val = std::max(u[l.row_upos[ir]].val, l.h_val[o + i]);
+                }
+            }
+        }
+        if ((int64_t) u.size() > n_u) {
+            std::nth_element(u.begin(), u.begin() + n_u, u.end(), [](const kvq_cand & a, const kvq_cand & b) { return a.val > b.val; });
+            u.resize(n_u);
+        }
+        cnt.pf_req += u.size();
+
+        // the resident rows first, so that the victims of the missing ones are older than this request
+        for (auto & c : u) {
+            c.slot = l.row_slot[(size_t) g*n_coarse_ + c.row];
+            if (c.slot >= 0) {
+                l.touch(g, c.slot, c.val, cap_tot, n_sink);
+            }
+        }
+        for (const auto & c : u) {
+            if (c.slot < 0) {
+                const int32_t s = l.head[g];
+                GGML_ASSERT(s >= 0 && l.slot_stamp[(size_t) g*cap_tot + s] != now);
+                l.assign(g, s, c.row, c.val, cap_tot, n_sink, n_coarse_);
+            }
+        }
+    }
+    cnt.pf_fetch += l.fetch.size();
+}
+
+void llama_kvq_store::plan_topup(layer & l) {
+    llama_kvq_counters & cnt = l.cnt;
+
+    const int64_t n_top = l.n_top;
+    const int64_t L     = l.n_pos;
+    const int32_t * sel = l.h_sel;
+
+    const uint32_t now = ++l.stamp;
+    l.fetch.clear();
+
+    cnt.n_tu++;
+    cnt.n_pos += L;
+
+    const bool    do_fetch = params.sync_mode != LLAMA_KVQ_SYNC_OFF;
+    const int64_t thr      = params.sync_mode == LLAMA_KVQ_SYNC_ALWAYS ? n_top : params.sync_min_hits;
+
+    std::vector<int32_t> hits(G*L, 0);
+    for (int64_t r = 0; r < G*L; ++r) {
+        const int32_t g = (int32_t) (r % G);
+        for (int64_t i = 0; i < n_top; ++i) {
+            hits[r] += l.row_slot[(size_t) g*n_coarse_ + sel[r*n_top + i]] >= 0;
+        }
+        cnt.top_hit += hits[r];
+    }
+    cnt.top_n    += n_top*G*L;
+    cnt.tu_check += G*L;
+
+    // slots of this step's prefetch by ascending score, the victims once the older slots are used up
+    std::vector<std::vector<int32_t>> cand(G);
+    std::vector<size_t> cand_pos(G, 0);
+    std::vector<bool>   cand_init(G, false);
+    auto victim = [&](int32_t g) {
+        const size_t o = (size_t) g*cap_tot;
+        const int32_t s = l.head[g];
+        if (l.slot_stamp[o + s] < l.pf_stamp || l.pf_stamp == 0) {
+            return s;
+        }
+        if (!cand_init[g]) {
+            cand_init[g] = true;
+            for (int32_t t = n_sink; t < n_sink + cap; ++t) {
+                if (l.slot_stamp[o + t] != now) {
+                    cand[g].push_back(t);
+                }
+            }
+            std::sort(cand[g].begin(), cand[g].end(), [&](int32_t a, int32_t b) { return l.slot_val[o + a] < l.slot_val[o + b]; });
+        }
+        while (cand_pos[g] < cand[g].size() && l.slot_stamp[o + cand[g][cand_pos[g]]] == now) {
+            cand_pos[g]++;
+        }
+        GGML_ASSERT(cand_pos[g] < cand[g].size());
+        return cand[g][cand_pos[g]++];
+    };
+
+    uint64_t stall = 0;
+    for (int64_t r = 0; r < G*L && do_fetch; ++r) {
+        const int32_t g = (int32_t) (r % G);
+        const int64_t p = r / G;
+        const int32_t * rows = sel + r*n_top;
+        for (int64_t i = 0; i < n_top; ++i) {
+            const int32_t s = l.row_slot[(size_t) g*n_coarse_ + rows[i]];
+            if (s >= 0) {
+                l.touch(g, s, INFINITY, cap_tot, n_sink);
+            }
+        }
+        if (hits[r] >= thr) {
+            continue;
+        }
+        cnt.tu_fire++;
+        stall |= 1ull << p;
+        for (int64_t i = 0; i < n_top; ++i) {
+            if (l.row_slot[(size_t) g*n_coarse_ + rows[i]] < 0) {
+                l.assign(g, victim(g), rows[i], INFINITY, cap_tot, n_sink, n_coarse_);
+            }
+        }
+    }
+    cnt.tu_stall += kvq_popcount(stall);
+    ub_fired |= stall;
+    cnt.tu_fetch += l.fetch.size();
+
+    // the flag of ggml_kvq_attn_cond
+    l.ridx[(size_t) G*cap_tot] = l.fetch.empty() ? 0 : 1;
+    cnt.tu_redo += !l.fetch.empty();
+}
+
+// rows, slot list and ridx of the last plan to the pinned buffers of the layer
+void llama_kvq_store::gather(layer & l, int64_t n_rows) {
+    const int64_t n = (int64_t) l.fetch.size();
+    GGML_ASSERT(2*n <= n_rows && n_rows <= n_stage);
+
+    // the previous upload from these buffers
+    if (l.up_rec) {
+        ggml_backend_event_synchronize(l.ev_up.get());
+        l.up_rec = false;
+    }
+
+    // in store order
+    std::sort(l.fetch.begin(), l.fetch.end(), [](const kvq_fetch & a, const kvq_fetch & b) { return a.g != b.g ? a.g < b.g : a.row < b.row; });
+    pool->run(l.fetch.data(), n, l.h_stage, l.store, n_coarse_);
+
+    for (int64_t i = 0; i < n; ++i) {
+        l.h_slots[2*i]     = (int32_t) ((0*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
+        l.h_slots[2*i + 1] = (int32_t) ((1*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
+    }
+    memcpy(l.h_ridx, l.ridx.data(), l.ridx.size()*sizeof(int32_t));
+}
+
+// on the stream of backend, after the previous readers of stage, slots and ridx of the layer
+void llama_kvq_store::upload(ggml_backend_t backend, layer & l) {
+    const int64_t n      = (int64_t) l.fetch.size();
+    const int64_t n_list = std::max<int64_t>(2*n, l.slots_hi);
+    std::fill(l.h_slots + 2*n, l.h_slots + n_list, cap_tot - 1);
+
+    if (n > 0) {
+        ggml_backend_tensor_set_async(backend, l.t.stage, l.h_stage, 0, 2*n*ROW);
+    }
+    if (n_list > 0) {
+        ggml_backend_tensor_set_async(backend, l.t.slots, l.h_slots, 0, n_list*sizeof(int32_t));
+    }
+    l.slots_hi = 2*n;
+    ggml_backend_tensor_set_async(backend, l.t.ridx, l.h_ridx, 0, ggml_nbytes(l.t.ridx));
+
+    ggml_backend_event_record(l.ev_up.get(), backend);
+    l.up_rec = true;
+
+    l.cnt.bytes += 2*n*ROW + n_list*sizeof(int32_t) + ggml_nbytes(l.t.ridx);
+}
+
+// worker thread
+void llama_kvq_store::run_prefetch(layer & l) {
+    ggml_backend_event_synchronize(l.ev_read.get());
+    const double t0 = kvq_now();
+    plan_prefetch(l);
+    const double t1 = kvq_now();
+    gather(l, 2*G*n_req(KIND_PREFETCH, l.n_top, l.n_pos));
+    const double t2 = kvq_now();
+    l.cnt.t_plan   += t1 - t0;
+    l.cnt.t_gather += t2 - t1;
+}
+
+void llama_kvq_store::wait(layer & l) {
+    GGML_ASSERT(l.pending);
+    work->wait(l);
+    l.pending = false;
+}
+
+// forgets the rows of a prefetch that was not joined, the device has the previous ridx
+void llama_kvq_store::drop(layer & l) {
+    wait(l);
+    for (const auto & f : l.fetch) {
+        l.ridx[(size_t) f.g*cap_tot + f.slot] = -1;
+        l.row_slot[(size_t) f.g*n_coarse_ + f.row] = -1;
+    }
+    l.fetch.clear();
+    ggml_backend_synchronize(backend_cp.get());
+    l.up_rec = false;
+    ggml_backend_tensor_set(l.t.ridx, l.ridx.data(), 0, ggml_nbytes(l.t.ridx));
 }
 
 bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -505,249 +1053,79 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
     const int kind = it->second.second;
     llama_kvq_counters & cnt = l.cnt;
 
-    const double t0 = kvq_now();
-
-    // trig = get_rows(reshape(vals), trigger), vals = get_rows(scores, ids)
-    const int n_nodes = ggml_graph_n_nodes(graph);
-    const ggml_tensor * trig = nullptr;
-    for (int i = 0; i < n_nodes && trig == nullptr; ++i) {
-        const ggml_tensor * node = ggml_graph_node(graph, i);
-        if (node->op == GGML_OP_GET_ROWS && node->src[1] == dst) {
-            trig = node;
-        }
-    }
-    GGML_ASSERT(trig != nullptr);
-    const ggml_tensor * vals = trig->src[0]->view_src;
-    GGML_ASSERT(vals != nullptr && vals->op == GGML_OP_GET_ROWS);
-    const ggml_tensor * ids = vals->src[1];
-    for (int i = 0; i < n_nodes; ++i) {
-        const ggml_tensor * node = ggml_graph_node(graph, i);
-        if (node == vals || node == ids) {
-            GGML_ABORT("the selection of layer %d is computed in the same split as its trigger", l.il);
-        }
-    }
-    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(vals) && ids->type == GGML_TYPE_I32 && vals->type == GGML_TYPE_F32);
-
-    const int64_t n_top = ids->ne[0];
-    const int64_t L     = ids->ne[1]/G;
-
-    ggml_backend_synchronize(backend);
-    const double t1 = kvq_now();
-
-    // the scheduler waits for the GPU before it calls the callback, so the wait is the gap since the previous callback of this ubatch
+    // the time since the previous callback of this ubatch: GPU work if the scheduler waits for it, else launches
+    const double t0    = kvq_now();
     const double t_gap = cb_ubatch == n_ubatch ? t0 - cb_end : 0.0;
 
-    std::vector<int32_t> sel(n_top*G*L);
-    std::vector<float>   val(n_top*G*L);
-    ggml_backend_tensor_get_async(backend, ids,  sel.data(), 0, ggml_nbytes(ids));
-    ggml_backend_tensor_get_async(backend, vals, val.data(), 0, ggml_nbytes(vals));
-    ggml_backend_synchronize(backend);
-    const double t2 = kvq_now();
-
-    const uint32_t now = ++stamp;
-    std::vector<kvq_fetch> fetch;
-
-    auto touch = [&](int32_t g, int32_t s, float v) {
-        const size_t o = (size_t) g*cap_tot;
-        l.slot_stamp[o + s] = now;
-        l.slot_val[o + s]   = v;
-        if (s < n_sink || s == l.tail[g]) {
-            return;
+    if (kind == KIND_JOIN) {
+        if (probe) {
+            cnt.t_idle += work->probe(l, backend);
         }
-        // unlink, then append at the tail
-        if (l.prev[o + s] >= 0) {
-            l.next[o + l.prev[o + s]] = l.next[o + s];
+        // no prefetch (e.g. dropped): nothing to scatter, the slot list is trash
+        if (l.pending) {
+            wait(l);
         } else {
-            l.head[g] = l.next[o + s];
+            l.fetch.clear();
+            ggml_backend_event_record(l.ev_sel.get(), backend);
+            ggml_backend_event_wait(backend_cp.get(), l.ev_sel.get());
         }
-        l.prev[o + l.next[o + s]] = l.prev[o + s];
-        l.prev[o + s] = l.tail[g];
-        l.next[o + s] = -1;
-        l.next[o + l.tail[g]] = s;
-        l.tail[g] = s;
-    };
-
-    auto assign = [&](int32_t g, int32_t s, int32_t row, float v) {
-        const size_t o = (size_t) g*cap_tot;
-        const int32_t old = l.ridx[o + s];
-        if (old >= 0) {
-            l.row_slot[(size_t) g*n_coarse_ + old] = -1;
-            cnt.evict++;
+        const double t1 = kvq_now();
+        // the copy stream is after ev_sel of this prefetch, so after the previous readers of the layer
+        upload(backend_cp.get(), l);
+        ggml_backend_event_wait(backend, l.ev_up.get());
+        const double t2 = kvq_now();
+        if (probe) {
+            std::lock_guard<std::mutex> lk(work->m_probe);
+            l.t_end = t2;
         }
-        l.ridx[o + s] = row;
-        l.row_slot[(size_t) g*n_coarse_ + row] = s;
-        touch(g, s, v);
-        fetch.push_back({ g, s, row });
-    };
-
-    if (kind == KIND_PREFETCH) {
-        cnt.n_pf++;
-        l.pf_stamp = now;
-        std::vector<kvq_cand> u;
-        for (int32_t g = 0; g < G; ++g) {
-            // union over the positions, the max score of a row
-            u.clear();
-            for (int64_t p = 0; p < L; ++p) {
-                const int64_t o = (g + G*p)*n_top;
-                for (int64_t i = 0; i < n_top; ++i) {
-                    const int32_t row = sel[o + i];
-                    GGML_ASSERT(row >= n_sink && row < n_coarse_);
-                    const size_t ir = (size_t) g*n_coarse_ + row;
-                    if (l.row_mark[ir] != now) {
-                        l.row_mark[ir] = now;
-                        l.row_upos[ir] = (int32_t) u.size();
-                        u.push_back({ row, val[o + i] });
-                    } else {
-                        u[l.row_upos[ir]].val = std::max(u[l.row_upos[ir]].val, val[o + i]);
-                    }
-                }
-            }
-            if ((int64_t) u.size() > cap) {
-                std::nth_element(u.begin(), u.begin() + cap, u.end(), [](const kvq_cand & a, const kvq_cand & b) { return a.val > b.val; });
-                u.resize(cap);
-            }
-            cnt.pf_req += u.size();
-
-            // the resident rows first, so that the victims of the missing ones are older than this request
-            for (const auto & c : u) {
-                const int32_t s = l.row_slot[(size_t) g*n_coarse_ + c.row];
-                if (s >= 0) {
-                    touch(g, s, c.val);
-                }
-            }
-            for (const auto & c : u) {
-                if (l.row_slot[(size_t) g*n_coarse_ + c.row] < 0) {
-                    const int32_t s = l.head[g];
-                    GGML_ASSERT(s >= 0 && l.slot_stamp[(size_t) g*cap_tot + s] != now);
-                    assign(g, s, c.row, c.val);
-                }
-            }
-        }
-        cnt.pf_fetch += fetch.size();
+        cnt.n_join++;
+        cnt.t_join   += t1 - t0;
+        cnt.t_upload += t2 - t1;
     } else {
-        cnt.n_tu++;
-        cnt.n_pos += L;
+        const ggml_tensor * ids  = nullptr;
+        const ggml_tensor * vals = nullptr;
+        select(l, dst, graph, &ids, &vals);
 
-        const bool    do_fetch = params.sync_mode != LLAMA_KVQ_SYNC_OFF;
-        const int64_t thr      = params.sync_mode == LLAMA_KVQ_SYNC_ALWAYS ? n_top : params.sync_min_hits;
+        const int64_t n_top = ids->ne[0];
+        const int64_t L     = ids->ne[1]/G;
+        GGML_ASSERT(n_top*G*L <= (int64_t) std::max(params.prefetch_n, params.sync_m)*G*params.max_batch);
+        GGML_ASSERT(!l.pending);
 
-        std::vector<int32_t> hits(G*L, 0);
-        for (int64_t r = 0; r < G*L; ++r) {
-            const int32_t g = (int32_t) (r % G);
-            for (int64_t i = 0; i < n_top; ++i) {
-                hits[r] += l.row_slot[(size_t) g*n_coarse_ + sel[r*n_top + i]] >= 0;
-            }
-            cnt.top_hit += hits[r];
-        }
-        cnt.top_n    += n_top*G*L;
-        cnt.tu_check += G*L;
+        l.n_top = n_top;
+        l.n_pos = L;
 
-        // slots of this step's prefetch by ascending score, the victims once the older slots are used up
-        std::vector<std::vector<int32_t>> cand(G);
-        std::vector<size_t> cand_pos(G, 0);
-        std::vector<bool>   cand_init(G, false);
-        auto victim = [&](int32_t g) {
-            const size_t o = (size_t) g*cap_tot;
-            const int32_t s = l.head[g];
-            if (l.slot_stamp[o + s] < l.pf_stamp || l.pf_stamp == 0) {
-                return s;
-            }
-            if (!cand_init[g]) {
-                cand_init[g] = true;
-                for (int32_t t = n_sink; t < n_sink + cap; ++t) {
-                    if (l.slot_stamp[o + t] != now) {
-                        cand[g].push_back(t);
-                    }
-                }
-                std::sort(cand[g].begin(), cand[g].end(), [&](int32_t a, int32_t b) { return l.slot_val[o + a] < l.slot_val[o + b]; });
-            }
-            while (cand_pos[g] < cand[g].size() && l.slot_stamp[o + cand[g][cand_pos[g]]] == now) {
-                cand_pos[g]++;
-            }
-            GGML_ASSERT(cand_pos[g] < cand[g].size());
-            return cand[g][cand_pos[g]++];
-        };
-
-        uint64_t stall = 0;
-        for (int64_t r = 0; r < G*L && do_fetch; ++r) {
-            const int32_t g = (int32_t) (r % G);
-            const int64_t p = r / G;
-            const int32_t * rows = sel.data() + r*n_top;
-            for (int64_t i = 0; i < n_top; ++i) {
-                const int32_t s = l.row_slot[(size_t) g*n_coarse_ + rows[i]];
-                if (s >= 0) {
-                    touch(g, s, INFINITY);
-                }
-            }
-            if (hits[r] >= thr) {
-                continue;
-            }
-            cnt.tu_fire++;
-            stall |= 1ull << p;
-            for (int64_t i = 0; i < n_top; ++i) {
-                if (l.row_slot[(size_t) g*n_coarse_ + rows[i]] < 0) {
-                    assign(g, victim(g), rows[i], INFINITY);
-                }
-            }
-        }
-        cnt.tu_stall += kvq_popcount(stall);
-        ub_fired |= stall;
-        cnt.tu_fetch += fetch.size();
-
-        // the flag of ggml_kvq_attn_cond
-        l.ridx[(size_t) G*cap_tot] = fetch.empty() ? 0 : 1;
-        cnt.tu_redo += !fetch.empty();
-    }
-
-    // gather the rows and their slots
-    const int64_t n = (int64_t) fetch.size();
-    GGML_ASSERT(2*n <= n_stage);
-    if (pool && n >= 64) {
-        pool->fetch    = fetch.data();
-        pool->n        = n;
-        pool->dst      = stage_host;
-        pool->store    = l.store;
-        pool->n_coarse = n_coarse_;
-        pool->run();
-    } else {
-        for (int64_t i = 0; i < n; ++i) {
-            const kvq_fetch & f = fetch[i];
-            memcpy(stage_host + 2*i*ROW, l.store + ((size_t) f.g*n_coarse_ + f.row)*2*ROW, 2*ROW);
+        if (kind == KIND_PREFETCH) {
+            // the readback on the copy stream, after the selection on the main stream
+            ggml_backend_t cp = backend_cp.get();
+            ggml_backend_event_record(l.ev_sel.get(), backend);
+            ggml_backend_event_wait(cp, l.ev_sel.get());
+            ggml_backend_tensor_get_async(cp, ids,  l.h_sel, 0, ggml_nbytes(ids));
+            ggml_backend_tensor_get_async(cp, vals, l.h_val, 0, ggml_nbytes(vals));
+            ggml_backend_event_record(l.ev_read.get(), cp);
+            l.pending = true;
+            work->submit(l);
+            cnt.t_read += kvq_now() - t0;
+        } else {
+            ggml_backend_tensor_get_async(backend, ids,  l.h_sel, 0, ggml_nbytes(ids));
+            ggml_backend_tensor_get_async(backend, vals, l.h_val, 0, ggml_nbytes(vals));
+            ggml_backend_synchronize(backend);
+            const double t1 = kvq_now();
+            plan_topup(l);
+            const double t2 = kvq_now();
+            gather(l, 2*G*n_req(KIND_TOPUP, n_top, L));
+            const double t3 = kvq_now();
+            upload(backend, l);
+            const double t4 = kvq_now();
+            cnt.t_read   += t1 - t0;
+            cnt.t_plan   += t2 - t1;
+            cnt.t_gather += t3 - t2;
+            cnt.t_upload += t4 - t3;
         }
     }
-    for (int64_t i = 0; i < n; ++i) {
-        slots_host[2*i]     = (int32_t) ((0*G + fetch[i].g)*cap_tot + fetch[i].slot);
-        slots_host[2*i + 1] = (int32_t) ((1*G + fetch[i].g)*cap_tot + fetch[i].slot);
-    }
-    const int64_t n_list = std::max<int64_t>(2*n, slots_hi);
-    std::fill(slots_host.begin() + 2*n, slots_host.begin() + n_list, cap_tot - 1);
-    const double t3 = kvq_now();
 
-    if (n > 0) {
-        ggml_backend_tensor_set_async(backend, staging, stage_host, 0, 2*n*ROW);
-    }
-    if (n_list > 0) {
-        ggml_backend_tensor_set_async(backend, slots, slots_host.data(), 0, n_list*sizeof(int32_t));
-    }
-    slots_hi = 2*n;
-    ggml_backend_tensor_set_async(backend, l.t.ridx, l.ridx.data(), 0, ggml_nbytes(l.t.ridx));
-    // the index read by the trigger
-    ggml_backend_tensor_set_async(backend, dst, &zero, 0, sizeof(int32_t));
-
-    static const bool sync_upload = getenv("LLAMA_KVQ_SYNC_UPLOAD") != nullptr;
-    if (sync_upload) {
-        ggml_backend_synchronize(backend);
-    }
-    const double t4 = kvq_now();
-
-    cb_end    = t4;
+    cb_end    = kvq_now();
     cb_ubatch = n_ubatch;
-
-    cnt.bytes    += 2*n*ROW + n_list*sizeof(int32_t) + ggml_nbytes(l.t.ridx);
-    cnt.t_wait   += t_gap + (t1 - t0);
-    cnt.t_read   += t2 - t1;
-    cnt.t_gather += t3 - t2;
-    cnt.t_upload += t4 - t3;
+    cnt.t_wait += t_gap;
 
     return true;
 }
@@ -785,8 +1163,8 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
         mi.host_other += l.ridx.size()*sizeof(int32_t) + (l.row_slot.size() + l.row_mark.size() + l.row_upos.size())*sizeof(int32_t) +
                          (l.slot_stamp.size() + l.slot_val.size() + l.prev.size() + l.next.size())*sizeof(int32_t);
     }
-    mi.other_dev  = ggml_nbytes(bias) + ggml_nbytes(staging) + ggml_nbytes(slots);
-    mi.host_other += (size_t) n_stage*ROW + slots_host.size()*sizeof(int32_t);
+    mi.other_dev  = ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
+    mi.host_other += buf_pin ? ggml_backend_buffer_get_size(buf_pin.get()) : 0;
     mi.pinned = !buf_store.empty() && ggml_backend_buffer_get_type(buf_store[0].get()) != ggml_backend_cpu_buffer_type();
     return mi;
 }

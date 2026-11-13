@@ -781,6 +781,10 @@ void llama_context::sched_new(const sched_params & params) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+
+    // the triggers of the packed two-tier attention do not wait for the GPU (LLAMA_KVQ_SCHED_SYNC: debug, they do)
+    sched_copy_early = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()) != nullptr && getenv("LLAMA_KVQ_SCHED_SYNC") == nullptr;
+    ggml_backend_sched_set_copy_callback_early(sched.get(), sched_copy_early);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     sched_params_cur = params;
@@ -3163,6 +3167,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // the triggers of the packed two-tier attention
     if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(lctx->memory.get()); kvq && kvq->sched_copy(backend, src, dst, graph)) {
         return true;
+    }
+
+    // the wait that the scheduler skips for an early callback
+    if (lctx->sched_copy_early) {
+        ggml_backend_synchronize(backend);
     }
 
     auto & st = lctx->copy_experts;

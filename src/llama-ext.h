@@ -164,9 +164,9 @@ struct llama_kvq_params {
     bool    packed        = false;
     int32_t max_batch     = 8;
     int32_t prefetch_n    = 1024; // rows per (kv head, position) requested by the early query
-    int32_t resident_cap  = 1024; // evictable resident slots per (layer, kv head), the sinks have their own
+    int32_t resident_cap  = 4096; // evictable resident slots per (layer, kv head), the sinks have their own, least recently selected eviction
     int32_t lead          = 2;    // the early query of layer il runs at the input of layer il - lead, 0: no prefetch
-    int32_t sync_mode     = LLAMA_KVQ_SYNC_COUNT;
+    int32_t sync_mode     = LLAMA_KVQ_SYNC_OFF;
     int32_t sync_m        = 64;
     int32_t sync_min_hits = 48;
     bool    all_resident  = false; // debug: every coarse row resident, no prefetch and no top-up
@@ -211,10 +211,14 @@ struct llama_kvq_counters {
     int64_t top_hit    = 0; // rows of the true top sync_m resident before the top-up
     int64_t top_n      = 0;
     int64_t evict      = 0;
+    int64_t n_join     = 0; // prefetch joins
     int64_t bytes      = 0; // host -> device, rows and slot lists
-    double  t_wait     = 0.0; // since the previous callback of the ubatch: GPU work and launches
-    double  t_read     = 0.0;
-    double  t_gather   = 0.0;
+    double  t_wait     = 0.0; // since the previous callback of the ubatch: launches (and GPU work with LLAMA_KVQ_SCHED_SYNC)
+    double  t_read     = 0.0; // readback of the selection, top-up: with the wait for the GPU
+    double  t_plan     = 0.0; // slots and eviction, prefetch: worker thread
+    double  t_gather   = 0.0; // rows to the staging buffer, prefetch: worker thread
+    double  t_join     = 0.0; // decode thread blocked on the worker
+    double  t_idle     = 0.0; // LLAMA_KVQ_IDLE_PROBE: GPU at the join before the decode thread queued the upload (estimate)
     double  t_upload   = 0.0;
 };
 

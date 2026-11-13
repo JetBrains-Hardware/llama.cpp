@@ -389,6 +389,8 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+    // early: the copy callback is called before the split backend waits for its previous work, the callback must synchronize if it needs to
+    GGML_API void                 ggml_backend_sched_set_copy_callback_early(ggml_backend_sched_t sched, bool early);
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);

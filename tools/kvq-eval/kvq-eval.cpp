@@ -31,7 +31,7 @@
 //   coarse region = the full chunks of C rows that end at or before s - --kvq-protect, coded from the q8_0 rows (sinks included)
 //   the q8_0 cache is not changed, its rows of the coarse region are copied to the host store
 //   ubatches of up to 8 tokens attend through the packed path, larger ones through flash attention over the q8_0 cache
-//   --kvq-pf-n 1024, --kvq-cap 1024, --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
+//   --kvq-pf-n 1024, --kvq-cap 4096, --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
 //   --kvq-all-resident (debug: every coarse row resident), --kvq-pk-stats (top-m counters with sync off)
 // --kvq-no-rot: attention rotation off (for references of the packed mode)
 // --kvq-perf: no logits processing, decode times per chunk only
@@ -108,9 +108,9 @@ struct kvq_args {
 
     bool    packed          = false;
     int32_t pk_pf_n         = 1024;
-    int32_t pk_cap          = 1024;
+    int32_t pk_cap          = 4096;
     int32_t pk_lead         = 2;
-    int32_t pk_sync         = LLAMA_KVQ_SYNC_COUNT;
+    int32_t pk_sync         = LLAMA_KVQ_SYNC_OFF;
     int32_t pk_sync_m       = 64;
     int32_t pk_sync_hits    = 48;
     bool    pk_all_res      = false;
@@ -304,7 +304,7 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
                 "       [--kvq-variant exact|q8_0|aff8|K<b>V<b>|K<b>|V<b>] [--kvq-sinks 4] [--kvq-recent 0] [--kvq-qwin 2048] [--kvq-fit-chunk 0 [--kvq-kmetric own|last]]\n"
                 "       [--kvq-save-tables tables.bin] [--kvq-load-tables tables.bin [--kvq-load-only k|v] [--kvq-own-mean-k]] [--kvq-stats]\n"
                 "       [--kvq-two-tier all-precise|all-coarse|none|<N> [--kvq-protect 512] [--kvq-precise aff8|exact] [--kvq-tt-stats]]\n"
-                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 1024] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
+                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 4096] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
                 "                     [--kvq-all-resident] [--kvq-pk-stats]] [--kvq-no-rot] [--kvq-perf] [common args]\n", argv[0]);
         return false;
     }
@@ -1235,22 +1235,24 @@ static void kvq_print_counters(const llama_kvq_counters_all & c, int64_t n_decod
             (long long) c.n_ubatch, (long long) c.n_tokens, c.n_tokens ? 100.0*c.n_clean/c.n_tokens : NAN);
     LOG("kvq:   per layer: pf = rows requested / fetched per prefetch call; fire = firing share of (kv head, position) checks;\n");
     LOG("kvq:   stall = share of (layer, position) with a firing; per fire = rows per firing (kv head, position); top = share of the true top-m resident before the top-up\n");
-    LOG("kvq:   times in ms per call: wait for the GPU, readback, gather, upload\n");
+    LOG("kvq:   times in ms per call: since the previous callback, readback, plan, gather (prefetch: worker), join (blocked on the worker), upload\n");
     llama_kvq_counters t;
     for (const auto & l : c.layers) {
         const double n_pf = (double) std::max<int64_t>(1, l.n_pf);
         const double n_tu = (double) std::max<int64_t>(1, l.n_tu);
-        const double n_cb = (double) std::max<int64_t>(1, l.n_pf + l.n_tu);
+        const double n_cb = (double) std::max<int64_t>(1, l.n_pf + l.n_tu + l.n_join);
         LOG("kvq: layer %2d: pf %7.1f / %7.1f  evict %9lld | fire %6.3f%%  stall %6.3f%%  redo %6.3f%%  per fire %5.1f  top %7.3f%% | "
-            "%8.2f MiB | ms/call wait %.3f read %.3f gather %.3f upload %.3f\n",
+            "%8.2f MiB | ms/call wait %.3f read %.3f plan %.3f gather %.3f join %.3f upload %.3f\n",
                 l.il, l.pf_req/n_pf, l.pf_fetch/n_pf, (long long) l.evict,
                 l.tu_check ? 100.0*l.tu_fire/l.tu_check : NAN, l.n_pos ? 100.0*l.tu_stall/l.n_pos : NAN, l.n_tu ? 100.0*l.tu_redo/n_tu : NAN,
                 l.tu_fire ? (double) l.tu_fetch/l.tu_fire : NAN, l.top_n ? 100.0*l.top_hit/l.top_n : NAN,
-                l.bytes/1048576.0, 1e3*l.t_wait/n_cb, 1e3*l.t_read/n_cb, 1e3*l.t_gather/n_cb, 1e3*l.t_upload/n_cb);
+                l.bytes/1048576.0, 1e3*l.t_wait/n_cb, 1e3*l.t_read/n_cb, 1e3*l.t_plan/n_cb, 1e3*l.t_gather/n_cb, 1e3*l.t_join/n_cb, 1e3*l.t_upload/n_cb);
         t.n_pf += l.n_pf; t.pf_req += l.pf_req; t.pf_fetch += l.pf_fetch; t.n_tu += l.n_tu; t.n_pos += l.n_pos;
         t.tu_check += l.tu_check; t.tu_fire += l.tu_fire; t.tu_stall += l.tu_stall; t.tu_redo += l.tu_redo; t.tu_fetch += l.tu_fetch;
         t.top_hit += l.top_hit; t.top_n += l.top_n; t.evict += l.evict; t.bytes += l.bytes;
-        t.t_wait += l.t_wait; t.t_read += l.t_read; t.t_gather += l.t_gather; t.t_upload += l.t_upload;
+        t.n_join += l.n_join;
+        t.t_idle += l.t_idle;
+        t.t_wait += l.t_wait; t.t_read += l.t_read; t.t_plan += l.t_plan; t.t_gather += l.t_gather; t.t_join += l.t_join; t.t_upload += l.t_upload;
     }
     const double nt = (double) std::max<int64_t>(1, n_decode_tokens);
     LOG("kvq: total   : pf calls %lld, rows requested %.1f / fetched %.1f per call; top-up checks %lld, fire %.3f%%, stall %.3f%%, redo %.3f%%, "
@@ -1260,8 +1262,12 @@ static void kvq_print_counters(const llama_kvq_counters_all & c, int64_t n_decod
             t.n_tu ? 100.0*t.tu_redo/t.n_tu : NAN, t.tu_fire ? (double) t.tu_fetch/t.tu_fire : NAN, t.top_n ? 100.0*t.top_hit/t.top_n : NAN);
     LOG("kvq: per token: rows fetched %.1f (prefetch %.1f, top-up %.1f), %.3f MiB host->device, evictions %.1f\n",
             (t.pf_fetch + t.tu_fetch)/nt, t.pf_fetch/nt, t.tu_fetch/nt, t.bytes/1048576.0/nt, t.evict/nt);
-    LOG("kvq: per token: callback ms %.3f = wait %.3f + read %.3f + gather %.3f + upload %.3f\n",
-            1e3*(t.t_wait + t.t_read + t.t_gather + t.t_upload)/nt, 1e3*t.t_wait/nt, 1e3*t.t_read/nt, 1e3*t.t_gather/nt, 1e3*t.t_upload/nt);
+    // the prefetch plan and gather run on the worker, the top-up ones in the callback
+    LOG("kvq: per token: decode thread ms: since previous callback %.3f, readback %.3f, join wait %.3f, upload %.3f; plan %.3f + gather %.3f (worker for the prefetch)\n",
+            1e3*t.t_wait/nt, 1e3*t.t_read/nt, 1e3*t.t_join/nt, 1e3*t.t_upload/nt, 1e3*t.t_plan/nt, 1e3*t.t_gather/nt);
+    if (t.t_idle > 0.0) {
+        LOG("kvq: per token: GPU idle at the joins (LLAMA_KVQ_IDLE_PROBE) %.3f ms\n", 1e3*t.t_idle/nt);
+    }
 }
 
 int main(int argc, char ** argv) {

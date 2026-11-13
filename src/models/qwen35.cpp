@@ -622,6 +622,7 @@ void llama_model_qwen35::graph::build_kvq_prefetch(
 }
 
 // packed two-tier attention: the coarse region through the packed rows, its resident slots precise, the tail precise from the cache
+// the join of the prefetch scatters its rows before the attention
 // sync off: one attention with the resident slots as they are
 // count/always: attention and true-query score in one pass, the top-up trigger, then ggml_kvq_attn_cond, which runs only if the top-up fetched rows
 ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
@@ -659,6 +660,11 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
 
     const bool sync  = params.sync_mode != LLAMA_KVQ_SYNC_OFF && !params.all_resident;
     const bool check = (sync || params.stats) && !params.all_resident;
+
+    // the rows of the prefetch of this layer, see build_kvq_prefetch
+    if (params.lead > 0 && !params.all_resident) {
+        store->build_join(ctx0, gf, sched, il, params.prefetch_n, n_tokens);
+    }
 
     ggml_tensor * out = nullptr;
     if (!check) {

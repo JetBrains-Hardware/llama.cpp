@@ -19,11 +19,17 @@ class llama_kv_cache;
 //   host:   precise store (the q8_0 K/V rows of the coarse region), LRU state of the resident slots
 //
 // resident slots of a (layer, kv head): [0, n_sink) hold the sinks, then cap evictable slots, then one trash slot
-// the host fills the slots in the scheduler copy callback of a host trigger tensor, read by a get_rows after the selection:
+// the host fills the slots in the scheduler copy callbacks of host trigger tensors, each read by a get_rows:
 //   prefetch: top prefetch_n of the early query of layer il, built at the input of layer il - lead
-//   top-up:   top sync_m of the true query of layer il, before ggml_kvq_attn_cond
-// the callback reads the selection, gathers the missing rows into a staging tensor and its slot list,
-// and a set_rows after the trigger scatters them into rkv
+//             the callback reads the selection back and returns, a worker thread plans the slots and gathers the rows
+//   join:     before the attention of layer il, waits for the worker and uploads the rows, their slot list and ridx
+//   top-up:   top sync_m of the true query of layer il, before ggml_kvq_attn_cond, plans, gathers and uploads in the callback
+// a set_rows after the join and top-up triggers scatters the staging rows into rkv
+// the callbacks run before the scheduler waits for the GPU (ggml_backend_sched_set_copy_callback_early)
+// the readback and the uploads of the prefetch run on a copy stream (a second backend of the device), ordered by events:
+//   main: ev_sel at the prefetch trigger -> copy: readback, ev_read (worker) ... join: uploads, ev_up -> main waits ev_up
+// a memcpy between two graphs on the main stream costs a GPU stall of about 50 us (measured, Windows), events do not
+// the trigger tensors are not written: the trigger node is an add whose result is not used
 class llama_kvq_store {
 public:
     static constexpr int64_t D   = 256;
@@ -32,6 +38,7 @@ public:
     enum kind {
         KIND_PREFETCH = 0,
         KIND_TOPUP    = 1,
+        KIND_JOIN     = 2,
     };
 
     struct layer_tensors {
@@ -42,7 +49,9 @@ public:
         ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2]
         ggml_tensor * rkv_h = nullptr; // f16 [ROW/2, 2*G*cap_tot], alias of rkv, row (kv*G + g)*cap_tot + slot
         ggml_tensor * ridx  = nullptr; // i32 [cap_tot, G + 1], column G holds the flag of ggml_kvq_attn_cond
-        ggml_tensor * trig[2] = {};    // host i32 [1]
+        ggml_tensor * stage = nullptr; // f16 [ROW/2, n_stage], rows to scatter (set by enable)
+        ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest is the trash slot
+        ggml_tensor * trig[3] = {};    // host f32 [1], per kind
     };
 
     llama_kvq_store(const llama_kv_cache & kv, int32_t n_coarse, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
@@ -60,8 +69,12 @@ public:
     // ggml_backend_sched copy callback, false if src is not a trigger
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
-    // the graph of the selection of one trigger: score [n_coarse, G, L] -> top n_top per (kv head, position) -> trigger -> scatter
+    // the graph of the selection of one trigger: score [n_coarse, G, L] -> top n_top per (kv head, position) -> trigger
+    // top-up: then the scatter
     void build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, kind k, ggml_tensor * score, int64_t n_top) const;
+
+    // the join of the prefetch of layer il for L positions: trigger -> scatter, before the attention
+    void build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int64_t n_top, int64_t L) const;
 
     const layer_tensors & get_layer(int32_t il) const;
 
@@ -83,6 +96,7 @@ public:
 private:
     struct layer;
     struct gather_pool;
+    struct worker;
 
     int32_t n_coarse_ = 0;
     int32_t n_crow    = 0;
@@ -110,20 +124,16 @@ private:
     ggml_context_ptr        ctx_alias;
     ggml_context_ptr        ctx_host;
     ggml_backend_buffer_ptr buf_dev;
-    ggml_backend_buffer_ptr buf_host;  // triggers
-    ggml_backend_buffer_ptr buf_stage; // pinned staging rows
+    ggml_backend_buffer_ptr buf_host; // triggers
+    ggml_backend_buffer_ptr buf_pin;  // pinned host buffers of the layers (staging rows, readback, ridx, slot list)
+    ggml_context_ptr        ctx_stage;
+    ggml_backend_buffer_ptr buf_stage; // device staging rows and slot lists of the layers
+    ggml_backend_ptr        backend_cp; // copy stream
     std::vector<ggml_backend_buffer_ptr> buf_store; // precise store, one per layer
 
     ggml_tensor * bias    = nullptr; // f32 [n_coarse], -inf for the sinks
-    ggml_tensor * staging = nullptr; // f16 [ROW/2, n_stage]
-    ggml_tensor * slots   = nullptr; // i32 [n_stage]
-    int64_t       n_stage = 0;       // rows of the staging tensor
+    int64_t       n_stage = 0;       // rows of the staging tensors
 
-    uint8_t *            stage_host = nullptr;
-    std::vector<int32_t> slots_host;
-    int64_t              slots_hi = 0; // entries of the device slot list that are not trash
-
-    uint32_t stamp = 0; // selection clock
 
     // fired positions of the current ubatch, for the clean token count
     int64_t  ub_tokens = 0;
@@ -139,6 +149,19 @@ private:
     int64_t cb_ubatch = -1;
 
     std::unique_ptr<gather_pool> pool;
+    std::unique_ptr<worker>      work;
+    bool                         probe = false;
+
+    // rows per kv head of one request
+    int64_t n_req(int k, int64_t n_top, int64_t L) const;
 
     void flush_ubatch();
+    void select(const layer & l, const ggml_tensor * dst, ggml_cgraph * graph, const ggml_tensor ** ids, const ggml_tensor ** vals) const;
+    void plan_prefetch(layer & l);
+    void plan_topup(layer & l);
+    void gather(layer & l, int64_t n_rows);
+    void upload(ggml_backend_t backend, layer & l);
+    void run_prefetch(layer & l);
+    void wait(layer & l);
+    void drop(layer & l);
 };
