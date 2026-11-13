@@ -446,6 +446,12 @@ static void test_codec() {
             CHECK(is_v || n_diff == 0, "K: re-encode changed %zu codes", n_diff);
             // the gain of a decoded V row is close to, not equal to, the original
             CHECK(!is_v || n_diff < codes.size()/10, "V: re-encode changed %zu codes", n_diff);
+
+            // fit_encode gives the same table, codes and gains as fit and encode
+            llama_kvq_table t2;
+            CHECK(llama_kvq_fit_encode(t2, x.data(), T, n, m.data(), bits, is_v, codes2.data(), gain2.data(), 4), "fit_encode");
+            CHECK(t2.fwd == t.fwd && t2.bits == t.bits && t2.step == t.step, "fit_encode: other table");
+            CHECK(codes2 == codes && (!is_v || gain2 == gain), "fit_encode: other codes");
         }
     }
 

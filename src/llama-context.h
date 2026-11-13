@@ -410,6 +410,8 @@ private:
 
     bool sched_need_reserve = true;
 
+    int32_t kvq_fit_graph = 0; // llama_memory_hybrid_kvq::fit_graph_kind of the last reserve
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;

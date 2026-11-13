@@ -2605,6 +2605,12 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * q,
                             int   il);
 
+        // fit mode with per-chunk V: adds the sum of sigmoid(gate) of the ubatch to the store
+        void build_kvq_gstat(
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * gate_sigmoid,
+                            int   il);
+
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,

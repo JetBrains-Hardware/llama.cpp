@@ -128,7 +128,7 @@ static bool server_kvq_prepare_params(common_params & params) {
         SRV_ERR("%s", "--kvq: multimodal projectors are not supported\n");
         return false;
     }
-    if (params.kvq.v_tables.empty() || !std::filesystem::exists(params.kvq.v_tables)) {
+    if (!params.kvq.v_tables.empty() && !std::filesystem::exists(params.kvq.v_tables)) {
         SRV_ERR("--kvq: the V table file '%s' does not exist (--kvq-v-tables)\n", params.kvq.v_tables.c_str());
         return false;
     }

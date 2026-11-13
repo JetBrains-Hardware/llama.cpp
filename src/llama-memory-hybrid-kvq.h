@@ -104,6 +104,9 @@ public:
     // nullptr before packed_alloc or fit_enable
     llama_kvq_store * get_store() const { return store.get(); }
 
+    // the statistics nodes that the fit mode adds to every graph: 0 none, 1 queries, 2 queries and gates (for the reserve)
+    int32_t fit_graph_kind() const;
+
     // the backends of the context
     void set_backends(const std::vector<ggml_backend_t> & backends);
 
@@ -111,6 +114,8 @@ public:
     bool sched_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
 private:
+    const llama_model & model;
+
     const bool packed;
 
     const std::unique_ptr<llama_kv_cache> mem_coarse;
@@ -129,7 +134,7 @@ public:
     // used for errors
     explicit llama_memory_hybrid_kvq_context(llama_memory_status status);
 
-    // used to create a full-cache context, two-tier mode is off
+    // used to create a full-cache context, two-tier mode is off (fit mode: the store is set, for the statistics nodes of the reserve)
     explicit llama_memory_hybrid_kvq_context(llama_memory_hybrid_kvq * mem);
 
     // used to create a batch processing context from a batch

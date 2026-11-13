@@ -54,13 +54,15 @@ public:
         ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest is the trash slot
         ggml_tensor * trig[3] = {};    // host f32 [1], per kind
         ggml_tensor * qacc  = nullptr; // f32 [D, D, G], sum of q q^T over the query heads of each kv head (fit mode)
+        ggml_tensor * gacc  = nullptr; // f32 [n_gate], sum of sigmoid(gate) over the tokens (fit mode with n_gate > 0)
     };
 
     // the tensors hold n_rows coarse rows (a multiple of n_chunk_rows)
     // fill: the coarse region is [0, n_rows), its q8_0 rows are copied from the cache now (llama_memory_kvq_packed_alloc)
     // else: fit mode, the region starts empty and grows by chunks (set_n_coarse), the query statistics tensors are allocated
+    // n_gate > 0 (fit mode): also the gate statistics tensors, n_gate = n_head*D
     llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-            int32_t resident_cap, bool all_resident, int32_t n_sink, bool fill);
+            int32_t resident_cap, bool all_resident, int32_t n_sink, bool fill, int32_t n_gate = 0);
     ~llama_kvq_store();
 
     bool set_codes(int32_t il, int32_t g, bool is_v, const std::vector<llama_kvq_table> & tabs, const int8_t * codes, const float * gain);

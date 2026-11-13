@@ -2434,7 +2434,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kvq"},
         "two-tier KV cache (qwen35 only): small batches attend through packed K/V codes and a resident set of q8_0 rows,\n"
-        "the K tables are fitted per 8k chunk in the background; needs --kvq-v-tables and forces 1 slot, q8_0 K/V,\n"
+        "the K and V tables are fitted per 8k chunk in the background; forces 1 slot, q8_0 K/V,\n"
         "flash attention, no RAM prompt cache, no slot save, no context shift, no cache reuse (default: disabled)",
         [](common_params & params) {
             params.kvq.enabled = true;
@@ -2442,7 +2442,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KVQ").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kvq-v-tables"}, "FNAME",
-        "two-tier KV cache: file with the V table of each (attention layer, kv head)",
+        "two-tier KV cache: file with the V table of each (attention layer, kv head), used for every chunk (default: V fitted per chunk)",
         [](common_params & params, const std::string & value) {
             params.kvq.v_tables = value;
         }

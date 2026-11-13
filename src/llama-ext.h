@@ -250,8 +250,9 @@ LLAMA_API bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_me
 //   the graph sums q q^T of the queries (after q_norm and RoPE) per (attention layer, kv head) on the device;
 //   a ubatch counts for the chunk of its first position
 //   when the positions [c*chunk, (c+1)*chunk) are in the cache, the decode thread reads the sums and starts a job on CPU threads:
-//   K table fitted on the chunk's rows with the metric of the chunk's queries, K and V rows coded (V: one offline table set),
-//   packed, and the q8_0 rows copied to the host store
+//   K table fitted on the chunk's rows with the metric of the chunk's queries, V table fitted on the chunk's rows with the o_proj
+//   columns scaled by the chunk's mean sigmoid(gate) (also summed on the device), or one offline V table set for every chunk;
+//   K and V rows coded, packed, and the q8_0 rows copied to the host store
 //   a finished chunk joins the coarse region on the decode thread before the next ubatch (the chunks in order)
 //   the positions after the coarse region attend precisely (the q8_0 cache)
 // memory operations: clear and seq_rm of the end of the sequence; a seq_rm into the coarse region or into a chunk that
@@ -260,7 +261,7 @@ struct llama_kvq_fit_params {
     int32_t     chunk     = 8192;
     int32_t     bits_k    = 2;
     int32_t     bits_v    = 1;
-    std::string v_tables;      // llama_kvq_save file with a V table for each (attention layer, kv head), used for every chunk
+    std::string v_tables;      // empty: V fitted per chunk; else llama_kvq_save file with a V table for each (attention layer, kv head), used for every chunk
     int32_t     n_threads = 8; // CPU threads of the jobs, the chunks are fitted in order
 };
 

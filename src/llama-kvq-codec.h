@@ -41,6 +41,10 @@ LLAMA_API std::vector<uint8_t> llama_kvq_alloc_bits(const std::vector<double> & 
 // fit a table on x[n_tok*n] with error metric[n*n]
 LLAMA_API bool llama_kvq_fit(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v, int n_threads);
 
+// llama_kvq_fit, then llama_kvq_encode of the same rows (V: the fit's transformed rows are used again)
+LLAMA_API bool llama_kvq_fit_encode(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v,
+        int8_t * codes, float * gain, int n_threads);
+
 // codes[n_tok*n] in [-2^(b-1), 2^(b-1) - 1], 0 for b == 0; gain[n_tok] is used for V only (may be null for K)
 LLAMA_API void llama_kvq_encode(const llama_kvq_table & t, const float * x, int64_t n_tok, int8_t * codes, float * gain, int n_threads);
 LLAMA_API void llama_kvq_decode(const llama_kvq_table & t, const int8_t * codes, const float * gain, int64_t n_tok, float * x, int n_threads);

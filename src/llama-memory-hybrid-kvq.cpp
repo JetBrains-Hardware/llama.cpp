@@ -43,6 +43,7 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
+    model(model),
     packed(packed),
     mem_coarse([&]() -> llama_kv_cache * {
         if (packed) {
@@ -262,9 +263,24 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         return false;
     }
 
+    // no V table file: V is fitted per chunk with the o_proj weight and the gate statistics
     std::vector<llama_kvq_table> v_tabs;
-    if (!llama_kvq_load(fp.v_tables, v_tabs)) {
-        return false;
+    std::vector<const ggml_tensor *> wo;
+    int32_t n_head = 0;
+    if (!fp.v_tables.empty()) {
+        if (!llama_kvq_load(fp.v_tables, v_tabs)) {
+            return false;
+        }
+    } else {
+        for (int32_t il : kv->get_layer_ids()) {
+            const auto & layer = model.layers[il];
+            if (layer.wo == nullptr || layer.wo_s != nullptr || model.hdmd.rot.count(layer.wo) != 0 || (n_head != 0 && n_head != (int32_t) model.hparams.n_head(il))) {
+                LLAMA_LOG_ERROR("%s: per-chunk V does not support the o_proj weight of layer %d, give a V table file\n", __func__, il);
+                return false;
+            }
+            wo.push_back(layer.wo);
+            n_head = model.hparams.n_head(il);
+        }
     }
 
     params.enabled = false;
@@ -272,9 +288,10 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
     store.reset();
     try {
         const int32_t n_rows = (int32_t) (kv->get_size()/fp.chunk)*fp.chunk;
-        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, p.resident_cap, false, p.n_sink, false);
+        const int32_t n_gate = v_tabs.empty() ? n_head*(int32_t) llama_kvq_store::D : 0;
+        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, p.resident_cap, false, p.n_sink, false, n_gate);
         store->set_backend(backends);
-        fitter = std::make_unique<llama_kvq_fitter>(*store, fp, v_tabs);
+        fitter = std::make_unique<llama_kvq_fitter>(*store, fp, v_tabs, wo, n_head);
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
         fitter.reset();
@@ -287,6 +304,13 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         return false;
     }
     return true;
+}
+
+int32_t llama_memory_hybrid_kvq::fit_graph_kind() const {
+    if (!params.enabled || !store || !store->fit_mode()) {
+        return 0;
+    }
+    return store->get_layer(store->layer_ids()[0]).gacc ? 2 : 1;
 }
 
 void llama_memory_hybrid_kvq::fit_poll() {
@@ -409,6 +433,7 @@ llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(llama_memory_hy
     kv_attn(mem->get_mem_attn()),
     ctx_coarse(mem->get_mem_coarse() ? mem->get_mem_coarse()->init_full() : nullptr),
     params(),
+    store(mem->fit_graph_kind() > 0 ? mem->get_store() : nullptr),
     status(llama_memory_status_combine(llama_memory_hybrid_context::get_status(), ctx_coarse ? ctx_coarse->get_status() : LLAMA_MEMORY_STATUS_SUCCESS)) {
 }
 

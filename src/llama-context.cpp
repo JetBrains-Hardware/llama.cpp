@@ -794,6 +794,12 @@ void llama_context::sched_new(const sched_params & params) {
 }
 
 void llama_context::sched_reserve() {
+    // the fit mode of the packed two-tier attention adds statistics nodes to every graph
+    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()); kvq && kvq->fit_graph_kind() != kvq_fit_graph) {
+        kvq_fit_graph      = kvq->fit_graph_kind();
+        sched_need_reserve = true;
+    }
+
     if (!sched_need_reserve) {
         return;
     }

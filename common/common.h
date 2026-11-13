@@ -612,7 +612,7 @@ struct common_params {
     // two-tier KV cache of the main context (qwen35): packed attention, K tables fitted in the background, see llama_kvq_fit_params
     struct {
         bool        enabled      = false;
-        std::string v_tables;            // V table file (llama_kvq_save)
+        std::string v_tables;            // V table file (llama_kvq_save), empty: V fitted per chunk
         int32_t     n_threads    = -1;   // CPU threads of the fitter, -1: the physical cores
         int32_t     prefetch_n   = 1024; // rows per (kv head, position) of the early query
         int32_t     resident_cap = 1024; // resident rows per (layer, kv head)

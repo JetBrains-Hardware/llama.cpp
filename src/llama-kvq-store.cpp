@@ -324,7 +324,7 @@ static int kvq_popcount(uint64_t x) {
 }
 
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-        int32_t resident_cap, bool all_resident, int32_t n_sink, bool fill) :
+        int32_t resident_cap, bool all_resident, int32_t n_sink, bool fill, int32_t n_gate) :
     n_coarse_(fill ? n_rows : 0), n_rows_(n_rows), filled(fill), n_crow(n_chunk_rows), all_res(all_resident) {
     if (kv.get_n_stream() != 1) {
         throw std::runtime_error("packed two-tier mode needs a single KV stream");
@@ -392,7 +392,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         }
         return res;
     };
-    ctx_dev   = init_ctx(layers.size()*7 + 3);
+    ctx_dev   = init_ctx(layers.size()*8 + 3);
     ctx_alias = init_ctx(layers.size());
     ctx_host  = init_ctx(layers.size()*3);
 
@@ -413,6 +413,10 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         if (!fill) {
             t.qacc = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, D, D, G);
             ggml_format_name(t.qacc, "kvq_qacc-%d", l.il);
+            if (n_gate > 0) {
+                t.gacc = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_gate);
+                ggml_format_name(t.gacc, "kvq_gacc-%d", l.il);
+            }
         }
         for (int k = 0; k < 3; ++k) {
             t.trig[k] = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, 1);
@@ -427,7 +431,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     if (!buf_dev) {
         throw std::runtime_error("failed to allocate the packed two-tier device buffer");
     }
-    // the query statistics start at 0, unused table slots must not hold NaN
+    // the statistics start at 0, unused table slots must not hold NaN
     ggml_backend_buffer_clear(buf_dev.get(), 0);
     // as weights: the ops that read these tensors run on their device
     ggml_backend_buffer_set_usage(buf_dev.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -1275,7 +1279,7 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
         mi.tables     += ggml_nbytes(l.t.tinv) + ggml_nbytes(l.t.taux);
         mi.resident   += ggml_nbytes(l.t.rkv) + ggml_nbytes(l.t.ridx);
         mi.host_store += (size_t) G*n_rows_*2*ROW;
-        mi.other_dev  += l.t.qacc ? ggml_nbytes(l.t.qacc) : 0;
+        mi.other_dev  += (l.t.qacc ? ggml_nbytes(l.t.qacc) : 0) + (l.t.gacc ? ggml_nbytes(l.t.gacc) : 0);
         mi.host_other += l.ridx.size()*sizeof(int32_t) + l.row_slot.size()*sizeof(int32_t) + l.row_seen.size()*sizeof(kvq_seen) +
                          (l.slot_stamp.size() + l.slot_val.size() + l.prev.size() + l.next.size())*sizeof(int32_t);
     }

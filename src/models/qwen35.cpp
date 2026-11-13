@@ -432,6 +432,10 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
         ggml_set_name(inp->pre,  "kvq_pre");
         ggml_set_name(inp->prot, "kvq_prot");
         ggml_set_name(inp->bias, "kvq_bias");
+    } else if (mctx_kvq->get_store() != nullptr) {
+        // reserve graph in fit mode: the statistics nodes of a large ubatch
+        inp->store = mctx_kvq->get_store();
+        inp->fit   = true;
     }
 
     return (llm_graph_input_kvq *) res->add_input(std::move(inp));
@@ -653,6 +657,20 @@ void llama_model_qwen35::graph::build_kvq_qstat(llm_graph_input_kvq * inp_kvq, g
     ggml_build_forward_expand(gf, ggml_add_inplace(ctx0, acc, gram));
 }
 
+// fit mode: gacc += sum of sigmoid(gate) over the tokens
+void llama_model_qwen35::graph::build_kvq_gstat(llm_graph_input_kvq * inp_kvq, ggml_tensor * gate_sigmoid, int il) {
+    ggml_tensor * acc = inp_kvq->store->get_layer(il).gacc;
+
+    // one token (decode): the add only
+    ggml_tensor * sum = gate_sigmoid;
+    if (gate_sigmoid->ne[1] > 1) {
+        sum = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, gate_sigmoid))); // [1, n_gate]
+        cb(sum, "kvq_gsum", il);
+    }
+
+    ggml_build_forward_expand(gf, ggml_add_inplace(ctx0, acc, ggml_reshape_1d(ctx0, sum, acc->ne[0])));
+}
+
 // packed two-tier attention: the coarse region through the packed rows, its resident slots precise, the tail precise from the cache
 // the join of the prefetch scatters its rows before the attention
 // sync off: one attention with the resident slots as they are
@@ -806,6 +824,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
+
+    if (inp_kvq && inp_kvq->fit && inp_kvq->store->get_layer(il).gacc) {
+        build_kvq_gstat(inp_kvq, gate_sigmoid, il);
+    }
 
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);

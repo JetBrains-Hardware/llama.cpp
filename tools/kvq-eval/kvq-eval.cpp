@@ -36,8 +36,9 @@
 // --kvq-no-rot: attention rotation off (for references of the packed mode)
 // --kvq-perf: no logits processing, decode times per chunk only
 //
-// --kvq-lib vtab.bin: packed two-tier attention with the tables fitted by the library (llama_memory_kvq_fit_enable), during the prefill
-//   chunks of --kvq-fit-chunk (default 8192), K<b>V<b> of --kvq-variant (default K2V1), V tables from vtab.bin, --kvq-fit-threads 8,
+// --kvq-lib: packed two-tier attention with the tables fitted by the library (llama_memory_kvq_fit_enable), during the prefill
+//   chunks of --kvq-fit-chunk (default 8192), K<b>V<b> of --kvq-variant (default K2V1), --kvq-fit-threads 8,
+//   K and V fitted per chunk, or with --kvq-lib-vtab vtab.bin: V tables from vtab.bin for every chunk,
 //   the packed options as for --kvq-packed; waits for the fitter after the prefill
 //   --kvq-lib-nowait: does not wait
 //   --kvq-lib-busy: the job of the last chunk of the prefix runs during the scoring, its chunk joins after it (decode times busy vs idle)
@@ -126,13 +127,14 @@ struct kvq_args {
     bool    no_rot          = false;
     bool    perf            = false;
 
+    bool        lib_on      = false;
     std::string lib_vtab;
     int32_t     lib_threads = 8;
     bool        lib_nowait  = false;
     bool        lib_busy    = false;
     bool        rm_test     = false;
 
-    bool lib() const { return !lib_vtab.empty(); }
+    bool lib() const { return lib_on; }
 };
 
 static bool kvq_parse_two_tier(const std::string & v, kvq_args & args) {
@@ -305,7 +307,9 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.no_rot = true;
         } else if (a == "--kvq-perf") {
             args.perf = true;
-        } else if (a == "--kvq-lib" && has_val) {
+        } else if (a == "--kvq-lib") {
+            args.lib_on = true;
+        } else if (a == "--kvq-lib-vtab" && has_val) {
             args.lib_vtab = argv[++i];
         } else if (a == "--kvq-fit-threads" && has_val) {
             args.lib_threads = std::stoi(argv[++i]);
@@ -331,7 +335,7 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
                 "       [--kvq-two-tier all-precise|all-coarse|none|<N> [--kvq-protect 512] [--kvq-precise aff8|exact] [--kvq-tt-stats]]\n"
                 "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 1024] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
                 "                     [--kvq-all-resident] [--kvq-pk-stats]] [--kvq-no-rot] [--kvq-perf]\n"
-                "       [--kvq-lib vtab.bin [--kvq-fit-threads 8] [--kvq-lib-nowait] [--kvq-lib-busy] [--kvq-rm-test]] [common args]\n", argv[0]);
+                "       [--kvq-lib [--kvq-lib-vtab vtab.bin] [--kvq-fit-threads 8] [--kvq-lib-nowait] [--kvq-lib-busy] [--kvq-rm-test]] [common args]\n", argv[0]);
         return false;
     }
     if (args.chunk <= 0) {
@@ -355,8 +359,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
         args.packed = true;
         return true;
     }
-    if (args.lib_nowait || args.lib_busy || args.rm_test) {
-        LOG_ERR("%s: --kvq-lib-nowait, --kvq-lib-busy and --kvq-rm-test need --kvq-lib\n", __func__);
+    if (args.lib_nowait || args.lib_busy || args.rm_test || !args.lib_vtab.empty()) {
+        LOG_ERR("%s: --kvq-lib-vtab, --kvq-lib-nowait, --kvq-lib-busy and --kvq-rm-test need --kvq-lib\n", __func__);
         return false;
     }
     if (args.sinks < 0 || args.recent < 0 || args.q_win <= 0 || args.fit_chunk < 0) {

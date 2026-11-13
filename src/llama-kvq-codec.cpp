@@ -213,6 +213,14 @@ bool llama_kvq_eigh(int32_t n, std::vector<double> & a, std::vector<double> & w)
     V(n - 1, n - 1) = 1.0;
     e[0] = 0.0;
 
+    // tql2 works on the transpose, so that the rotations read contiguous rows
+    auto T = [&](int i, int j) -> double & { return a[(size_t) j*n + i]; };
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            std::swap(a[(size_t) i*n + j], a[(size_t) j*n + i]);
+        }
+    }
+
     // tql2
     for (int i = 1; i < n; i++) {
         e[i - 1] = e[i];
@@ -268,10 +276,12 @@ bool llama_kvq_eigh(int32_t n, std::vector<double> & a, std::vector<double> & w)
                     c  = p/r;
                     p  = c*d[i] - s*g;
                     d[i + 1] = h + s*(c*g + s*d[i]);
+                    double * vi  = &T(0, i);
+                    double * vi1 = &T(0, i + 1);
                     for (int k = 0; k < n; k++) {
-                        h = V(k, i + 1);
-                        V(k, i + 1) = s*V(k, i) + c*h;
-                        V(k, i)     = c*V(k, i) - s*h;
+                        h = vi1[k];
+                        vi1[k] = s*vi[k] + c*h;
+                        vi[k]  = c*vi[k] - s*h;
                     }
                 }
                 p    = -s*s2*c3*el1*e[l]/dl1;
@@ -297,8 +307,14 @@ bool llama_kvq_eigh(int32_t n, std::vector<double> & a, std::vector<double> & w)
             d[k] = d[i];
             d[i] = p;
             for (int j = 0; j < n; j++) {
-                std::swap(V(j, i), V(j, k));
+                std::swap(T(j, i), T(j, k));
             }
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            std::swap(a[(size_t) i*n + j], a[(size_t) j*n + i]);
         }
     }
 
@@ -418,7 +434,9 @@ static std::vector<double> kvq_lower_inverse(int n, const std::vector<double> & 
     return r;
 }
 
-bool llama_kvq_fit(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v, int n_threads) {
+// y_out: V only, the transformed rows (x - mu) fwd
+static bool kvq_fit_impl(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v,
+        std::vector<float> * y_out, int n_threads) {
     if (n_tok < 1 || n < 1) {
         return false;
     }
@@ -534,7 +552,9 @@ bool llama_kvq_fit(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t 
         }
         t.gain_den = (float) den;
 
-        std::vector<float> y((size_t) n_tok*n);
+        std::vector<float> y_tmp;
+        std::vector<float> & y = y_out ? *y_out : y_tmp;
+        y.resize((size_t) n_tok*n);
         kvq_matmul(xc.data(), n_tok, n, t.fwd.data(), n, y.data(), n_threads);
 
         // scale of the shape y / g
@@ -579,6 +599,38 @@ bool llama_kvq_fit(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t 
     return true;
 }
 
+bool llama_kvq_fit(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v, int n_threads) {
+    return kvq_fit_impl(t, x, n_tok, n, metric, avg_bits, is_v, nullptr, n_threads);
+}
+
+// codes of one transformed row y (V: y is divided by the gain)
+static void kvq_code_row(const llama_kvq_table & t, float * y, int8_t * cr, float * gain) {
+    const int n = t.n;
+    if (t.is_v) {
+        double ss = 0.0;
+        for (int c = 0; c < n; c++) {
+            ss += (double) y[c]*y[c];
+        }
+        const float g = (float) std::sqrt(ss/t.gain_den) + 1e-8f;
+        for (int c = 0; c < n; c++) {
+            y[c] /= g;
+        }
+        *gain = g;
+    } else if (gain) {
+        *gain = 1.0f;
+    }
+    for (int c = 0; c < n; c++) {
+        const int b = t.bits[c];
+        if (b == 0) {
+            cr[c] = 0;
+            continue;
+        }
+        const float half = (float) (1 << (b - 1));
+        const float q    = std::floor(y[c]/t.step[c]);
+        cr[c] = (int8_t) std::clamp(q, -half, half - 1.0f);
+    }
+}
+
 void llama_kvq_encode(const llama_kvq_table & t, const float * x, int64_t n_tok, int8_t * codes, float * gain, int n_threads) {
     const int n = t.n;
     GGML_ASSERT(!t.is_v || gain != nullptr);
@@ -591,32 +643,31 @@ void llama_kvq_encode(const llama_kvq_table & t, const float * x, int64_t n_tok,
                 xc[i] = x[r*n + i] - t.mu[i];
             }
             kvq_matmul(xc.data(), 1, n, t.fwd.data(), n, y.data(), 1);
-            if (t.is_v) {
-                double ss = 0.0;
-                for (int c = 0; c < n; c++) {
-                    ss += (double) y[c]*y[c];
-                }
-                const float g = (float) std::sqrt(ss/t.gain_den) + 1e-8f;
-                for (int c = 0; c < n; c++) {
-                    y[c] /= g;
-                }
-                gain[r] = g;
-            } else if (gain) {
-                gain[r] = 1.0f;
-            }
-            int8_t * cr = codes + r*n;
-            for (int c = 0; c < n; c++) {
-                const int b = t.bits[c];
-                if (b == 0) {
-                    cr[c] = 0;
-                    continue;
-                }
-                const float half = (float) (1 << (b - 1));
-                const float q    = std::floor(y[c]/t.step[c]);
-                cr[c] = (int8_t) std::clamp(q, -half, half - 1.0f);
-            }
+            kvq_code_row(t, y.data(), codes + r*n, gain ? gain + r : nullptr);
         }
     });
+}
+
+bool llama_kvq_fit_encode(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v,
+        int8_t * codes, float * gain, int n_threads) {
+    GGML_ASSERT(!is_v || gain != nullptr);
+    if (!is_v) {
+        if (!kvq_fit_impl(t, x, n_tok, n, metric, avg_bits, false, nullptr, n_threads)) {
+            return false;
+        }
+        llama_kvq_encode(t, x, n_tok, codes, gain, n_threads);
+        return true;
+    }
+    std::vector<float> y;
+    if (!kvq_fit_impl(t, x, n_tok, n, metric, avg_bits, true, &y, n_threads)) {
+        return false;
+    }
+    kvq_parallel_for(n_tok, n_threads, [&](int, int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; r++) {
+            kvq_code_row(t, y.data() + r*n, codes + r*n, gain + r);
+        }
+    });
+    return true;
 }
 
 void llama_kvq_decode(const llama_kvq_table & t, const int8_t * codes, const float * gain, int64_t n_tok, float * x, int n_threads) {
