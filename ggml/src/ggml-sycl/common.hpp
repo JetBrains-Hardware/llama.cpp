@@ -583,6 +583,28 @@ struct ggml_backend_sycl_context {
     std::unordered_map<std::string, sdpa_partition> sdpa_partitions;
 #endif
 
+    // f16 copy of the f32 activations (src1) of the last library GEMM. Matmuls of the same graph that read the
+    // same tensor (FFN gate and up, the q/k/v projections, ...) reuse it instead of converting src1 again.
+    // node_src1 is src[1] of the MUL_MAT node being computed: only real graph tensors are cached, their data
+    // cannot change while they still have a consumer in the graph.
+    struct src1_f16_cache_t {
+        const ggml_tensor * node_src1 = nullptr;
+        const ggml_tensor * tensor    = nullptr;
+        const void *        data      = nullptr;
+        size_t              ne        = 0;
+        void *              buf       = nullptr;
+        size_t              cap       = 0; // bytes
+    } src1_f16_cache;
+
+    ~ggml_backend_sycl_context() {
+        if (src1_f16_cache.buf != nullptr) {
+            try {
+                sycl::free(src1_f16_cache.buf, *stream());
+            } catch (...) {
+            }
+        }
+    }
+
     // pool
     std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES];
 
