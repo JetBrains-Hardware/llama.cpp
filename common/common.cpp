@@ -1429,6 +1429,27 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
     }
 }
 
+// Prompt-batch warm-up: after the usual empty run, decodes of full physical batches up to 4096 tokens of context,
+// followed by batches of 1..8 tokens on top of them. GPU backends that compile kernels and size their buffers per batch shape (SYCL: a
+// kernel per small batch width and attention regime, oneDNN primitives, device pools, int8 scales) otherwise
+// pay for that inside the first long prompt - seconds when the driver has not cached the kernels on disk yet.
+//   LLAMA_WARMUP_PROMPT_BATCH=0 / 1   never / always; unset: only with layers offloaded and a SYCL device present
+static bool common_warmup_prompt_batch(const common_params & params) {
+    if (const char * e = getenv("LLAMA_WARMUP_PROMPT_BATCH")) {
+        return atoi(e) != 0;
+    }
+    if (params.n_gpu_layers == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
+        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "SYCL") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
     common_init_result_ptr res(new common_init_result(params, model_only));
 
@@ -1538,6 +1559,46 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+
+            const size_t n_wide = std::min({ (size_t) params.n_ubatch, (size_t) params.n_batch, (size_t) llama_n_ctx(lctx) });
+            if (n_wide > tmp.size() && common_warmup_prompt_batch(params)) {
+                // ordinary text rather than a run of one token: backends may take statistics of the activations
+                static const char * text =
+                    "The quick brown fox jumps over the lazy dog. A function takes its arguments, checks them and "
+                    "returns a value; when the check fails it reports an error to the caller instead.\n"
+                    "for (int i = 0; i < n; ++i) { sum += values[i] * weights[i]; }\n"
+                    "In 1969 the first two people walked on the Moon, about 384,400 km away from the Earth.\n";
+                std::vector<llama_token> piece = common_tokenize(vocab, text, false, false);
+                if (piece.empty()) {
+                    piece = tmp;
+                }
+                // then batches of 1..8 tokens on top of it: backends may have a kernel per small batch width and
+                // per attention regime (SYCL does: short batch over a long context), and both the last batch of
+                // a prompt and the first generated tokens are such batches
+                // (a short batch over 4096+ tokens of context is one such regime, hence up to 4 full batches)
+                const size_t n_ctx_warm = llama_n_ctx(lctx);
+                std::vector<size_t> sizes(std::min<size_t>(4, (4096 + n_wide - 1) / n_wide), n_wide);
+                sizes.insert(sizes.end(), { 1, 2, 3, 4, 5, 6, 7, 8 });
+                size_t n_used = 0;
+                llama_memory_clear(llama_get_memory(lctx), true);
+                for (size_t n : sizes) {
+                    if (n > n_wide || n_used + n > n_ctx_warm) {
+                        continue;
+                    }
+                    std::vector<llama_token> toks;
+                    if (n_used == 0) {
+                        toks = tmp;
+                        toks.resize(std::min(toks.size(), n));
+                    }
+                    while (toks.size() < n) {
+                        toks.push_back(piece[(n_used + toks.size()) % piece.size()]);
+                    }
+                    common_batch warm_batch = common_batch_get_one(lctx, toks);
+                    common_batch_set_zero_state(warm_batch, model, zeros);
+                    llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, warm_batch.get());
+                    n_used += n;
+                }
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
