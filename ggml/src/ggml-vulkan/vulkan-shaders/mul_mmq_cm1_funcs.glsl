@@ -353,20 +353,24 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
 
 #elif defined(DATA_A_Q6_K)
 
+// As for Q4_K, block_a_load() takes the first block of the k step plus ks: the four blocks of
+// half a 256-block share their qh bytes and blocks j and j + 2 share their ql bytes, so these
+// loads are only issued once per k step.
+#define CM1_A_LOAD_KSTEP
+
 struct block_a_prefetch {
     uint32_t qs0;
     uint32_t qs1;
-    uint ib;
+    vec2 d;  // d * scale of the two 16-blocks; only set for loadr == 0
 };
 
-block_a_prefetch block_a_load(uint ib, uint loadr) {
+block_a_prefetch block_a_load(uint ib0, uint ks, uint loadr) {
     block_a_prefetch blk;
-    const uint ib_k = ib / 8;
-    const uint sub = ib % 8;
-    const uint g = sub / 4;
-    const uint j = sub % 4;
+    const uint ib_k = ib0 / 8;
+    const uint g = (ib0 % 8) / 4;
+    const uint j = ib0 % 4 + ks;
 
-    const uint ql_u16 = g * 32 + (j & 1) * 16 + loadr * 4;
+    const uint ql_u16 = g * 32 + (ks & 1) * 16 + loadr * 4;
     const uint qh_u16 = g * 16 + loadr * 4;
     const uint qh_shift = j * 2;
 
@@ -389,7 +393,14 @@ block_a_prefetch block_a_load(uint ib, uint loadr) {
 
     blk.qs0 = ql0 | (((qh0 >> qh_shift) & 0x03030303) << 4);
     blk.qs1 = ql1 | (((qh1 >> qh_shift) & 0x03030303) << 4);
-    blk.ib = ib;
+
+    // The scales are fetched here, with the weights, instead of in the store phase.
+    blk.d = vec2(0.0f);
+    if (loadr == 0) {
+        const i8vec2 sc = unpack8(int32_t(int16_t(data_a_packed16[ib_k].scales[g * 4 + j]))).xy;
+        const float d = float(data_a_packed16[ib_k].d);
+        blk.d = vec2(d * float(sc.x), d * float(sc.y));
+    }
 
     return blk;
 }
@@ -401,11 +412,8 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = v1;
 
     if (loadr == 0) {
-        const uint ib_k = blk.ib / 8;
-        const uint sub = blk.ib % 8;
-        i8vec2 sc = unpack8(int32_t(int16_t(data_a_packed16[ib_k].scales[sub]))).xy;
-        buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = in_bounds ? float(data_a_packed16[ib_k].d) * float(sc.x) : 0.0f;
-        buf_a_d[(ks * KSCALES + 1) * BM + buf_ib] = in_bounds ? float(data_a_packed16[ib_k].d) * float(sc.y) : 0.0f;
+        buf_a_d[(ks * KSCALES    ) * BM + buf_ib] = in_bounds ? blk.d.x : 0.0f;
+        buf_a_d[(ks * KSCALES + 1) * BM + buf_ib] = in_bounds ? blk.d.y : 0.0f;
     }
 }
 
