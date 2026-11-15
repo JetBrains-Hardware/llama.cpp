@@ -6876,7 +6876,38 @@ static void ggml_sycl_prof_dump(int n_nodes) {
     ggml_sycl_prof_tab().clear();
 }
 
+// GGML_SYCL_GRAPH_WALL=1 (diagnostics): wait at the end of every graph and print its wall time and the time
+// spent outside graph computation since the previous graph
+struct ggml_sycl_graph_wall {
+    ggml_backend_sycl_context * ctx; int n_nodes; bool on;
+    std::chrono::steady_clock::time_point t0;
+    static bool enabled() { static const bool e = getenv("GGML_SYCL_GRAPH_WALL") && atoi(getenv("GGML_SYCL_GRAPH_WALL")) != 0; return e; }
+    static std::chrono::steady_clock::time_point & last_end() { static std::chrono::steady_clock::time_point t; return t; }
+    ggml_sycl_graph_wall(ggml_backend_sycl_context * c, int n) : ctx(c), n_nodes(n), on(enabled()) {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~ggml_sycl_graph_wall() {
+        if (!on) return;
+        const auto ts = std::chrono::steady_clock::now();
+        ctx->stream()->wait();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double gap = last_end().time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t0 - last_end()).count() : 0.0;
+        fprintf(stderr, "ggml-sycl graph wall: nodes %d compute %.2f ms, outside since previous graph %.2f ms", n_nodes,
+                std::chrono::duration<double, std::milli>(t1 - t0).count(), gap);
+        fprintf(stderr, " | submit %.2f ms final wait %.2f ms", std::chrono::duration<double, std::milli>(ts - t0).count(),
+                std::chrono::duration<double, std::milli>(t1 - ts).count());
+#if GGML_SYCL_DNNL
+        auto & h = ggml_sycl_int8_host();
+        fprintf(stderr, " | int8 host: drift sync %.2f alloc %.2f meminfo %.2f ms", h.drift_us / 1e3, h.alloc_us / 1e3, h.meminfo_us / 1e3);
+        h = ggml_sycl_int8_host_times();
+#endif
+        fprintf(stderr, "\n");
+        last_end() = t1;
+    }
+};
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    ggml_sycl_graph_wall graph_wall(sycl_ctx, cgraph->n_nodes);
     g_ggml_sycl_graph_epoch.fetch_add(1);
     sycl_ctx->src1_f16_cache.tensor = nullptr;
     sycl_ctx->int8_xr_cache.tensor  = nullptr;
