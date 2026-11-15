@@ -824,6 +824,12 @@ struct vk_device_struct {
     // 16-byte-store dequantizers that fill the f16 scratch of pipeline_matmul_f16_gemm
     vk_pipeline pipeline_dequant_wide[GGML_TYPE_COUNT];
     uint32_t matmul_f16_gemm_min_n;
+    // RDNA3: int8 x int8 GEMM for wide batches over an int8 copy of A (null when unsupported or disabled)
+    vk_pipeline pipeline_matmul_i8_gemm;
+    vk_pipeline pipeline_requant_i8[GGML_TYPE_COUNT];           // q4_K / q6_K -> int8 with one scale per row
+    vk_pipeline pipeline_requant_i8_rowscale[GGML_TYPE_COUNT];  // the row scales, from the block headers
+    vk_pipeline pipeline_quantize_i8_cols;                      // f32 -> int8 with one scale per (column, 256 values)
+    uint32_t matmul_i8_gemm_min_n;
     vk_pipeline pipeline_quantize_q8_1_x4;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];

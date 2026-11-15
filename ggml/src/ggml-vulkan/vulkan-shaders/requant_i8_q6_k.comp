@@ -1,0 +1,58 @@
+#version 450
+
+// q6_K -> int8 with one scale per row (requant_i8_rowscale.comp), sixteen weights (one 16-byte store) per
+// invocation, for the int8 scratch of the RDNA3 int8 GEMM path.
+// Block layout (210 bytes, only 2-byte aligned): ql[128], qh[64], scales[16] (int8), d f16.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uint16_t data_a[]; };
+layout (binding = 1) writeonly buffer D { uvec4 data_d[]; };
+layout (binding = 2) readonly buffer S { float data_s[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint nel;       // number of weights
+    uint groups_x;  // workgroups per dispatch row
+    uint K;
+} p;
+
+uint load32(uint i) {
+    return uint(data_a[i]) | (uint(data_a[i + 1u]) << 16);
+}
+
+uint requant(uint q, float ds) {
+    const ivec4 r = ivec4(round(ds * (vec4(q & 0xFFu, (q >> 8) & 0xFFu, (q >> 16) & 0xFFu, q >> 24) - 32.0)));
+    return (uint(r.x) & 0xFFu) | ((uint(r.y) & 0xFFu) << 8) | ((uint(r.z) & 0xFFu) << 16) | (uint(r.w) << 24);
+}
+
+void main() {
+    const uint gid = (gl_WorkGroupID.y * p.groups_x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    const uint ib = gid / 16u;
+    if (ib >= p.nel / 256u) {
+        return;
+    }
+    const uint t   = gid % 16u;        // weights 16t .. 16t+15 of the block
+    const uint ip  = t / 8u;           // half of the block
+    const uint qr  = (t % 8u) / 2u;    // quarter of the half: 32 weights
+    const uint il0 = (t % 2u) * 16u;   // first weight inside the quarter
+    const uint base = ib * 105u;
+
+    const float d = unpackHalf2x16(uint(data_a[base + 104u])).x;
+    const uint sidx = 8u * ip + il0 / 16u + 2u * qr;
+    const uint sw = uint(data_a[base + 96u + sidx / 2u]);
+    const int  sc = (int((sw >> (8u * (sidx & 1u))) & 0xFFu) << 24) >> 24;
+    const float s = data_s[ib / (p.K / 256u)];
+    const float ds = s > 0.0 ? d * float(sc) / s : 0.0;
+
+    const uint li = base + (64u * ip + il0 + 32u * (qr & 1u)) / 2u;
+    const uint hi = base + 64u + (32u * ip + il0) / 2u;
+    const uvec4 ql = (uvec4(load32(li), load32(li + 2u), load32(li + 4u), load32(li + 6u)) >> (4u * (qr >> 1))) & 0x0F0F0F0Fu;
+    const uvec4 qh = ((uvec4(load32(hi), load32(hi + 2u), load32(hi + 4u), load32(hi + 6u)) >> (2u * qr)) & 0x03030303u) << 4;
+    const uvec4 q = ql | qh;
+
+    data_d[gid] = uvec4(requant(q.x, ds), requant(q.y, ds), requant(q.z, ds), requant(q.w, ds));
+}

@@ -948,6 +948,12 @@ void process_shaders() {
     string_to_spv("matmul_f16_gemm", "mul_mm_f16_gemm.comp", {}, true, true, false, false);
     string_to_spv("dequant_wide_q4_k", "dequant_wide_q4_k.comp", {});
     string_to_spv("dequant_wide_q6_k", "dequant_wide_q6_k.comp", {});
+    string_to_spv("matmul_i8_gemm", "mul_mm_i8_gemm.comp", {}, true, true, false, false);
+    string_to_spv("requant_i8_q4_k", "requant_i8_q4_k.comp", {});
+    string_to_spv("requant_i8_q6_k", "requant_i8_q6_k.comp", {});
+    string_to_spv("requant_i8_rowscale_q4_k", "requant_i8_rowscale.comp", {{"DATA_A_Q4_K", "1"}});
+    string_to_spv("requant_i8_rowscale_q6_k", "requant_i8_rowscale.comp", {{"DATA_A_Q6_K", "1"}});
+    string_to_spv("quantize_i8_cols", "quantize_i8_cols.comp", {});
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
     string_to_spv("fa_prefill", "flash_attn_prefill.comp", {}, true, true, false, false);

@@ -1,0 +1,61 @@
+#version 450
+
+// Row scales for the int8 copy of a q4_K / q6_K matrix (A operand of mul_mm_i8_gemm.comp).
+// sa[m] = bound / 127, where bound is the largest magnitude any weight of the row can have according to
+// the block headers alone, so the weights themselves are not read. One invocation per row.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef DATA_A_Q6_K
+layout (binding = 0) readonly buffer A { uint16_t data_a[]; };
+#else
+layout (binding = 0) readonly buffer A { uint data_a[]; };
+#endif
+layout (binding = 1) writeonly buffer S { float data_s[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint M;
+    uint K;
+} p;
+
+void main() {
+    const uint m = gl_GlobalInvocationID.x;
+    if (m >= p.M) {
+        return;
+    }
+    const uint KB = p.K / 256u;
+    float bound = 0.0;
+    for (uint b = 0u; b < KB; b++) {
+#ifdef DATA_A_Q6_K
+        // block: ql[128], qh[64], scales[16] (int8), d f16; value = d * scale * (q - 32)
+        const uint base = (m * KB + b) * 105u;
+        int smax = 0;
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            const uint w = uint(data_a[base + 96u + i]);
+            smax = max(smax, max(abs((int(w & 0xFFu) << 24) >> 24), abs((int(w >> 8) << 24) >> 24)));
+        }
+        const float d = unpackHalf2x16(uint(data_a[base + 104u])).x;
+        bound = max(bound, 32.0 * abs(d) * float(smax));
+#else
+        // block: d f16, dmin f16, scales[12], qs[128]; value = d * sc * q - dmin * mn, q in 0..15
+        const uint base = (m * KB + b) * 36u;
+        const vec2 dm = unpackHalf2x16(data_a[base]);
+        const uvec4 sh = uvec4(0u, 8u, 16u, 24u);
+        const uvec4 y = (uvec4(data_a[base + 1u]) >> sh) & 0xFFu;
+        const uvec4 z = (uvec4(data_a[base + 2u]) >> sh) & 0xFFu;
+        const uvec4 w = (uvec4(data_a[base + 3u]) >> sh) & 0xFFu;
+        const vec4 step_lo = dm.x * vec4(y & 0x3Fu);
+        const vec4 off_lo  = dm.y * vec4(z & 0x3Fu);
+        const vec4 step_hi = dm.x * vec4((w & 0xFu) | ((y >> 6) << 4));
+        const vec4 off_hi  = dm.y * vec4((w >> 4) | ((z >> 6) << 4));
+        const vec4 b4 = max(max(abs(off_lo), abs(15.0 * step_lo - off_lo)),
+                            max(abs(off_hi), abs(15.0 * step_hi - off_hi)));
+        bound = max(bound, max(max(b4.x, b4.y), max(b4.z, b4.w)));
+#endif
+    }
+    data_s[m] = bound * (1.0 / 127.0);
+}

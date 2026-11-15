@@ -1,0 +1,61 @@
+#version 450
+
+// q4_K -> int8 with one scale per row (requant_i8_rowscale.comp), sixteen weights (one 16-byte store) per
+// invocation. Fills the int8 scratch of the RDNA3 int8 GEMM path.
+// Block layout (144 bytes): d f16, dmin f16, scales[12], qs[128].
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uint data_a[]; };
+layout (binding = 1) writeonly buffer D { uvec4 data_d[]; };
+layout (binding = 2) readonly buffer S { float data_s[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint nel;       // number of weights
+    uint groups_x;  // workgroups per dispatch row
+    uint K;
+} p;
+
+uint requant(uint q, float d, float m) {
+    const ivec4 r = ivec4(round(d * vec4(q & 0xFFu, (q >> 8) & 0xFFu, (q >> 16) & 0xFFu, q >> 24) - m));
+    return (uint(r.x) & 0xFFu) | ((uint(r.y) & 0xFFu) << 8) | ((uint(r.z) & 0xFFu) << 16) | (uint(r.w) << 24);
+}
+
+void main() {
+    const uint gid = (gl_WorkGroupID.y * p.groups_x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    const uint ib = gid / 16u;
+    if (ib >= p.nel / 256u) {
+        return;
+    }
+    const uint t  = gid % 16u;   // weights 16t .. 16t+15 of the block
+    const uint j  = t / 2u;      // sub-block of 32 weights
+    const uint il = j / 2u;
+    const uint hi = j & 1u;      // high nibbles
+    const uint base = ib * 36u;
+
+    const vec2 dm = unpackHalf2x16(data_a[base]);
+    const uint s0 = data_a[base + 1u], s1 = data_a[base + 2u], s2 = data_a[base + 3u];
+    // scales[j], scales[j + 4] for j < 4; scales[j + 4], scales[j - 4], scales[j] otherwise
+    const uint sh = 8u * (j & 3u);
+    uint sc, mn;
+    if (j < 4u) {
+        sc = (s0 >> sh) & 63u;
+        mn = (s1 >> sh) & 63u;
+    } else {
+        const uint b = (s2 >> sh) & 0xFFu;
+        sc = (b & 0xFu) | ((((s0 >> sh) & 0xFFu) >> 6) << 4);
+        mn = (b >> 4)   | ((((s1 >> sh) & 0xFFu) >> 6) << 4);
+    }
+    const float s = data_s[ib / (p.K / 256u)];
+    const float inv = s > 0.0 ? 1.0 / s : 0.0;
+    const float d = dm.x * float(sc) * inv;
+    const float m = dm.y * float(mn) * inv;
+
+    const uint qi = base + 4u + il * 8u + (t & 1u) * 4u;
+    const uvec4 q = (uvec4(data_a[qi], data_a[qi + 1u], data_a[qi + 2u], data_a[qi + 3u]) >> (4u * hi)) & 0x0F0F0F0Fu;
+
+    data_d[gid] = uvec4(requant(q.x, d, m), requant(q.y, d, m), requant(q.z, d, m), requant(q.w, d, m));
+}

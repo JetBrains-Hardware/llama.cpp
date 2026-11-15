@@ -1,0 +1,181 @@
+#version 450
+
+// Dense int8 x int8 matrix multiply for wide batches on RDNA3 (32-lane subgroups, integer WMMA through
+// VK_KHR_cooperative_matrix): D[n][m] = sa[m] * sum_k A[m][k] * B[n][k] * sb[n][k / 256].
+//
+// A is int8 with one scale per row, B is int8 with one scale per (column, 256 values of K). The feed is
+// the one of mul_mm_f16_gemm.comp (hipBLASLt shape): every lane fetches 16-byte units of A and B for the
+// next k step into registers before the multiply of the current step and writes them to the other half
+// of a ping-pong shared buffer after it.
+//
+// The int32 accumulators are never copied out during the k loop. At every 256 boundary they are rescaled
+// in place from the units of the previous block of B to the units of the next one (the ratios are
+// precomputed by quantize_i8_cols.comp, which also bounds them, see there), so the kernel needs no second
+// set of float accumulators and stays inside the register budget of a 4x4 tile subgroup.
+//
+// Relies on the RADV layout of a 16x16 accumulator in a 32-lane subgroup: lane l holds column l % 16 and
+// rows l / 16 + 2 e in its 8 elements. K must be a multiple of 256. M and N are arbitrary: loads are
+// clamped, edge workgroups store through shared memory.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+#define WG 128u
+#define NWAVES 4u
+#define BM 128u
+#define BN 128u
+#define TA 4u
+#define TB 4u
+#define UPR 2u      // 16-byte units (16 int8) per staged row: 32 k
+#define PITCH 3u    // staged row pitch in units; odd, so that rows do not collide on shared memory banks
+#define UPB 16u     // units per 256 values of K
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uvec4 data_a[]; };
+layout (binding = 1) readonly buffer B { uvec4 data_b[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+layout (binding = 3) readonly buffer SA { float data_sa[]; };  // [M] row scales of A
+layout (binding = 4) readonly buffer RB { float data_rb[]; };  // [N][K / 256 + 1]: ratios, then the last scale
+
+layout (push_constant) uniform parameter
+{
+    uint M;
+    uint N;
+    uint K;
+    uint stride_d;
+} p;
+
+shared uvec4 sh_a[2u * BM * PITCH];
+shared uvec4 sh_b[2u * BN * PITCH];
+shared float sh_d[NWAVES * 256u];
+
+#define NLA (BM * UPR / WG)
+#define NLB (BN * UPR / WG)
+
+#define CMA coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define CMB coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define CMC coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define CMF coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+void main() {
+    const uint lid  = gl_LocalInvocationID.x;
+    const uint wave = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint WPR  = BM / (16u * TA);
+    const uint r0 = (wave % WPR) * 16u * TA;
+    const uint c0 = (wave / WPR) * 16u * TB;
+    // the x axis of the dispatch walks the columns of D, see mul_mm_f16_gemm.comp
+    const uint m0 = gl_WorkGroupID.y * BM;
+    const uint n0 = gl_WorkGroupID.x * BN;
+    const uint KU = p.K / 16u;
+    const uint RS = p.K / 256u + 1u;
+
+    CMC acc[TA * TB];
+    [[unroll]] for (uint i = 0; i < TA * TB; i++) {
+        acc[i] = CMC(int32_t(0));
+    }
+
+    // rows past the end repeat the last row; their results are never stored
+    uint row_a[NLA], row_b[NLB];
+    [[unroll]] for (uint t = 0; t < NLA; t++) { row_a[t] = min(m0 + (lid + t * WG) / UPR, p.M - 1u) * KU + (lid + t * WG) % UPR; }
+    [[unroll]] for (uint t = 0; t < NLB; t++) { row_b[t] = min(n0 + (lid + t * WG) / UPR, p.N - 1u) * KU + (lid + t * WG) % UPR; }
+
+    // this lane's column of D in each of the TB tile columns
+    uint col_rb[TB];
+    [[unroll]] for (uint j = 0; j < TB; j++) { col_rb[j] = min(n0 + c0 + j * 16u + lane % 16u, p.N - 1u) * RS; }
+
+    uvec4 pa[NLA], pb[NLB];
+#define FETCH(ku_) { \
+        [[unroll]] for (uint t = 0; t < NLA; t++) { pa[t] = data_a[row_a[t] + (ku_)]; } \
+        [[unroll]] for (uint t = 0; t < NLB; t++) { pb[t] = data_b[row_b[t] + (ku_)]; } }
+#define STORE() { \
+        [[unroll]] for (uint t = 0; t < NLA; t++) { const uint i = lid + t * WG; sh_a[oa + (i / UPR) * PITCH + i % UPR] = pa[t]; } \
+        [[unroll]] for (uint t = 0; t < NLB; t++) { const uint i = lid + t * WG; sh_b[ob + (i / UPR) * PITCH + i % UPR] = pb[t]; } }
+
+    uint oa = 0u, ob = 0u;
+    FETCH(0u)
+    STORE()
+    for (uint ku = 0; ku < KU; ku += UPR) {
+        barrier();
+        FETCH(min(ku + UPR, KU - UPR))
+        if (ku != 0u && ku % UPB == 0u) {
+            // next 256-block of K: bring the running sums to the units of its B scale
+            float rb[TB];
+            [[unroll]] for (uint j = 0; j < TB; j++) { rb[j] = data_rb[col_rb[j] + ku / UPB]; }
+            [[unroll]] for (uint i = 0; i < TA; i++) {
+                [[unroll]] for (uint j = 0; j < TB; j++) {
+                    [[unroll]] for (uint e = 0; e < 8u; e++) {
+                        acc[i * TB + j][e] = int32_t(roundEven(float(acc[i * TB + j][e]) * rb[j]));
+                    }
+                }
+            }
+        }
+        [[unroll]] for (uint h = 0; h < 2u; h++) {
+            CMA ma[TA];
+            CMB mb[TB];
+            [[unroll]] for (uint i = 0; i < TA; i++) {
+                coopMatLoad(ma[i], sh_a, oa + (r0 + i * 16u) * PITCH + h, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0; j < TB; j++) {
+                coopMatLoad(mb[j], sh_b, ob + (c0 + j * 16u) * PITCH + h, PITCH, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0; i < TA; i++) {
+                [[unroll]] for (uint j = 0; j < TB; j++) {
+                    acc[i * TB + j] = coopMatMulAdd(ma[i], mb[j], acc[i * TB + j]);
+                }
+            }
+        }
+        oa = BM * PITCH - oa;
+        ob = BN * PITCH - ob;
+        STORE()
+    }
+
+    // to float: sum * sa[m] * (last scale of B)[n]
+    float sl[TB];
+    [[unroll]] for (uint j = 0; j < TB; j++) { sl[j] = data_rb[col_rb[j] + RS - 1u]; }
+    CMF res[TA * TB];
+    [[unroll]] for (uint i = 0; i < TA; i++) {
+        float sa[8];
+        [[unroll]] for (uint e = 0; e < 8u; e++) {
+            sa[e] = data_sa[min(m0 + r0 + i * 16u + lane / 16u + 2u * e, p.M - 1u)];
+        }
+        [[unroll]] for (uint j = 0; j < TB; j++) {
+            res[i * TB + j] = CMF(acc[i * TB + j]);
+            [[unroll]] for (uint e = 0; e < 8u; e++) {
+                res[i * TB + j][e] = res[i * TB + j][e] * (sa[e] * sl[j]);
+            }
+        }
+    }
+
+    if (m0 + BM <= p.M && n0 + BN <= p.N) {
+        [[unroll]] for (uint i = 0; i < TA; i++) {
+            [[unroll]] for (uint j = 0; j < TB; j++) {
+                coopMatStore(res[i * TB + j], data_d, (n0 + c0 + j * 16u) * p.stride_d + m0 + r0 + i * 16u, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+        }
+    } else {
+        // edge workgroup: pass every tile through shared memory and store only the elements inside D
+        // (unrolled: a dynamic index would keep the accumulators out of registers)
+        [[unroll]] for (uint t = 0; t < TA * TB; t++) {
+            barrier();
+            coopMatStore(res[t], sh_d, wave * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+            barrier();
+            const uint mt = m0 + r0 + (t / TB) * 16u;
+            const uint nt = n0 + c0 + (t % TB) * 16u;
+            [[unroll]] for (uint e = 0; e < 8u; e++) {
+                const uint x = lane * 8u + e;
+                const uint m = mt + x % 16u;
+                const uint n = nt + x / 16u;
+                if (m < p.M && n < p.N) {
+                    data_d[n * p.stride_d + m] = sh_d[wave * 256u + x];
+                }
+            }
+        }
+    }
+}

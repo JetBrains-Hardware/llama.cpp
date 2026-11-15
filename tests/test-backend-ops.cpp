@@ -1607,6 +1607,9 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            if (getenv("TEST_PRINT_NMSE") != nullptr) {
+                printf("[NMSE %.3e] ", err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
