@@ -444,8 +444,8 @@ struct ggml_tensor_extra_gpu {
   dpct::event_ptr events[GGML_SYCL_MAX_DEVICES]
                         [GGML_SYCL_MAX_STREAMS]; // events for synchronizing multiple GPUs
   optimize_feature optimized_feature;
-  // max over the rows of |W[:, d]| for the int8 prompt-batch GEMM (int8-gemm.hpp), filled on first use
-  std::shared_ptr<float> int8_wcolmax;
+  // state of the int8 prompt-batch GEMM for this weight (int8-gemm.hpp), created on first use
+  std::shared_ptr<struct ggml_sycl_int8_state> int8;
 };
 
 extern int g_ggml_sycl_use_level_zero_api;
@@ -596,12 +596,26 @@ struct ggml_backend_sycl_context {
         size_t              cap       = 0; // bytes
     } src1_f16_cache;
 
+    // per-dimension rms of the activations (src1) of the last int8 prompt-batch GEMM (int8-gemm.hpp), reused by
+    // the matmuls of the same graph that read the same tensor; same validity rule as src1_f16_cache
+    struct int8_xr_cache_t {
+        const ggml_tensor * tensor = nullptr;
+        const void *        data   = nullptr;
+        size_t              n      = 0;
+        size_t              k      = 0;
+        float *             buf    = nullptr;
+        size_t              cap    = 0; // floats
+    } int8_xr_cache;
+
     ~ggml_backend_sycl_context() {
-        if (src1_f16_cache.buf != nullptr) {
-            try {
+        try {
+            if (src1_f16_cache.buf != nullptr) {
                 sycl::free(src1_f16_cache.buf, *stream());
-            } catch (...) {
             }
+            if (int8_xr_cache.buf != nullptr) {
+                sycl::free(int8_xr_cache.buf, *stream());
+            }
+        } catch (...) {
         }
     }
 
