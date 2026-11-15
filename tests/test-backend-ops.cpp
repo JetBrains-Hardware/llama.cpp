@@ -12232,6 +12232,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
 
+    // batches of 512+ columns over k-quant weights (Vulkan on RDNA3: int8 GEMM), partial tiles, one and many 256-blocks of K
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128,  512, 256,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 512, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 257,  777, 512,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 130,  600, 17408, {1, 1}, {1, 1}));
+    }
+
     // wide dense batches over quantized weights (Vulkan on RDNA3: dequantize + f16 GEMM), full and partial tiles
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 384,  1024, 256, {1, 1}, {1, 1}));

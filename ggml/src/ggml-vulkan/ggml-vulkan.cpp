@@ -3560,7 +3560,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // mul_mm_i8_gemm.comp multiplies them with int32 accumulation. Not bit-identical to the other paths.
     // GGML_VK_DISABLE_I8_GEMM turns it off, GGML_VK_I8_GEMM_MIN_N moves the batch threshold,
     // GGML_VK_I8_GEMM_BLOCK=256|128|64 sets the number of values per activation scale.
-    device->matmul_i8_gemm_min_n = 1024;
+    // From 512 columns it beats the quantized kernels (n=512: q4_K 56-59 -> 59-73 TFLOPS, q6_K 43-50 -> 57-71);
+    // narrower batches were not measured and keep their kernels.
+    device->matmul_i8_gemm_min_n = 512;
     if (const char * min_n_env = getenv("GGML_VK_I8_GEMM_MIN_N")) {
         device->matmul_i8_gemm_min_n = (uint32_t)std::max(1, atoi(min_n_env));
     }
