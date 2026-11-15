@@ -1430,6 +1430,8 @@ struct vk_fa_tuning_params {
     bool q_in_regs;
     bool flip;
     bool flip_direct;
+    bool flip_pipe;
+    bool flip_vt_scratch;
     uint32_t limit_occupancy_shmem;
 
     void print() const {

@@ -34,6 +34,23 @@ void main() {
 
     const float d = float(data_a[ib].d);
 
+#ifdef DEQUANT_TRANSPOSE
+    if (p.stride_b != 0) {
+        // write tiles of TW cached tokens, d-major inside a tile: [TW, HS, KV / TW, NH, NS]
+        const uint TW = p.stride_b;
+        const uint kv = (e0 / (HS * NH)) % KVn;
+        const uint t_idx = (kv / TW) * (TW * HS) + (kv % TW)
+                         + ((e0 / HS) % NH) * (HS * KVn)
+                         + (e0 / (HS * NH * KVn)) * (HS * KVn * NH)
+                         + ((e0 % HS) + q_idx) * TW;
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            data_b[t_idx + (l +  0) * TW] = D_TYPE(d * ((data_a[ib].qs[q_idx + l] & 0xF) - 8.0f));
+            data_b[t_idx + (l + 16) * TW] = D_TYPE(d * ((data_a[ib].qs[q_idx + l] >>  4) - 8.0f));
+        }
+        return;
+    }
+#endif
+
     [[unroll]] for (uint l = 0; l < 8; ++l) {
         data_b[b_idx + l +  0] = D_TYPE(d * ((data_a[ib].qs[q_idx + l] & 0xF) - 8.0f));
         data_b[b_idx + l + 16] = D_TYPE(d * ((data_a[ib].qs[q_idx + l] >>  4) - 8.0f));

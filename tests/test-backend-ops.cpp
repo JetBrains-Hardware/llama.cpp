@@ -9157,6 +9157,26 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// prefill at depth: causal mask, the last nb KV positions are the batch itself
+struct test_flash_attn_ext_causal : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * t = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> data(ggml_nelements(t));
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        for (int64_t q = 0; q < t->ne[1]; ++q) {
+            const int64_t visible = t->ne[0] - t->ne[1] + q + 1;
+            for (int64_t k = 0; k < t->ne[0]; ++k) {
+                data[q*t->ne[0] + k] = k < visible ? zero : ninf;
+            }
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13071,6 +13091,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
+    // prefill at depth with a causal mask, dense K/V cache layout (Vulkan: dequantized scratch, flipped coopmat paths)
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, 4352, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {3, 1}, 1280,  300, true, true,  0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext_causal(192, 192, 2, {2, 1}, 1024,  130, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 2, {2, 1}, 2048, 200, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
@@ -13524,6 +13551,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
+    }
+
+    // Qwen 27B prefill attention: 24 heads over 4 K/V heads, head size 256, ubatch 2048, causal mask
+    for (ggml_type type_KV : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
+        for (int64_t kv : {20224, 60160}) {
+            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, false));
+        }
     }
 
     // LoRA at prefill: B is [rank, n_out], so K = rank

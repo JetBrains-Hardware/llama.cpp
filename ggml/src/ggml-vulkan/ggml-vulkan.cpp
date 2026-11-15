@@ -1342,6 +1342,24 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
         }
         result.block_rows = num_subgroups * coopmat_block_rows;
         result.block_cols = (device->uma && (hsk >= 256 || hsv >= 256)) ? 16 : 32;
+        // RDNA3, head size above 128: a 64-lane subgroup cannot hold Q and O (192 VGPRs of matrices) without spilling,
+        // and every matrix load from LDS is paid for 64 lanes. Split the work between pairs of 32-lane subgroups:
+        // eight pairs (128 Q rows) share one staged K/V tile of 16 cached tokens.
+        // GGML_VK_FA_FLIP_PIPE=0 disables this, =1 forces it on other AMD architectures and head sizes.
+        static const char * pipe_env = getenv("GGML_VK_FA_FLIP_PIPE");
+        const bool pipe_default = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && !device->uma &&
+                                  (hsk > 128 || hsv > 128);
+        const bool pipe_wanted = pipe_env != nullptr ? atoi(pipe_env) != 0 : pipe_default;
+        if (pipe_wanted && !result.flip_direct && k_type == GGML_TYPE_F16 &&
+            device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32) {
+            const uint32_t pairs = 8;
+            result.flip_pipe = true;
+            result.subgroup_size = 32;
+            result.row_split = 2 * pairs;
+            result.workgroup_size = 2 * pairs * 32;
+            result.block_rows = pairs * coopmat_block_rows;
+            result.block_cols = 16;
+        }
         result.q_in_regs = false;
         result.shmem_staging = 0;
     }
@@ -1443,7 +1461,9 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_sparse        ? 16 : 0) |
                      (params.q_in_regs  ? 32 : 0) |
                      (params.flip       ? 64 : 0) |
-                     (params.flip_direct ? 128 : 0);
+                     (params.flip_direct ? 128 : 0) |
+                     (params.flip_pipe   ? 256 : 0) |
+                     (params.flip_vt_scratch ? 512 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -8588,6 +8608,13 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
         const bool p_in_sshf = k_type != GGML_TYPE_BF16;
         const uint32_t pshf = p_in_sshf ? 0 : params.row_split * 16 * (Bc / 4 + 2) * f16vec4;
         total_size = kvshf + sshf + pshf;
+        if (params.flip_pipe) {
+            // K tile and V tile packed tightly (V^T rows padded by one uvec2), three S slabs per subgroup pair
+            const uint32_t karea = Bc * (d_pad / 4 + 2) * 8;
+            const uint32_t varea = hsv_pad * (Bc / 4 + 1) * 8 > karea ? hsv_pad * (Bc / 4 + 1) * 8 : karea;
+            const uint32_t apipe = params.row_split * 32 * 4;
+            total_size = karea + varea + sshf * 3 / 2 + apipe;
+        }
     }
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
@@ -8793,6 +8820,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (((HSK | HSV) % 16) != 0 && tuning_params.path == FA_COOPMAT2) {
         aligned = false;
     }
+
+    // Paired flip path: dequantize V straight into d-major tiles so that staging V^T is a plain copy.
+    static const bool disable_vt_scratch = getenv("GGML_VK_FA_DISABLE_VT_SCRATCH") != nullptr;
+    tuning_params.flip_vt_scratch = tuning_params.flip && tuning_params.flip_pipe && use_dequant_kv && !kv_raw_strided &&
+                                    !disable_vt_scratch && (KV % tuning_params.block_cols) == 0 &&
+                                    (tuning_params.block_cols % 8) == 0 && (HSV % 16) == 0;
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
@@ -9082,7 +9115,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             }
             { const std::vector<uint32_t> pc = { (uint32_t)HSK, (uint32_t)nek2, (uint32_t)KV, 0, k_nel };
               ggml_vk_dispatch_pipeline(ctx, subctx, tr_k, { k_buf, k_dst }, pc, { k_nel, 1, 1 }); }
-            { const std::vector<uint32_t> pc = { (uint32_t)HSV, (uint32_t)nev2, (uint32_t)KV, 0, v_nel };
+            { const std::vector<uint32_t> pc = { (uint32_t)HSV, (uint32_t)nev2, (uint32_t)KV, tuning_params.flip_vt_scratch ? tuning_params.block_cols : 0u, v_nel };
               ggml_vk_dispatch_pipeline(ctx, subctx, tr_v, { v_buf, v_dst }, pc, { v_nel, 1, 1 }); }
         }
         ggml_vk_sync_buffers(ctx, subctx);

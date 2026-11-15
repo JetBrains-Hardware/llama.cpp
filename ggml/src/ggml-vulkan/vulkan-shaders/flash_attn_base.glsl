@@ -30,6 +30,10 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+// coopmat1 flip with 32-lane subgroup pairs: one subgroup does QK^T and the softmax, its partner does PV one tile behind.
+const bool FLIP_PIPE       = (Flags & 256) != 0;
+// The V scratch holds tiles of Bc cached tokens stored d-major ([HSV][Bc] per tile), ready to stage as V^T.
+const bool FLIP_VT_SCRATCH = (Flags & 512) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
