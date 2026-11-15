@@ -2,6 +2,7 @@
 // Each quant type defines:
 //   struct block_a_prefetch  — register data for one A-block per thread
 //   block_a_load()           — load from global memory into a block_a_prefetch
+//                              (ib, loadr), or (ib0, ks, loadr) with CM1_A_LOAD_KSTEP
 //   block_a_to_shmem()       — unpack and write to shared memory
 
 #if defined(DATA_A_Q4_0)
@@ -245,49 +246,54 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
 
 #elif defined(DATA_A_Q4_K)
 
+// LOAD_VEC_A=16: one 16-byte load per thread fetches a pair of 32-blocks. A qs byte holds an
+// even block in its low nibble and the following odd block in its high nibble, and a k step
+// never crosses a 256-block. block_a_load() therefore takes the first block of the k step plus
+// ks, so that both blocks of a pair read the same address and the load is shared; the same
+// goes for the header (dm and scales) of the 256-block.
+#define CM1_A_LOAD_KSTEP
+
 struct block_a_prefetch {
-    uint32_t qs0;
-    uint32_t qs1;
-    uint ib;
+    uvec4 qs;  // raw bytes, both nibbles
+    vec2 dm;   // d * scale, -(dmin * min); only set for loadr == 0
 };
 
-block_a_prefetch block_a_load(uint ib, uint loadr) {
+block_a_prefetch block_a_load(uint ib0, uint ks, uint loadr) {
     block_a_prefetch blk;
-    const uint ib_k = ib / 8;
-    const uint sub = ib % 8;
-    const uint qs_base = (sub >> 1) * 8;
+    const uint ib_k = ib0 / 8;
+    const uint sub0 = ib0 % 8;
 
-    uint32_t raw0 = data_a_packed32[ib_k].qs[qs_base + loadr * 2];
-    uint32_t raw1 = data_a_packed32[ib_k].qs[qs_base + loadr * 2 + 1];
-    if ((sub & 1u) != 0u) {
-        blk.qs0 = (raw0 >> 4) & 0x0F0F0F0F;
-        blk.qs1 = (raw1 >> 4) & 0x0F0F0F0F;
-    } else {
-        blk.qs0 = raw0 & 0x0F0F0F0F;
-        blk.qs1 = raw1 & 0x0F0F0F0F;
+    blk.qs = data_a_packed128[ib_k].q4k[1 + ((sub0 >> 1) + (ks >> 1)) * 2 + loadr];
+
+    // The scales are fetched here, with the weights, instead of in the store phase.
+    blk.dm = vec2(0.0f);
+    if (loadr == 0) {
+        const uvec4 hdr = data_a_packed128[ib_k].q4k[0];  // dm, scales[12]
+        const uint sub = sub0 + ks;
+        const uint sh = 8u * (sub & 3u);
+        const uint s_j  = (hdr.y >> sh) & 0xFFu;
+        const uint s_j4 = (hdr.z >> sh) & 0xFFu;
+        const uint s_j8 = (hdr.w >> sh) & 0xFFu;
+        const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
+        const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
+        const vec2 dm = unpackHalf2x16(hdr.x);
+        blk.dm = vec2(dm.x * float(sc_val), -(dm.y * float(mn_val)));
     }
-    blk.ib = ib;
 
     return blk;
 }
 
 void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
-    // Store raw unsigned nibbles (blk.qs already masked); no -8 recentering needed.
-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = blk.qs0;
-    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = blk.qs1;
+    // Store raw unsigned nibbles; no -8 recentering needed.
+    const uvec4 q = (blk.qs >> (4u * (ks & 1u))) & uvec4(0x0F0F0F0F);
+    const uint base = buf_ib * QPITCH + ks * (BK / 4) + loadr * 4;
+    buf_a_qs[base    ] = q.x;
+    buf_a_qs[base + 1] = q.y;
+    buf_a_qs[base + 2] = q.z;
+    buf_a_qs[base + 3] = q.w;
 
     if (loadr == 0) {
-        const uint ib_k = blk.ib / 8;
-        const uint sub = blk.ib % 8;
-        const uint j = sub & 3u;
-        const uint s_j  = uint(data_a[ib_k].scales[j]);
-        const uint s_j4 = uint(data_a[ib_k].scales[j + 4]);
-        const uint s_j8 = uint(data_a[ib_k].scales[j + 8]);
-        const uint sc_val = (sub < 4) ? (s_j  & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j  >> 6) << 4));
-        const uint mn_val = (sub < 4) ? (s_j4 & 0x3Fu) : ((s_j8 >> 4)    | ((s_j4 >> 6) << 4));
-        vec2 dm = vec2(data_a_packed32[ib_k].dm);
-        float d_scaled = dm.x * float(sc_val);
-        buf_a_dm[ks * BM + buf_ib] = in_bounds ? vec2(d_scaled, -(dm.y * float(mn_val))) : vec2(0.0f);
+        buf_a_dm[ks * BM + buf_ib] = in_bounds ? blk.dm : vec2(0.0f);
     }
 }
 
@@ -553,15 +559,21 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
             const uint ib = pos_b_ib + buf_ib * p.stride_b / BK;
 #endif
 
+// A k step past end_k re-reads an in-bounds block; its scale is zeroed when it is stored.
+// This cannot happen with CM1_A_LOAD_KSTEP, where K and k_split are multiples of 256.
+#ifdef CM1_A_LOAD_KSTEP
+#define PREFETCH_A(blk, ib, ks) block_a_load(ib, ks, loadr_a)
+#else
+#define PREFETCH_A(blk, ib, ks) block_a_load(((blk) + (ks) * BK < end_k) ? ((ib) + (ks)) : (ib), loadr_a)
+#endif
+
 #define PREFETCH_BLOCK(blk)                                                                     \
     [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
             const uint ib = pos_a_ib + buf_ib * p.stride_a / BK;                                \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                /* a k step past end_k re-reads an in-bounds block; its scale is zeroed below */ \
-                const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;                   \
-                pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                         \
+                pre_a[li * BK_STEP + ks] = PREFETCH_A(blk, ib, ks);                             \
             }                                                                                   \
         }                                                                                       \
     }                                                                                           \

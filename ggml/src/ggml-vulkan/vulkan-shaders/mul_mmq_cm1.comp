@@ -34,6 +34,9 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
+#if defined(DATA_A_Q4_K)
+layout (binding = 0) readonly buffer A_PACKED128 {block_q4_K_packed128 data_a_packed128[];};
+#endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
@@ -114,7 +117,9 @@ shared float buf_b_s[BN * BK_STEP];
 shared int8_t cm1_kvalues[16];
 #endif
 
-#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4)
+#if defined(DATA_A_Q4_K)
+#define LOAD_VEC_A 16
+#elif defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4)
 #define LOAD_VEC_A 8
 #else
 #define LOAD_VEC_A (4 * QUANT_R)
@@ -446,6 +451,7 @@ void main() {
     }
 
 #undef PREFETCH_BLOCK
+#undef PREFETCH_A
 #undef STORE_BLOCK_TO_LDS
 #undef B_IB_CALC
 
