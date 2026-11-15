@@ -6879,6 +6879,7 @@ static void ggml_sycl_prof_dump(int n_nodes) {
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     g_ggml_sycl_graph_epoch.fetch_add(1);
     sycl_ctx->src1_f16_cache.tensor = nullptr;
+    sycl_ctx->int8_xr_cache.tensor  = nullptr;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         sycl_ctx->src1_f16_cache.node_src1 = node->op == GGML_OP_MUL_MAT ? node->src[1] : nullptr;
