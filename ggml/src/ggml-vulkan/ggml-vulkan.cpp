@@ -3558,10 +3558,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // int8 copy of A is half the size of an f16 one. For q4_K / q6_K weights and wide batches A is re-quantized
     // to int8 with one scale per row, the activations to int8 with one scale per (column, 256 values), and
     // mul_mm_i8_gemm.comp multiplies them with int32 accumulation. Not bit-identical to the other paths.
-    // GGML_VK_DISABLE_I8_GEMM turns it off, GGML_VK_I8_GEMM_MIN_N moves the batch threshold.
+    // GGML_VK_DISABLE_I8_GEMM turns it off, GGML_VK_I8_GEMM_MIN_N moves the batch threshold,
+    // GGML_VK_I8_GEMM_BLOCK=256|128|64 sets the number of values per activation scale.
     device->matmul_i8_gemm_min_n = 1024;
     if (const char * min_n_env = getenv("GGML_VK_I8_GEMM_MIN_N")) {
         device->matmul_i8_gemm_min_n = (uint32_t)std::max(1, atoi(min_n_env));
+    }
+    device->matmul_i8_gemm_block = 256;
+    if (const char * block_env = getenv("GGML_VK_I8_GEMM_BLOCK")) {
+        const int block = atoi(block_env);
+        if (block == 256 || block == 128 || block == 64) {
+            device->matmul_i8_gemm_block = (uint32_t)block;
+        }
     }
     if (getenv("GGML_VK_DISABLE_I8_GEMM") == nullptr &&
         device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && !device->uma &&
@@ -3570,12 +3578,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         device->subgroup_arithmetic && device->subgroup_require_full_support &&
         device->properties.limits.maxComputeSharedMemorySize >= 32768 &&
         device->properties.limits.maxComputeWorkGroupSize[0] >= 256) {
-        ggml_vk_create_pipeline(device, device->pipeline_matmul_i8_gemm, "matmul_i8_gemm", matmul_i8_gemm_cm1_len, matmul_i8_gemm_cm1_data, "main", 5, 4 * sizeof(uint32_t), {128, 128, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_i8_gemm, "matmul_i8_gemm", matmul_i8_gemm_cm1_len, matmul_i8_gemm_cm1_data, "main", 5, 4 * sizeof(uint32_t), {128, 128, 1}, { device->matmul_i8_gemm_block / 16 }, 1, true, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8[GGML_TYPE_Q4_K], "requant_i8_q4_k", requant_i8_q4_k_len, requant_i8_q4_k_data, "main", 3, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8[GGML_TYPE_Q6_K], "requant_i8_q6_k", requant_i8_q6_k_len, requant_i8_q6_k_data, "main", 3, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8_rowscale[GGML_TYPE_Q4_K], "requant_i8_rowscale_q4_k", requant_i8_rowscale_q4_k_len, requant_i8_rowscale_q4_k_data, "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8_rowscale[GGML_TYPE_Q6_K], "requant_i8_rowscale_q6_k", requant_i8_rowscale_q6_k_len, requant_i8_rowscale_q6_k_data, "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true);
-        ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_cols, "quantize_i8_cols", quantize_i8_cols_len, quantize_i8_cols_data, "main", 3, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true, true, 64);
+        if (device->matmul_i8_gemm_block == 64) {
+            ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_cols, "quantize_i8_cols_64", quantize_i8_cols_64_len, quantize_i8_cols_64_data, "main", 3, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true, true, 64);
+        } else if (device->matmul_i8_gemm_block == 128) {
+            ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_cols, "quantize_i8_cols_128", quantize_i8_cols_128_len, quantize_i8_cols_128_data, "main", 3, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true, true, 64);
+        } else {
+            ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_cols, "quantize_i8_cols", quantize_i8_cols_len, quantize_i8_cols_data, "main", 3, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true, true, 64);
+        }
     }
 
     if (device->xe_fa_support) {
@@ -6895,8 +6909,8 @@ static bool ggml_vk_use_i8_gemm(ggml_backend_vk_context * ctx, const ggml_tensor
         return false;
     }
     const uint64_t m = src0->ne[1], n = src1->ne[1], k = src0->ne[0];
-    // quantize_i8_cols.comp keeps up to 256 block maxima per column in shared memory
-    if (n < device->matmul_i8_gemm_min_n || m < 128 || k % 256 != 0 || k / 256 > 256) {
+    // quantize_i8_cols.comp keeps up to 1024 block maxima per column in shared memory
+    if (n < device->matmul_i8_gemm_min_n || m < 128 || k % 256 != 0 || k / 64 > 1024) {
         return false;
     }
     // every binding must fit one range with 32-bit indexing
@@ -6933,7 +6947,7 @@ static void ggml_vk_mul_mat_i8_gemm(ggml_backend_vk_context * ctx, vk_context& s
     const uint64_t sa_sz  = m * sizeof(float);
     const uint64_t yq_sz  = n * k;
     const uint64_t rb_off = ggml_vk_align_size(yq_sz, 256);
-    const uint64_t rb_sz  = n * (k / 256 + 1) * sizeof(float);
+    const uint64_t rb_sz  = n * (k / ctx->device->matmul_i8_gemm_block + 1) * sizeof(float);
 
     vk_pipeline& rowscale = ctx->device->pipeline_requant_i8_rowscale[src0->type];
     vk_pipeline& requant  = ctx->device->pipeline_requant_i8[src0->type];

@@ -954,6 +954,8 @@ void process_shaders() {
     string_to_spv("requant_i8_rowscale_q4_k", "requant_i8_rowscale.comp", {{"DATA_A_Q4_K", "1"}});
     string_to_spv("requant_i8_rowscale_q6_k", "requant_i8_rowscale.comp", {{"DATA_A_Q6_K", "1"}});
     string_to_spv("quantize_i8_cols", "quantize_i8_cols.comp", {});
+    string_to_spv("quantize_i8_cols_128", "quantize_i8_cols.comp", {{"SUBS", "2"}});
+    string_to_spv("quantize_i8_cols_64", "quantize_i8_cols.comp", {{"SUBS", "4"}});
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
     string_to_spv("fa_prefill", "flash_attn_prefill.comp", {}, true, true, false, false);

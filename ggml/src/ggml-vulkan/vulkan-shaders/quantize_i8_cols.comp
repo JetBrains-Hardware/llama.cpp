@@ -1,6 +1,7 @@
 #version 450
 
-// f32 -> int8 for the B operand of mul_mm_i8_gemm.comp: one workgroup per column, one scale per 256 values.
+// f32 -> int8 for the B operand of mul_mm_i8_gemm.comp: one workgroup per column, one scale per block of
+// 256 / SUBS values (SUBS = 1, 2 or 4).
 //
 // Block scale s_b = max(amax_b, amax_column / MAX_RATIO) / 127. The floor keeps the scales of one column
 // within a factor of MAX_RATIO, which bounds the in-place rescale of the integer sums in the kernel: a sum
@@ -9,16 +10,21 @@
 // than 7 bits; they are also that much less important for the product.
 //
 // Output: Q  int8 [N][K]
-//         R  float [N][K / 256 + 1]: R[b] = s_(b-1) / s_b for b >= 1, R[K / 256] = s of the last block
+//         R  float [N][NB + 1], NB = SUBS * K / 256: R[b] = s_(b-1) / s_b for b >= 1, R[NB] = s of the last block
 //
-// Each 64-lane subgroup handles one block per iteration (4 values per lane).
+// Each 64-lane subgroup handles 256 values per iteration (4 values per lane), SUBS clusters of lanes.
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 
 #define MAX_RATIO 32.0
-#define MAX_BLOCKS 256u
+#define MAX_BLOCKS 1024u
+#ifndef SUBS
+#define SUBS 1
+#endif
+#define CL (64 / SUBS)   // lanes per scale block
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -43,31 +49,37 @@ void main() {
 
     for (uint b = sg; b < KB; b += 4u) {
         const vec4 v = abs(data_a[base + b * 64u + lane]);
+#if SUBS == 1
         const float m = subgroupMax(max(max(v.x, v.y), max(v.z, v.w)));
-        if (lane == 0u) {
-            sh_max[b] = m;
+#else
+        const float m = subgroupClusteredMax(max(max(v.x, v.y), max(v.z, v.w)), CL);
+#endif
+        if (lane % CL == 0u) {
+            sh_max[b * SUBS + lane / CL] = m;
         }
     }
     barrier();
 
+    const uint NB = KB * SUBS;
     float cmax = 0.0;
-    for (uint b = 0u; b < KB; b++) {
-        cmax = max(cmax, sh_max[b]);
+    for (uint i = 0u; i < NB; i++) {
+        cmax = max(cmax, sh_max[i]);
     }
     const float lo = cmax * (1.0 / MAX_RATIO);
 
     for (uint b = sg; b < KB; b += 4u) {
-        const float am  = max(sh_max[b], lo);
+        const uint i = b * SUBS + lane / CL;
+        const float am  = max(sh_max[i], lo);
         const float inv = am > 0.0 ? 127.0 / am : 0.0;
         const ivec4 q = ivec4(round(data_a[base + b * 64u + lane] * inv));
         data_q[base + b * 64u + lane] = (uint(q.x) & 0xFFu) | ((uint(q.y) & 0xFFu) << 8) | ((uint(q.z) & 0xFFu) << 16) | (uint(q.w) << 24);
-        if (lane == 0u) {
-            const uint r = n * (KB + 1u);
-            if (b > 0u) {
-                data_r[r + b] = am > 0.0 ? max(sh_max[b - 1u], lo) / am : 1.0;
+        if (lane % CL == 0u) {
+            const uint r = n * (NB + 1u);
+            if (i > 0u) {
+                data_r[r + i] = am > 0.0 ? max(sh_max[i - 1u], lo) / am : 1.0;
             }
-            if (b == KB - 1u) {
-                data_r[r + KB] = am * (1.0 / 127.0);
+            if (i == NB - 1u) {
+                data_r[r + NB] = am * (1.0 / 127.0);
             }
         }
     }

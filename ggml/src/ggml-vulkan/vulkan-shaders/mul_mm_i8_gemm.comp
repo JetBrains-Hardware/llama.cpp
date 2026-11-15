@@ -3,12 +3,13 @@
 // Dense int8 x int8 matrix multiply for wide batches on RDNA3 (32-lane subgroups, integer WMMA through
 // VK_KHR_cooperative_matrix): D[n][m] = sa[m] * sum_k A[m][k] * B[n][k] * sb[n][k / 256].
 //
-// A is int8 with one scale per row, B is int8 with one scale per (column, 256 values of K). The feed is
+// A is int8 with one scale per row, B is int8 with one scale per (column, block of 256 / SUBS values of K).
+// The feed is
 // the one of mul_mm_f16_gemm.comp (hipBLASLt shape): every lane fetches 16-byte units of A and B for the
 // next k step into registers before the multiply of the current step and writes them to the other half
 // of a ping-pong shared buffer after it.
 //
-// The int32 accumulators are never copied out during the k loop. At every 256 boundary they are rescaled
+// The int32 accumulators are never copied out during the k loop. At every block boundary of B they are rescaled
 // in place from the units of the previous block of B to the units of the next one (the ratios are
 // precomputed by quantize_i8_cols.comp, which also bounds them, see there), so the kernel needs no second
 // set of float accumulators and stays inside the register budget of a 4x4 tile subgroup.
@@ -33,15 +34,16 @@
 #define TB 4u
 #define UPR 2u      // 16-byte units (16 int8) per staged row: 32 k
 #define PITCH 3u    // staged row pitch in units; odd, so that rows do not collide on shared memory banks
-#define UPB 16u     // units per 256 values of K
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint UPB = 16u;  // 16-byte units per scale block of B: 16 = 256 values of K
 
 layout (binding = 0) readonly buffer A { uvec4 data_a[]; };
 layout (binding = 1) readonly buffer B { uvec4 data_b[]; };
 layout (binding = 2) writeonly buffer D { float data_d[]; };
 layout (binding = 3) readonly buffer SA { float data_sa[]; };  // [M] row scales of A
-layout (binding = 4) readonly buffer RB { float data_rb[]; };  // [N][K / 256 + 1]: ratios, then the last scale
+layout (binding = 4) readonly buffer RB { float data_rb[]; };  // [N][blocks + 1]: ratios, then the last scale
 
 layout (push_constant) uniform parameter
 {
@@ -74,7 +76,7 @@ void main() {
     const uint m0 = gl_WorkGroupID.y * BM;
     const uint n0 = gl_WorkGroupID.x * BN;
     const uint KU = p.K / 16u;
-    const uint RS = p.K / 256u + 1u;
+    const uint RS = KU / UPB + 1u;
 
     CMC acc[TA * TB];
     [[unroll]] for (uint i = 0; i < TA * TB; i++) {
@@ -105,7 +107,7 @@ void main() {
         barrier();
         FETCH(min(ku + UPR, KU - UPR))
         if (ku != 0u && ku % UPB == 0u) {
-            // next 256-block of K: bring the running sums to the units of its B scale
+            // next scale block of B: bring the running sums to its units
             float rb[TB];
             [[unroll]] for (uint j = 0; j < TB; j++) { rb[j] = data_rb[col_rb[j] + ku / UPB]; }
             [[unroll]] for (uint i = 0; i < TA; i++) {
