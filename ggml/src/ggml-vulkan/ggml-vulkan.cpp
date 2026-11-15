@@ -3535,6 +3535,25 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    // RDNA3: the quantized coopmat kernels reach 48-59 TFLOPS on wide batches, an f16 GEMM fed like the
+    // hipBLASLt kernel 72-80. Dequantizing A to f16 first costs about 0.4 ms per 89M weights, which pays off
+    // from about 1024 columns (at 512 columns q4_K is still faster in the int8 kernel).
+    // GGML_VK_DISABLE_F16_GEMM restores the quantized kernels, GGML_VK_F16_GEMM_MIN_N moves the batch threshold.
+    device->matmul_f16_gemm_min_n = 1024;
+    if (const char * min_n_env = getenv("GGML_VK_F16_GEMM_MIN_N")) {
+        device->matmul_f16_gemm_min_n = (uint32_t)std::max(1, atoi(min_n_env));
+    }
+    if (getenv("GGML_VK_DISABLE_F16_GEMM") == nullptr &&
+        device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && !device->uma &&
+        device->coopmat_support && device->fp16 &&
+        device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32 &&
+        device->properties.limits.maxComputeSharedMemorySize >= 40960 &&
+        device->properties.limits.maxComputeWorkGroupSize[0] >= 256) {
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_f16_gemm, "matmul_f16_gemm", matmul_f16_gemm_cm1_len, matmul_f16_gemm_cm1_data, "main", 3, 4 * sizeof(uint32_t), {256, 128, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_wide[GGML_TYPE_Q4_K], "dequant_wide_q4_k", dequant_wide_q4_k_len, dequant_wide_q4_k_data, "main", 2, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_wide[GGML_TYPE_Q6_K], "dequant_wide_q6_k", dequant_wide_q6_k_len, dequant_wide_q6_k_data, "main", 2, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
+    }
+
     if (device->xe_fa_support) {
         uint32_t shmem_sz = (uint32_t)device->properties.limits.maxComputeSharedMemorySize;
         vk_xe_fa_tuning_params xe_fa_params {};
@@ -6807,6 +6826,37 @@ static ggml_type ggml_vk_mul_mat_b_type(
     return f16_type;
 }
 
+// Dense wide batches over quantized weights on RDNA3: dequantize A into the f16 scratch and run the f16 GEMM.
+static bool ggml_vk_use_f16_gemm(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    const vk_device& device = ctx->device;
+    if (!device->pipeline_matmul_f16_gemm || ctx->num_additional_fused_ops != 0) {
+        return false;
+    }
+    // only the types that have a 16-byte-store dequantizer and were measured (q4_K, q6_K)
+    if (!device->pipeline_dequant_wide[src0->type] || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const uint64_t m = src0->ne[1], n = src1->ne[1], k = src0->ne[0];
+    if (n < device->matmul_f16_gemm_min_n || m < 128 || k % 256 != 0) {
+        return false;
+    }
+    // the scratch copy of A and the f16 copy of B must fit one binding with 32-bit indexing
+    const uint64_t max_range = std::min<uint64_t>(device->properties.limits.maxStorageBufferRange, 1ull << 31);
+    if (m * k * sizeof(ggml_fp16_t) > max_range || ggml_nbytes(src0) > max_range ||
+        CEIL_DIV(n, 256) * 256 * k * sizeof(ggml_fp16_t) > max_range || m * n * sizeof(float) > max_range) {
+        return false;
+    }
+    if (CEIL_DIV(n, 256) > device->properties.limits.maxComputeWorkGroupCount[0] ||
+        CEIL_DIV(m, 128) > device->properties.limits.maxComputeWorkGroupCount[1]) {
+        return false;
+    }
+    return true;
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -6862,7 +6912,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
-    const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
+    const bool f16_gemm = ggml_vk_use_f16_gemm(ctx, src0, src1, dst);
+
+    const ggml_type y_kernel_type = f16_gemm ? GGML_TYPE_F16 :
+                                    ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         ggml_prec_get_acc(dst), false, can_quantize_y, prefer_f16_b);
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
@@ -6872,7 +6925,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst));
 
-    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
+    const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig || f16_gemm;
     const bool qy_needs_dequant = y_needs_reformat;
 
     if (qx_needs_dequant) {
@@ -6885,9 +6938,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    vk_pipeline pipeline = f16_gemm ? ctx->device->pipeline_matmul_f16_gemm :
+                           ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
 
-    if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+    if (!f16_gemm && ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
 
@@ -6899,7 +6953,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t d_ne = ggml_nelements(dst);
 
     const bool narrow_n = mmp_map->back().narrow_n_max != 0 && ne11 <= mmp_map->back().narrow_n_max;
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, narrow_n);
+    const uint32_t split_k = f16_gemm ? 1 : ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline, narrow_n);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -6914,7 +6968,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (x_non_contig) {
         to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
     } else {
-        to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
+        to_fp16_vk_0 = f16_gemm ? ctx->device->pipeline_dequant_wide[src0->type] : ggml_vk_get_to_fp16(ctx, src0->type);
     }
     if (y_needs_reformat) {
         to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, y_kernel_type);
@@ -7010,6 +7064,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (x_non_contig) {
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
+    } else if (f16_gemm) {
+        // eight weights per invocation; the dispatch is folded into rows so that it also fits very large matrices
+        const uint32_t groups   = (uint32_t)CEIL_DIV(x_ne / 8, 256);
+        const uint32_t groups_x = std::min<uint32_t>(groups, 32768);
+        const std::array<uint32_t, 2> pc = { (uint32_t)x_ne, groups_x };
+        ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { groups_x * 256, CEIL_DIV(groups, groups_x), 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
     } else if (qx_needs_dequant) {
         const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)(x_ne), 1, 1});
@@ -7064,6 +7125,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         : (uint64_t)src1->nb[1];
 
     // compute
+    if (f16_gemm) {
+        GGML_ASSERT(qx_needs_dequant && qy_needs_dequant && x_buf_offset == 0 && y_buf_offset == 0);
+        const std::array<uint32_t, 4> pc = { (uint32_t)ne01, (uint32_t)ne11, (uint32_t)ne10, stride_d };
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { vk_subbuffer{ d_X, 0, x_sz }, vk_subbuffer{ d_Y, 0, y_sz }, ggml_vk_subbuffer(ctx, d_D, d_buf_offset) },
+            pc, { (uint32_t)ne11, (uint32_t)ne01, 1 });
+    } else
     ggml_vk_matmul(
         ctx, subctx, pipeline,
         { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },

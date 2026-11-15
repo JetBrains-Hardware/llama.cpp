@@ -1,0 +1,52 @@
+#version 450
+
+// q6_K -> f16, eight weights (one 16-byte store) per invocation, for the f16 scratch of the RDNA3 f16 GEMM path.
+// Block layout (210 bytes, only 2-byte aligned): ql[128], qh[64], scales[16] (int8), d f16.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uint16_t data_a[]; };
+layout (binding = 1) writeonly buffer D { uvec4 data_d[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint nel;       // number of weights
+    uint groups_x;  // workgroups per dispatch row
+} p;
+
+uint load32(uint i) {
+    return uint(data_a[i]) | (uint(data_a[i + 1u]) << 16);
+}
+
+void main() {
+    const uint gid = (gl_WorkGroupID.y * p.groups_x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    const uint ib = gid / 32u;
+    if (ib >= p.nel / 256u) {
+        return;
+    }
+    const uint t   = gid % 32u;        // weights 8t .. 8t+7 of the block
+    const uint ip  = t / 16u;          // half of the block
+    const uint qr  = (t % 16u) / 4u;   // quarter of the half: 32 weights
+    const uint il0 = (t % 4u) * 8u;    // first weight inside the quarter
+    const uint base = ib * 105u;
+
+    const float d = unpackHalf2x16(uint(data_a[base + 104u])).x;
+    const uint sidx = 8u * ip + il0 / 16u + 2u * qr;
+    const uint sw = uint(data_a[base + 96u + sidx / 2u]);
+    const int  sc = (int((sw >> (8u * (sidx & 1u))) & 0xFFu) << 24) >> 24;
+    const float ds = d * float(sc);
+
+    const uint li = base + (64u * ip + il0 + 32u * (qr & 1u)) / 2u;
+    const uint hi = base + 64u + (32u * ip + il0) / 2u;
+    const uvec2 ql = (uvec2(load32(li), load32(li + 2u)) >> (4u * (qr >> 1))) & 0x0F0F0F0Fu;
+    const uvec2 qh = ((uvec2(load32(hi), load32(hi + 2u)) >> (2u * qr)) & 0x03030303u) << 4;
+    const uvec2 q = ql | qh;
+
+    const vec4 v0 = ds * (vec4(q.x & 0xFFu, (q.x >> 8) & 0xFFu, (q.x >> 16) & 0xFFu, q.x >> 24) - 32.0);
+    const vec4 v1 = ds * (vec4(q.y & 0xFFu, (q.y >> 8) & 0xFFu, (q.y >> 16) & 0xFFu, q.y >> 24) - 32.0);
+
+    data_d[gid] = uvec4(packHalf2x16(v0.xy), packHalf2x16(v0.zw), packHalf2x16(v1.xy), packHalf2x16(v1.zw));
+}

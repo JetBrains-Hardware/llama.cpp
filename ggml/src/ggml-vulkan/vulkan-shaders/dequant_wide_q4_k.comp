@@ -1,0 +1,55 @@
+#version 450
+
+// q4_K -> f16, eight weights (one 16-byte store) per invocation. Fills the f16 scratch of the
+// RDNA3 f16 GEMM path: 0.38 ms per 89M weights on an RX 7900 XTX, dequant_q4_k.comp needs 0.59 ms.
+// Block layout (144 bytes): d f16, dmin f16, scales[12], qs[128].
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uint data_a[]; };
+layout (binding = 1) writeonly buffer D { uvec4 data_d[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint nel;       // number of weights
+    uint groups_x;  // workgroups per dispatch row
+} p;
+
+void main() {
+    const uint gid = (gl_WorkGroupID.y * p.groups_x + gl_WorkGroupID.x) * 256u + gl_LocalInvocationID.x;
+    const uint ib = gid / 32u;
+    if (ib >= p.nel / 256u) {
+        return;
+    }
+    const uint t  = gid % 32u;   // weights 8t .. 8t+7 of the block
+    const uint j  = t / 4u;      // sub-block of 32 weights
+    const uint il = j / 2u;
+    const uint hi = j & 1u;      // high nibbles
+    const uint base = ib * 36u;
+
+    const vec2 dm = unpackHalf2x16(data_a[base]);
+    const uint s0 = data_a[base + 1u], s1 = data_a[base + 2u], s2 = data_a[base + 3u];
+    // scales[j], scales[j + 4] for j < 4; scales[j + 4], scales[j - 4], scales[j] otherwise
+    const uint sh = 8u * (j & 3u);
+    uint sc, mn;
+    if (j < 4u) {
+        sc = (s0 >> sh) & 63u;
+        mn = (s1 >> sh) & 63u;
+    } else {
+        const uint b = (s2 >> sh) & 0xFFu;
+        sc = (b & 0xFu) | ((((s0 >> sh) & 0xFFu) >> 6) << 4);
+        mn = (b >> 4)   | ((((s1 >> sh) & 0xFFu) >> 6) << 4);
+    }
+    const float d = dm.x * float(sc);
+    const float m = dm.y * float(mn);
+
+    const uint qi = base + 4u + il * 8u + (t & 3u) * 2u;
+    const uvec2 q = (uvec2(data_a[qi], data_a[qi + 1u]) >> (4u * hi)) & 0x0F0F0F0Fu;
+
+    const vec4 v0 = d * vec4(q.x & 0xFFu, (q.x >> 8) & 0xFFu, (q.x >> 16) & 0xFFu, q.x >> 24) - m;
+    const vec4 v1 = d * vec4(q.y & 0xFFu, (q.y >> 8) & 0xFFu, (q.y >> 16) & 0xFFu, q.y >> 24) - m;
+
+    data_d[gid] = uvec4(packHalf2x16(v0.xy), packHalf2x16(v0.zw), packHalf2x16(v1.xy), packHalf2x16(v1.zw));
+}

@@ -819,6 +819,11 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_id_tile_selector;
 
     vk_pipeline pipeline_matmul_split_k_reduce;
+    // RDNA3: f16 x f16 GEMM for wide batches over a dequantized A (null when unsupported or disabled)
+    vk_pipeline pipeline_matmul_f16_gemm;
+    // 16-byte-store dequantizers that fill the f16 scratch of pipeline_matmul_f16_gemm
+    vk_pipeline pipeline_dequant_wide[GGML_TYPE_COUNT];
+    uint32_t matmul_f16_gemm_min_n;
     vk_pipeline pipeline_quantize_q8_1_x4;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];

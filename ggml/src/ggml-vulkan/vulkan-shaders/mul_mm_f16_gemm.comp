@@ -1,0 +1,133 @@
+#version 450
+
+// Dense f16 x f16 matrix multiply for wide batches on RDNA3 (32-lane subgroups, WMMA through
+// VK_KHR_cooperative_matrix): D[n][m] = sum_k A[m][k] * B[n][k], f32 accumulation, f32 output.
+//
+// The structure follows the hipBLASLt half-precision kernel for gfx1100 (macro tile 128x256,
+// k step 32, 8 subgroups of 4x4 16x16 tiles): every lane fetches 16-byte units of A and B for
+// the next k step into registers, the units go to shared memory, and each subgroup reads its
+// operand matrices from there. The fetch of step k+1 is issued before the multiply of step k
+// and stored after it, so the fetched registers are never live across the loop back edge and
+// the global loads overlap the multiply.
+//
+// A and B are tightly packed f16 buffers bound at 16-byte aligned offsets; K must be a multiple
+// of 32. M and N are arbitrary: loads are clamped, edge workgroups store through shared memory.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+#define WG 256u
+#define NWAVES 8u
+#define BM 128u
+#define BN 256u
+#define TA 4u
+#define TB 4u
+#define UPR 4u      // 16-byte units (8 f16) per staged row: 32 k
+#define PITCH 5u    // staged row pitch in units; odd, so that rows do not collide on shared memory banks
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uvec4 data_a[]; };
+layout (binding = 1) readonly buffer B { uvec4 data_b[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint M;
+    uint N;
+    uint K;
+    uint stride_d;
+} p;
+
+shared uvec4 sh_a[BM * PITCH];
+shared uvec4 sh_b[BN * PITCH];
+shared float sh_d[NWAVES * 256u];
+
+#define NLA (BM * UPR / WG)
+#define NLB (BN * UPR / WG)
+
+void main() {
+    const uint lid  = gl_LocalInvocationID.x;
+    const uint wave = gl_SubgroupID;
+    const uint WPR  = BM / (16u * TA);
+    const uint r0 = (wave % WPR) * 16u * TA;
+    const uint c0 = (wave / WPR) * 16u * TB;
+    // The x axis of the dispatch walks the columns of D: the workgroups in flight then share their rows of A,
+    // which is the big operand, and cycle through a B that stays in cache (80 instead of 74.5 TFLOPS on
+    // 17408x5120 with 2048 columns; hipBLASLt orders its workgroups the same way, WorkGroupMapping 8).
+    const uint m0 = gl_WorkGroupID.y * BM;
+    const uint n0 = gl_WorkGroupID.x * BN;
+    const uint KU = p.K / 8u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[TA * TB];
+    [[unroll]] for (uint i = 0; i < TA * TB; i++) {
+        acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    // rows past the end repeat the last row; their results are never stored
+    uint row_a[NLA], row_b[NLB];
+    [[unroll]] for (uint t = 0; t < NLA; t++) { row_a[t] = min(m0 + (lid + t * WG) / UPR, p.M - 1u) * KU + (lid + t * WG) % UPR; }
+    [[unroll]] for (uint t = 0; t < NLB; t++) { row_b[t] = min(n0 + (lid + t * WG) / UPR, p.N - 1u) * KU + (lid + t * WG) % UPR; }
+
+    uvec4 pa[NLA], pb[NLB];
+#define FETCH(ku_) { \
+        [[unroll]] for (uint t = 0; t < NLA; t++) { pa[t] = data_a[row_a[t] + (ku_)]; } \
+        [[unroll]] for (uint t = 0; t < NLB; t++) { pb[t] = data_b[row_b[t] + (ku_)]; } }
+#define STORE() { \
+        [[unroll]] for (uint t = 0; t < NLA; t++) { const uint i = lid + t * WG; sh_a[(i / UPR) * PITCH + i % UPR] = pa[t]; } \
+        [[unroll]] for (uint t = 0; t < NLB; t++) { const uint i = lid + t * WG; sh_b[(i / UPR) * PITCH + i % UPR] = pb[t]; } }
+
+    FETCH(0u)
+    STORE()
+    for (uint ku = 0; ku < KU; ku += UPR) {
+        barrier();
+        FETCH(min(ku + UPR, KU - UPR))
+        [[unroll]] for (uint h = 0; h < 2u; h++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[TA];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[TB];
+            [[unroll]] for (uint i = 0; i < TA; i++) {
+                coopMatLoad(ma[i], sh_a, (r0 + i * 16u) * PITCH + h * 2u, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0; j < TB; j++) {
+                coopMatLoad(mb[j], sh_b, (c0 + j * 16u) * PITCH + h * 2u, PITCH, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0; i < TA; i++) {
+                [[unroll]] for (uint j = 0; j < TB; j++) {
+                    acc[i * TB + j] = coopMatMulAdd(ma[i], mb[j], acc[i * TB + j]);
+                }
+            }
+        }
+        barrier();
+        STORE()
+    }
+
+    if (m0 + BM <= p.M && n0 + BN <= p.N) {
+        [[unroll]] for (uint i = 0; i < TA; i++) {
+            [[unroll]] for (uint j = 0; j < TB; j++) {
+                coopMatStore(acc[i * TB + j], data_d, (n0 + c0 + j * 16u) * p.stride_d + m0 + r0 + i * 16u, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+        }
+    } else {
+        // edge workgroup: pass every tile through shared memory and store only the elements inside D
+        // (unrolled: a dynamic index would keep the accumulators out of registers)
+        [[unroll]] for (uint t = 0; t < TA * TB; t++) {
+            barrier();
+            coopMatStore(acc[t], sh_d, wave * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+            barrier();
+            const uint mt = m0 + r0 + (t / TB) * 16u;
+            const uint nt = n0 + c0 + (t % TB) * 16u;
+            [[unroll]] for (uint e = 0; e < 8u; e++) {
+                const uint x = gl_SubgroupInvocationID * 8u + e;
+                const uint m = mt + x % 16u;
+                const uint n = nt + x / 16u;
+                if (m < p.M && n < p.N) {
+                    data_d[n * p.stride_d + m] = sh_d[wave * 256u + x];
+                }
+            }
+        }
+    }
+}

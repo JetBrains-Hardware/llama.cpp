@@ -945,6 +945,9 @@ void process_shaders() {
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("matmul_f16_gemm", "mul_mm_f16_gemm.comp", {}, true, true, false, false);
+    string_to_spv("dequant_wide_q4_k", "dequant_wide_q4_k.comp", {});
+    string_to_spv("dequant_wide_q6_k", "dequant_wide_q6_k.comp", {});
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
     string_to_spv("fa_prefill", "flash_attn_prefill.comp", {}, true, true, false, false);
