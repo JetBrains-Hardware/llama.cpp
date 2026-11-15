@@ -572,6 +572,10 @@ struct ggml_backend_sycl_context {
         size_t              ne        = 0;
         void *              buf       = nullptr;
         size_t              cap       = 0; // bytes
+        // tensor whose f32 data was not written, only this f16 copy (ggml_sycl_glu_f16_only), and whether the
+        // GEMM that reads it took the copy
+        const ggml_tensor * f16_only      = nullptr;
+        bool                f16_only_used = false;
     } src1_f16_cache;
 
     // per-dimension rms of the activations (src1) of the last int8 prompt-batch GEMM (int8-gemm.hpp), reused by

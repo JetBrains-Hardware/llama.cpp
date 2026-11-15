@@ -107,6 +107,7 @@ int g_ggml_sycl_enable_optimize = 1;
 int g_ggml_sycl_enable_graph = 0;
 std::atomic<uint64_t> g_ggml_sycl_graph_epoch{ 0 };
 int g_ggml_sycl_src1_f16_cache = 1; // GGML_SYCL_SRC1_F16_CACHE: reuse the f16 activations between matmuls
+int g_ggml_sycl_glu_f16 = 1;        // GGML_SYCL_GLU_F16: SwiGLU of a prompt batch straight to the f16 the next GEMM reads
 int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
@@ -441,6 +442,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_src1_f16_cache = ggml_sycl_get_env("GGML_SYCL_SRC1_F16_CACHE", 1);
+        g_ggml_sycl_glu_f16 = ggml_sycl_get_env("GGML_SYCL_GLU_F16", 1);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
@@ -578,6 +580,7 @@ static void ggml_check_sycl() try {
 #ifdef GGML_SYCL_GRAPH
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_GRAPH: %d\n", g_ggml_sycl_enable_graph);
         GGML_LOG_INFO("  GGML_SYCL_SRC1_F16_CACHE: %d\n", g_ggml_sycl_src1_f16_cache);
+        GGML_LOG_INFO("  GGML_SYCL_GLU_F16: %d\n", g_ggml_sycl_glu_f16);
         GGML_LOG_INFO("  GGML_SYCL_GRAPH_EVICTION_TIMEOUT: %d\n", g_ggml_sycl_graph_eviction_timeout);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_GRAPH: graph disabled by compile flag\n");
@@ -3346,6 +3349,9 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                    src1 == cache.node_src1 && src1->type == GGML_TYPE_F32;
             if (cacheable && cache.tensor == src1 && cache.data == (const void *) src1_ddf_i && cache.ne == ne) {
                 src1_ptr = (const sycl::half *) cache.buf;
+                if (cache.f16_only == src1) {
+                    cache.f16_only_used = true;
+                }
             } else {
                 const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
                 GGML_ASSERT(to_fp16_sycl != nullptr);
@@ -6876,6 +6882,92 @@ static void ggml_sycl_prof_dump(int n_nodes) {
     ggml_sycl_prof_tab().clear();
 }
 
+// SwiGLU of a prompt batch that only the next node reads, a MUL_MAT over a quantized or f16 weight (the FFN down
+// projection): that GEMM runs in f16 and would convert the f32 result (0.8 ms per layer for 17408 x 2048), so
+// write the result as f16 straight into the activation cache and never as f32. Returns false when it does not
+// apply; the caller then runs the GLU as usual.
+static bool ggml_sycl_glu_f16_only(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    if (!g_ggml_sycl_glu_f16 || !g_ggml_sycl_src1_f16_cache || g_ggml_sycl_enable_graph || node->op != GGML_OP_GLU ||
+        ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    const ggml_tensor * a = node->src[0];
+    const ggml_tensor * b = node->src[1];
+    if (a == nullptr || b == nullptr || node->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+        node->ne[1] < 128 || node->ne[1] <= g_ggml_sycl_xmx_max_cols || node->ne[2] != 1 || node->ne[3] != 1 ||
+        !ggml_are_same_shape(a, node) || !ggml_are_same_shape(b, node) || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) ||
+        !ggml_is_contiguous(node) || (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+    // the only reader must be the next computed node
+    const ggml_tensor * reader = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->view_src == node) {
+            return false;
+        }
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            reads = reads || n->src[s] == node;
+        }
+        if (reader == nullptr) {
+            if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                if (reads) {
+                    return false;
+                }
+                continue;
+            }
+            if (!reads || n->op != GGML_OP_MUL_MAT || n->src[1] != node || n->src[0] == node ||
+                !(ggml_is_quantized(n->src[0]->type) || n->src[0]->type == GGML_TYPE_F16) ||
+                ggml_backend_buffer_is_sycl_split(n->src[0]->buffer)) {
+                return false;
+            }
+            reader = n;
+        } else if (reads) {
+            return false;
+        }
+    }
+    if (reader == nullptr) {
+        return false;
+    }
+    queue_ptr stream = ctx.stream();
+    auto & cache = ctx.src1_f16_cache;
+    const size_t ne = (size_t) ggml_nelements(node);
+    if (cache.cap < ne * sizeof(sycl::half)) {
+        if (cache.buf != nullptr) {
+            stream->wait(); // queued kernels may still read the old copy
+            sycl::free(cache.buf, *stream);
+        }
+        cache.tensor = nullptr;
+        cache.cap    = 0;
+        cache.buf    = sycl::malloc_device(ne * sizeof(sycl::half), *stream);
+        GGML_ASSERT(cache.buf != nullptr);
+        cache.cap = ne * sizeof(sycl::half);
+    }
+    ggml_sycl_swiglu_f16(ctx, node, (sycl::half *) cache.buf);
+    cache.tensor        = node;
+    cache.data          = node->data;
+    cache.ne            = ne;
+    cache.f16_only      = node;
+    cache.f16_only_used = false;
+    return true;
+}
+
+// The reader of an f16-only tensor did not take the f16 copy (it chose another kernel): write the f32 data from
+// the copy after all. The caller runs the reader again.
+static void ggml_sycl_f16_only_materialize(ggml_backend_sycl_context & ctx) {
+    auto & cache = ctx.src1_f16_cache;
+    const sycl::half * h = (const sycl::half *) cache.buf;
+    float *            d = (float *) cache.f16_only->data;
+    ctx.stream()->parallel_for(sycl::range<1>(cache.ne), [=](sycl::id<1> id) { d[id] = (float) h[id]; });
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        GGML_LOG_WARN("%s: the reader of an f16-only GLU did not use the f16 copy, recomputing it from f32 (GGML_SYCL_GLU_F16=0 avoids this)\n", __func__);
+    }
+}
+
 // GGML_SYCL_GRAPH_WALL=1 (diagnostics): wait at the end of every graph and print its wall time and the time
 // spent outside graph computation since the previous graph
 struct ggml_sycl_graph_wall {
@@ -6909,8 +7001,9 @@ struct ggml_sycl_graph_wall {
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_graph_wall graph_wall(sycl_ctx, cgraph->n_nodes);
     g_ggml_sycl_graph_epoch.fetch_add(1);
-    sycl_ctx->src1_f16_cache.tensor = nullptr;
-    sycl_ctx->int8_xr_cache.tensor  = nullptr;
+    sycl_ctx->src1_f16_cache.tensor   = nullptr;
+    sycl_ctx->src1_f16_cache.f16_only = nullptr;
+    sycl_ctx->int8_xr_cache.tensor    = nullptr;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         sycl_ctx->src1_f16_cache.node_src1 = node->op == GGML_OP_MUL_MAT ? node->src[1] : nullptr;
@@ -6921,6 +7014,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         ggml_sycl_prof_scope prof_scope(sycl_ctx, node);
+
+        if (sycl_ctx->src1_f16_cache.f16_only != nullptr) {
+            // the previous node left its result as f16 only (ggml_sycl_glu_f16_only) and this node is its reader:
+            // run it on its own and, should it not take the f16 copy, once more from f32
+            auto & cache = sycl_ctx->src1_f16_cache;
+            if (node->op != GGML_OP_MUL_MAT || node->src[1] != cache.f16_only) {
+                ggml_sycl_f16_only_materialize(*sycl_ctx);
+                cache.f16_only = nullptr;
+            } else {
+                bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+                GGML_ASSERT(ok);
+                if (!cache.f16_only_used) {
+                    ggml_sycl_f16_only_materialize(*sycl_ctx);
+                    cache.f16_only = nullptr;
+                    ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+                    GGML_ASSERT(ok);
+                }
+                cache.f16_only = nullptr;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_GLU && ggml_sycl_glu_f16_only(*sycl_ctx, cgraph, i)) {
+            continue;
+        }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
