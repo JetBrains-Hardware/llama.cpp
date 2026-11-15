@@ -1322,7 +1322,7 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.q_in_regs = result.block_rows == coopmat_block_rows && device->vendor_id == VK_VENDOR_ID_AMD && n_rows >= 64;
 
     // Flipped ownership: each subgroup owns 16 Q rows.
-    // uma, nvidia: K/V tiles staged in separate LDS buffers; discrete AMD GQA: K/V loaded directly from global memory.
+    // uma, nvidia, discrete RDNA3: K/V tiles staged in separate LDS buffers; discrete RDNA4 GQA: K/V loaded directly from global memory.
     static const bool disable_flip = getenv("GGML_VK_DISABLE_FA_FLIP") != nullptr;
     static const char * force_flip = getenv("GGML_VK_FORCE_FA_FLIP");
     const bool flip_arch = force_flip != nullptr || device->vendor_id == VK_VENDOR_ID_NVIDIA ||
@@ -1332,7 +1332,9 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
         hsk % 16 == 0 && hsv % 16 == 0 && hsk <= 256 && hsv <= 256 &&
         k_type == v_type && (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_BF16)) {
         result.flip = true;
-        result.flip_direct = !device->uma && qk_ratio > 1 && device->vendor_id != VK_VENDOR_ID_NVIDIA;
+        // Direct loads lose to LDS staging on RDNA3 (RX 7900 XTX, GQA 6:1, 60k KV: 655 -> 705 t/s prefill).
+        result.flip_direct = !device->uma && qk_ratio > 1 && device->vendor_id != VK_VENDOR_ID_NVIDIA &&
+                             device->architecture != AMD_RDNA3;
         if (force_flip != nullptr && strcmp(force_flip, "kvsep") == 0) {
             result.flip_direct = false;
         } else if (force_flip != nullptr && strcmp(force_flip, "direct") == 0) {
