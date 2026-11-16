@@ -830,6 +830,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_requant_i8_rowscale[GGML_TYPE_COUNT];  // the row scales, from the block headers
     vk_pipeline pipeline_quantize_i8_cols;                      // f32 -> int8 with one scale per (column, 256 values)
     uint32_t matmul_i8_gemm_min_n;
+    uint32_t matmul_i8_gemm_q6k;                                // q6_K on the int8 path: 0 none, 1 all but attn_qkv, 2 all
     uint32_t matmul_i8_gemm_block;                              // values of K per activation scale: 256, 128 or 64
     vk_pipeline pipeline_quantize_q8_1_x4;
 

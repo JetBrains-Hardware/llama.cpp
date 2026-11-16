@@ -3558,7 +3558,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // int8 copy of A is half the size of an f16 one. For q4_K (optionally q6_K) weights and wide batches A is re-quantized
     // to int8 with one scale per row, the activations to int8 with one scale per (column, 256 values), and
     // mul_mm_i8_gemm.comp multiplies them with int32 accumulation. Not bit-identical to the other paths.
-    // GGML_VK_DISABLE_I8_GEMM turns it off, GGML_VK_I8_GEMM_Q6K=1 adds q6_K weights, GGML_VK_I8_GEMM_MIN_N moves the batch threshold,
+    // GGML_VK_DISABLE_I8_GEMM turns it off, GGML_VK_I8_GEMM_Q6K=0|1 selects the q6_K weights, GGML_VK_I8_GEMM_MIN_N moves the batch threshold,
     // GGML_VK_I8_GEMM_BLOCK=256|128|64 sets the number of values per activation scale.
     // From 512 columns it beats the quantized kernels (n=512: q4_K 56-59 -> 59-73 TFLOPS, q6_K 43-50 -> 57-71);
     // narrower batches were not measured and keep their kernels.
@@ -3583,11 +3583,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_matmul_i8_gemm, "matmul_i8_gemm", matmul_i8_gemm_cm1_len, matmul_i8_gemm_cm1_data, "main", 5, 4 * sizeof(uint32_t), {128, 128, 1}, { device->matmul_i8_gemm_block / 16 }, 1, true, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8[GGML_TYPE_Q4_K], "requant_i8_q4_k", requant_i8_q4_k_len, requant_i8_q4_k_data, "main", 3, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8_rowscale[GGML_TYPE_Q4_K], "requant_i8_rowscale_q4_k", requant_i8_rowscale_q4_k_len, requant_i8_rowscale_q4_k_data, "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true);
-        // q6_K weights stay on the f16 GEMM unless GGML_VK_I8_GEMM_Q6K is set: with them on the int8 path the DFlash
-        // draft of Qwen3.6-27B was accepted less often after a 20k-token prompt (170 against 179 of 300 tokens,
-        // 55.1 against 59.0 t/s), without them 177 (58.2 t/s). They are the tensors the quantizer keeps at 6 bits
-        // because they are sensitive.
-        if (getenv("GGML_VK_I8_GEMM_Q6K") != nullptr) {
+        // q6_K: GGML_VK_I8_GEMM_Q6K=0 keeps all of them on the f16 GEMM, =1 puts all of them on the int8 path.
+        // By default the fused q/k/v projections of the gated delta net layers (attn_qkv) stay on the f16 GEMM:
+        // with them on the int8 path the DFlash draft of Qwen3.6-27B is accepted less often after a 20k-token
+        // prompt (12 prompts, accepted of 300 tokens: f16 control 175.8, all q6_K 171.4, all but attn_qkv 177.6,
+        // only attn_qkv 175.2, attn_qkv + attn_v 174.4, attn_qkv + ffn_down 174.8; +-1.2).
+        device->matmul_i8_gemm_q6k = 1;
+        if (const char * q6k_env = getenv("GGML_VK_I8_GEMM_Q6K")) {
+            device->matmul_i8_gemm_q6k = atoi(q6k_env) != 0 ? 2 : 0;
+        }
+        if (device->matmul_i8_gemm_q6k != 0) {
             ggml_vk_create_pipeline(device, device->pipeline_requant_i8[GGML_TYPE_Q6_K], "requant_i8_q6_k", requant_i8_q6_k_len, requant_i8_q6_k_data, "main", 3, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
             ggml_vk_create_pipeline(device, device->pipeline_requant_i8_rowscale[GGML_TYPE_Q6_K], "requant_i8_rowscale_q6_k", requant_i8_rowscale_q6_k_len, requant_i8_rowscale_q6_k_data, "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true);
         }
@@ -6916,9 +6921,12 @@ static bool ggml_vk_use_i8_gemm(ggml_backend_vk_context * ctx, const ggml_tensor
         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;
     }
+    if (src0->type == GGML_TYPE_Q6_K && device->matmul_i8_gemm_q6k == 1 && strstr(src0->name, "attn_qkv") != nullptr) {
+        return false;
+    }
     const uint64_t m = src0->ne[1], n = src1->ne[1], k = src0->ne[0];
     // quantize_i8_cols.comp keeps up to 1024 block maxima per column in shared memory
-    if (n < device->matmul_i8_gemm_min_n || m < 128 || k % 256 != 0 || k / 64 > 1024) {
+    if (n < device->matmul_i8_gemm_min_n || m < 32 || k % 256 != 0 || k / 64 > 1024) {
         return false;
     }
     // every binding must fit one range with 32-bit indexing
