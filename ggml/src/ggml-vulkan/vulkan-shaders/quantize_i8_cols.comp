@@ -9,6 +9,11 @@
 // Blocks that are more than MAX_RATIO times smaller than the largest block of their column keep fewer
 // than 7 bits; they are also that much less important for the product.
 //
+// Overflow guard: with |A| <= 127 the running int32 sum of the kernel in block b is at most
+// 127 * P_b, P_b = P_(b-1) * s_(b-1) / s_b + sum |q| over block b. If the largest P_b of a column is above
+// SUM_LIMIT (2^23, i.e. sums could pass 2^30, a factor 2 below int32), the column is quantized again with
+// one scale; then the sum is at most 127 * 127 * K < 2^30 for K <= 65536. So the kernel cannot overflow.
+//
 // Output: Q  int8 [N][K]
 //         R  float [N][NB + 1], NB = SUBS * K / 256: R[b] = s_(b-1) / s_b for b >= 1, R[NB] = s of the last block
 //
@@ -21,6 +26,7 @@
 
 #define MAX_RATIO 32.0
 #define MAX_BLOCKS 1024u
+#define SUM_LIMIT 8388608.0
 #ifndef SUBS
 #define SUBS 1
 #endif
@@ -39,6 +45,7 @@ layout (push_constant) uniform parameter
 } p;
 
 shared float sh_max[MAX_BLOCKS];
+shared float sh_l1[MAX_BLOCKS];
 
 void main() {
     const uint n    = gl_WorkGroupID.x;
@@ -73,13 +80,49 @@ void main() {
         const float inv = am > 0.0 ? 127.0 / am : 0.0;
         const ivec4 q = ivec4(round(data_a[base + b * 64u + lane] * inv));
         data_q[base + b * 64u + lane] = (uint(q.x) & 0xFFu) | ((uint(q.y) & 0xFFu) << 8) | ((uint(q.z) & 0xFFu) << 16) | (uint(q.w) << 24);
+        const ivec4 aq = abs(q);
+#if SUBS == 1
+        const float l1 = subgroupAdd(float(aq.x + aq.y + aq.z + aq.w));
+#else
+        const float l1 = subgroupClusteredAdd(float(aq.x + aq.y + aq.z + aq.w), CL);
+#endif
         if (lane % CL == 0u) {
+            sh_l1[i] = l1;
             const uint r = n * (NB + 1u);
             if (i > 0u) {
                 data_r[r + i] = am > 0.0 ? max(sh_max[i - 1u], lo) / am : 1.0;
             }
             if (i == NB - 1u) {
                 data_r[r + NB] = am * (1.0 / 127.0);
+            }
+        }
+    }
+    barrier();
+
+    // overflow guard, see above
+    float P = 0.0, G = 0.0;
+    for (uint i = 0u; i < NB; i++) {
+        const float am = max(sh_max[i], lo);
+        if (i > 0u && am > 0.0) {
+            P *= max(sh_max[i - 1u], lo) / am;
+        }
+        P += sh_l1[i];
+        G = max(G, P);
+    }
+    if (G > SUM_LIMIT) {
+        const float inv = 127.0 / cmax;
+        for (uint b = sg; b < KB; b += 4u) {
+            const uint i = b * SUBS + lane / CL;
+            const ivec4 q = ivec4(round(data_a[base + b * 64u + lane] * inv));
+            data_q[base + b * 64u + lane] = (uint(q.x) & 0xFFu) | ((uint(q.y) & 0xFFu) << 8) | ((uint(q.z) & 0xFFu) << 16) | (uint(q.w) << 24);
+            if (lane % CL == 0u) {
+                const uint r = n * (NB + 1u);
+                if (i > 0u) {
+                    data_r[r + i] = 1.0;
+                }
+                if (i == NB - 1u) {
+                    data_r[r + NB] = cmax * (1.0 / 127.0);
+                }
             }
         }
     }
