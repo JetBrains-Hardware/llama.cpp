@@ -13,7 +13,10 @@
 #ifndef GGML_SYCL_COMMON_HPP
 #define GGML_SYCL_COMMON_HPP
 
+#include <atomic>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -143,6 +146,9 @@ static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
+extern int g_ggml_sycl_enable_graph;
+// counts graph computes; ops use it to cache what they learn about a graph input for the rest of the graph
+extern std::atomic<uint64_t> g_ggml_sycl_graph_epoch;
 extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;
 extern int g_ggml_sycl_fa_dpas;
@@ -493,7 +499,12 @@ struct sdpa_partition {
     dnnl::graph::logical_tensor              out;
     size_t id_q = 0, id_k = 0, id_v = 0, id_scale = 0, id_mask = 0;
     bool   has_mask = false;
-    bool   ok = false;
+    // causal mask made by the kernel: host scalars of the graph (they live here; a map entry never moves)
+    size_t  id_kv_len = SIZE_MAX, id_q_len = SIZE_MAX, id_neg_inf = SIZE_MAX;
+    int32_t kv_len    = 0;
+    int32_t q_len     = 0;
+    float   neg_inf   = -INFINITY;
+    bool    ok = false;
 };
 #endif
 

@@ -1,8 +1,12 @@
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <optional>
 #include <unordered_map>
@@ -164,11 +168,90 @@ static void permute_sdpa_out_sycl(const sycl::half * out, float * dst,
     });
 }
 
+// The mask of a prompt batch that sits at the end of the cache is the "bottom right" causal mask:
+// row i sees the keys 0 .. n_used - q + i and nothing else (n_used = keys in use, the rest of the
+// row is padding). oneDNN can generate that mask inside the SDPA kernel, which is about twice as
+// fast as reading it: the explicit mask costs a load of q x n_kv values for every head (measured on
+// Arc B65, 2048 x 20480, 24 heads: 31.4 ms with the mask tensor, 17.0 ms with the implicit mask,
+// same output).
+// Returns n_used when the mask tensor is exactly that pattern, else -1. The answer is cached per
+// graph compute (g_ggml_sycl_graph_epoch), all attention layers of a graph share one mask.
+static int64_t sdpa_causal_mask_keys(dpct::queue_ptr stream, const ggml_tensor * mask, int64_t q, int64_t seq) {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_CAUSAL", 1) != 0;
+    // graph record / replay runs ops outside ggml_backend_sycl_graph_compute_impl(): no epoch to key the cache on
+    if (mask == nullptr || !enabled || g_ggml_sycl_enable_graph != 0) {
+        return -1;
+    }
+    if (mask->ne[0] != seq || mask->ne[1] != q || mask->nb[0] != sizeof(sycl::half) ||
+        mask->nb[1] != (size_t) seq * sizeof(sycl::half) || seq < q) {
+        return -1;
+    }
+    struct verdict {
+        uint64_t     epoch = UINT64_MAX;
+        const void * data  = nullptr;
+        int64_t      q = 0, seq = 0, used = -1;
+    };
+    static std::mutex mtx;
+    static verdict    last;
+    std::lock_guard<std::mutex> lock(mtx);
+    const uint64_t epoch = g_ggml_sycl_graph_epoch.load();
+    if (last.epoch == epoch && last.data == mask->data && last.q == q && last.seq == seq) {
+        return last.used;
+    }
+    constexpr uint16_t F16_ZERO = 0x0000, F16_NEG_INF = 0xFC00;
+    const uint16_t * m = (const uint16_t *) mask->data;
+
+    // the last row gives the number of keys in use
+    std::vector<uint16_t> row((size_t) seq);
+    stream->memcpy(row.data(), m + (q - 1) * seq, (size_t) seq * sizeof(uint16_t)).wait();
+    int64_t used = 0;
+    while (used < seq && row[used] == F16_ZERO) {
+        used++;
+    }
+    for (int64_t j = used; j < seq; j++) {
+        if (row[j] != F16_NEG_INF) {
+            used = -1;
+            break;
+        }
+    }
+    if (used < q) {
+        used = -1;
+    }
+    if (used >= 0) {
+        // every element must match the pattern
+        int64_t bad = 0;
+        {
+            sycl::buffer<int64_t, 1> bad_buf(&bad, sycl::range<1>(1));
+            const int64_t first = used - q; // last key that row 0 sees
+            stream->submit([&](sycl::handler & cgh) {
+                auto red = sycl::reduction(bad_buf, cgh, sycl::plus<int64_t>());
+                cgh.parallel_for(sycl::range<1>((size_t) (q * seq)), red, [=](sycl::id<1> ix, auto & sum) {
+                    const int64_t  i    = (int64_t) ix[0] / seq;
+                    const int64_t  j    = (int64_t) ix[0] - i * seq;
+                    const uint16_t want = j <= first + i ? F16_ZERO : F16_NEG_INF;
+                    sum += (int64_t) (m[ix[0]] != want ? 1 : 0);
+                });
+            });
+        }
+        if (bad != 0) {
+            used = -1;
+        }
+    }
+    last.epoch = epoch;
+    last.data  = mask->data;
+    last.q     = q;
+    last.seq   = seq;
+    last.used  = used;
+    return used;
+}
+
 // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->[Add]->SoftMax->MatMul), f32 out.
 // The Add node is only present with a mask.
+// causal: no mask input, the kernel masks key j of row i when j > seq - q + i (bottom right causal mask).
 // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
 static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d, bool has_mask,
-                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str) try {
+                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str,
+                                 bool causal) try {
     using ltype = logical_tensor::layout_type;
     using dt    = logical_tensor::data_type;
     using ldims = logical_tensor::dims;
@@ -203,11 +286,38 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
         madd->add_inputs({scaled, mask}); madd->add_outputs({smax_in});
     }
 
+    // implicit bottom right causal mask, the pattern of oneDNN examples/graph/sdpa_bottom_right_causal_mask.cpp:
+    // select(row + kv_len - q_len >= col, scaled, -inf)
+    using ptype = logical_tensor::property_type;
+    auto index_row  = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
+    auto gen_row    = op(id++, op::kind::GenIndex, "gen_index_row");
+    gen_row.set_attr<int64_t>(op::attr::axis, -2);
+    gen_row.add_inputs({scaled}); gen_row.add_outputs({index_row});
+    auto kv_len     = logical_tensor(id++, dt::s32, 0, ltype::strided, ptype::host_scalar);
+    auto row_add    = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
+    auto cadd       = op(id++, op::kind::Add, "causal_add");
+    cadd.add_inputs({index_row, kv_len}); cadd.add_outputs({row_add});
+    auto q_len      = logical_tensor(id++, dt::s32, 0, ltype::strided, ptype::host_scalar);
+    auto row_sub    = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
+    auto csub       = op(id++, op::kind::Subtract, "causal_sub");
+    csub.add_inputs({row_add, q_len}); csub.add_outputs({row_sub});
+    auto index_col  = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
+    auto gen_col    = op(id++, op::kind::GenIndex, "gen_index_col");
+    gen_col.set_attr<int64_t>(op::attr::axis, -1);
+    gen_col.add_inputs({scaled}); gen_col.add_outputs({index_col});
+    auto visible    = logical_tensor(id++, dt::boolean, s_sz, ltype::strided);
+    auto cge        = op(id++, op::kind::GreaterEqual, "causal_ge");
+    cge.add_inputs({row_sub, index_col}); cge.add_outputs({visible});
+    auto neg_inf    = logical_tensor(id++, dt::f32, 0, ltype::strided, ptype::host_scalar);
+    auto cmasked    = logical_tensor(id++, fi, s_sz, ltype::strided);
+    auto csel       = op(id++, op::kind::Select, "causal_select");
+    csel.add_inputs({visible, scaled, neg_inf}); csel.add_outputs({cmasked});
+
     auto probs  = logical_tensor(id++, t,  s_sz, ltype::strided);
     auto smax   = op(id++, op::kind::SoftMax, "softmax");
     smax.set_attr<int64_t>(op::attr::axis, -1);
     smax.set_attr<std::string>(op::attr::mode, "inf_as_zero");
-    smax.add_inputs({smax_in}); smax.add_outputs({probs});
+    smax.add_inputs({causal ? cmasked : smax_in}); smax.add_outputs({probs});
 
     auto value  = logical_tensor(id++, t,  kv_sz, v_st);
     // f16 output is REQUIRED to hit sdp_primitive_kernel_t (the systolic micro-kernel); an f32 output
@@ -219,7 +329,9 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
 
     dnnl::graph::graph g(eng.get_kind());
     g.add_op(bmm1); g.add_op(sdiv);
-    if (madd) {
+    if (causal) {
+        g.add_op(gen_row); g.add_op(cadd); g.add_op(csub); g.add_op(gen_col); g.add_op(cge); g.add_op(csel);
+    } else if (madd) {
         g.add_op(*madd);
     }
     g.add_op(smax); g.add_op(bmm2);
@@ -238,6 +350,11 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     E.id_scale = scale.get_id();
     E.id_mask  = has_mask ? mask.get_id() : 0;
     E.has_mask = has_mask;
+    if (causal) {
+        E.id_kv_len = kv_len.get_id(); E.id_q_len = q_len.get_id(); E.id_neg_inf = neg_inf.get_id();
+        E.kv_len    = seq;
+        E.q_len     = q;
+    }
     E.ok       = true;
     return E;
 }
@@ -254,8 +371,9 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
-    const int64_t d   = K->ne[0];   // head_dim
-    const int64_t seq = K->ne[1];   // n_kv
+    const int64_t d    = K->ne[0];   // head_dim
+    const int64_t n_kv = K->ne[1];   // rows of the K/V tensors
+    int64_t       seq  = n_kv;       // keys the SDPA attends to
     const int64_t Hkv = K->ne[2];   // n_head_kv
     const int64_t H   = Q->ne[2];   // n_head
     const int64_t q   = Q->ne[1];   // n_tok
@@ -270,6 +388,19 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
 
     const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
 
+    // diagnostic stage timer (GGML_SYCL_FA_PROF=1): waits after every stage, so it slows the op
+    static const bool fa_prof = getenv("GGML_SYCL_FA_PROF") && atoi(getenv("GGML_SYCL_FA_PROF")) != 0;
+    double fa_us[6] = {0, 0, 0, 0, 0, 0};
+    auto   fa_t0    = std::chrono::steady_clock::now();
+    if (fa_prof) { stream->wait(); fa_t0 = std::chrono::steady_clock::now(); }
+    auto fa_mark = [&](int i) {
+        if (!fa_prof) { return; }
+        stream->wait();
+        auto t1 = std::chrono::steady_clock::now();
+        fa_us[i] += std::chrono::duration<double, std::micro>(t1 - fa_t0).count();
+        fa_t0 = t1;
+    };
+
     // Q: always f32 -- copy to dense f16.
     std::optional<ggml_sycl_pool_alloc<sycl::half>> Qf_pool;
     sycl::half * Qf_ptr = (sycl::half *) extra.Q_buffer_ptr;
@@ -278,13 +409,14 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         Qf_ptr = Qf_pool->get();
     }
     cont_to_f16_sycl<float>((const char *) Q->data, Qf_ptr, d, q, H, mb, Q->nb[1], Q->nb[2], Q->nb[3], stream);
+    fa_mark(0);
 
     // K/V: bind the f16 cache in place. llama.cpp permutes it to [token][head][dim], so its head
     // plane is strided rather than dense, which is what an explicit stride vector expresses.
     // Quantized and f32 KV still stage a dense copy -- the layout the k_str/v_str defaults describe.
     sycl::half * K_ptr = nullptr;
     sycl::half * V_ptr = nullptr;
-    std::array<int64_t, 5> k_str{ Hkv * seq * d, seq * d, seq * d, d, 1 };
+    std::array<int64_t, 5> k_str{ Hkv * n_kv * d, n_kv * d, n_kv * d, d, 1 };
     std::array<int64_t, 5> v_str = k_str;
     std::optional<ggml_sycl_pool_alloc<sycl::half>> Kf_pool;
     std::optional<ggml_sycl_pool_alloc<sycl::half>> Vf_pool;
@@ -308,10 +440,10 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         k_str = elem_strides(K);
         v_str = elem_strides(V);
     } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
-        K_ptr = stage_k((size_t) Hkv * seq * d);
-        V_ptr = stage_v((size_t) Hkv * seq * d);
-        cont_to_f16_sycl<sycl::half>((const char *) K->data, K_ptr, d, seq, Hkv, mb, K->nb[1], K->nb[2], K->nb[3], stream);
-        cont_to_f16_sycl<sycl::half>((const char *) V->data, V_ptr, d, seq, Hkv, mb, V->nb[1], V->nb[2], V->nb[3], stream);
+        K_ptr = stage_k((size_t) Hkv * n_kv * d);
+        V_ptr = stage_v((size_t) Hkv * n_kv * d);
+        cont_to_f16_sycl<sycl::half>((const char *) K->data, K_ptr, d, n_kv, Hkv, mb, K->nb[1], K->nb[2], K->nb[3], stream);
+        cont_to_f16_sycl<sycl::half>((const char *) V->data, V_ptr, d, n_kv, Hkv, mb, V->nb[1], V->nb[2], V->nb[3], stream);
     } else if (ggml_is_quantized(K->type)) {
         // Quantized K/V: dequant to dense F16 using pool, same lifetime as F16 path.
         K_ptr = stage_k((size_t) ggml_nelements(K));
@@ -329,6 +461,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
                         (int64_t)K->nb[1] / ts, (int64_t)K->nb[2] / ts, (int64_t)K->nb[3] / ts, stream);
             }
         }
+        fa_mark(1);
         // Quantized V: always dequant separately. Even when K and V share
         // the same underlying allocation (V is a view of K with the same
         // data pointer), their logical values differ because the quantized
@@ -359,6 +492,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
                                 V->nb[1], V->nb[2], V->nb[3], stream);
     }
 
+    fa_mark(2);
     // divide-by-(1/scale) reproduces ggml's score *= kq_scale on the proven probe graph.
     //
     // The scale must not be uploaded with an async memcpy from a stack local: on the in-order
@@ -384,19 +518,42 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         outf_ptr = outf_pool->get();
     }
 
-    // compile once per (shape, mask presence, KV strides) in this device's context, reuse across layers/calls.
-    // Stride 2 always repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
-    const bool has_mask = mask != nullptr;
-    char keyb[256];
-    snprintf(keyb, sizeof(keyb), "%lld:%lld:%lld:%lld:%lld:%d:%lld:%lld:%lld:%lld:%lld:%lld",
-             (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d, (int) has_mask,
-             (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
-             (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
-    auto it = ctx.sdpa_partitions.find(keyb);
-    if (it == ctx.sdpa_partitions.end()) {
-        it = ctx.sdpa_partitions.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, has_mask, k_str, v_str)).first;
+    // a prompt batch at the end of the cache: let the kernel generate the causal mask and attend only
+    // to the keys in use. K and V keep their strides, the padding rows are simply never addressed.
+    const int64_t used   = mb == 1 ? sdpa_causal_mask_keys(stream, mask, q, n_kv) : -1;
+    const bool    causal = used >= q;
+    if (causal) {
+        seq = used;
     }
-    sdpa_partition & E = it->second;
+
+    // compile once per (shape, mask kind, KV strides) in this device's context, reuse across layers/calls.
+    // Stride 2 always repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
+    // Mask kind: 0 = none, 1 = mask tensor, 2 = causal mask made by the kernel.
+    auto lookup = [&](bool causal_mask, int64_t n_keys) -> sdpa_partition & {
+        const bool has_mask = mask != nullptr && !causal_mask;
+        char keyb[256];
+        snprintf(keyb, sizeof(keyb), "%lld:%lld:%lld:%lld:%lld:%d:%lld:%lld:%lld:%lld:%lld:%lld",
+                 (long long) H, (long long) Hkv, (long long) q, (long long) n_keys, (long long) d, causal_mask ? 2 : (int) has_mask,
+                 (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
+                 (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
+        auto it = ctx.sdpa_partitions.find(keyb);
+        if (it == ctx.sdpa_partitions.end()) {
+            // the causal entries are keyed on the exact number of keys: keep the cache bounded
+            if (ctx.sdpa_partitions.size() >= 256) {
+                ctx.sdpa_partitions.clear();
+            }
+            it = ctx.sdpa_partitions.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) n_keys, (int) d, has_mask, k_str, v_str, causal_mask)).first;
+        }
+        return it->second;
+    };
+    sdpa_partition * Ep = &lookup(causal, seq);
+    if (!Ep->ok && causal) {
+        // no implicit mask in this oneDNN: the mask tensor over all rows of K/V works everywhere
+        seq = n_kv;
+        Ep  = &lookup(false, seq);
+    }
+    fa_mark(3);
+    sdpa_partition & E = *Ep;
     if (!E.ok) {
         // oneDNN can decline a shape or a stride set that _supported() never sees; build_sdpa warns per key.
         ggml_sycl_flash_attn_ext_tile(ctx, dst);
@@ -414,12 +571,29 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     std::vector<tensor> ti;
     ti.reserve(E.ins.size());
     for (auto & lt : E.ins) {
-        ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
+        const size_t r = lt.get_id();
+        if (r == E.id_kv_len) {
+            ti.push_back(tensor::make_scalar_tensor(lt, &E.kv_len));
+        } else if (r == E.id_q_len) {
+            ti.push_back(tensor::make_scalar_tensor(lt, &E.q_len));
+        } else if (r == E.id_neg_inf) {
+            ti.push_back(tensor::make_scalar_tensor(lt, &E.neg_inf));
+        } else {
+            ti.emplace_back(lt, eng, id2ptr(r));
+        }
     }
     tensor to(E.out, eng, outf_ptr);
     E.cp.execute(strm, ti, {to});
+    fa_mark(4);
 
     permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
+    fa_mark(5);
+    if (fa_prof) {
+        const double gflop = 4.0 * (double) H * q * seq * d / 1e9;
+        fprintf(stderr, "[FA-PROF] q=%lld kv=%lld H=%lld Hkv=%lld d=%lld kvtype=%s causal=%d us: qcopy=%.0f kdeq=%.0f vdeq=%.0f build=%.0f sdpa=%.0f out=%.0f | %.1f GFLOP sdpa %.1f TFLOPS\n",
+                (long long) q, (long long) seq, (long long) H, (long long) Hkv, (long long) d, ggml_type_name(K->type), causal ? 1 : 0,
+                fa_us[0], fa_us[1], fa_us[2], fa_us[3], fa_us[4], fa_us[5], gflop, gflop / fa_us[4] * 1e3);
+    }
     // Single device needs no sync: the dnnl stream wraps this same in-order queue, so the SDPA
     // serializes with the staging kernels before it and the permute/pool reuse after it. The
     // garbage output formerly blamed on the missing sync here was the scale use-after-return
