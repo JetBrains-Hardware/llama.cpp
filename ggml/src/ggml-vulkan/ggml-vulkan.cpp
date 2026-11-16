@@ -3555,10 +3555,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     // RDNA3: the integer WMMA path is faster than the f16 one (register peak 115 against 86 TFLOPS), and an
-    // int8 copy of A is half the size of an f16 one. For q4_K / q6_K weights and wide batches A is re-quantized
+    // int8 copy of A is half the size of an f16 one. For q4_K (optionally q6_K) weights and wide batches A is re-quantized
     // to int8 with one scale per row, the activations to int8 with one scale per (column, 256 values), and
     // mul_mm_i8_gemm.comp multiplies them with int32 accumulation. Not bit-identical to the other paths.
-    // GGML_VK_DISABLE_I8_GEMM turns it off, GGML_VK_I8_GEMM_MIN_N moves the batch threshold,
+    // GGML_VK_DISABLE_I8_GEMM turns it off, GGML_VK_I8_GEMM_Q6K=1 adds q6_K weights, GGML_VK_I8_GEMM_MIN_N moves the batch threshold,
     // GGML_VK_I8_GEMM_BLOCK=256|128|64 sets the number of values per activation scale.
     // From 512 columns it beats the quantized kernels (n=512: q4_K 56-59 -> 59-73 TFLOPS, q6_K 43-50 -> 57-71);
     // narrower batches were not measured and keep their kernels.
@@ -3582,9 +3582,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         device->properties.limits.maxComputeWorkGroupSize[0] >= 256) {
         ggml_vk_create_pipeline(device, device->pipeline_matmul_i8_gemm, "matmul_i8_gemm", matmul_i8_gemm_cm1_len, matmul_i8_gemm_cm1_data, "main", 5, 4 * sizeof(uint32_t), {128, 128, 1}, { device->matmul_i8_gemm_block / 16 }, 1, true, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8[GGML_TYPE_Q4_K], "requant_i8_q4_k", requant_i8_q4_k_len, requant_i8_q4_k_data, "main", 3, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
-        ggml_vk_create_pipeline(device, device->pipeline_requant_i8[GGML_TYPE_Q6_K], "requant_i8_q6_k", requant_i8_q6_k_len, requant_i8_q6_k_data, "main", 3, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8_rowscale[GGML_TYPE_Q4_K], "requant_i8_rowscale_q4_k", requant_i8_rowscale_q4_k_len, requant_i8_rowscale_q4_k_data, "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true);
-        ggml_vk_create_pipeline(device, device->pipeline_requant_i8_rowscale[GGML_TYPE_Q6_K], "requant_i8_rowscale_q6_k", requant_i8_rowscale_q6_k_len, requant_i8_rowscale_q6_k_data, "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true);
+        // q6_K weights stay on the f16 GEMM unless GGML_VK_I8_GEMM_Q6K is set: with them on the int8 path the DFlash
+        // draft of Qwen3.6-27B was accepted less often after a 20k-token prompt (170 against 179 of 300 tokens,
+        // 55.1 against 59.0 t/s), without them 177 (58.2 t/s). They are the tensors the quantizer keeps at 6 bits
+        // because they are sensitive.
+        if (getenv("GGML_VK_I8_GEMM_Q6K") != nullptr) {
+            ggml_vk_create_pipeline(device, device->pipeline_requant_i8[GGML_TYPE_Q6_K], "requant_i8_q6_k", requant_i8_q6_k_len, requant_i8_q6_k_data, "main", 3, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
+            ggml_vk_create_pipeline(device, device->pipeline_requant_i8_rowscale[GGML_TYPE_Q6_K], "requant_i8_rowscale_q6_k", requant_i8_rowscale_q6_k_len, requant_i8_rowscale_q6_k_data, "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true);
+        }
         if (device->matmul_i8_gemm_block == 64) {
             ggml_vk_create_pipeline(device, device->pipeline_quantize_i8_cols, "quantize_i8_cols_64", quantize_i8_cols_64_len, quantize_i8_cols_64_data, "main", 3, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true, true, 64);
         } else if (device->matmul_i8_gemm_block == 128) {
