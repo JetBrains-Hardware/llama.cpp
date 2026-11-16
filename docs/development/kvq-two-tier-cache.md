@@ -236,6 +236,32 @@ Feasibility in the current structure:
 
 Quality, measured as a proxy (LLAMA_KVQ_FOLD_EVERY=64 with LLAMA_KVQ_FOLD_FIXED=1, a switch removed since: every 64 reply rows are coded with the existing tables of the partial chunk, the last up to 63 stay precise; and without FOLD_FIXED: refitted every 64 rows instead), see Results.
 
+### Wide test and the measurements behind the redesign (2026-11-16, build fa865aee3 unless noted)
+
+All against a q8_0 teacher (rotation off, 1 token per decode), teacher forced on the reply tokens of dataset rows, `--kvq-lib --kvq-lib-hold`, `-b 2048`. The noise baseline is the same q8_0 cache with 4 tokens per decode. Scripts and per-row results: `kvq-scratch\wide`, `tailt`, `topk`, `chunk16`, `repro`.
+
+Wide test, 42 requests of 12k to 121k tokens, 22,760 scored reply tokens (up to 600 per request), nothing failed:
+
+| Context | Requests | Positions | Top-1 flips two-tier | Top-1 flips baseline | KL two-tier | KL baseline |
+|---|---|---|---|---|---|---|
+| 10-20k | 7 | 2874 | 11 (0.38%) | 12 (0.42%) | 1.14e-4 | 1.04e-4 |
+| 20-40k | 7 | 3647 | 9 (0.25%) | 6 (0.17%) | 1.07e-4 | 6.9e-5 |
+| 40-70k | 7 | 4107 | 10 (0.24%) | 6 (0.15%) | 9.3e-5 | 6.3e-5 |
+| 70-90k | 7 | 3901 | 9 (0.23%) | 7 (0.18%) | 1.75e-4 | 7.7e-5 |
+| 90-110k | 10 | 5831 | 13 (0.22%) | 9 (0.15%) | 1.75e-4 | 6.4e-5 |
+| 110-150k | 4 | 2400 | 4 (0.17%) | 1 (0.04%) | 8.9e-5 | 2.9e-5 |
+| all | 42 | 22760 | 56 (0.246%) | 41 (0.180%) | 1.33e-4 | 6.8e-5 |
+
+The Wilson intervals of the flip rates overlap (0.190 - 0.319% against 0.133 - 0.244%; positions of one request are correlated, so they are optimistic). Every flip of both configurations is at a position where the teacher's top probability is below 0.6 (median 0.44 and 0.43), none at 0.6 or above. The worst request has KL 3.36e-4, the largest KL at a flip is 2.7e-2. The KL ratio to the baseline grows with the context, from 1.1 at 10-20k to 2.3 - 3 above 70k. The 110-150k bucket has only 2 task groups.
+
+Precise recent prompt positions (two-tier, the number t of precise prompt positions at the start of the reply set by the prefix length): mean KL 1.13e-4, 1.66e-4, 1.33e-4, 1.29e-4, 0.80e-4, 0.79e-4 at t = 8, 70, 300, 1091, 4000, 8100 on row2660 (471 positions) and 1.92e-4, 2.25e-4, 1.95e-4, 1.74e-4, 1.45e-4, 1.43e-4 at t = 8, 70, 300, 1000, 4000, 8100 on row1830 (289 positions); all intervals overlap, at most 1 flip per run, the two largest t have one chunk fewer. The reply tokens stayed precise in every run. This is why the ring keeps no tail of prompt positions.
+
+Where the top attended positions are (plain q8_0 cache, exact attention from the captured queries and the cached K rows, first 150 reply positions, all 16 layers and 24 heads, `--kvq-attn-top` of kvq-eval in the worktree `kvq-wt-save`, not in this branch): of the top 64 positions, 12.3 / 16.9 / 18.7 / 31.1 / 46.0 / 53.9 lie in the last 64 / 256 / 1024 / 2048 / 4096 / 8192 positions at 100k and 11.1 / 18.2 / 19.3 / 20.2 / 30.9 / 40.2 at 50k; the attention mass on these windows is 23 / 27 / 30 / 46 / 67 / 79% and 20 / 31 / 33 / 34 / 48 / 61%. The top 64 hold about 60% of the mass, the top 128 about 68%. Heads differ widely (one head has 60 of its top 64 in the last 1024, others about 1 of 64 in the last 2048).
+
+Chunk size (10 requests of 17k to 101k with the same coarse region for every size): the mean KL ratio of 16384-row chunks to 8192 is 1.12 (median 1.02, 4 requests better, 6 worse, per request 0.76 to 1.88), of 4096 to 8192 it is 0.88 (median 0.86, 9 comparable requests, 7 better, none worse by more than 3%). Flips: baseline 12, 8192: 16, 16384: 17, 4096: 14. The CPU part of the fit is about 2.2 s per chunk at every size, prefill and decode time are equal. So `--kvq-rem merge` (a 16k group) has no quality argument and 8192 stays; 4096 would cost twice the tables and fit CPU.
+
+One teacher run of the chunk test (row 2663, plain q8_0) gave NLL 0.111682 where the wide test and five repeats give 0.111541, with identical logged settings; not explained, not seen again. The two-tier runs of that row are byte-identical run to run on fa865aee3 and on c08afcc49 (3 runs each), the teacher runs too (2 each, and equal across the builds).
+
 ### Before the ring redesign
 
 Server, ctx 230000, 100k prompt, MTP with 3 drafts:
