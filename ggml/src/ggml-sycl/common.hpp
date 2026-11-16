@@ -13,6 +13,7 @@
 #ifndef GGML_SYCL_COMMON_HPP
 #define GGML_SYCL_COMMON_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
@@ -141,6 +142,9 @@ static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
+extern int g_ggml_sycl_enable_graph;
+// counts graph computes; ops use it to cache what they learn about a graph input for the rest of the graph
+extern std::atomic<uint64_t> g_ggml_sycl_graph_epoch;
 extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;
 extern int g_ggml_sycl_fa_dpas;
