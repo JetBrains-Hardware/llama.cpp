@@ -14,6 +14,8 @@
 
 class llama_kv_cache;
 class llama_kvq_store;
+class llama_io_write_i;
+class llama_io_read_i;
 
 // fits and codes the chunks of the coarse region of a packed store in fit mode (see llama_kvq_fit_params)
 // a job is one chunk, its tasks are the (attention layer, kv head, K or V) triples
@@ -51,6 +53,14 @@ public:
     void get_progress(llama_kvq_fit_progress & out) const;
 
     void set_hold(bool value) { hold = value; }
+
+    // state save and load, the decode thread: the statistics of the coarse chunks (for a later removal into a chunk) and the sums of the open chunk
+    // the save needs a fitter without jobs and without complete chunks outside the coarse region (after wait), else it throws
+    // state_read_meta throws on a mismatch; state_read_data after remove(0) and the store's state_read_data, n_chunk coarse chunks
+    void state_write_meta(llama_io_write_i & io) const;
+    void state_write_data(llama_io_write_i & io) const;
+    void state_read_meta (llama_io_read_i  & io, int32_t n_chunk) const;
+    void state_read_data (llama_io_read_i  & io, int32_t n_chunk);
 
 private:
     struct job;

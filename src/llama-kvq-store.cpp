@@ -1,6 +1,7 @@
 #include "llama-kvq-store.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-kvq-codec.h"
 #include "llama-kvq-pack.h"
@@ -741,6 +742,98 @@ void llama_kvq_store::set_n_coarse(int32_t n) {
         }
     }
     n_coarse_ = n;
+}
+
+// the table tensors go by their own type and slice size, so a change of the packed table format is a mismatch, not a misread
+void llama_kvq_store::state_write_meta(llama_io_write_i & io) const {
+    GGML_ASSERT(!filled);
+    const layer_tensors & t = layers[0].t;
+    const int32_t v[12] = {
+        (int32_t) layers.size(), G, (int32_t) D, (int32_t) ROW, n_crow, nwk, nwv, n_coarse_,
+        (int32_t) t.tinv->type, (int32_t) t.tinv->nb[2], (int32_t) t.taux->type, (int32_t) t.taux->nb[2],
+    };
+    io.write(v, sizeof(v));
+    for (const auto & l : layers) {
+        io.write(&l.il, sizeof(l.il));
+    }
+}
+
+int32_t llama_kvq_store::state_read_meta(llama_io_read_i & io) const {
+    GGML_ASSERT(!filled);
+    const layer_tensors & t = layers[0].t;
+    int32_t v[12];
+    io.read(v, sizeof(v));
+    if (v[0] != (int32_t) layers.size() || v[1] != G || v[2] != (int32_t) D || v[3] != (int32_t) ROW) {
+        throw std::runtime_error(format("kvq state of %d attention layers with %d kv heads of %d, this context: %d, %d, %d",
+                v[0], v[1], v[2], (int) layers.size(), G, (int) D));
+    }
+    if (v[4] != n_crow || v[5] != nwk || v[6] != nwv) {
+        throw std::runtime_error(format("kvq state with chunks of %d rows and %d / %d words per K / V row, this context: %d, %d / %d",
+                v[4], v[5], v[6], n_crow, nwk, nwv));
+    }
+    if (v[8] != (int32_t) t.tinv->type || v[9] != (int32_t) t.tinv->nb[2] || v[10] != (int32_t) t.taux->type || v[11] != (int32_t) t.taux->nb[2]) {
+        throw std::runtime_error(format("kvq state with tables of type %d / %d (%d / %d bytes), this context: %d / %d (%d / %d bytes)",
+                v[8], v[10], v[9], v[11], (int) t.tinv->type, (int) t.taux->type, (int) t.tinv->nb[2], (int) t.taux->nb[2]));
+    }
+    const int32_t n = v[7];
+    if (n < 0 || n % n_crow != 0 || n > n_rows_) {
+        throw std::runtime_error(format("kvq state with a coarse region of %d rows, this context holds %d", n, n_rows_));
+    }
+    for (const auto & l : layers) {
+        int32_t il = -1;
+        io.read(&il, sizeof(il));
+        if (il != l.il) {
+            throw std::runtime_error(format("kvq state with attention layer %d where this context has layer %d", il, l.il));
+        }
+    }
+    return n;
+}
+
+// per layer: the host rows of each kv head, the codes of each kv head, the tables of the chunks
+void llama_kvq_store::state_write_data(llama_io_write_i & io) {
+    GGML_ASSERT(!filled);
+    synchronize();
+    const int32_t n = n_coarse_;
+    if (n == 0) {
+        return;
+    }
+    for (auto & l : layers) {
+        for (int32_t g = 0; g < G; ++g) {
+            io.write(l.store + (size_t) g*n_rows_*2*ROW, (size_t) n*2*ROW);
+        }
+        for (ggml_tensor * rows : { l.t.kc, l.t.vc }) {
+            for (int32_t g = 0; g < G; ++g) {
+                io.write_tensor(rows, g*rows->nb[2], (size_t) n*rows->nb[1]);
+            }
+        }
+        for (ggml_tensor * tab : { l.t.tinv, l.t.taux }) {
+            io.write_tensor(tab, 0, (size_t) (n/n_crow)*tab->nb[3]);
+        }
+    }
+}
+
+void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n) {
+    GGML_ASSERT(!filled && n_coarse_ == 0 && n % n_crow == 0 && n <= n_rows_);
+    if (n == 0) {
+        return;
+    }
+    drop_pending();
+    synchronize();
+    for (auto & l : layers) {
+        for (int32_t g = 0; g < G; ++g) {
+            io.read(l.store + (size_t) g*n_rows_*2*ROW, (size_t) n*2*ROW);
+        }
+        for (ggml_tensor * rows : { l.t.kc, l.t.vc }) {
+            for (int32_t g = 0; g < G; ++g) {
+                io.read_tensor(rows, g*rows->nb[2], (size_t) n*rows->nb[1]);
+            }
+        }
+        for (ggml_tensor * tab : { l.t.tinv, l.t.taux }) {
+            io.read_tensor(tab, 0, (size_t) (n/n_crow)*tab->nb[3]);
+        }
+    }
+    // the sink rows are read from the host store now
+    set_n_coarse(n);
 }
 
 bool llama_kvq_store::set_codes(int32_t il, int32_t g, bool is_v, const std::vector<llama_kvq_table> & tabs, const int8_t * codes, const float * gain) {

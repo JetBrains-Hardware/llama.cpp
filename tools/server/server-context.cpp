@@ -5002,6 +5002,13 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
+                // --kvq: the prompt is done when every complete chunk is in the coarse region
+                if (params_base.kvq.enabled) {
+                    const int64_t t_wait_start = ggml_time_us();
+                    llama_memory_kvq_fit_wait(llama_get_memory(ctx_tgt));
+                    SLT_INF(slot, "kvq: waited %.3f s for the fitter at the end of the prompt\n", (ggml_time_us() - t_wait_start)*1e-6);
+                }
+
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }

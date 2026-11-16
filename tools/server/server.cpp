@@ -118,7 +118,7 @@ static server_role_type server_role_detect(const common_params & params, server_
     return has_model ? SERVER_ROLE_INSTANCE : SERVER_ROLE_ROUTER;
 }
 
-// --kvq: the two-tier KV cache holds one sequence and cannot copy, shift or save the K/V,
+// --kvq: the two-tier KV cache holds one sequence and cannot copy or shift the K/V (save and load: tail ring only),
 // the settings it needs are forced with a warning, the others are an error
 static bool server_kvq_prepare_params(common_params & params) {
     // ubatches of up to this many tokens use the packed attention (llama_kvq_params::max_batch)
@@ -143,13 +143,10 @@ static bool server_kvq_prepare_params(common_params & params) {
     if (params.kv_unified) {
         params.kv_unified = false;
     }
-    if (params.cache_ram_mib != 0) {
-        SRV_WRN("%s", "--kvq: the K/V cannot be saved, disabling the RAM prompt cache (--cache-ram 0)\n");
-        params.cache_ram_mib = 0;
-    }
     params.cache_idle_slots = false;
-    if (!params.slot_save_path.empty()) {
-        SRV_WRN("%s", "--kvq: the K/V cannot be saved, disabling the slot save and restore (--slot-save-path)\n");
+    if (params.kvq.tail == 0 && (params.cache_ram_mib != 0 || !params.slot_save_path.empty())) {
+        SRV_WRN("%s", "--kvq-tail 0: the K/V cannot be saved, disabling the RAM prompt cache and the slot save and restore\n");
+        params.cache_ram_mib = 0;
         params.slot_save_path.clear();
     }
     if (params.ctx_shift) {

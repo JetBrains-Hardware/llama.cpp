@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid-kvq.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-model.h"
 
 #include <algorithm>
@@ -198,7 +199,11 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         if (seq_id > 0) {
             GGML_ABORT("seq_rm of sequence %d: the fit mode supports sequence 0 only", seq_id);
         }
-        const llama_pos pos_max = get_mem_attn()->seq_pos_max(0);
+        // the attention positions: a restored recurrent checkpoint can end before them; the ring is empty when they end with the coarse region
+        llama_pos pos_max = get_mem_attn()->seq_pos_max(0);
+        if (pos_max < 0 && store->n_coarse() > 0) {
+            pos_max = store->n_coarse() - 1;
+        }
         const llama_pos q0      = std::max<llama_pos>(p0, 0);
         const llama_pos q1      = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
         if (q0 >= q1 || q0 > pos_max) {
@@ -271,22 +276,109 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_kvq::memory_bre
     return mb;
 }
 
-// the partial state is the recurrent one, the attention cache writes nothing for it
-// a failed state write looks like an empty state to the caller, so the other cases abort
+llama_pos llama_memory_hybrid_kvq::seq_pos_max(llama_seq_id seq_id) const {
+    const llama_pos res = llama_memory_hybrid::seq_pos_max(seq_id);
+    if (tail && store && seq_id == 0 && res < 0 && store->n_coarse() > 0) {
+        return std::min<llama_pos>(store->n_coarse() - 1, get_mem_recr()->seq_pos_max(seq_id));
+    }
+    return res;
+}
+
+// state of the fit mode with the tail, sequence 0 (seq_id -1 is the same):
+//   magic, version, meta of the store and of the fitter (checked before the data is read)
+//   ring: the plain state of the attention cache, the positions after the coarse region
+//   recurrent: the plain state
+//   store: host rows, codes and tables of the coarse region; fitter: statistics of the coarse chunks, sums of the open chunk
+// a plain state starts with the stream count of the attention cache, so neither reader takes the state of the other
+static constexpr uint32_t KVQ_STATE_MAGIC   = 0x5351564b; // "KVQS"
+static constexpr uint32_t KVQ_STATE_VERSION = 1;
+
+void llama_memory_hybrid_kvq::state_check(llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (!fitter || !tail) {
+        throw std::runtime_error("the K/V state of the two-tier cache can be saved and loaded only in the fit mode with a tail ring (--kvq, --kvq-tail > 0)");
+    }
+    if (seq_id > 0) {
+        throw std::runtime_error(format("the two-tier cache holds sequence 0 only, not %d", seq_id));
+    }
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        throw std::runtime_error("the K/V state of the two-tier cache cannot be kept on the device");
+    }
+}
+
 void llama_memory_hybrid_kvq::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((params.enabled || store) && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-        GGML_ABORT("state write of the K/V is not supported in two-tier mode");
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || (!params.enabled && !store)) {
+        llama_memory_hybrid::state_write(io, seq_id, flags);
+        return;
+    }
+    state_check(seq_id, flags);
+
+    // no chunk in flight in a saved state
+    const int64_t t0 = ggml_time_us();
+    const_cast<llama_memory_hybrid_kvq *>(this)->fit_wait();
+    const double t_wait = (ggml_time_us() - t0)*1e-6;
+    if (t_wait >= 0.001) {
+        LLAMA_LOG_INFO("%s: waited %.3f s for the fitter, the coarse region has %d rows\n", __func__, t_wait, store->n_coarse());
     }
 
-    llama_memory_hybrid::state_write(io, seq_id, flags);
+    io.write(&KVQ_STATE_MAGIC,   sizeof(KVQ_STATE_MAGIC));
+    io.write(&KVQ_STATE_VERSION, sizeof(KVQ_STATE_VERSION));
+    store->state_write_meta(io);
+    fitter->state_write_meta(io);
+
+    get_mem_attn()->state_write(io, 0, flags);
+    get_mem_recr()->state_write(io, seq_id, flags);
+
+    store->state_write_data(io);
+    fitter->state_write_data(io);
 }
 
 void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((params.enabled || store) && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-        GGML_ABORT("state read of the K/V is not supported in two-tier mode");
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || (!params.enabled && !store)) {
+        llama_memory_hybrid::state_read(io, seq_id, flags);
+        return;
     }
+    state_check(seq_id, flags);
 
-    llama_memory_hybrid::state_read(io, seq_id, flags);
+    // the memory starts empty and stays empty after a failed read: cancels the jobs, drops the coarse region
+    clear(false);
+
+    try {
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        io.read(&magic, sizeof(magic));
+        if (magic != KVQ_STATE_MAGIC) {
+            throw std::runtime_error("not a state of the two-tier cache (saved without --kvq?)");
+        }
+        io.read(&version, sizeof(version));
+        if (version != KVQ_STATE_VERSION) {
+            throw std::runtime_error(format("version %u of the two-tier cache state, expected %u", version, KVQ_STATE_VERSION));
+        }
+        const int32_t n = store->state_read_meta(io);
+        fitter->state_read_meta(io, n/store->n_chunk_rows());
+
+        get_mem_attn()->state_read(io, 0, flags);
+        get_mem_recr()->state_read(io, seq_id, flags);
+
+        const llama_pos p_min = get_mem_attn()->seq_pos_min(0);
+        const llama_pos p_max = get_mem_attn()->seq_pos_max(0);
+        if (p_max >= 0 && (p_min != n || p_max >= (llama_pos) n_ctx_max)) {
+            throw std::runtime_error(format("the ring holds positions [%d, %d], expected the positions after the coarse region of %d rows, below %u", p_min, p_max, n, n_ctx_max));
+        }
+
+        store->state_read_data(io, n);
+        fitter->state_read_data(io, n/store->n_chunk_rows());
+        n_released = n;
+
+        // the resident slots start empty
+        if (!store->enable(params)) {
+            throw std::runtime_error("failed to reset the resident rows");
+        }
+        LLAMA_LOG_INFO("%s: coarse region of %d rows (%d chunks), %d positions in the ring\n", __func__,
+                n, n/store->n_chunk_rows(), p_max >= 0 ? p_max - p_min + 1 : 0);
+    } catch (...) {
+        clear(false);
+        throw;
+    }
 }
 
 llama_kv_cache * llama_memory_hybrid_kvq::get_mem_coarse() const {

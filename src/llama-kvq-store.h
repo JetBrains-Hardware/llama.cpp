@@ -13,6 +13,8 @@
 
 struct llama_kvq_table;
 class llama_kv_cache;
+class llama_io_write_i;
+class llama_io_read_i;
 
 // packed two-tier state of the attention layers of one sequence (see llama_kvq_params::packed)
 //   device: packed coarse rows and tables of the coarse region, resident precise rows (rkv, ridx) per layer, top-k bias
@@ -93,6 +95,14 @@ public:
 
     // waits for the main stream and the copy stream
     void synchronize();
+
+    // fit mode, state save and load of the coarse region [0, n_coarse): host rows, codes and tables, the decode thread
+    // meta: shapes and types, state_read_meta throws on a mismatch and returns n_coarse of the state
+    // state_read_data: the coarse region must be empty, it becomes [0, n)
+    void    state_write_meta(llama_io_write_i & io) const;
+    void    state_write_data(llama_io_write_i & io);
+    int32_t state_read_meta (llama_io_read_i  & io) const;
+    void    state_read_data (llama_io_read_i  & io, int32_t n);
 
     // the main backend (set_backend), the device and the buffer type of the device tensors
     ggml_backend_t             backend() const { return backend_main; }

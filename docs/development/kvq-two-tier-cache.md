@@ -45,6 +45,16 @@ Prefill (larger ubatches), per attention layer: the installed region is uploaded
 
 Rollback. Removing the end of the sequence is cheap when it stays in the tail (MTP draft rollback). When it cuts into an installed chunk, the chunk is dropped, its rows before the cut are restored from the host store into the ring, and it is fitted again later. `clear` drops everything and the fitter starts again.
 
+Save and restore (`llama_memory_hybrid_kvq::state_write` / `state_read`, fit mode with the tail ring only). The state is exact: nothing is fitted again on load. A save first waits for the fitter until every complete chunk is in the coarse region (`fit_wait`), so a saved state has no chunk in flight; the server also waits at the end of every prompt. Layout of the state of sequence 0 (the full-context state is the same with the arch string in front):
+
+1. Magic `KVQS` and version 1, then the meta of the store (attention layers, kv heads, head dim, chunk rows, words per K / V row, coarse rows, type and slice size of the two table tensors) and of the fitter (K / V bits, V fitted per chunk or from a file). The loader checks all of it before it reads any data.
+2. The ring: the plain state of the attention cache (the positions after the coarse region), read back with `find_slot`, which places a position at cell `pos mod size`.
+3. The recurrent state, plain.
+4. Per attention layer: the q8_0 host rows of the coarse region per kv head (raw blocks from and into the pinned store), the codes (`kc`, `vc`) per kv head, the tables of the coarse chunks (by the tensors' own type and size, so a change of the table format is a mismatch and not a misread).
+5. The fitter: query and gate statistics of each coarse chunk (for a later rollback into a chunk) and the device sums of the open chunk.
+
+A plain state starts with the stream count of the attention cache, so a plain context refuses a kvq state ("n_stream mismatch") and a kvq context refuses a plain one ("not a state of the two-tier cache"); after a failed load the sequence is empty. The resident set starts empty after a load. The server's slot file appends the context checkpoints and the MTP draft state as before. The RAM prompt cache serializes the same state into RAM (an entry over `--cache-ram` is skipped).
+
 ## Code map
 
 | Part | Files |
@@ -72,7 +82,7 @@ llama-server --fit off -m Qwen3.8-3.6-27B-blend-Q4_K_M.gguf --ctx-size 230000 --
 
 Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (1024), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default 2 * 8192 + n_batch + 256, 0 = full device cache), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
 
-With `--kvq` the server forces, with a warning: 1 slot, RAM prompt cache off, slot save path cleared, context shift and cache reuse off, flash attention on, q8_0 K/V, draft n_max <= 7. It refuses to start for a model that is not qwen35, `--mmproj`, embeddings. Attention rotation of quantized caches is turned off for the model (also for the MTP context). `--fit` does not count the kvq memory.
+With `--kvq` the server forces, with a warning: 1 slot, context shift and cache reuse off, flash attention on, q8_0 K/V, draft n_max <= 7; with `--kvq-tail 0` also the RAM prompt cache off and the slot save path cleared. At the end of each prompt the server waits until every complete chunk is in the coarse region (log line `kvq: waited ... at the end of the prompt`). It refuses to start for a model that is not qwen35, `--mmproj`, embeddings. Attention rotation of quantized caches is turned off for the model (also for the MTP context). `--fit` does not count the kvq memory.
 
 Evaluation tool (teacher-forced KL against saved reference logits):
 
@@ -80,7 +90,7 @@ Evaluation tool (teacher-forced KL against saved reference logits):
 llama-kvq-eval -m MODEL -ngl 99 -fa on -fit off -b 2048 -ub 2048 -ctk q8_0 -ctv q8_0 --kvq-tokens TOKENS.bin --kvq-prefix-len S --kvq-chunk 1 --kvq-ref REF --kvq-lib
 ```
 
-`--kvq-lib` is the library path (same as the server), `--kvq-lib-full` keeps the full device cache, `--kvq-rm-test` checks the removal cases, `--kvq-scr-check N` compares scratch and cache prefill logits bit for bit. The older `--kvq-variant`, `--kvq-two-tier`, `--kvq-packed` modes are tool-driven experiments from earlier stages.
+`--kvq-lib` is the library path (same as the server), `--kvq-lib-full` keeps the full device cache, `--kvq-rm-test` checks the removal cases, `--kvq-scr-check N` compares scratch and cache prefill logits bit for bit. State checks: `--kvq-state-save FILE` (after the prefill and the wait), `--kvq-state-load FILE` (instead of the prefill), `--kvq-state-ckpt P` (a recurrent checkpoint at P; after the save or load, roll back to P and process the rest of the prefix again), `--kvq-lib-hold` (no chunk joins during the scoring). Compare two runs with `--kvq-save-ref` files. The older `--kvq-variant`, `--kvq-two-tier`, `--kvq-packed` modes are tool-driven experiments from earlier stages.
 
 Environment variables for debugging: `LLAMA_KVQ_SCHED_SYNC`, `LLAMA_KVQ_GATHER_THREADS`, `LLAMA_KVQ_IDLE_PROBE`, `LLAMA_KVQ_SCRATCH`, `LLAMA_SERVER_GEN_TIMES`, `LLAMA_KVQ_FIT_SYNC` (synchronize around the device phases of the fitter, logs the device time per chunk and phase).
 
@@ -128,6 +138,19 @@ VRAM as allocated at ctx 230000 (MiB): coarse rows 1400, tables 235 (459 with fp
 
 Per format at 150k, main model only (arithmetic): f16 9.16 GiB, q8_0 4.86 GiB, q4_0 2.57 GiB.
 
+Save and restore at 100k (2026-11-16, measured; the files were read back right after they were written, so the loads probably came from the OS file cache):
+
+| | Two-tier | Plain q8_0 (same binary, no `--kvq`) |
+|---|---|---|
+| kvq-eval state (prefix 99395) | 4459.6 MiB, save 1.84 - 2.33 s, load 0.65 - 0.75 s | 3452.5 MiB, save 2.20 s, load 1.30 s |
+| Server slot file (99598 tokens, with 3 checkpoints 449 MiB and the MTP draft 391 MiB) | 5.56 GB, save 2.3 - 2.5 s, restore 1.22 - 1.25 s | 4.51 GB, save 2.9 - 3.0 s, restore 1.96 s |
+| RAM prompt cache entry (with the draft) | 4863 MiB, saved in 0.52 s | not run |
+
+- Restore is exact: a restored state saved again is byte-identical to the file (24k and 100k), and two saves of the same state are identical. Logits of a run continued from a restored state are bit-identical to the run that saved it when the scoring uses ubatches of 64 tokens (scratch attention); this holds also for a rollback to a recurrent checkpoint at 90000 (two coarse chunks dropped and fitted again) after the restore, and for a load into a context with a larger ring (`-b 4096`).
+- With one token per decode (packed attention) two runs are never bit-identical, also two runs from the same restored file: `ggml_kvq_attn` sums with float atomics. Between two identical runs KL is about 4.5e-5 mean, the same as between the saving run and the restored run (24k, 245 positions, top-1 equal at 244). The fit itself is deterministic: two runs wrote identical state files.
+- The wait at the end of the prompt: 0.011 - 0.015 s in the server after a 100k prompt (the last chunk was nearly done), 0.41 - 0.48 s in kvq-eval (-ub 2048). First-request generation 128.9 t/s (two sessions), the same as before the change. A save while a chunk was in flight waited 0.435 s for it.
+- Server sequence: 100k request, trim to the confirmed prefix (`n_predict` 0), slot save, process restart, restore, continuation of 600 + 300 tokens: generated ids equal to the continuation without the restart, 300 of 300, also after a restore into a non-empty slot and after a switch through the RAM prompt cache.
+
 ## Decisions taken, with the reason
 
 - K 2 bit, V 1 bit: K2V1 is as good as K2V2 in the two-tier setting.
@@ -164,8 +187,8 @@ Sizes are for ctx 230000 as allocated today.
 
 - Quality is measured on few traces: the final library path on one 100k trace, earlier stages on four (12k to 100k). Nothing was run at 150k or above, which is the target length. A wider check over more traces and lengths is needed.
 - Speed of the final build was measured only at 100k. Not measured at 24k / 50k and at 150k+.
-- Slot save and the RAM prompt cache do not work (full state save aborts). The production launch passes `--slot-save-path`, so saving and restoring a session is lost with `--kvq`.
-- Output is not reproducible from run to run (the coarse region depends on fitter timing). A deterministic install rule would be needed for exact comparisons.
+- Slot save and restore and the RAM prompt cache work (see Results), checked at 24k and 100k only, not at 150k+ (about 10 GiB per state at 230k, estimated). A kvq state is about 29% larger than the plain one. The launcher must give kvq snapshots their own directory (its snapshot directory hash does not know `--kvq`), plain snapshots cannot be loaded.
+- Output is not reproducible from run to run: the coarse region depends on fitter timing during a prompt, and the packed attention sums with float atomics, so even a fixed coarse region gives slightly different logits (KL about 4.5e-5 between two runs).
 - CUDA only. The attention op and the fit op have a CPU reference and a CUDA kernel, nothing for Metal or Vulkan; the fit mode refuses to start when the device cannot run the fit graphs. The fitter needs about 2 CPU-seconds per 8k chunk (one core is enough at 100k on this GPU, see Results).
 - The fitter's device work runs on the main stream between ubatches. A second stream would hide its ~35 ms per chunk, not built.
 - Host memory: 7.6 GB of pinned RAM at ctx 230000, per sequence.
@@ -179,6 +202,7 @@ Sizes are for ctx 230000 as allocated today.
 ## Not exercised
 
 - Two-tier without MTP, drafts of 7 tokens on the packed path, model reload after sleep, a chat-endpoint conversation with user-message checkpoints.
+- Save and restore: a load into a smaller context or ring than the state needs, the full-context state API (`llama_state_save_file`), a sequence that ends exactly at a chunk boundary (empty ring, handled by `seq_pos_max`), the launcher itself with `--kvq`.
 - Top-up modes `count` / `always`, lead 1 and 3 after the async prefetch change.
 - The server with `--kvq-tail 0` or other tail sizes, the hard error when the ring is too small.
 - The tool-driven `--kvq-packed` modes of kvq-eval after the tail-mode change.
@@ -187,7 +211,9 @@ Sizes are for ctx 230000 as allocated today.
 
 ## Not supported (aborts with a message)
 
-Full state save and load (RAM prompt cache, slot save files), more than one sequence, `seq_cp`, `seq_add` / `seq_div` (context shift, cache reuse), removal of a middle range. Recurrent-only state (context checkpoints) works.
+More than one sequence, `seq_cp`, `seq_add` / `seq_div` (context shift, cache reuse), removal of a middle range.
+
+State save and load of the K/V outside the fit mode with a tail ring (`--kvq-tail 0`, the tool-driven packed and two-tier modes): an error, the save or load returns 0. A plain state (saved without `--kvq`) into a kvq context and a kvq state into a plain context: an error, the sequence is empty afterwards; there is no migration from plain snapshots. The `ON_DEVICE` state flag on a kvq state: an error.
 
 ## Working material outside the repository
 

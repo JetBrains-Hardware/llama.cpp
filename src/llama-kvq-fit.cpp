@@ -1,6 +1,7 @@
 #include "llama-kvq-fit.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-kvq-pack.h"
 #include "llama-kvq-store.h"
@@ -989,6 +990,87 @@ void llama_kvq_fitter::remove(llama_pos p0) {
     // a failed chunk before c0 still blocks the later ones
     if (c0 == 0) {
         failed = false;
+    }
+}
+
+static size_t kvq_fit_n_gram(const llama_kvq_store & store) {
+    return (size_t) KVQ_D*KVQ_D*store.n_head_kv()*store.layer_ids().size();
+}
+
+void llama_kvq_fitter::state_write_meta(llama_io_write_i & io) const {
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (failed || !jobs.empty() || !snaps.empty() || n_taken != n_coarse_chunks) {
+            throw std::runtime_error(format("the kvq fitter is not idle (failed = %d, %zu jobs, %zu complete chunks without a job), the state is not saved",
+                    failed ? 1 : 0, jobs.size(), snaps.size()));
+        }
+    }
+    GGML_ASSERT(n_coarse_chunks*store.n_chunk_rows() == store.n_coarse() && n_snap == n_coarse_chunks);
+    const int32_t v[4] = { fparams.bits_k, fparams.bits_v, v_fit ? 1 : 0, v_fit ? n_head : 0 };
+    io.write(v, sizeof(v));
+}
+
+void llama_kvq_fitter::state_read_meta(llama_io_read_i & io, int32_t n_chunk) const {
+    int32_t v[4];
+    io.read(v, sizeof(v));
+    if (v[0] != fparams.bits_k || v[1] != fparams.bits_v || v[2] != (v_fit ? 1 : 0) || v[3] != (v_fit ? n_head : 0)) {
+        throw std::runtime_error(format("kvq state with K %d / V %d bits, V %s, this context: K %d / V %d bits, V %s",
+                v[0], v[1], v[2] ? "fitted per chunk" : "from a table file", fparams.bits_k, fparams.bits_v, v_fit ? "fitted per chunk" : "from a table file"));
+    }
+    GGML_ASSERT(n_chunk >= 0 && (int64_t) n_chunk*store.n_chunk_rows() <= store.n_rows());
+}
+
+// the statistics of each coarse chunk, then the device sums of the open chunk
+void llama_kvq_fitter::state_write_data(llama_io_write_i & io) const {
+    const size_t n_gram = kvq_fit_n_gram(store);
+    const size_t n_gsum = v_fit ? (size_t) n_head*KVQ_D*layer_ids.size() : 0;
+    GGML_ASSERT((int32_t) grams.size() >= n_coarse_chunks && (int32_t) gsums.size() >= n_coarse_chunks);
+    for (int32_t c = 0; c < n_coarse_chunks; ++c) {
+        GGML_ASSERT(grams[c].size() == n_gram && gsums[c].size() == n_gsum);
+        io.write(grams[c].data(), n_gram*sizeof(float));
+        if (n_gsum > 0) {
+            io.write(gsums[c].data(), n_gsum*sizeof(float));
+        }
+    }
+    for (int32_t il : layer_ids) {
+        const auto & t = store.get_layer(il);
+        io.write_tensor(t.qacc, 0, ggml_nbytes(t.qacc));
+        if (v_fit) {
+            io.write_tensor(t.gacc, 0, ggml_nbytes(t.gacc));
+        }
+    }
+}
+
+void llama_kvq_fitter::state_read_data(llama_io_read_i & io, int32_t n_chunk) {
+    {
+        std::lock_guard<std::mutex> lk(m);
+        GGML_ASSERT(jobs.empty() && tasks.empty());
+    }
+    GGML_ASSERT(store.n_coarse() == n_chunk*store.n_chunk_rows());
+    const size_t n_gram = kvq_fit_n_gram(store);
+    const size_t n_gsum = v_fit ? (size_t) n_head*KVQ_D*layer_ids.size() : 0;
+    grams.assign(n_chunk, {});
+    gsums.assign(n_chunk, {});
+    for (int32_t c = 0; c < n_chunk; ++c) {
+        grams[c].resize(n_gram);
+        io.read(grams[c].data(), n_gram*sizeof(float));
+        gsums[c].resize(n_gsum);
+        if (n_gsum > 0) {
+            io.read(gsums[c].data(), n_gsum*sizeof(float));
+        }
+    }
+    snaps.clear();
+    n_coarse_chunks = n_chunk;
+    n_taken         = n_chunk;
+    n_snap          = n_chunk;
+    failed          = false;
+    store.synchronize();
+    for (int32_t il : layer_ids) {
+        const auto & t = store.get_layer(il);
+        io.read_tensor(t.qacc, 0, ggml_nbytes(t.qacc));
+        if (v_fit) {
+            io.read_tensor(t.gacc, 0, ggml_nbytes(t.gacc));
+        }
     }
 }
 

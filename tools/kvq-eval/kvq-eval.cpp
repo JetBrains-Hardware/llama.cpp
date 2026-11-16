@@ -138,6 +138,11 @@ struct kvq_args {
     bool        rm_test     = false;
     int32_t     scr_check   = 0;
     bool        lib_full    = false;
+    bool        lib_hold    = false;
+
+    std::string state_save;     // sequence state file after the prefill (and the wait)
+    std::string state_load;     // sequence state file instead of the prefill
+    int32_t     state_ckpt = 0; // recurrent checkpoint at this position, rollback to it after the save or load and prefill again
 
     bool lib() const { return lib_on; }
 };
@@ -328,6 +333,14 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.scr_check = std::stoi(argv[++i]);
         } else if (a == "--kvq-lib-full") {
             args.lib_full = true;
+        } else if (a == "--kvq-lib-hold") {
+            args.lib_hold = true;
+        } else if (a == "--kvq-state-save" && has_val) {
+            args.state_save = argv[++i];
+        } else if (a == "--kvq-state-load" && has_val) {
+            args.state_load = argv[++i];
+        } else if (a == "--kvq-state-ckpt" && has_val) {
+            args.state_ckpt = std::stoi(argv[++i]);
         } else if (a.rfind("--kvq-", 0) == 0) {
             LOG_ERR("%s: unknown or incomplete argument '%s'\n", __func__, a.c_str());
             return false;
@@ -1704,9 +1717,47 @@ int main(int argc, char ** argv) {
         }
     }
 
+    const int32_t ckpt = args.state_ckpt;
+    if (ckpt < 0 || ckpt >= s) {
+        LOG_ERR("%s: --kvq-state-ckpt must be in [1, %d)\n", __func__, s);
+        return 1;
+    }
+    const llama_state_seq_flags fl_part = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    std::vector<uint8_t> ckpt_data;
+
     const int64_t t_prefill_start = ggml_time_us();
     cap.enabled = capture;
-    if (args.lib_busy && s > args.fit_chunk) {
+    if (!args.state_load.empty()) {
+        std::vector<llama_token> toks(ids.size());
+        size_t n_tok = 0;
+        const int64_t t0 = ggml_time_us();
+        const size_t n_read = llama_state_seq_load_file(ctx, args.state_load.c_str(), 0, toks.data(), toks.size(), &n_tok);
+        const double t_load = (ggml_time_us() - t0)/1e6;
+        if (n_read == 0 || n_tok != (size_t) s || !std::equal(toks.begin(), toks.begin() + s, ids.begin())) {
+            LOG_ERR("%s: cannot load the state %s, or its tokens are not the prefix\n", __func__, args.state_load.c_str());
+            return 1;
+        }
+        LOG("kvq: state: loaded %.1f MiB in %.2f s (%.2f GB/s), last position %d\n", n_read/1048576.0, t_load, n_read/t_load/1e9,
+                (int) llama_memory_seq_pos_max(llama_get_memory(ctx), 0));
+        if (ckpt > 0) {
+            std::ifstream f(args.state_load + ".ckpt", std::ios::binary | std::ios::ate);
+            ckpt_data.resize(f ? (size_t) f.tellg() : 0);
+            f.seekg(0);
+            if (ckpt_data.empty() || !f.read((char *) ckpt_data.data(), ckpt_data.size())) {
+                LOG_ERR("%s: cannot read %s.ckpt\n", __func__, args.state_load.c_str());
+                return 1;
+            }
+        }
+    } else if (ckpt > 0) {
+        if (!kvq_prefill(ctx, ids, ckpt, params.n_batch)) {
+            return 1;
+        }
+        ckpt_data.resize(llama_state_seq_get_size_ext(ctx, 0, fl_part));
+        if (ckpt_data.empty() || llama_state_seq_get_data_ext(ctx, ckpt_data.data(), ckpt_data.size(), 0, fl_part) != ckpt_data.size() ||
+                !kvq_prefill(ctx, ids, s, params.n_batch, ckpt)) {
+            return 1;
+        }
+    } else if (args.lib_busy && s > args.fit_chunk) {
         // the last chunk of the prefix is complete with the second part: its job starts there, and the chunk joins after the scoring
         const int32_t s1 = (s/args.fit_chunk)*args.fit_chunk - 1;
         if (!kvq_prefill(ctx, ids, s1, params.n_batch) || !llama_memory_kvq_fit_wait(llama_get_memory(ctx))) {
@@ -1736,6 +1787,49 @@ int main(int argc, char ** argv) {
         if (args.scr_check > 0) {
             return kvq_scr_check(ctx, ids, s, args.scr_check, n_vocab, tp_packed) ? 0 : 1;
         }
+    }
+
+    if (!args.state_save.empty()) {
+        const int64_t t0 = ggml_time_us();
+        const size_t n_write = llama_state_seq_save_file(ctx, args.state_save.c_str(), 0, ids.data(), s);
+        const double t_save = (ggml_time_us() - t0)/1e6;
+        if (n_write == 0) {
+            LOG_ERR("%s: cannot save the state to %s\n", __func__, args.state_save.c_str());
+            return 1;
+        }
+        LOG("kvq: state: saved %.1f MiB in %.2f s (%.2f GB/s)\n", n_write/1048576.0, t_save, n_write/t_save/1e9);
+        if (ckpt > 0) {
+            std::ofstream f(args.state_save + ".ckpt", std::ios::binary);
+            if (!f.write((const char *) ckpt_data.data(), ckpt_data.size())) {
+                LOG_ERR("%s: cannot write %s.ckpt\n", __func__, args.state_save.c_str());
+                return 1;
+            }
+        }
+        if (args.lib()) {
+            kvq_print_progress(llama_get_memory(ctx));
+        }
+    }
+
+    // rollback to the checkpoint (into a coarse chunk), the rest of the prefix again
+    if (ckpt > 0) {
+        llama_memory_t mem = llama_get_memory(ctx);
+        if (llama_state_seq_set_data_ext(ctx, ckpt_data.data(), ckpt_data.size(), 0, fl_part) != ckpt_data.size() || !llama_memory_seq_rm(mem, 0, ckpt, -1)) {
+            LOG_ERR("%s: rollback to position %d failed\n", __func__, ckpt);
+            return 1;
+        }
+        if (args.lib()) {
+            kvq_print_progress(mem);
+        }
+        if (!kvq_prefill(ctx, ids, s, params.n_batch, ckpt) || (args.lib() && !llama_memory_kvq_fit_wait(mem))) {
+            return 1;
+        }
+        LOG("kvq: state: rolled back to position %d and processed the prefix again\n", ckpt);
+        if (args.lib()) {
+            kvq_print_progress(mem);
+        }
+    }
+    if (args.lib_hold && !llama_memory_kvq_fit_set_hold(llama_get_memory(ctx), true)) {
+        return 1;
     }
 
     if (capture) {

@@ -75,9 +75,13 @@ public:
     void seq_add (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override;
 
+    // tail: the ring is empty when the sequence ends with the coarse region
+    llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
-    // the coarse copy is not saved: in two-tier mode a state write or read aborts, unless it is of the partial state only (recurrent)
+    // fit mode with the tail: the state of sequence 0 (see state_write in the .cpp), the save waits until every complete chunk is coarse
+    // the partial state is the recurrent one; other two-tier modes: a state write or read of the K/V throws
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
@@ -138,6 +142,9 @@ private:
 
     // tail: before the batch is placed, waits for the fitter until its positions fit the ring
     bool tail_wait(const llama_batch_allocr & balloc);
+
+    // throws if the K/V state cannot be saved or loaded
+    void state_check(llama_seq_id seq_id, llama_state_seq_flags flags) const;
 
     const std::unique_ptr<llama_kv_cache> mem_coarse;
 
