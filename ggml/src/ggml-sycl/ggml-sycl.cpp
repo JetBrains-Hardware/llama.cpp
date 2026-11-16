@@ -64,10 +64,14 @@
 #include "ggml-sycl/add-id.hpp"
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/fattn-dpas.hpp"
+#include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/gemm.hpp"
+#include "ggml-sycl/int8-gemm.hpp"
+#include "ggml-sycl/int8-audit.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/norm.hpp"
@@ -3307,6 +3311,16 @@ inline void ggml_sycl_op_mul_mat_sycl(
     if (const auto * src0_extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra)) {
         src0_reordered = src0_extra->optimized_feature.reorder;
     }
+#if GGML_SYCL_DNNL
+    // prompt batches of expanding q4_K / q6_K projections: int8 GEMM (int8-gemm.hpp)
+    const bool int8_gemm_ok = src0_reordered && row_diff == src0->ne[1] && g_ggml_sycl_enable_dnn &&
+                              ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) && ggml_sycl_src1_f16_ok(dst) &&
+                              ggml_prec_get_acc(dst) == GGML_PREC_UNDEFINED && ggml_sycl_int8_gemm_shape_ok(src0, src1, src1_ncols);
+    if (int8_gemm_ok && !ggml_sycl_int8_audit_on() &&
+        ggml_sycl_int8_gemm(ctx, src0, dst, src0_dd_i, src1_ddf_i, dst_dd_i, row_diff, src1_ncols, ne10, stream)) {
+        return;
+    }
+#endif
     if (ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] &&
         ggml_sycl_fused_dequant_gemm(src0->type, src0_reordered, src0_dd_i, src1_ddf_i, src1->type, ggml_sycl_src1_prec(dst), dst_dd_i,
                                      row_diff, src1_ncols, ne10, ldc, ctx.pool(), stream)) {
@@ -3364,6 +3378,21 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 dst_dd_i, dpct::library_data_t::real_float, ldc,
                 dpct::library_data_t::real_float)));
         }
+#if GGML_SYCL_DNNL
+        if (ggml_sycl_int8_audit_on() && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32) {
+            ggml_sycl_int8_audit_call(ctx, src0, src0_ptr, src1_ddf_i, dst_dd_i, row_diff, src1_ncols, ne10, stream);
+            auto & aud = ggml_sycl_int8_audit();
+            if (aud.last_audited && int8_gemm_ok) {
+                // the production int8 path on the same call
+                ggml_sycl_int8_gemm(ctx, src0, dst, src0_dd_i, src1_ddf_i, aud.Cacc, row_diff, src1_ncols, ne10, stream);
+                stream->wait();
+                const double e = ggml_sycl_int8_audit_nmse(aud, *stream, aud.Cacc, dst_dd_i, row_diff, src1_ncols);
+                fprintf(aud.log, "AUD name=%s type=%s m=%zu k=%zu n=%zu scheme=prod nmse=%.4e werr=0 xerr=0\n", src0->name,
+                        ggml_type_name(src0->type), (size_t) row_diff, (size_t) ne10, (size_t) src1_ncols, e);
+                fflush(aud.log);
+            }
+        }
+#endif
     } else {
         ggml_sycl_pool_alloc<float> src0_ddq_as_f32(ctx.pool());
         ggml_sycl_pool_alloc<float> src1_ddq_as_f32(ctx.pool());
@@ -5238,6 +5267,28 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     bool use_mul_mat_q = can_use_mul_mat_q(src0, src1, dst);
 
+#if GGML_SYCL_DNNL
+    // int8 audit: keep the result of the per-32 XMX kernel on this call as the accuracy reference
+    if (ggml_sycl_int8_audit_on() && !split && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+        auto & aud = ggml_sycl_int8_audit();
+        aud.xmx_valid = false;
+        if (src1->ne[1] >= aud.min_cols && (aud.calls % aud.every) == 0) {
+            const int saved_max_cols = g_ggml_sycl_xmx_max_cols;
+            g_ggml_sycl_xmx_max_cols = INT_MAX;
+            opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+            if (can_use_xmx_batch(ctx.device, src0, src1)) {
+                ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+                ctx.stream()->wait();
+                ggml_sycl_int8_audit_reserve(aud, *ctx.stream(), dst->ne[0], dst->ne[1], src0->ne[0]);
+                ctx.stream()->memcpy(aud.Cxmx, dst->data, sizeof(float) * dst->ne[0] * dst->ne[1]).wait();
+                aud.xmx_valid = true;
+            }
+            g_ggml_sycl_xmx_max_cols = saved_max_cols;
+        }
+    }
+#endif
+
     // When reorder is enabled, both ESIMD, MMVQ and DMMV kernels may be used. For
     // best performance use ESIMD when supported, followed by MMVQ, and finally DMMV.
     // But the reordered ESIMD path cannot be used without reordered MMVQ. A later
@@ -5286,6 +5337,17 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (use_mul_mat_q) {
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else {
+#if GGML_SYCL_DNNL
+        // the int8 prompt-batch GEMM reads the reordered layout; a weight that only ever sees wide batches
+        // would otherwise never be reordered
+        if (!split && g_ggml_sycl_enable_optimize && ctx.opt_feature.reorder && dst->op == GGML_OP_MUL_MAT && src1->ne[2] == 1 &&
+            src1->ne[3] == 1 && ggml_sycl_supports_reorder_mmvq(src0->type) && ggml_sycl_int8_gemm_shape_ok(src0, src1, src1->ne[1])) {
+            ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+            if (extra && !extra->optimized_feature.reorder && reorder_qw(src0, ctx.stream())) {
+                extra->optimized_feature.reorder = true;
+            }
+        }
+#endif
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
     }
 }
@@ -6732,6 +6794,59 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+
+#include <map>
+#include <chrono>
+#include <string>
+struct ggml_sycl_prof_entry { double us = 0; int64_t n = 0; double flops = 0; };
+static bool ggml_sycl_prof_on() { static int on = getenv("GGML_SYCL_PROF") ? atoi(getenv("GGML_SYCL_PROF")) : 0; return on != 0; }
+static std::map<std::string, ggml_sycl_prof_entry> & ggml_sycl_prof_tab() { static std::map<std::string, ggml_sycl_prof_entry> t; return t; }
+struct ggml_sycl_prof_scope {
+    ggml_backend_sycl_context * ctx; const ggml_tensor * node; bool on;
+    std::chrono::steady_clock::time_point t0;
+    ggml_sycl_prof_scope(ggml_backend_sycl_context * c, const ggml_tensor * n) : ctx(c), node(n), on(ggml_sycl_prof_on()) {
+        if (on) { t0 = std::chrono::steady_clock::now(); }
+    }
+    ~ggml_sycl_prof_scope() {
+        if (!on) return;
+        ctx->stream()->wait();
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        char buf[256]; double flops = 0;
+        const ggml_tensor * a = node->src[0]; const ggml_tensor * b = node->src[1];
+        if (node->op == GGML_OP_MUL_MAT && a && b) {
+            double batch = (double) node->ne[2] * node->ne[3];
+            flops = 2.0 * a->ne[0] * a->ne[1] * b->ne[1] * batch;
+            snprintf(buf, sizeof(buf), "MUL_MAT %s x %s m=%d n=%d k=%d b=%d", ggml_type_name(a->type), ggml_type_name(b->type), (int) a->ne[1], (int) b->ne[1], (int) a->ne[0], (int) batch);
+        } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            const ggml_tensor * k = node->src[1];
+            const char * kn = ggml_sycl_flash_attn_ext_uses_onednn(ctx->device, node) ? "ONEDNN" : ggml_sycl_flash_attn_ext_needs_sync(ctx->device, node) ? "MKL" : ggml_sycl_flash_attn_ext_dpas_supported(ctx->device, node) ? "DPAS" : "TILE/VEC";
+            snprintf(buf, sizeof(buf), "FLASH_ATTN_EXT[%s] kv=%s q(%d,%d,%d) k(%d,%d,%d)", kn, ggml_type_name(k->type), (int) a->ne[0], (int) a->ne[1], (int) a->ne[2], (int) k->ne[0], (int) k->ne[1], (int) k->ne[2]);
+        } else if (node->op == GGML_OP_UNARY) {
+            snprintf(buf, sizeof(buf), "UNARY_%s", ggml_unary_op_name(ggml_get_unary_op(node)));
+        } else if (node->op == GGML_OP_CPY && a) {
+            snprintf(buf, sizeof(buf), "CPY %s->%s", ggml_type_name(a->type), ggml_type_name(node->type));
+        } else if ((node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_GET_ROWS) && a) {
+            snprintf(buf, sizeof(buf), "%s %s->%s", ggml_op_name(node->op), ggml_type_name(a->type), ggml_type_name(node->type));
+        } else {
+            snprintf(buf, sizeof(buf), "%s", ggml_op_name(node->op));
+        }
+        auto & e = ggml_sycl_prof_tab()[buf]; e.us += us; e.n += 1; e.flops += flops;
+    }
+};
+static void ggml_sycl_prof_dump(int n_nodes) {
+    if (!ggml_sycl_prof_on()) return;
+    double total = 0;
+    fprintf(stderr, "----------------\nSYCL Timings (graph nodes %d):\n", n_nodes);
+    for (auto & kv : ggml_sycl_prof_tab()) {
+        total += kv.second.us;
+        fprintf(stderr, "%s: %lld x %.3f us = %.1f us", kv.first.c_str(), (long long) kv.second.n, kv.second.us / kv.second.n, kv.second.us);
+        if (kv.second.flops > 0) fprintf(stderr, " (%.1f GFLOPS/s)", kv.second.flops / kv.second.us / 1e3);
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "Total time: %.1f us.\n", total);
+    ggml_sycl_prof_tab().clear();
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     g_ggml_sycl_graph_epoch.fetch_add(1);
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -6742,6 +6857,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+        ggml_sycl_prof_scope prof_scope(sycl_ctx, node);
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
@@ -6845,6 +6961,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
     }
+    ggml_sycl_prof_dump(cgraph->n_nodes);
 }
 
 #ifdef GGML_SYCL_GRAPH

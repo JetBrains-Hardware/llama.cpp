@@ -11879,6 +11879,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }
 
+    // Prompt-batch widths over expanding K-quant projections (the SYCL backend runs these through an int8
+    // GEMM, ggml-sycl/int8-gemm.hpp) and the same widths over a contracting one, which stays on the f16 GEMM.
+    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        for (int n : { 511, 512, 1024, 2048 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 3072, n, 1024, { 1, 1 }, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4352, 2048, 1280, { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 2048, 3072, { 1, 1 }, { 1, 1 }));
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
