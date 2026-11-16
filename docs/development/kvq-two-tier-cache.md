@@ -11,7 +11,7 @@ A KV cache for Qwen3.8-27B (GGUF arch `qwen35`) that keeps most of the attention
 - Coarse tier, VRAM: every row of a fitted chunk as transform-coded low-bit codes (K 2 bit, V 1 bit plus a gain). The attention is computed on the packed codes by a custom op.
 - Precise tier, system RAM: the q8_0 rows of the same positions in a pinned host store.
 - Resident set, VRAM: 1024 precise rows per (layer, kv head), selected per token by an early query and fetched from RAM while the GPU runs the two layers before the attention.
-- Ring, VRAM: q8_0 rows of the positions whose rows are not in the host store yet: the reply since the end of the last prompt, and the rows of a prompt while it is processed (ring-shaped device cache, `--kvq-tail`, default one chunk + one batch + 256 cells).
+- Ring, VRAM: q8_0 rows of the positions whose rows are not in the host store yet: the reply since the end of the last prompt, and the rows of a prompt while it is processed (ring-shaped device cache, `--kvq-tail`, default one batch + 256 cells, at least 4352).
 
 Model facts used everywhere: 64 trunk blocks, 16 attention layers (il = 3, 7, ..., 63), 24 query heads, 4 kv heads, head dim 256. The MTP block (block 64) runs in its own context with its own plain cache and does not use any of this.
 
@@ -91,7 +91,7 @@ Server, production configuration plus `--kvq`:
 llama-server --fit off -m Qwen3.8-3.6-27B-blend-Q4_K_M.gguf --ctx-size 230000 --n-gpu-layers all --parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --jinja --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-type-k f16 --spec-draft-type-v f16 --batch-size 4096 --ubatch-size 1024 --kvq
 ```
 
-Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (1024), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default chunk + n_batch + 256, 0 = full device cache; the code works down to n_batch + 256, see Results), `--kvq-chunk N` (rows per chunk, 8192), `--kvq-rem own|merge` (the rows after the last complete chunk, default own), `--kvq-min-rows N` (own: fewer rows after the last complete chunk stay precise, default 256), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
+Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (1024), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default max(n_batch, 4096) + 256 = one batch, 0 = full device cache; not below n_batch + 256), `--kvq-chunk N` (rows per chunk, 8192), `--kvq-rem own|merge` (the rows after the last complete chunk, default own), `--kvq-min-rows N` (own: fewer rows after the last complete chunk stay precise, default 256), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
 
 With `--kvq` the server forces, with a warning: 1 slot, context shift and cache reuse off, flash attention on, q8_0 K/V, draft n_max <= 7; with `--kvq-tail 0` also the RAM prompt cache off and the slot save path cleared. At the end of each prompt the server waits until the prompt is fitted up to its end (log line `kvq: waited ... at the end of the prompt, coarse region N rows`); no fit work runs during the reply. It refuses to start for a model that is not qwen35, `--mmproj`, embeddings. Attention rotation of quantized caches is turned off for the model (also for the MTP context). `--fit` does not count the kvq memory.
 
@@ -118,10 +118,12 @@ Ring and VRAM (34,816 B per cell; codes 6,400 B per row; tables per slot 8.4 MiB
 | | ring cells | ring MiB | coarse rows (ctx 230000 / 100352) | tables | scratch |
 |---|---|---|---|---|---|
 | before: 2 chunks + n_batch + 256 | 20,736 | 688.5 | 229,376 / 98,304 rows | 28 / 12 slots | 519 / 247 MiB |
-| now, default: chunk + n_batch + 256 | 12,544 | 416.5 | 230,000 / 100,352 rows (1404 / 613 MiB) | 29 / 13 slots (243 / 109 MiB) | 503 / 234 MiB |
-| `--kvq-tail` = n_batch + 256 (one batch) | 4,352 | 144.5 | same | same | 486 / 217 MiB |
+| chunk + n_batch + 256 (`--kvq-tail 12544`, the default of commit 3705fe400) | 12,544 | 416.5 | 230,000 / 100,352 rows (1404 / 613 MiB) | 29 / 13 slots (243 / 109 MiB) | 503 / 234 MiB |
+| now, default: max(n_batch, 4096) + 256 (one batch) | 4,352 | 144.5 | same | same | 486 / 217 MiB |
 
 (-b 4096; the coarse region now reaches n_ctx rows and a slot for the last partial chunk.) Saving against before: 272 MiB of ring with the default, 544 MiB with one batch, the scratch 16 - 33 MiB more; the tables 8 MiB and the codes 4 MiB less saving because of the last slot.
+
+In the results of this section "default ring" is the default of that build, chunk + n_batch + 256 (12,544 cells at -b 4096, 10,496 at -b 2048); the default since is one batch.
 
 kvq-eval, -b 2048 -ub 2048, 1 token per decode, deterministic, against the q8_0 teacher (`ref/row*.q8c1`); KL with the 95% bootstrap CI, flips = positions where the top-1 differs:
 
@@ -349,7 +351,9 @@ What this means for the quality numbers: the model itself moves by about the sam
 - Rollback into the coded region leaves the rows in the host store and refits at the next end of a prompt (instead of copying them back into the ring): a ring smaller than a chunk could not take them, and the server always processes a prompt after a rollback.
 - The resident set is emptied at the end of every prompt: the decoding after it depends only on the memory state, which makes multi-turn equal to one prefill and a slot restore equal to the original run. Cost: the first verify batch after a prompt starts cold.
 - `--kvq-min-rows 256` (own): no quality difference measured between fitting and keeping precise 10 - 1000 rows; 256 is the rank limit of the covariance (D + 1 = 257 rows).
-- `own` stays the default for now; `merge` is implemented and checked, the choice waits for the 16k-chunk test (another agent, `kvq-scratch/chunk16/res/`).
+- `own` is the default, `merge` stays as an option (owner's idea, decided 2026-11-16 by the chunk size test): a merged group is a 16k-row fit, which is not better than 8k (mean KL ratio 1.12, median 1.02), costs 82 MiB more during the fit and doubles the wait on a turn that completes a chunk.
+- Ring of one batch by default (owner's decision 2026-11-16): max(n_batch, 4096) + 256 cells, 144.5 MiB at -b 4096, 544 MiB less than before the redesign. Same prefill time, generation speed and ids as chunk + batch + 256 in the server on the three standard requests, bit-identical logits in kvq-eval. Cost: a long reply is fitted in line once per ring size of tokens (0.57 s every 4.3k tokens with 4 threads); the floor of 4096 keeps that rate with a smaller batch (my addition).
+- `--kvq-threads` stays 4 by default (owner's decision 2026-11-16). They are CPU threads: the GPU part of a fit is about 35 ms per chunk, the CPU part is 128 problems of 256 x 256 per job (16 layers x 4 kv heads x K and V), about 2 CPU seconds. The end-of-prompt wait is 0.55 s with 4 threads, 0.30 s with 8, 0.21 s with 12, about 2 s with 1; generation and ids do not change. This is the one place where the feature depends on the CPU; a device eigen solver would remove it (not started).
 
 ## Open bottlenecks, largest first
 
@@ -366,7 +370,7 @@ What this means for the quality numbers: the model itself moves by about the sam
 
 Sizes are for ctx 230000 as allocated today.
 
-1. 16k chunks. Halves the tables (243 -> about 125 MiB); chunk size 4k to 16k made no quality difference. The default ring is now chunk + n_batch + 256 (16k: 20,736 cells, 689 MiB), but a ring of one batch (144.5 MiB) works for any chunk size, so the ring no longer blocks it; the fitter stage and graph buffers double (about 17 + 63 MiB more).
+1. 16k chunks. Halves the tables (243 -> about 125 MiB), and the ring of one batch does not grow with the chunk; the fitter stage and graph buffers double (about 17 + 63 MiB more). Measured since (chunk size test, see Results): mean KL ratio to 8k chunks 1.12, median 1.02, so it costs a little quality or nothing; not planned.
 2. Done: 8-bit tables instead of fp16 (see Decisions).
 3. Partly done (ring redesign): rows that do not fit in the ring go to the host store uncompressed (spill), prefill reads them through the scratch; the fit is done before generation (at the end of the prompt), not during it. Open point: generation needs those rows precise in VRAM until their chunk is fitted (a per-token upload is too expensive), so they need a place there; item 4 is the candidate. With the CPU fitter on 16 threads the backlog was about one chunk, 285 MB of rows.
 4. Reuse the prefill buffers during generation. The scratch (519 MiB) and the flash attention F16 copies in the compute buffer (most of 1642 MiB) are only used by large ubatches and sit idle during generation. Candidates to live there: the not yet fitted rows of item 3, a larger resident set, or the ring itself, so that this memory is allocated once and used by both phases.
@@ -381,7 +385,7 @@ Sizes are for ctx 230000 as allocated today.
 - Batch independence holds only for the same batch boundaries (multi-turn with turn ends at batch boundaries is byte-identical to one prefill); with other boundaries the model's own rows differ in rounding (plain q8_0 moves by 1.6e-4 at 100k).
 - CUDA only. The attention op and the fit op have a CPU reference and a CUDA kernel, nothing for Metal or Vulkan; the fit mode refuses to start when the device cannot run the fit graphs. The fitter needs about 2 CPU-seconds per 8k chunk (one core is enough at 100k on this GPU, see Results).
 - The fitter's device work runs on the main stream between ubatches, now with 570 MB of host uploads per 8k chunk (phases 2 and 3 read the rows from the host store; phase 2 uploads K too). A second stream or V-only uploads would hide or halve it, not built.
-- With a ring of one batch (`--kvq-tail` = n_batch + 256) a long reply folds every ring size of tokens (about 4.3k at -b 4096, 0.57 s each in line with 4 threads, measured once in the server); with the default ring every 12k.
+- With the ring of one batch (the default) a long reply folds every ring size of tokens (about 4.3k at -b 4096, 0.57 s each in line with 4 threads, measured in two server sessions with identical ids); with `--kvq-tail 12544` every 12k.
 - The slots of a batch are placed for the whole batch at once, so the ring cannot be smaller than one batch (per-ubatch placement would allow n_ubatch + 256, not built).
 - Host memory: 7.6 GB of pinned RAM at ctx 230000, per sequence.
 - Deferred tuning: resident capacity (1024 vs 4096), top-up rules and thresholds, lead, prefetch size.

@@ -45,7 +45,7 @@
 //   --kvq-rm-test: functional check of clear and seq_rm on the first chunk, no scoring
 //   --kvq-scr-check N: after the prefill and the fit, the logits of the last of N more positions (one batch) twice over the scratch
 //                      and once over the cache (llama_kvq_params::scratch, needs --kvq-lib-full), the recurrent state restored in between, no scoring
-//   --kvq-lib-full: one cache cell per position, else the device cache is a ring of chunk + batch + 256 cells (llama_model_set_kvq_tail),
+//   --kvq-lib-full: one cache cell per position, else the device cache is a ring of max(batch, 4096) + 256 cells (llama_model_set_kvq_tail),
 //                   or --kvq-ring N cells
 //   --kvq-rem own|merge, --kvq-min-rows N: the rows after the last complete chunk (llama_kvq_rem)
 //   --kvq-turns S1,S2,...: the prefix in turns: prefill up to S_i (batches at multiples of the batch size), the end of the prompt,
@@ -146,7 +146,7 @@ struct kvq_args {
     bool        lib_hold    = false;
     int32_t     lib_rem     = LLAMA_KVQ_REM_OWN;
     int32_t     lib_min_rows = 256;
-    int32_t     lib_ring    = 0; // 0: chunk + batch + 256
+    int32_t     lib_ring    = 0; // 0: max(batch, 4096) + 256
     std::vector<int32_t> turns;
     int32_t     turn_gen    = 0;
 
@@ -1780,7 +1780,7 @@ int main(int argc, char ** argv) {
         if (args.packed || args.no_rot) {
             llama_model_set_attn_rot(model, false);
         }
-        const int32_t ring = args.lib_ring > 0 ? args.lib_ring : GGML_PAD(args.fit_chunk + params.n_batch + 256, 256);
+        const int32_t ring = args.lib_ring > 0 ? args.lib_ring : GGML_PAD(std::max(params.n_batch, 4096) + 256, 256);
         llama_model_set_kvq_tail(model, args.lib() && !args.lib_full ? ring : 0);
         llama_context_params cparams = common_context_params_to_llama(params);
         if (args.rm_test || args.rb_test) {

@@ -2489,7 +2489,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KVQ_LEAD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kvq-tail"}, "N",
-        "two-tier KV cache: cells of the q8_0 cache on the device (a ring of the positions that are not coded yet), 0 = one cell per position (default: chunk + batch size + 256)",
+        "two-tier KV cache: cells of the q8_0 cache on the device (a ring of the positions that are not coded yet), 0 = one cell per position (default: batch size + 256, at least 4352)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

@@ -1394,9 +1394,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         llama_model_set_kvq_packed(model, true);
         llama_model_set_attn_rot(model, false);
 
-        // the device cache holds the chunk being filled and a batch; a chunk leaves it when its job starts
-        const int32_t chunk = params.kvq.chunk;
-        const int32_t tail  = params.kvq.tail >= 0 ? params.kvq.tail : GGML_PAD(chunk + params.n_batch + 256, 256);
+        // the device cache holds one batch: the rows of a prompt go to the host store when the ring is full or their job starts
+        // at least 4096 positions, a long reply is fitted in line once per ring size of tokens
+        const int32_t tail = params.kvq.tail >= 0 ? params.kvq.tail : GGML_PAD(std::max(params.n_batch, 4096) + 256, 256);
         llama_model_set_kvq_tail(model, (uint32_t) tail);
     }
 
