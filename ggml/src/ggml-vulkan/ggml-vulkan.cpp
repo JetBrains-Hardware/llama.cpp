@@ -3559,6 +3559,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // to int8 with one scale per row, the activations to int8 with one scale per (column, 256 values), and
     // mul_mm_i8_gemm.comp multiplies them with int32 accumulation. Not bit-identical to the other paths.
     // GGML_VK_DISABLE_I8_GEMM turns it off, GGML_VK_I8_GEMM_Q6K=0|1 selects the q6_K weights, GGML_VK_I8_GEMM_MIN_N moves the batch threshold,
+    // GGML_VK_I8_GEMM_ROUND makes the in-place rescale round to nearest instead of truncating,
     // GGML_VK_I8_GEMM_BLOCK=256|128|64 sets the number of values per activation scale.
     // From 512 columns it beats the quantized kernels (n=512: q4_K 56-59 -> 59-73 TFLOPS, q6_K 43-50 -> 57-71);
     // narrower batches were not measured and keep their kernels.
@@ -3580,7 +3581,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         device->subgroup_arithmetic && device->subgroup_require_full_support &&
         device->properties.limits.maxComputeSharedMemorySize >= 32768 &&
         device->properties.limits.maxComputeWorkGroupSize[0] >= 256) {
-        ggml_vk_create_pipeline(device, device->pipeline_matmul_i8_gemm, "matmul_i8_gemm", matmul_i8_gemm_cm1_len, matmul_i8_gemm_cm1_data, "main", 5, 4 * sizeof(uint32_t), {128, 128, 1}, { device->matmul_i8_gemm_block / 16 }, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_matmul_i8_gemm, "matmul_i8_gemm", matmul_i8_gemm_cm1_len, matmul_i8_gemm_cm1_data, "main", 5, 4 * sizeof(uint32_t), {128, 128, 1}, { device->matmul_i8_gemm_block / 16, getenv("GGML_VK_I8_GEMM_ROUND") != nullptr ? 1u : 0u }, 1, true, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8[GGML_TYPE_Q4_K], "requant_i8_q4_k", requant_i8_q4_k_len, requant_i8_q4_k_data, "main", 3, 3 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_requant_i8_rowscale[GGML_TYPE_Q4_K], "requant_i8_rowscale_q4_k", requant_i8_rowscale_q4_k_len, requant_i8_rowscale_q4_k_data, "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1, true);
         // q6_K: GGML_VK_I8_GEMM_Q6K=0 keeps all of them on the f16 GEMM, =1 puts all of them on the int8 path.

@@ -38,6 +38,7 @@
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout (constant_id = 0) const uint UPB = 16u;  // 16-byte units per scale block of B: 16 = 256 values of K
+layout (constant_id = 1) const uint ROUND_NEAREST = 0u;  // rescale: 0 truncates, 1 rounds to nearest
 
 layout (binding = 0) readonly buffer A { uvec4 data_a[]; };
 layout (binding = 1) readonly buffer B { uvec4 data_b[]; };
@@ -108,13 +109,14 @@ void main() {
         FETCH(min(ku + UPR, KU - UPR))
         if (ku != 0u && ku % UPB == 0u) {
             // next scale block of B: bring the running sums to its units
-            // (truncating conversion: at most one unit per boundary, 0.8% faster than rounding to nearest)
+            // (truncating conversion by default: at most one unit per boundary, 0.8% faster than rounding to nearest)
             float rb[TB];
             [[unroll]] for (uint j = 0; j < TB; j++) { rb[j] = data_rb[col_rb[j] + ku / UPB]; }
             [[unroll]] for (uint i = 0; i < TA; i++) {
                 [[unroll]] for (uint j = 0; j < TB; j++) {
                     [[unroll]] for (uint e = 0; e < 8u; e++) {
-                        acc[i * TB + j][e] = int32_t(float(acc[i * TB + j][e]) * rb[j]);
+                        const float t = float(acc[i * TB + j][e]) * rb[j];
+                        acc[i * TB + j][e] = int32_t(ROUND_NEAREST != 0u ? roundEven(t) : t);
                     }
                 }
             }
