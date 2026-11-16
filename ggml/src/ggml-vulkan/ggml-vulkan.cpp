@@ -6926,7 +6926,7 @@ static bool ggml_vk_use_i8_gemm(ggml_backend_vk_context * ctx, const ggml_tensor
     }
     const uint64_t m = src0->ne[1], n = src1->ne[1], k = src0->ne[0];
     // quantize_i8_cols.comp keeps up to 1024 block maxima per column in shared memory
-    if (n < device->matmul_i8_gemm_min_n || m < 32 || k % 256 != 0 || k / 64 > 1024) {
+    if (n < device->matmul_i8_gemm_min_n || m < 128 || k % 256 != 0 || k / 64 > 1024) {
         return false;
     }
     // every binding must fit one range with 32-bit indexing

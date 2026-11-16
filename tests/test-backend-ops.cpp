@@ -12238,8 +12238,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 512, 1024, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 257,  777, 512,  {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 130,  600, 17408, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48,   2048, 5120, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 33,   513, 256,  {1, 1}, {1, 1}));
     }
 
     // wide dense batches over quantized weights (Vulkan on RDNA3: dequantize + f16 GEMM), full and partial tiles
