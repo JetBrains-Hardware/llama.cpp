@@ -87,29 +87,68 @@ llama_memory_context_ptr llama_memory_hybrid_kvq::init_batch(llama_batch_allocr 
     return std::make_unique<llama_memory_hybrid_kvq_context>(this, std::move(heads_attn), std::move(ubatches));
 }
 
+llama_pos llama_memory_hybrid_kvq::n_pos() const {
+    const llama_pos p = get_mem_attn()->seq_pos_max(0);
+    return std::max<llama_pos>(p + 1, store ? store->n_host() : 0);
+}
+
 bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
+    const llama_pos p0    = balloc.seq_pos_min(0);
     const llama_pos p_end = balloc.seq_pos_max(0);
     const int64_t   size  = get_mem_attn()->get_size();
     if (p_end < 0) {
         return true;
     }
+    const llama_kv_cache & kv = *get_mem_attn();
     const int64_t t0 = ggml_time_us();
+
+    // small batches attend through the packed path: the jobs in flight join first, so the path does not depend on their timing
+    const bool small = balloc.get_n_tokens() <= (uint32_t) params.max_batch;
+    if (small && fitter->has_jobs()) {
+        fitter->wait_jobs();
+        tail_release();
+    }
+
+    // generation: the fold position depends on the first position of the batch only
+    const llama_pos last = small ? std::max<llama_pos>(p_end, p0 + params.max_batch - 1) : p_end;
+    auto room = [&]() { return last + 1 - (int64_t) n_released <= size; };
+    const bool fold_now = small && fold_every > 0 && p0 - store->n_coarse() >= fold_every;
+
     bool waited = false;
-    while (p_end + 1 - (int64_t) store->n_coarse() > size) {
-        if (!fitter->wait_front(*get_mem_attn())) {
-            llama_kvq_fit_progress pr;
-            fitter->get_progress(pr);
-            LLAMA_LOG_ERROR("%s: the ring of %lld cells cannot hold the positions [%d, %d] of the batch: %s\n", __func__,
-                    (long long) size, store->n_coarse(), p_end, pr.failed ? "the fit failed" : "the batch is too large for the ring (see llama_model_set_kvq_tail)");
+    if (!room() && !small) {
+        // the complete chunks before the batch, then the rest of the ring rows to the host store
+        fitter->poll(kv, n_pos(), true);
+        tail_release();
+        if (!room()) {
+            fitter->spill(kv, p0);
+            tail_release();
+        }
+        waited = true;
+    }
+    if ((!room() || fold_now) && small) {
+        // the rows after the last complete chunk are fitted in line
+        const int64_t t1 = ggml_time_us();
+        if (fold_now && fitter->extend(kv, p0)) {
+            tail_release();
+        } else if (!settle(p0)) {
             return false;
         }
-        tail_release();
-        waited = true;
+        n_fold++;
+        t_fold += (ggml_time_us() - t1)*1e-6;
+        LLAMA_LOG_INFO("%s: fold at position %d: coarse region %d rows, %d positions in the ring, %.3f s (%d folds, %.2f s in all)\n", __func__,
+                p0, store->n_coarse(), (int) (p0 - n_released), (ggml_time_us() - t1)*1e-6, n_fold, t_fold);
+    }
+    if (!room()) {
+        llama_kvq_fit_progress pr;
+        fitter->get_progress(pr);
+        LLAMA_LOG_ERROR("%s: the ring of %lld cells cannot hold the positions [%d, %d] of the batch: %s\n", __func__,
+                (long long) size, n_released, last, pr.failed ? "the fit failed" : "the batch is too large for the ring (see llama_model_set_kvq_tail)");
+        return false;
     }
     if (waited) {
         n_tail_wait++;
         t_tail_wait += (ggml_time_us() - t0)*1e-6;
-        LLAMA_LOG_INFO("%s: the batch up to position %d waited %.3f s for the fitter (%d batches, %.2f s in all)\n", __func__,
+        LLAMA_LOG_DEBUG("%s: the batch up to position %d made room in the ring in %.3f s (%d batches, %.2f s in all)\n", __func__,
                 p_end, (ggml_time_us() - t0)*1e-6, n_tail_wait, t_tail_wait);
     }
     return true;
@@ -119,28 +158,26 @@ void llama_memory_hybrid_kvq::tail_release() {
     if (!tail || !store) {
         return;
     }
-    const llama_pos n = store->n_coarse();
+    const llama_pos n = store->n_host();
     if (n > n_released) {
         get_mem_attn()->seq_rm(0, n_released, n);
+        n_released = n;
     }
-    n_released = n;
 }
 
-void llama_memory_hybrid_kvq::tail_restore(llama_pos p0) {
-    if (!tail || !store) {
-        return;
+bool llama_memory_hybrid_kvq::tail_restore(llama_pos p_lo, llama_pos p_hi) {
+    if (!tail || !store || p_hi <= p_lo) {
+        return true;
     }
-    const llama_pos p_lo = store->n_coarse();
-    const llama_pos p_hi = std::min(p0, n_released);
-    n_released = p_lo;
-    if (p_hi <= p_lo) {
-        return;
-    }
-
     // host store [head][row][K, V] -> cache [cell][head][ROW], cell = position mod size, in at most two runs
     llama_kv_cache * kv = get_mem_attn();
     const int64_t size = kv->get_size();
     const int64_t n    = p_hi - p_lo;
+    if (n_pos() - p_lo > size) {
+        LLAMA_LOG_ERROR("%s: the ring of %lld cells cannot hold the positions [%d, %d)\n", __func__, (long long) size, p_lo, n_pos());
+        return false;
+    }
+    GGML_ASSERT(p_lo >= store->n_coarse() && p_hi == store->n_host() && n_released == p_hi);
     const int64_t G    = store->n_head_kv();
     const size_t  ROW  = llama_kvq_store::ROW;
     const size_t  nb1  = G*ROW;
@@ -165,7 +202,25 @@ void llama_memory_hybrid_kvq::tail_restore(llama_pos p0) {
         }
     }
     kv->ring_add(0, p_lo, p_hi);
+    store->set_n_host(p_lo);
+    n_released = p_lo;
     LLAMA_LOG_INFO("%s: positions [%d, %d) back in the ring from the host store\n", __func__, p_lo, p_hi);
+    return true;
+}
+
+bool llama_memory_hybrid_kvq::settle(llama_pos n) {
+    const llama_pos e = fitter->settle(*get_mem_attn(), n);
+    if (tail) {
+        tail_release();
+        if (store->n_host() > e && !tail_restore(e, store->n_host())) {
+            return false;
+        }
+    }
+    // the decoding after a prompt depends on the memory state, not on the resident rows of an earlier reply
+    if (!getenv("LLAMA_KVQ_DIAG_NORESET")) {
+        store->reset_resident();
+    }
+    return true;
 }
 
 llama_memory_context_ptr llama_memory_hybrid_kvq::init_full() {
@@ -199,11 +254,8 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         if (seq_id > 0) {
             GGML_ABORT("seq_rm of sequence %d: the fit mode supports sequence 0 only", seq_id);
         }
-        // the attention positions: a restored recurrent checkpoint can end before them; the ring is empty when they end with the coarse region
-        llama_pos pos_max = get_mem_attn()->seq_pos_max(0);
-        if (pos_max < 0 && store->n_coarse() > 0) {
-            pos_max = store->n_coarse() - 1;
-        }
+        // the attention positions: a restored recurrent checkpoint can end before them; the ring is empty when they end with the host store
+        const llama_pos pos_max = n_pos() - 1;
         const llama_pos q0      = std::max<llama_pos>(p0, 0);
         const llama_pos q1      = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
         if (q0 >= q1 || q0 > pos_max) {
@@ -215,8 +267,9 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         if (!llama_memory_hybrid::seq_rm(seq_id, p0, p1)) {
             return false;
         }
+        // the rows before q0 that leave the coarse region stay in the host store, the next fit_wait fits them again
         fitter->remove(q0);
-        tail_restore(q0);
+        n_released = std::min(n_released, q0);
         return true;
     }
 
@@ -278,20 +331,22 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_kvq::memory_bre
 
 llama_pos llama_memory_hybrid_kvq::seq_pos_max(llama_seq_id seq_id) const {
     const llama_pos res = llama_memory_hybrid::seq_pos_max(seq_id);
-    if (tail && store && seq_id == 0 && res < 0 && store->n_coarse() > 0) {
-        return std::min<llama_pos>(store->n_coarse() - 1, get_mem_recr()->seq_pos_max(seq_id));
+    if (tail && store && seq_id == 0 && res < 0 && store->n_host() > 0) {
+        return std::min<llama_pos>(store->n_host() - 1, get_mem_recr()->seq_pos_max(seq_id));
     }
     return res;
 }
 
 // state of the fit mode with the tail, sequence 0 (seq_id -1 is the same):
 //   magic, version, meta of the store and of the fitter (checked before the data is read)
-//   ring: the plain state of the attention cache, the positions after the coarse region
+//   ring: the plain state of the attention cache, the positions after the rows of the host store
 //   recurrent: the plain state
-//   store: host rows, codes and tables of the coarse region; fitter: statistics of the coarse chunks, sums of the open chunk
+//   store: host rows [0, n_host), codes and tables of the coarse region [0, n_coarse) (it can end inside a chunk);
+//   fitter: the fitted range of each chunk slot, statistics of the complete chunks, sums of the open chunk
 // a plain state starts with the stream count of the attention cache, so neither reader takes the state of the other
+// version 2: the coarse region ends at any row, the host store can hold rows after it
 static constexpr uint32_t KVQ_STATE_MAGIC   = 0x5351564b; // "KVQS"
-static constexpr uint32_t KVQ_STATE_VERSION = 1;
+static constexpr uint32_t KVQ_STATE_VERSION = 2;
 
 void llama_memory_hybrid_kvq::state_check(llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (!fitter || !tail) {
@@ -312,9 +367,10 @@ void llama_memory_hybrid_kvq::state_write(llama_io_write_i & io, llama_seq_id se
     }
     state_check(seq_id, flags);
 
-    // no chunk in flight in a saved state
+    // no job in flight in a saved state; the state is not fitted further
     const int64_t t0 = ggml_time_us();
-    const_cast<llama_memory_hybrid_kvq *>(this)->fit_wait();
+    fitter->wait_jobs();
+    const_cast<llama_memory_hybrid_kvq *>(this)->tail_release();
     const double t_wait = (ggml_time_us() - t0)*1e-6;
     if (t_wait >= 0.001) {
         LLAMA_LOG_INFO("%s: waited %.3f s for the fitter, the coarse region has %d rows\n", __func__, t_wait, store->n_coarse());
@@ -353,28 +409,30 @@ void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_
         if (version != KVQ_STATE_VERSION) {
             throw std::runtime_error(format("version %u of the two-tier cache state, expected %u", version, KVQ_STATE_VERSION));
         }
-        const int32_t n = store->state_read_meta(io);
-        fitter->state_read_meta(io, n/store->n_chunk_rows());
+        int32_t n = 0;
+        int32_t h = 0;
+        store->state_read_meta(io, n, h);
+        fitter->state_read_meta(io);
 
         get_mem_attn()->state_read(io, 0, flags);
         get_mem_recr()->state_read(io, seq_id, flags);
 
         const llama_pos p_min = get_mem_attn()->seq_pos_min(0);
         const llama_pos p_max = get_mem_attn()->seq_pos_max(0);
-        if (p_max >= 0 && (p_min != n || p_max >= (llama_pos) n_ctx_max)) {
-            throw std::runtime_error(format("the ring holds positions [%d, %d], expected the positions after the coarse region of %d rows, below %u", p_min, p_max, n, n_ctx_max));
+        if (p_max >= 0 && (p_min != h || p_max >= (llama_pos) n_ctx_max)) {
+            throw std::runtime_error(format("the ring holds positions [%d, %d], expected the positions after the %d rows of the host store, below %u", p_min, p_max, h, n_ctx_max));
         }
 
-        store->state_read_data(io, n);
-        fitter->state_read_data(io, n/store->n_chunk_rows());
-        n_released = n;
+        store->state_read_data(io, n, h);
+        fitter->state_read_data(io);
+        n_released = h;
 
         // the resident slots start empty
         if (!store->enable(params)) {
             throw std::runtime_error("failed to reset the resident rows");
         }
-        LLAMA_LOG_INFO("%s: coarse region of %d rows (%d chunks), %d positions in the ring\n", __func__,
-                n, n/store->n_chunk_rows(), p_max >= 0 ? p_max - p_min + 1 : 0);
+        LLAMA_LOG_INFO("%s: coarse region of %d rows, %d rows in the host store, %d positions in the ring\n", __func__,
+                n, h, p_max >= 0 ? p_max - p_min + 1 : 0);
     } catch (...) {
         clear(false);
         throw;
@@ -442,10 +500,11 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         LLAMA_LOG_ERROR("%s: the fit mode needs an empty memory with a single KV stream\n", __func__);
         return false;
     }
-    // drafts are rolled back by up to max_batch - 1 positions: a chunk is taken this far behind the last position
-    const int32_t margin = std::max(64, p.max_batch);
-    if (fp.chunk <= p.n_sink || fp.n_threads < 1 || (int64_t) n_ctx_max < fp.chunk || (tail && (int64_t) kv->get_size() < fp.chunk + margin + p.max_batch)) {
-        LLAMA_LOG_ERROR("%s: bad chunk (%d, %u positions, cache of %u cells) or thread count\n", __func__, fp.chunk, n_ctx_max, kv->get_size());
+    // the smallest coarse region: the prefetch selects prefetch_n rows that are not sinks
+    const int32_t min_first = p.prefetch_n + p.n_sink;
+    if (fp.chunk <= p.n_sink || fp.chunk < min_first || fp.n_threads < 1 || fp.min_rows < 1 || (int64_t) n_ctx_max < fp.chunk ||
+            (tail && (int64_t) kv->get_size() < 2*p.max_batch + 256)) {
+        LLAMA_LOG_ERROR("%s: bad chunk (%d, %u positions, cache of %u cells), min_rows (%d) or thread count\n", __func__, fp.chunk, n_ctx_max, kv->get_size(), fp.min_rows);
         return false;
     }
     if (backends.empty()) {
@@ -477,14 +536,14 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
     fitter.reset();
     store.reset();
     try {
-        const int32_t n_rows = (int32_t) (n_ctx_max/fp.chunk)*fp.chunk;
+        const int32_t n_rows = (int32_t) n_ctx_max;
         const int32_t n_gate = v_tabs.empty() ? n_head*(int32_t) llama_kvq_store::D : 0;
         store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, p.resident_cap, false, p.n_sink, false, n_gate);
         store->set_backend(backends);
         if (tail && !store->scratch_ok()) {
             throw std::runtime_error("the tail mode needs the scratch attention (pinned host memory, LLAMA_KVQ_SCRATCH not 0)");
         }
-        fitter = std::make_unique<llama_kvq_fitter>(*store, fp, v_tabs, wo, n_head, margin);
+        fitter = std::make_unique<llama_kvq_fitter>(*store, fp, v_tabs, wo, n_head, min_first);
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
         fitter.reset();
@@ -499,6 +558,14 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
     n_released  = 0;
     n_tail_wait = 0;
     t_tail_wait = 0.0;
+    n_fold      = 0;
+    t_fold      = 0.0;
+    n_settle    = 0;
+    t_settle    = 0.0;
+    fold_every  = getenv("LLAMA_KVQ_FOLD_EVERY") ? std::max(0, atoi(getenv("LLAMA_KVQ_FOLD_EVERY"))) : 0;
+    if (fold_every > 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_KVQ_FOLD_EVERY = %d: the reply rows are fitted in line when %d of them follow the coarse region\n", __func__, fold_every, fold_every);
+    }
     return true;
 }
 
@@ -509,9 +576,9 @@ int32_t llama_memory_hybrid_kvq::fit_graph_kind() const {
     return store->get_layer(store->layer_ids()[0]).gacc ? 2 : 1;
 }
 
-void llama_memory_hybrid_kvq::fit_poll() {
+void llama_memory_hybrid_kvq::fit_poll(uint32_t n_tokens) {
     if (fitter) {
-        fitter->poll(*get_mem_attn());
+        fitter->poll(*get_mem_attn(), n_pos(), n_tokens > (uint32_t) params.max_batch);
         tail_release();
     }
 }
@@ -520,9 +587,14 @@ bool llama_memory_hybrid_kvq::fit_wait() {
     if (!fitter) {
         return false;
     }
-    fitter->wait(*get_mem_attn());
-    tail_release();
-    return true;
+    const int64_t t0 = ggml_time_us();
+    const int32_t c0 = store->n_coarse();
+    const bool ok = settle(n_pos());
+    if (store->n_coarse() != c0) {
+        n_settle++;
+        t_settle += (ggml_time_us() - t0)*1e-6;
+    }
+    return ok;
 }
 
 bool llama_memory_hybrid_kvq::fit_get_progress(llama_kvq_fit_progress & out) const {
@@ -532,6 +604,10 @@ bool llama_memory_hybrid_kvq::fit_get_progress(llama_kvq_fit_progress & out) con
     fitter->get_progress(out);
     out.n_tail_wait = n_tail_wait;
     out.t_tail_wait = t_tail_wait;
+    out.n_fold      = n_fold;
+    out.t_fold      = t_fold;
+    out.n_settle    = n_settle;
+    out.t_settle    = t_settle;
     return true;
 }
 
@@ -662,7 +738,7 @@ bool llama_memory_hybrid_kvq_context::next() {
 bool llama_memory_hybrid_kvq_context::apply() {
     // the previous ubatches are queued: the fit mode can start a job or move the coarse boundary now
     if (mem_kvq) {
-        mem_kvq->fit_poll();
+        mem_kvq->fit_poll(get_ubatch().n_tokens);
     }
 
     // the attention cache updates the shared cells first, then the coarse context reads n_kv from them
@@ -748,6 +824,9 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggm
             continue;
         }
         const llama_pos p = cells.pos_get(j);
+        if (p < n_coarse) {
+            continue;
+        }
         if (p < p_min) {
             row[n_coarse + j] = zero;
         } else {
@@ -770,18 +849,18 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggm
     }
 }
 
-void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_coarse) const {
+void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_host) const {
     if (mask == nullptr || mask->buffer == nullptr) {
         return;
     }
     GGML_ASSERT(kv_attn->get_n_stream() == 1 && ggml_backend_buffer_is_host(mask->buffer));
-    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_coarse && mask->ne[1] == ubatch->n_tokens);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_host && mask->ne[1] == ubatch->n_tokens);
 
     const auto & cells = kv_attn->get_cells(0);
 
     const int64_t n_rows = mask->ne[0];
     const int64_t size   = cells.size();
-    GGML_ASSERT(n_rows - n_coarse <= size);
+    GGML_ASSERT(n_rows - n_host <= size);
 
     llama_pos p_min = ubatch->pos[0];
     for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
@@ -798,14 +877,14 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, cons
 
     // the rows of the positions before the ubatch, then per token the positions of the ubatch up to its own
     std::vector<ggml_fp16_t> row(n_rows, ninf);
-    std::fill(row.begin(), row.begin() + n_coarse, zero);
-    for (int64_t r = n_coarse; r < std::min<int64_t>(p_min, n_rows); ++r) {
+    std::fill(row.begin(), row.begin() + n_host, zero);
+    for (int64_t r = n_host; r < std::min<int64_t>(p_min, n_rows); ++r) {
         if (has(r)) {
             row[r] = zero;
         }
     }
     std::vector<int64_t> late;
-    for (int64_t r = std::max<int64_t>(n_coarse, p_min); r < n_rows; ++r) {
+    for (int64_t r = std::max<int64_t>(n_host, p_min); r < n_rows; ++r) {
         if (has(r)) {
             late.push_back(r);
         }

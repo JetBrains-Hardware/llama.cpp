@@ -45,7 +45,11 @@
 //   --kvq-rm-test: functional check of clear and seq_rm on the first chunk, no scoring
 //   --kvq-scr-check N: after the prefill and the fit, the logits of the last of N more positions (one batch) twice over the scratch
 //                      and once over the cache (llama_kvq_params::scratch, needs --kvq-lib-full), the recurrent state restored in between, no scoring
-//   --kvq-lib-full: one cache cell per position, else the device cache is a ring of 2*chunk + batch + 256 cells (llama_model_set_kvq_tail)
+//   --kvq-lib-full: one cache cell per position, else the device cache is a ring of chunk + batch + 256 cells (llama_model_set_kvq_tail),
+//                   or --kvq-ring N cells
+//   --kvq-rem own|merge, --kvq-min-rows N: the rows after the last complete chunk (llama_kvq_rem)
+//   --kvq-turns S1,S2,...: the prefix in turns: prefill up to S_i (batches at multiples of the batch size), the end of the prompt,
+//                          --kvq-turn-gen N greedy tokens (1 per decode, not printed), back to S_i (recurrent checkpoint), the next turn
 
 #include "arg.h"
 #include "common.h"
@@ -139,6 +143,11 @@ struct kvq_args {
     int32_t     scr_check   = 0;
     bool        lib_full    = false;
     bool        lib_hold    = false;
+    int32_t     lib_rem     = LLAMA_KVQ_REM_OWN;
+    int32_t     lib_min_rows = 256;
+    int32_t     lib_ring    = 0; // 0: chunk + batch + 256
+    std::vector<int32_t> turns;
+    int32_t     turn_gen    = 0;
 
     std::string state_save;     // sequence state file after the prefill (and the wait)
     std::string state_load;     // sequence state file instead of the prefill
@@ -335,6 +344,26 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.lib_full = true;
         } else if (a == "--kvq-lib-hold") {
             args.lib_hold = true;
+        } else if (a == "--kvq-rem" && has_val) {
+            const std::string v = argv[++i];
+            if (v != "own" && v != "merge") {
+                LOG_ERR("%s: bad --kvq-rem '%s'\n", __func__, v.c_str());
+                return false;
+            }
+            args.lib_rem = v == "merge" ? LLAMA_KVQ_REM_MERGE : LLAMA_KVQ_REM_OWN;
+        } else if (a == "--kvq-min-rows" && has_val) {
+            args.lib_min_rows = std::stoi(argv[++i]);
+        } else if (a == "--kvq-ring" && has_val) {
+            args.lib_ring = std::stoi(argv[++i]);
+        } else if (a == "--kvq-turns" && has_val) {
+            std::string v = argv[++i];
+            for (size_t p = 0; p < v.size();) {
+                const size_t q = v.find(',', p);
+                args.turns.push_back(std::stoi(v.substr(p, q == std::string::npos ? std::string::npos : q - p)));
+                p = q == std::string::npos ? v.size() : q + 1;
+            }
+        } else if (a == "--kvq-turn-gen" && has_val) {
+            args.turn_gen = std::stoi(argv[++i]);
         } else if (a == "--kvq-state-save" && has_val) {
             args.state_save = argv[++i];
         } else if (a == "--kvq-state-load" && has_val) {
@@ -485,14 +514,14 @@ static int32_t kvq_argmax(const float * x, int32_t n) {
     return (int32_t) (std::max_element(x, x + n) - x);
 }
 
-// fill the memory with ids[p_begin:n_prefix], no logits
+// fill the memory with ids[p_begin:n_prefix], no logits, the batches end at multiples of n_batch
 static bool kvq_prefill(llama_context * ctx, const std::vector<llama_token> & ids, int32_t n_prefix, int32_t n_batch, int32_t p_begin = 0) {
     common_batch batch(ctx);
     for (int32_t i = 0; i < n_prefix; i++) {
         batch.add(ids[i], i, 0, false);
     }
-    for (int32_t i = p_begin; i < n_prefix; i += n_batch) {
-        const int32_t n = std::min(n_batch, n_prefix - i);
+    for (int32_t i = p_begin, n = 0; i < n_prefix; i += n) {
+        n = std::min((i/n_batch + 1)*n_batch, n_prefix) - i;
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(i, n))) {
             LOG_ERR("%s: decode failed at pos %d\n", __func__, i);
             return false;
@@ -1371,10 +1400,11 @@ static void kvq_print_progress(llama_memory_t mem) {
     for (size_t i = 0; i < pr.t_job.size(); i++) {
         tj += string_format("%s%.2f/%.2f", i ? " " : "", pr.t_job[i], pr.t_wall[i]);
     }
-    LOG("kvq: fit: coarse rows %d (%d chunks), running %d, ready %d, cancelled %d, dropped %d%s\n",
-            pr.n_coarse, pr.n_chunk, pr.n_running, pr.n_ready, pr.n_cancel, pr.n_drop, pr.failed ? ", FAILED" : "");
-    if (pr.n_tail_wait > 0) {
-        LOG("kvq: fit: %d batches waited %.2f s for the fitter before they fit the ring of the tail\n", pr.n_tail_wait, pr.t_tail_wait);
+    LOG("kvq: fit: coarse rows %d (%d chunks), host rows %d, running %d, ready %d, cancelled %d, drops %d%s\n",
+            pr.n_coarse, pr.n_chunk, pr.n_host, pr.n_running, pr.n_ready, pr.n_cancel, pr.n_drop, pr.failed ? ", FAILED" : "");
+    if (pr.n_tail_wait > 0 || pr.n_spill > 0 || pr.n_fold > 0 || pr.n_settle > 0) {
+        LOG("kvq: fit: %d batches made room in the ring (%.2f s), %d spills, %d folds (%.2f s), %d end-of-prompt fits (%.2f s)\n",
+                pr.n_tail_wait, pr.t_tail_wait, pr.n_spill, pr.n_fold, pr.t_fold, pr.n_settle, pr.t_settle);
     }
     if (!pr.t_job.empty()) {
         LOG("kvq: fit: %.2f s CPU per chunk; decode thread per chunk: readback and phase 1 %.1f ms (with the wait for the queued ubatches), "
@@ -1457,17 +1487,18 @@ static bool kvq_scr_check(llama_context * ctx, const std::vector<llama_token> & 
 }
 
 // clear and seq_rm in the fit mode around the end of the first chunk C: the memory is empty and in the fit mode
-static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & ids, int32_t C, int32_t n_vocab) {
+// rem, min_rows, min_first: the layout of the rows after the last complete chunk (llama_kvq_rem)
+static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & ids, int32_t C, int32_t n_vocab, int32_t rem, int32_t min_rows, int32_t min_first) {
     llama_memory_t mem = llama_get_memory(ctx);
     const int32_t n_batch = (int32_t) llama_n_batch(ctx);
-    if ((int32_t) ids.size() < C + 72) {
-        LOG_ERR("%s: needs at least %d tokens\n", __func__, C + 72);
+    if ((int32_t) ids.size() < 2*C + n_batch + 1100) {
+        LOG_ERR("%s: needs at least %d tokens\n", __func__, 2*C + n_batch + 1100);
         return false;
     }
 
     bool ok = true;
     auto check = [&](bool cond, const char * what) {
-        LOG("kvq: rm-test: %-70s %s\n", what, cond ? "ok" : "FAILED");
+        LOG("kvq: rm-test: %-80s %s\n", what, cond ? "ok" : "FAILED");
         ok = ok && cond;
     };
     auto coarse = [&]() {
@@ -1480,72 +1511,166 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
         const double kl = kvq_kl_logits(a, b, same);
         LOG("kvq: rm-test: %s: KL %.3e, same top-1 %d\n", what, kl, same ? 1 : 0);
     };
+    // the end of the coarse region after the end of a prompt of n positions
+    auto layout_end = [&](int32_t n) {
+        const int32_t n_full = n/C;
+        int32_t e = n_full*C;
+        if (n > e && (rem == LLAMA_KVQ_REM_MERGE || n_full == 0 || n - e >= min_rows)) {
+            e = n;
+        }
+        return e < min_first ? 0 : e;
+    };
 
     std::vector<float> la, lb, lc;
 
-    // a job in flight, then clear; a chunk is taken 64 positions after its end, at the next ubatch
-    if (!kvq_prefill(ctx, ids, C + 70, n_batch) || !kvq_decode_last(ctx, ids, C + 70, C + 71, n_vocab, lc)) {
+    // a job in flight (a large ubatch 64 positions after the chunk takes it, merge: after the next chunk), then a small batch:
+    // the job joins before it; then clear
+    const int32_t a0 = (rem == LLAMA_KVQ_REM_MERGE ? 2*C : C) + n_batch + 70;
+    if (!kvq_prefill(ctx, ids, a0, n_batch)) {
         return false;
     }
     check(coarse().n_running + coarse().n_ready + coarse().n_chunk == 1, "prefill past the first chunk starts its job");
+    check(coarse().n_host >= C, "and its rows are in the host store");
+    if (!kvq_decode_last(ctx, ids, a0, a0 + 1, n_vocab, lc)) {
+        return false;
+    }
+    check(coarse().n_coarse == C && coarse().n_running + coarse().n_ready == 0, "a small batch adds the job first");
     llama_memory_clear(mem, true);
-    check(coarse().n_coarse == 0 && coarse().n_running == 0 && coarse().n_cancel + coarse().n_drop == 1, "clear cancels or drops it");
+    check(coarse().n_coarse == 0 && coarse().n_host == 0 && llama_memory_seq_pos_max(mem, 0) == -1, "clear empties the memory");
 
-    // the first chunk is completed by a ubatch of 4 tokens [C - 2, C + 2)
-    if (!kvq_prefill(ctx, ids, C - 2, n_batch) || !kvq_decode_last(ctx, ids, C - 2, C + 2, n_vocab, la)) {
+    // the end of the prompt fits the rows after the first chunk, a small batch after it
+    const int32_t a = C + 497;
+    if (!kvq_prefill(ctx, ids, a, n_batch) || !llama_memory_kvq_fit_wait(mem)) {
         return false;
     }
-    llama_memory_kvq_fit_wait(mem);
-    check(coarse().n_coarse == C, "after the wait the first chunk is coarse");
-
-    // into the fitted chunk: the recurrent state rolls back inside the last ubatch
-    check(llama_memory_seq_rm(mem, 0, C - 1, -1), "seq_rm(C - 1, end) into the coarse chunk succeeds");
-    check(coarse().n_coarse == 0 && coarse().n_drop == 1, "the chunk left the coarse region");
-    check(llama_memory_seq_pos_max(mem, 0) == C - 2, "last position is C - 2");
-    if (!kvq_decode_last(ctx, ids, C - 1, C + 2, n_vocab, lb)) {
+    check(coarse().n_coarse == layout_end(a) && coarse().n_running == 0, "the end of the prompt fits up to the layout end");
+    if (!kvq_decode_last(ctx, ids, a, a + 4, n_vocab, la) || !llama_memory_kvq_fit_wait(mem)) {
         return false;
     }
-    compare(la, lb, "logits at C + 1 before and after the removal (both precise)");
-    llama_memory_kvq_fit_wait(mem);
-    check(coarse().n_coarse == C && coarse().n_chunk == 1, "the chunk is fitted again and coarse");
+    check(coarse().n_coarse == layout_end(a + 4), "the next end of the prompt fits the 4 new rows too");
 
-    // the tail only: a ubatch of 4 after the coarse region, remove 3 of them, decode them again
-    if (!kvq_decode_last(ctx, ids, C + 2, C + 6, n_vocab, la)) {
+    // into the coarse rows after the chunk: the recurrent state rolls back inside the last ubatch, the coarse region back to the grid
+    check(llama_memory_seq_rm(mem, 0, a + 1, -1), "seq_rm(a + 1, end) into the coarse rows succeeds");
+    check(coarse().n_coarse == std::min(C, layout_end(a + 4)) && coarse().n_host == (layout_end(a + 4) > C ? a + 1 : C), "the coarse region is back at the chunk grid, the host store keeps the rows");
+    check(llama_memory_seq_pos_max(mem, 0) == a, "last position is a");
+    if (!kvq_decode_last(ctx, ids, a + 1, a + 4, n_vocab, lb)) {
+        return false;
+    }
+    compare(la, lb, "logits at a + 3 before (packed) and after the removal (scratch)");
+    if (!llama_memory_kvq_fit_wait(mem)) {
+        return false;
+    }
+    check(coarse().n_coarse == layout_end(a + 4) && coarse().n_host == std::max(layout_end(a + 4), C), "the end of the prompt fits them again");
+
+    // the ring only (draft rollback): a ubatch of 4 after the coarse region, remove 3 of them, decode them again
+    const int32_t b = a + 4;
+    if (!kvq_decode_last(ctx, ids, b, b + 4, n_vocab, la)) {
         return false;
     }
     const auto pr0 = coarse();
     const int64_t t0 = ggml_time_us();
-    check(llama_memory_seq_rm(mem, 0, C + 3, -1), "seq_rm(C + 3, end) in the tail succeeds");
+    check(llama_memory_seq_rm(mem, 0, b + 1, -1), "seq_rm(b + 1, end) in the ring succeeds");
     const double t_rm = (ggml_time_us() - t0)/1e3;
     const auto pr1 = coarse();
-    check(pr1.n_coarse == C && pr1.n_cancel == pr0.n_cancel && pr1.n_drop == pr0.n_drop, "the coarse region is not changed");
-    LOG("kvq: rm-test: tail seq_rm took %.3f ms\n", t_rm);
-    check(llama_memory_seq_rm(mem, 0, C + 10, -1), "seq_rm of an empty range succeeds");
-    if (!kvq_decode_last(ctx, ids, C + 3, C + 6, n_vocab, lb)) {
+    check(pr1.n_coarse == pr0.n_coarse && pr1.n_host == pr0.n_host && pr1.n_cancel == pr0.n_cancel && pr1.n_drop == pr0.n_drop, "the coarse region is not changed");
+    LOG("kvq: rm-test: ring seq_rm took %.3f ms\n", t_rm);
+    check(llama_memory_seq_rm(mem, 0, b + 10, -1), "seq_rm of an empty range succeeds");
+    if (!kvq_decode_last(ctx, ids, b + 1, b + 4, n_vocab, lb)) {
         return false;
     }
-    compare(la, lb, "logits at C + 5 before and after the tail removal (packed path)");
+    compare(la, lb, "logits at b + 3 before and after the ring removal (packed path)");
 
     // too far back for the recurrent state: fails, nothing changes
     check(!llama_memory_seq_rm(mem, 0, 100, -1), "seq_rm(100, end) fails (no recurrent snapshot)");
-    check(coarse().n_coarse == C && llama_memory_seq_pos_max(mem, 0) == C + 5, "and changes nothing");
+    check(coarse().n_coarse == pr0.n_coarse && llama_memory_seq_pos_max(mem, 0) == b + 3, "and changes nothing");
 
     // all of the sequence, as the server's prompt clear (seq_id -1 fails in the recurrent memory)
     check(llama_memory_seq_rm(mem, 0, -1, -1), "seq_rm(0, -1, -1) succeeds");
-    check(coarse().n_coarse == 0 && llama_memory_seq_pos_max(mem, 0) == -1, "the memory is empty, no coarse rows");
+    check(coarse().n_coarse == 0 && coarse().n_host == 0 && llama_memory_seq_pos_max(mem, 0) == -1, "the memory is empty, no coarse rows");
 
-    // comes up again
-    if (!kvq_prefill(ctx, ids, C + 8, n_batch) || !kvq_decode_last(ctx, ids, C + 8, C + 12, n_vocab, lc)) {
+    // a few rows after the chunk: own with fewer than min_rows stays precise in the ring
+    if (!kvq_prefill(ctx, ids, C + 8, n_batch) || !llama_memory_kvq_fit_wait(mem)) {
         return false;
     }
-    llama_memory_kvq_fit_wait(mem);
-    check(coarse().n_coarse == C && !coarse().failed, "a new prefill fits the chunk again");
-    if (!kvq_decode_last(ctx, ids, C + 12, C + 14, n_vocab, lc)) {
+    check(coarse().n_coarse == layout_end(C + 8) && !coarse().failed, "a new prefill fits up to the layout end again");
+    check(llama_memory_seq_pos_max(mem, 0) == C + 7, "last position is C + 7");
+    if (!kvq_decode_last(ctx, ids, C + 8, C + 12, n_vocab, lc)) {
         return false;
     }
+
+    // the complete chunk and a group or own chunk after it: across the chunk boundary
+    if (!kvq_prefill(ctx, ids, C + 1000, n_batch, C + 12) || !llama_memory_kvq_fit_wait(mem)) {
+        return false;
+    }
+    check(coarse().n_coarse == layout_end(C + 1000), "the end of the prompt fits up to the layout end");
+    if (!kvq_decode_last(ctx, ids, C + 1000, C + 1002, n_vocab, lc)) {
+        return false;
+    }
+
+    // the geometry of the earlier version of this test: the first chunk coarse, 2 positions in the ring, a ring removal after them
+    check(llama_memory_seq_rm(mem, 0, -1, -1), "seq_rm(0, -1, -1) succeeds");
+    if (!kvq_prefill(ctx, ids, C - 2, n_batch) || !kvq_decode_last(ctx, ids, C - 2, C + 2, n_vocab, lc) || !llama_memory_kvq_fit_wait(mem)) {
+        return false;
+    }
+    check(coarse().n_coarse == layout_end(C + 2), "the end of the prompt fits up to the layout end");
+    if (!kvq_decode_last(ctx, ids, C + 2, C + 6, n_vocab, la) || !llama_memory_seq_rm(mem, 0, C + 3, -1) ||
+        !kvq_decode_last(ctx, ids, C + 3, C + 6, n_vocab, lb)) {
+        return false;
+    }
+    compare(la, lb, "logits at C + 5 before and after the ring removal (packed path, earlier geometry)");
     kvq_print_progress(mem);
     LOG("kvq: rm-test: %s\n", ok ? "all checks passed" : "SOME CHECKS FAILED");
     return ok;
+}
+
+// the prefix in turns, see --kvq-turns: the memory is empty
+static bool kvq_turns(llama_context * ctx, const std::vector<llama_token> & ids, const std::vector<int32_t> & turns, int32_t n_gen, int32_t n_batch, int32_t n_vocab, bool lib) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    const llama_state_seq_flags fl = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    int32_t p = 0;
+    for (size_t t = 0; t < turns.size(); ++t) {
+        const int32_t s_t = turns[t];
+        const int64_t t0  = ggml_time_us();
+        if (!kvq_prefill(ctx, ids, s_t, n_batch, p)) {
+            return false;
+        }
+        const int64_t t1 = ggml_time_us();
+        if (lib && !llama_memory_kvq_fit_wait(mem)) {
+            return false;
+        }
+        const int64_t t2 = ggml_time_us();
+        llama_kvq_fit_progress pr;
+        llama_memory_kvq_fit_get_progress(mem, pr);
+        LOG("kvq: turn %zu: prefill [%d, %d) %.2f s, end-of-prompt fit %.3f s, coarse rows %d, host rows %d\n",
+                t, p, s_t, (t1 - t0)*1e-6, (t2 - t1)*1e-6, pr.n_coarse, pr.n_host);
+        p = s_t;
+        if (t + 1 == turns.size()) {
+            break;
+        }
+        // a reply, then back to the end of the prompt (the recurrent state from a checkpoint)
+        std::vector<uint8_t> ckpt(llama_state_seq_get_size_ext(ctx, 0, fl));
+        if (ckpt.empty() || llama_state_seq_get_data_ext(ctx, ckpt.data(), ckpt.size(), 0, fl) != ckpt.size()) {
+            LOG_ERR("%s: cannot save the recurrent state\n", __func__);
+            return false;
+        }
+        llama_token tok = ids[s_t];
+        common_batch batch(ctx);
+        for (int32_t i = 0; i < n_gen; ++i) {
+            batch.clear();
+            batch.add(tok, s_t + i, 0, true);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+                LOG_ERR("%s: decode failed at pos %d\n", __func__, s_t + i);
+                return false;
+            }
+            tok = kvq_argmax(llama_get_logits_ith(ctx, -1), n_vocab);
+        }
+        if (llama_state_seq_set_data_ext(ctx, ckpt.data(), ckpt.size(), 0, fl) != ckpt.size() || !llama_memory_seq_rm(mem, 0, s_t, -1)) {
+            LOG_ERR("%s: rollback to position %d failed\n", __func__, s_t);
+            return false;
+        }
+        LOG("kvq: turn %zu: %d generated tokens, back to position %d\n", t, n_gen, s_t);
+    }
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -1601,12 +1726,14 @@ int main(int argc, char ** argv) {
         if (args.packed || args.no_rot) {
             llama_model_set_attn_rot(model, false);
         }
-        llama_model_set_kvq_tail(model, args.lib() && !args.lib_full ? GGML_PAD(2*args.fit_chunk + params.n_batch + 256, 256) : 0);
+        const int32_t ring = args.lib_ring > 0 ? args.lib_ring : GGML_PAD(args.fit_chunk + params.n_batch + 256, 256);
+        llama_model_set_kvq_tail(model, args.lib() && !args.lib_full ? ring : 0);
         llama_context_params cparams = common_context_params_to_llama(params);
         if (args.rm_test) {
             // recurrent snapshots for a seq_rm into the last ubatch
             cparams.n_rs_seq = 4;
         }
+        LOG_INF("%s: ring of %d cells\n", __func__, args.lib() && !args.lib_full ? ring : 0);
         ctx_tt.reset(llama_init_from_model(model, cparams));
     }
 
@@ -1708,12 +1835,14 @@ int main(int argc, char ** argv) {
         fp.bits_v    = args.v_bits;
         fp.v_tables  = args.lib_vtab;
         fp.n_threads = args.lib_threads;
+        fp.rem       = args.lib_rem;
+        fp.min_rows  = args.lib_min_rows;
         if (!llama_memory_kvq_fit_enable(llama_get_memory(ctx), fp, tp_packed)) {
             LOG_ERR("%s: cannot enable the fit mode\n", __func__);
             return 1;
         }
         if (args.rm_test) {
-            return kvq_rm_test(ctx, ids, args.fit_chunk, n_vocab) ? 0 : 1;
+            return kvq_rm_test(ctx, ids, args.fit_chunk, n_vocab, args.lib_rem, args.lib_min_rows, tp_packed.prefetch_n + tp_packed.n_sink) ? 0 : 1;
         }
     }
 
@@ -1755,6 +1884,18 @@ int main(int argc, char ** argv) {
         ckpt_data.resize(llama_state_seq_get_size_ext(ctx, 0, fl_part));
         if (ckpt_data.empty() || llama_state_seq_get_data_ext(ctx, ckpt_data.data(), ckpt_data.size(), 0, fl_part) != ckpt_data.size() ||
                 !kvq_prefill(ctx, ids, s, params.n_batch, ckpt)) {
+            return 1;
+        }
+    } else if (!args.turns.empty()) {
+        std::vector<int32_t> turns = args.turns;
+        turns.push_back(s);
+        for (size_t t = 0; t < turns.size(); ++t) {
+            if (turns[t] <= (t ? turns[t - 1] : 0) || turns[t] > s || ckpt > 0) {
+                LOG_ERR("%s: --kvq-turns needs ascending positions below the prefix length and no --kvq-state-ckpt\n", __func__);
+                return 1;
+            }
+        }
+        if (!kvq_turns(ctx, ids, turns, args.turn_gen, params.n_batch, n_vocab, args.lib())) {
             return 1;
         }
     } else if (args.lib_busy && s > args.fit_chunk) {

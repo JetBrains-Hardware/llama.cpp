@@ -530,15 +530,27 @@ bool llama_kvq_fit_cov(llama_kvq_table & t, const float * mu, const double * cov
     }
     const size_t nn = (size_t) n*n;
 
-    std::vector<double> l(metric, metric + nn);
     double tr = 0.0;
     for (int i = 0; i < n; i++) {
-        tr += l[(size_t) i*n + i];
+        tr += metric[(size_t) i*n + i];
     }
-    for (int i = 0; i < n; i++) {
-        l[(size_t) i*n + i] += 1e-6*tr/n;
+    // a metric from few queries is near singular, the rounding of its sums can make it indefinite: a larger ridge then
+    std::vector<double> l;
+    bool chol = false;
+    for (const double ridge : { 1e-6, 1e-4, 1e-2 }) {
+        l.assign(metric, metric + nn);
+        for (int i = 0; i < n; i++) {
+            l[(size_t) i*n + i] += ridge*tr/n;
+        }
+        chol = kvq_cholesky(n, l);
+        if (chol) {
+            if (ridge > 1e-6) {
+                LLAMA_LOG_WARN("%s: the metric needed a ridge of %.0e of its mean diagonal\n", __func__, ridge);
+            }
+            break;
+        }
     }
-    if (!kvq_cholesky(n, l)) {
+    if (!chol) {
         LLAMA_LOG_ERROR("%s: metric is not positive definite\n", __func__);
         return false;
     }

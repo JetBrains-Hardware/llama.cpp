@@ -35,10 +35,10 @@ class llama_io_read_i;
 // the trigger tensors are not written: the trigger node is an add whose result is not used
 //
 // fit mode, scratch attention of the large ubatches (prefill): one device scratch holds the q8_0 K/V rows that flash attention reads,
-// the coarse region [0, n_coarse) uploaded from the host store per layer, the rest copied on the device from the cache
-// (the cells after the coarse region, or in tail mode the whole ring after the coarse rows)
+// the rows [0, n_host) uploaded from the host store per layer, the rest copied on the device from the cache
+// (the cells after them, or in tail mode the ring cells of the positions after them)
 //   scratch up:   after the attention of the previous attention layer (or at the graph start), the copy stream waits for the main
-//                 stream and uploads the rows of layer il, one copy per kv head
+//                 stream and uploads the rows [0, n_host) of layer il, one copy per kv head
 //   scratch join: before the attention of layer il, the main stream waits for the uploads
 class llama_kvq_store {
 public:
@@ -71,9 +71,9 @@ public:
         ggml_tensor * v_h   = nullptr; // f16 [ROW/2, G, kv_size], alias of the V cache (fit mode)
     };
 
-    // the tensors hold n_rows coarse rows (a multiple of n_chunk_rows)
-    // fill: the coarse region is [0, n_rows), its q8_0 rows are copied from the cache now (llama_memory_kvq_packed_alloc)
-    // else: fit mode, the region starts empty and grows by chunks (set_n_coarse), the query statistics tensors are allocated
+    // the tensors hold n_rows coarse rows, table sets of n_chunk_rows rows
+    // fill: the coarse region is [0, n_rows) (a multiple of n_chunk_rows), its q8_0 rows are copied from the cache now (llama_memory_kvq_packed_alloc)
+    // else: fit mode, the region starts empty and grows (set_n_coarse), the query statistics tensors are allocated
     // n_gate > 0 (fit mode): also the gate statistics tensors, n_gate = n_head*D
     llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
             int32_t resident_cap, bool all_resident, int32_t n_sink, bool fill, int32_t n_gate = 0);
@@ -82,13 +82,17 @@ public:
     bool set_codes(int32_t il, int32_t g, bool is_v, const std::vector<llama_kvq_table> & tabs, const int8_t * codes, const float * gain);
 
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
-    // only for chunks at or after the coarse region; the decode thread, between graphs
+    // the decode thread, between graphs; a coarse chunk must get its new codes before the next graph
     // async: a copy on the main stream, the memory must stay valid until the next synchronize (pinned memory for a real async copy)
     void set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async = false);
 
-    // fit mode: the coarse region becomes [0, n), n a multiple of n_chunk_rows; new chunks must have rows, tables and host rows set
+    // fit mode: the coarse region becomes [0, n), n <= n_host; new rows must have codes and tables set
     // the resident rows at or after n are dropped; the decode thread, between graphs
     void set_n_coarse(int32_t n);
+
+    // fit mode: the positions [0, n) have their q8_0 rows in the host store (or will have, by work queued on the main stream)
+    // the scratch attention reads these rows from the host store, the later ones from the cache
+    void set_n_host(int32_t n);
 
     // the main backend of the device (one of the backends of the context)
     void set_backend(const std::vector<ggml_backend_t> & backends);
@@ -97,12 +101,13 @@ public:
     void synchronize();
 
     // fit mode, state save and load of the coarse region [0, n_coarse): host rows, codes and tables, the decode thread
-    // meta: shapes and types, state_read_meta throws on a mismatch and returns n_coarse of the state
-    // state_read_data: the coarse region must be empty, it becomes [0, n)
-    void    state_write_meta(llama_io_write_i & io) const;
-    void    state_write_data(llama_io_write_i & io);
-    int32_t state_read_meta (llama_io_read_i  & io) const;
-    void    state_read_data (llama_io_read_i  & io, int32_t n);
+    // host rows [0, n_host), codes [0, n_coarse), tables of the chunks of the coarse region
+    // meta: shapes and types, state_read_meta throws on a mismatch and returns n_coarse and n_host of the state
+    // state_read_data: the coarse region must be empty, it becomes [0, n), the host rows [0, n_host)
+    void state_write_meta(llama_io_write_i & io) const;
+    void state_write_data(llama_io_write_i & io);
+    void state_read_meta (llama_io_read_i  & io, int32_t & n, int32_t & n_host) const;
+    void state_read_data (llama_io_read_i  & io, int32_t n, int32_t n_host);
 
     // the main backend (set_backend), the device and the buffer type of the device tensors
     ggml_backend_t             backend() const { return backend_main; }
@@ -120,6 +125,9 @@ public:
 
     // checks the parameters against the allocation and resets the resident slots and the counters
     bool enable(const llama_kvq_params & params);
+
+    // the resident slots start empty (the sinks stay), so the packed attention after this depends on the memory state only
+    void reset_resident();
 
     // called once per ubatch of the packed path
     void begin_ubatch(int64_t n_tokens);
@@ -157,6 +165,8 @@ public:
     ggml_tensor * get_vc(ggml_context * ctx, int32_t il) const;
 
     int32_t n_coarse()     const { return n_coarse_; }
+    int32_t n_host()       const { return n_host_; }
+    int32_t n_chunks()     const { return n_chunk; }
     int32_t n_rows()       const { return n_rows_; }
     int32_t n_chunk_rows() const { return n_crow; }
     int32_t n_head_kv()    const { return G; }
@@ -181,6 +191,7 @@ private:
     struct worker;
 
     int32_t n_coarse_ = 0;
+    int32_t n_host_   = 0;
     int32_t n_rows_   = 0; // allocated rows, the stride of the per-row host arrays
     bool    filled    = false;
     bool    tail      = false; // the cache is a ring (llama_kv_cache::get_ring), the scratch holds the coarse region and then the ring

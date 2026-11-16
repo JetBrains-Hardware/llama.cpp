@@ -1,6 +1,6 @@
 # Two-tier KV cache for qwen35 (kvq) - prototype state
 
-State of branch `kvq-two-tier-cache` at commit cefce74bc (2026-11-13), with the GPU fitter (2026-11-16) on top of 7604e664e. The CPU fitter is kept on branch `kvq-fit-cpu`. The branch starts from ggml-org/master 951d465f5 and is pushed to the JetBrains-Hardware fork. This file is the starting point for the next work session.
+State of branch `kvq-two-tier-cache` at commit cefce74bc (2026-11-13), with the GPU fitter (2026-11-16) on top of 7604e664e, and the ring redesign (2026-11-16 evening, on top of fa865aee3, not committed when this was written: the rows after the last complete chunk are fitted at the end of every prompt, the ring holds only rows that are not coded yet). The CPU fitter is kept on branch `kvq-fit-cpu`. The branch starts from ggml-org/master 951d465f5 and is pushed to the JetBrains-Hardware fork. This file is the starting point for the next work session.
 
 Research background, codec definition and the original plan are in the `qwen3.8-exp` repository: `notes/kvq_implementation_plan.md`, `notes/kv_prefetch_results.md`, `src/qexp/kvcodec.py`, `experiments/14_kv_prefetch.py`.
 
@@ -11,47 +11,58 @@ A KV cache for Qwen3.8-27B (GGUF arch `qwen35`) that keeps most of the attention
 - Coarse tier, VRAM: every row of a fitted chunk as transform-coded low-bit codes (K 2 bit, V 1 bit plus a gain). The attention is computed on the packed codes by a custom op.
 - Precise tier, system RAM: the q8_0 rows of the same positions in a pinned host store.
 - Resident set, VRAM: 1024 precise rows per (layer, kv head), selected per token by an early query and fetched from RAM while the GPU runs the two layers before the attention.
-- Precise tail, VRAM: q8_0 rows of positions that are not in a fitted chunk yet (ring-shaped device cache).
+- Ring, VRAM: q8_0 rows of the positions whose rows are not in the host store yet: the reply since the end of the last prompt, and the rows of a prompt while it is processed (ring-shaped device cache, `--kvq-tail`, default one chunk + one batch + 256 cells).
 
 Model facts used everywhere: 64 trunk blocks, 16 attention layers (il = 3, 7, ..., 63), 24 query heads, 4 kv heads, head dim 256. The MTP block (block 64) runs in its own context with its own plain cache and does not use any of this.
 
 ## How it works
 
-Chunks. The sequence is cut in chunks of 8192 positions. When a chunk is complete (plus a margin of 64 positions), the fitter fits a K table and a V table per (layer, kv head) on the chunk's own rows, codes the rows, and the chunk joins the coarse region. Then the chunk's rows leave the device cache.
+Chunks. The sequence is cut in chunks of C positions (`--kvq-chunk`, default 8192): chunk c covers [c*C, (c+1)*C). A complete chunk is fitted alone: a K table and a V table per (layer, kv head) on the chunk's own rows; its rows are coded and join the coarse region. A fit is always made from scratch from its rows (q8_0, from the host store or the ring) and its statistics, so its tables do not depend on how often or when the range was fitted before.
 
-Tables. Per (chunk, layer, kv head, K or V) a 256 x 256 inverse table and a small aux array (step, mu, bits). The inverse table is stored as int8 with one scale per component c (row inv[c][:] divided by its max abs, times 127); the scale is folded into the step that the attention op reads, so the decode formula is unchanged. The codec itself (fit, encode, bits, the step of the device CODE mode) still works in float.
+The rows after the last complete chunk (`--kvq-rem`). At the end of every prompt (`llama_memory_kvq_fit_wait`, the server calls it when the prompt is done) the fitter fits the layout of the token count S, waits for all of it, and nothing of the fit runs afterwards. With n_full = floor(S/C):
 
-Fitter (`llama_kvq_fitter`). The work on the rows runs on the GPU, on the main stream between two ubatches; only the small 256 x 256 problem per (layer, kv head, K or V) runs on CPU threads. A job is a small state machine over several polls of the decode thread (before each ubatch), one graph per attention layer and phase:
+- `own` (default): chunks 0 .. n_full - 1 alone, then [n_full*C, S) as a chunk of its own if it has at least `--kvq-min-rows` rows (default 256); fewer rows stay precise in the ring.
+- `merge`: chunks 0 .. n_full - 2 alone, then [(n_full - 1)*C, S) as one group (C to 2C - 1 rows) with one table set, written to the table slots of both chunks (the attention op takes the table of a row by its chunk, so no kernel change). When the next chunk is complete, the head of the group is fitted alone again.
+- n_full = 0: [0, S) as one partial chunk, both policies.
+- A coarse region smaller than prefetch_n + n_sink (1028) is not made (the prefetch selects from its rows); those rows stay precise.
 
-1. Phase 1, when the job starts: the chunk's q8_0 rows are read from the ring (`get_rows`, wrap-around by index), copied to the pinned host store (device relayout, one download per (layer, kv head)), and their mean and covariance (`ggml_kvq_fit`) go to the host, 33 MiB per chunk.
-2. CPU tasks (`--kvq-threads`, low priority), the V tasks first: metric (from `qacc` / `gacc`), `llama_kvq_fit_cov` (Cholesky, `L^T cov L`, eigen solver, fwd/inv tables), for K also bits, steps and the packed table. The tasks wait for the event of phase 1, not the decode thread.
-3. Phase 2, at the first poll after the V tasks (the K tasks may still run): V fwd tables up, rows rotated, the scale of the shape (gain per row, column statistics) goes to the host. CPU tasks for V: bits, steps, packed table.
-4. Phase 3 and install, at the first poll after all tasks: fwd tables up, rows rotated, K and V codes packed straight into `kc` and `vc`, the tables uploaded, `set_n_coarse` (one synchronize per chunk, as before).
+At the next end of a prompt the partial chunk or group is fitted again with all rows it has then, from the host store. The rows of a reply stay precise in the ring until the next end of a prompt. The resident set is emptied at the end of every prompt, so the decoding after it depends only on the memory state (also after a slot restore).
 
-The decode thread never waits in a poll for device work it queued in the same poll. The packed codes never go through the host. The eigen step is the function `llama_kvq_fit_cov`, a device eigen solver could replace it. The o_proj grams of the V metric are computed once on the GPU when the fit mode starts.
+Three boundaries. n_coarse: positions [0, n_coarse) are coded (any row, not a chunk multiple). n_host >= n_coarse: positions [0, n_host) have their q8_0 rows in the host store. The ring (device q8_0 cache, `--kvq-tail`) holds the positions [n_host, end), position p in cell p mod size; its cells are freed as soon as a job has started on their rows, not when the job ends. The packed attention (small batches) reads coarse rows + resident rows + the ring, so it needs n_host == n_coarse; otherwise a small batch attends over the scratch like the prefill (correct, slower; only after a rollback or a spill before the next end of a prompt).
 
-- K metric: second moment of the queries at the chunk's own positions, summed on the device during decoding (`qacc`), read back once per chunk.
-- V metric: o_proj columns scaled by the chunk's mean sigmoid(gate), summed on the device (`gacc`).
-- Codec: Cholesky of the metric, eigen-decomposition, reverse water-filling bit allocation, uniform quantizer with Gaussian steps. Exact definition: `src/llama-kvq-codec.cpp` and the research code.
+Tables. Per (chunk slot, layer, kv head, K or V) a 256 x 256 inverse table and a small aux array (step, mu, bits). The inverse table is stored as int8 with one scale per component c (row inv[c][:] divided by its max abs, times 127); the scale is folded into the step that the attention op reads, so the decode formula is unchanged. The codec itself (fit, encode, bits, the step of the device CODE mode) still works in float. There are ceil(n_ctx/C) slots and the coarse region can reach n_ctx rows (before: floor(n_ctx/C) full chunks only).
+
+Fitter (`llama_kvq_fitter`). A job is a row range [r0, r1) with one table set (a chunk, a partial chunk or a group). The work on the rows runs on the GPU, on the main stream between two ubatches; only the 256 x 256 problem per (layer, kv head, K or V) runs on CPU threads. One graph per attention layer and phase, the rows of a layer go through a device stage (q8_0, C rows; 2C - 1 rows with `merge`):
+
+1. Phase 1, when the job starts: rows [r0, n_host) are uploaded from the host store into the stage, the ring rows [n_host, r1) are copied into it on the device and from there to the host store (one download per (layer, kv head)); mean and covariance (`ggml_kvq_fit`) of the stage rows go to the host. n_host becomes r1 and the ring cells are free.
+2. CPU tasks (`--kvq-threads`, low priority), the V tasks first: metric (from the statistics), `llama_kvq_fit_cov` (Cholesky, `L^T cov L`, eigen solver, fwd/inv tables), for K also bits, steps and the packed table. The tasks wait for the event of phase 1, not the decode thread.
+3. Phase 2, at the first poll after the V tasks: the rows again from the host store (K and V, 285 MB per 8k chunk), V fwd tables up, rows rotated, the scale of the shape to the host. CPU tasks for V: bits, steps, packed table.
+4. Phase 3 and install, at the first poll after all tasks: the rows again from the host store, fwd tables up, rows rotated, K and V codes packed straight into `kc` and `vc`, the tables uploaded to every slot of the range, `set_n_coarse` (one synchronize per job). A range that is coarse already gets its new codes and tables in the same poll, so no graph sees a mix.
+
+When jobs start. Prefill (ubatches larger than max_batch): a complete chunk is taken at the first ubatch after it is complete (`merge`: once the next chunk is complete too). Generation (small ubatches): no job starts; the jobs in flight are waited for before a small batch, so the path of the small batch (packed or scratch) does not depend on the fitter threads. At the end of a prompt: the layout as above, sync.
+
+Statistics. K metric: second moment of the queries summed on the device during decoding (`qacc`), a ubatch counts for the chunk of its first position; when a chunk is complete its sums are read and kept on the host (for its fit and for a rollback into it) and the device sums start again from 0. A group uses the kept sums of its complete chunk plus the device sums of the open chunk; an own partial chunk also takes the kept sums of the chunk before it (its own sums can cover very few positions: in a server session the 1024-token ubatch that crossed the boundary counted for the previous chunk and the partial chunk of 152 rows had the queries of 4 positions, the metric was indefinite and the fit failed; the queries just before stand in). The device sums of the open chunk are read without a reset and kept with their position; a rollback to exactly that position restores them, so a reply that is rolled back leaves no queries behind. V metric: o_proj columns scaled by the mean sigmoid(gate), summed the same way (`gacc`).
+
+Ring overflow. Before a batch is placed (`tail_wait`), the ring needs room for it. A large batch: first the jobs of the complete chunks start (their ring cells are free at once), then the remaining ring rows before the batch are copied to the host store without a fit (spill). A small batch (generation): when p0 + max_batch - n_host > ring size, the rows after the last complete chunk are fitted in line on the decode thread (fold: the layout of p0, sync, then the batch); the position of a fold depends only on the first position of the batch and the state, so generation stays reproducible.
 
 Generation and MTP verify (ubatch <= 8 tokens), per attention layer il:
 
 1. At the input of layer il - 2 the graph computes layer il's query from the earlier hidden state, scores all coarse rows, and takes the top 1024 per (kv head, position).
 2. A scheduler split with a copy callback queues the readback of the selection on a copy stream. A worker thread plans the resident slots (least recently selected eviction) and gathers the rows from the host store. The GPU keeps running layers il - 2 and il - 1.
 3. Before layer il's attention a join uploads the rows and scatters them into the resident tensor.
-4. `ggml_kvq_attn` computes the attention over coarse rows + resident precise rows + the tail.
+4. `ggml_kvq_attn` computes the attention over coarse rows + resident precise rows + the ring.
 
-Prefill (larger ubatches), per attention layer: the installed region is uploaded from the pinned host store into one device scratch buffer (4 async uploads on the copy stream, overlapping the layers before), the tail rows are copied in on the device, and normal flash attention runs over the scratch. Logits are bit-identical to attention over a full device cache.
+Prefill (larger ubatches), per attention layer: the rows [0, n_host) are uploaded from the pinned host store into one device scratch buffer (4 async uploads on the copy stream, overlapping the layers before), the ring rows after them are copied in on the device, and normal flash attention runs over the scratch. Logits are bit-identical to attention over a full device cache.
 
-Rollback. Removing the end of the sequence is cheap when it stays in the tail (MTP draft rollback). When it cuts into an installed chunk, the chunk is dropped, its rows before the cut are restored from the host store into the ring, and it is fitted again later. `clear` drops everything and the fitter starts again.
+Rollback (`seq_rm` of the end at p0). Inside the ring (MTP drafts): only the ring cells. Into the coarse region: the jobs with rows at or after p0 are cancelled, the coarse region drops back to the chunk grid (n_coarse = floor(p0/C)*C), n_host = p0: the rows before p0 stay in the host store, nothing is copied back. The next end of a prompt fits them again (they are prefilled over the scratch until then). If the layout at the end of a prompt leaves rows precise that are only in the host store (fewer than min_rows), they are copied back to the ring then. `clear` drops everything and the fitter starts again.
 
-Save and restore (`llama_memory_hybrid_kvq::state_write` / `state_read`, fit mode with the tail ring only). The state is exact: nothing is fitted again on load. A save first waits for the fitter until every complete chunk is in the coarse region (`fit_wait`), so a saved state has no chunk in flight; the server also waits at the end of every prompt. Layout of the state of sequence 0 (the full-context state is the same with the arch string in front):
+Save and restore (`llama_memory_hybrid_kvq::state_write` / `state_read`, fit mode with the tail ring only). The state is exact: nothing is fitted again on load. A save waits for the jobs in flight (there are none after the end of a prompt) and does not fit anything. Layout of the state of sequence 0 (the full-context state is the same with the arch string in front), version 2:
 
-1. Magic `KVQS` and version 1, then the meta of the store (attention layers, kv heads, head dim, chunk rows, words per K / V row, coarse rows, type and slice size of the two table tensors) and of the fitter (K / V bits, V fitted per chunk or from a file). The loader checks all of it before it reads any data.
-2. The ring: the plain state of the attention cache (the positions after the coarse region), read back with `find_slot`, which places a position at cell `pos mod size`.
+1. Magic `KVQS` and version 2, then the meta of the store (attention layers, kv heads, head dim, chunk rows, words per K / V row, n_coarse, type and slice size of the two table tensors, n_host) and of the fitter (K / V bits, V fitted per chunk or from a file). The loader checks all of it before it reads any data. A version 1 state fails with "version 1 of the two-tier cache state, expected 2", the sequence is empty afterwards.
+2. The ring: the plain state of the attention cache (the positions after n_host), read back with `find_slot`, which places a position at cell `pos mod size`.
 3. The recurrent state, plain.
-4. Per attention layer: the q8_0 host rows of the coarse region per kv head (raw blocks from and into the pinned store), the codes (`kc`, `vc`) per kv head, the tables of the coarse chunks (by the tensors' own type and size, so a change of the table format is a mismatch and not a misread).
-5. The fitter: query and gate statistics of each coarse chunk (for a later rollback into a chunk) and the device sums of the open chunk.
+4. Per attention layer: the q8_0 host rows [0, n_host) per kv head (raw blocks from and into the pinned store), the codes (`kc`, `vc`) of [0, n_coarse) per kv head, the tables of the ceil(n_coarse/C) slots of the coarse region (by the tensors' own type and size, so a change of the table format is a mismatch and not a misread).
+5. The fitter: the fitted range of each slot of the coarse region (so a partial chunk and its row count round-trip), the statistics of the complete chunks, the device sums of the open chunk, the kept sums of the last partial fit and their position.
 
 A plain state starts with the stream count of the attention cache, so a plain context refuses a kvq state ("n_stream mismatch") and a kvq context refuses a plain one ("not a state of the two-tier cache"); after a failed load the sequence is empty. The resident set starts empty after a load. The server's slot file appends the context checkpoints and the MTP draft state as before. The RAM prompt cache serializes the same state into RAM (an entry over `--cache-ram` is skipped).
 
@@ -80,9 +91,9 @@ Server, production configuration plus `--kvq`:
 llama-server --fit off -m Qwen3.8-3.6-27B-blend-Q4_K_M.gguf --ctx-size 230000 --n-gpu-layers all --parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --jinja --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-type-k f16 --spec-draft-type-v f16 --batch-size 4096 --ubatch-size 1024 --kvq
 ```
 
-Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (1024), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default 2 * 8192 + n_batch + 256, 0 = full device cache), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
+Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (1024), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default chunk + n_batch + 256, 0 = full device cache; the code works down to n_batch + 256, see Results), `--kvq-chunk N` (rows per chunk, 8192), `--kvq-rem own|merge` (the rows after the last complete chunk, default own), `--kvq-min-rows N` (own: fewer rows after the last complete chunk stay precise, default 256), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
 
-With `--kvq` the server forces, with a warning: 1 slot, context shift and cache reuse off, flash attention on, q8_0 K/V, draft n_max <= 7; with `--kvq-tail 0` also the RAM prompt cache off and the slot save path cleared. At the end of each prompt the server waits until every complete chunk is in the coarse region (log line `kvq: waited ... at the end of the prompt`). It refuses to start for a model that is not qwen35, `--mmproj`, embeddings. Attention rotation of quantized caches is turned off for the model (also for the MTP context). `--fit` does not count the kvq memory.
+With `--kvq` the server forces, with a warning: 1 slot, context shift and cache reuse off, flash attention on, q8_0 K/V, draft n_max <= 7; with `--kvq-tail 0` also the RAM prompt cache off and the slot save path cleared. At the end of each prompt the server waits until the prompt is fitted up to its end (log line `kvq: waited ... at the end of the prompt, coarse region N rows`); no fit work runs during the reply. It refuses to start for a model that is not qwen35, `--mmproj`, embeddings. Attention rotation of quantized caches is turned off for the model (also for the MTP context). `--fit` does not count the kvq memory.
 
 Evaluation tool (teacher-forced KL against saved reference logits):
 
@@ -90,13 +101,108 @@ Evaluation tool (teacher-forced KL against saved reference logits):
 llama-kvq-eval -m MODEL -ngl 99 -fa on -fit off -b 2048 -ub 2048 -ctk q8_0 -ctv q8_0 --kvq-tokens TOKENS.bin --kvq-prefix-len S --kvq-chunk 1 --kvq-ref REF --kvq-lib
 ```
 
-`--kvq-lib` is the library path (same as the server), `--kvq-lib-full` keeps the full device cache, `--kvq-rm-test` checks the removal cases, `--kvq-scr-check N` compares scratch and cache prefill logits bit for bit. State checks: `--kvq-state-save FILE` (after the prefill and the wait), `--kvq-state-load FILE` (instead of the prefill), `--kvq-state-ckpt P` (a recurrent checkpoint at P; after the save or load, roll back to P and process the rest of the prefix again), `--kvq-lib-hold` (no chunk joins during the scoring). Compare two runs with `--kvq-save-ref` files. The older `--kvq-variant`, `--kvq-two-tier`, `--kvq-packed` modes are tool-driven experiments from earlier stages.
+`--kvq-lib` is the library path (same as the server), `--kvq-lib-full` keeps the full device cache, `--kvq-ring N` sets the ring (default chunk + batch + 256), `--kvq-rem` / `--kvq-min-rows` as in the server, `--kvq-rm-test` checks the removal cases (both policies), `--kvq-turns S1,S2,... --kvq-turn-gen N` processes the prefix in turns (prefill to S_i with batches at multiples of the batch size, the end of the prompt, N greedy tokens one per decode, back to S_i through a recurrent checkpoint, the next turn), `--kvq-ref2` compares with a second reference (e.g. the single-prefill run), `--kvq-scr-check N` compares scratch and cache prefill logits bit for bit. State checks: `--kvq-state-save FILE` (after the prefill and the wait), `--kvq-state-load FILE` (instead of the prefill), `--kvq-state-ckpt P` (a recurrent checkpoint at P; after the save or load, roll back to P and process the rest of the prefix again), `--kvq-lib-hold` (no chunk joins during the scoring). Compare two runs with `--kvq-save-ref` files. The older `--kvq-variant`, `--kvq-two-tier`, `--kvq-packed` modes are tool-driven experiments from earlier stages.
 
-Environment variables for debugging: `LLAMA_KVQ_SCHED_SYNC`, `LLAMA_KVQ_GATHER_THREADS`, `LLAMA_KVQ_IDLE_PROBE`, `LLAMA_KVQ_SCRATCH`, `LLAMA_SERVER_GEN_TIMES`, `LLAMA_KVQ_FIT_SYNC` (synchronize around the device phases of the fitter, logs the device time per chunk and phase).
+Environment variables for debugging: `LLAMA_KVQ_SCHED_SYNC`, `LLAMA_KVQ_GATHER_THREADS`, `LLAMA_KVQ_IDLE_PROBE`, `LLAMA_KVQ_SCRATCH`, `LLAMA_SERVER_GEN_TIMES`, `LLAMA_KVQ_FIT_SYNC` (synchronize around the device phases of the fitter, logs the device time per job and phase). Experiments: `LLAMA_KVQ_FOLD_EVERY=N` (a fold whenever N reply rows follow the coarse region), with `LLAMA_KVQ_FOLD_FIXED=1` the fold codes the new rows with the tables of the last fit instead of a new fit; `LLAMA_KVQ_DIAG_NORESET` (the resident set is not emptied at the end of a prompt).
 
 ## Results
 
 Machine: RTX 5090 32 GB, Ryzen 9950X3D, Windows 11, CUDA 12.9. One trace of 100k tokens unless noted; treat single runs as such.
+
+### Ring redesign (2026-11-16 evening)
+
+What forced 2 chunks before: phases 2 and 3 of a job read the chunk's rows from the ring (`get_rows` by cell), so the chunk stayed in the ring until it was installed, about 1 - 2.5 s after it was complete, while the next chunk filled (prefill makes a chunk every 3.3 - 3.6 s). Ring = the chunk being fitted + the chunk being filled + a batch. Now phase 1 copies the ring rows to the host store and the cells are free at once; phases 2 and 3 upload the rows from the host store into the fitter's stage, layer by layer (2 x 285 MB per 8k chunk). With the spill (ring rows to the host store without a fit) the ring can be as small as one batch.
+
+Ring and VRAM (34,816 B per cell; codes 6,400 B per row; tables per slot 8.4 MiB int8):
+
+| | ring cells | ring MiB | coarse rows (ctx 230000 / 100352) | tables | scratch |
+|---|---|---|---|---|---|
+| before: 2 chunks + n_batch + 256 | 20,736 | 688.5 | 229,376 / 98,304 rows | 28 / 12 slots | 519 / 247 MiB |
+| now, default: chunk + n_batch + 256 | 12,544 | 416.5 | 230,000 / 100,352 rows (1404 / 613 MiB) | 29 / 13 slots (243 / 109 MiB) | 503 / 234 MiB |
+| `--kvq-tail` = n_batch + 256 (one batch) | 4,352 | 144.5 | same | same | 486 / 217 MiB |
+
+(-b 4096; the coarse region now reaches n_ctx rows and a slot for the last partial chunk.) Saving against before: 272 MiB of ring with the default, 544 MiB with one batch, the scratch 16 - 33 MiB more; the tables 8 MiB and the codes 4 MiB less saving because of the last slot.
+
+kvq-eval, -b 2048 -ub 2048, 1 token per decode, deterministic, against the q8_0 teacher (`ref/row*.q8c1`); KL with the 95% bootstrap CI, flips = positions where the top-1 differs:
+
+| Trace | before (fa865aee3) | own | merge |
+|---|---|---|---|
+| row310, 24k (245 scored) | 4.47e-5 | 4.38e-5 [3.01, 5.90], 1 flip (first build: 6.02e-5, 0 flips) | 7.99e-5 [4.78, 12.1], 0 flips |
+| row1830, 50k (289) | not run | 2.35e-4 [1.58, 3.12], 0 flips | not run |
+| row2660, 100k (471) | 1.291e-4 | 1.349e-4 [1.01, 1.74], 1 flip (first build: 1.478e-4) | 1.332e-4 [0.98, 1.74], 1 flip |
+| row2660, ring of one batch (2304 cells) | | 1.494e-4 [1.11, 1.92], 1 flip | |
+
+Final build: the own partial chunk takes the previous chunk's statistics into its metric (see Statistics); the other own numbers in this section (sweep, multi-turn, folds, small ring, 1830) are from the first build, merge is unaffected by that change. The precise set changed: the rows after the last complete chunk (7,799 at 24k, 1,091 at 100k, 585 at 50k) are now coded. All intervals overlap with the earlier numbers; at 24k the earlier spread of 13 non-deterministic runs was 3.6e-5 - 5.7e-5.
+
+Prefill and the end-of-prompt wait (kvq-eval, 8 fit threads, the GPU otherwise idle): 100k prefill 40.08 s (own), 40.15 s (merge, 9 spills), 40.26 s (own, one-batch ring, 36 spills, all chunks read back from the host store in phase 1); wait at the end of the prompt 0.60 s (own, a partial chunk of 1,091 rows), 0.62 s (merge, a group of 9,283 rows), 0.31 - 0.35 s at 24k. The CPU part of a job does not depend on its row count, so a partial chunk of 9 rows costs the same 0.28 s as one of 1,000. The eval prefill of the version before was not measured with the same flags, so the prefill cost of the redesign is only measured in the server (below).
+
+Minimum rows of an own partial chunk. The codec handles few rows: the covariance has rank n - 1, the eigen solver gives zero variances for the rest, the bit allocation gives them 0 bits (if fewer than 64 components have variance, the spare K bits go to zero-variance components with a step of about 1e-15 and code zeros), the rows are coded inside their own span; the K metric from few positions is near-singular but regularized (1e-6 of its trace). Measured by choosing the chunk size so that about 10, 100, 300 and 1000 rows follow the last complete chunk, fitted (min_rows 1) against kept precise in the ring:
+
+| rows after the last chunk | row310 fitted / precise | row2660 fitted / precise |
+|---|---|---|
+| 9 / 11 (C 8058 / 8282) | 6.58e-5 / 6.91e-5 | 1.371e-4 / 1.372e-4 |
+| 99 / 107 (C 8028 / 8274) | 8.07e-5 / 6.23e-5 | 1.453e-4 / 1.290e-4 |
+| 300 / 299 (C 7961 / 8258) | 8.37e-5 / 5.82e-5 | 1.240e-4 / 1.307e-4 |
+| 999 / 1007 (C 7728 / 8199) | 5.71e-5 / 5.66e-5 | 1.488e-4 / 1.386e-4 |
+
+Flips 0 - 2 everywhere, every pair inside the run-to-run interval: no measurable quality difference. Default `--kvq-min-rows 256`: below D + 1 = 257 rows the covariance of the rows is rank deficient, and the fit of a few rows costs the full 0.28 s of end-of-prompt wait. The first coarse region needs prefetch_n + n_sink = 1028 rows (the prefetch selects 1024 non-sink rows).
+
+Reproducibility and state:
+
+- Two processes, same flags: identical logits files (row310, own). Two processes with 7 in-line folds each (row2660, `LLAMA_KVQ_FOLD_EVERY=64`): identical logits.
+- State at 100k (own, first and final build): 4,395 MiB (before 4,460), saved in 1.7 - 1.8 s, loaded in 0.67 - 0.76 s; the logits of the run from the loaded state are identical to the run that saved it, and the loaded state saved again is byte-identical.
+- A version-1 state (the version field of a v2 file set to 1): "error loading sequence state file: version 1 of the two-tier cache state, expected 2", the load returns 0, no crash.
+- `--kvq-rm-test` passes for own and merge (rollback into the coded rows after a chunk back to the grid, refit at the next end of the prompt, ring rollback 0.02 ms, a small batch after a prefill waits for the job in flight, clear, recurrent rollback failure, the layout end after each prompt). The ring rollback in the geometry of the earlier test (first chunk coarse, 2 ring rows) gives KL 1.5e-6 between the two decodes (2.0e-6 before); about 500 rows after a chunk the same check gives 1.0e-3 - 2.5e-3 (with the rows there coded or precise, with or without the reset of the resident set), the positions there are more sensitive to which rows are resident.
+
+Multi-turn (`--kvq-turns`, 64 greedy tokens and a rollback to the turn end between turns):
+
+- row310, turn ends at 10240 and 18432 (batch boundaries, the same batches as the single prefill): the final state file is byte-identical (first and final build) to the single prefill and the logits are identical (KL 0), for own and for merge. So a chunk first fitted as a partial chunk (or a group) and later refitted complete equals the chunk fitted complete at once, and the rolled-back reply leaves nothing behind (the sums of the open chunk are restored to the end of the last fit).
+- row2660, turn ends at 40000 and 81000 (inside batches): KL against the teacher 2.35e-4 (own) and 2.37e-4 (merge), against the single prefill of the same policy 1.73e-4 / 1.58e-4, 0 - 1 flips. The control, the same turns on a plain q8_0 cache: 1.64e-4 against the teacher (the teacher is the single prefill of that cache). The difference comes from the batch split itself (K/V rows and recurrent state computed in other batch shapes), not from the two-tier cache.
+
+Batch independence: achieved in the sense above when the batch boundaries are the same (the state is a function of the rows and statistics only, the rollback restores the statistics); not achievable bit for bit across different batch splits, because the model's own K/V rows and query sums change with the batch shape (plain q8_0 moves by 1.6e-4 at 100k).
+
+Reply rows coded during generation (proxy for the coordinator's question; row2660 / row1830):
+
+| | row2660 | row1830 |
+|---|---|---|
+| reply precise in the ring (default) | 1.478e-4, 1 flip | 2.354e-4, 0 flips |
+| every 64 reply rows refitted with the partial chunk (in-line fold, 0.29 s each) | 1.608e-4, 0 flips | 2.391e-4, 0 flips |
+| every 64 reply rows coded with the existing tables of the partial chunk (5 - 6 ms each) | 1.909e-4 [1.41, 2.54], 1 flip | 2.737e-4 [1.83, 3.77], 0 flips |
+
+Coding the reply with the existing tables costs +16% (50k) to +29% (100k) KL here, the intervals overlap; one trace each.
+
+Server, ctx 230000, MTP 3 drafts, -b 4096 -ub 1024, default ring (12,544 cells), 4 fit threads; three requests per session: r1 = 100k prompt (99,398 tokens) + up to 300 tokens, r2 = r1 + 50 of its tokens + 500 new (a rollback into the coded rows after the last chunk, checkpoint restore at the end of r1's prompt), r3 = r2 + 100 of its tokens + 6,600 new (crosses the boundary of chunk 13) + 1000 tokens. Idle GPU before every session: 750 MiB (nvidia-smi, other processes).
+
+| | kvq, final build, session A / B | kvq, first build (A / B) | production (same day) |
+|---|---|---|---|
+| VRAM loaded (nvidia-smi) | 23,125 MiB, 23,189 after r1 | 23,137 MiB, 23,201 after r1 | 27,951 MiB, 27,997 after r1 |
+| r1 prompt (100k) | 44.93 / 44.94 s (wait at the end 0.553 s) | 45.37 / 45.30 s (wait at the end 0.548 s) | 44.01 s |
+| r1 generation | 129.3 / 128.9 t/s | 128.4 / 127.7 t/s | 119.2 t/s |
+| r2 prompt (554 tokens) | 1.10 / 1.10 s (wait 0.559 s) | 1.10 s (wait 0.549 s) | 0.49 s |
+| r2 generation (300) | 131.6 / 131.8 t/s | 130.1 / 129.9 t/s | 126.7 t/s |
+| r3 prompt (6,704 tokens) | 5.44 / 5.45 s (wait 0.574 s; the 152 rows after chunk 13 stay precise, fewer than 256) | 5.75 / 5.74 s (wait 0.823 s) | 4.89 s |
+| r3 generation (1000) | 128.9 / 129.8 t/s | 128.0 / 128.0 t/s | 122.2 t/s |
+| generated ids | equal between A and B and to production on all 3 requests | equal between A and B and to production on all 3 requests (265, 300, 1000) | |
+
+Allocation line (`llama_kvq_store`): `n_coarse = 0 of 230144 rows, 29 chunks of 8192 rows ... device: codes 1404.7 MiB, tables 242.9 MiB, resident 34.5 MiB, scratch 503.6 MiB (used), other 17.3 MiB; host: store 7641.5 MiB (pinned), other 169.9 MiB`, the ring `a ring of 12544 cells for 230144 positions`. No batch had to make room in the ring, no spill, no fold.
+
+Prefill against production the same day: +0.92 s at 100k (44.93 against 44.01 s), of which 0.55 s is the end-of-prompt wait (the partial chunk of 1,094 rows; the CPU part of a job is about 0.55 s on 4 threads whatever its row count) and 0.37 s the rest (0.8% of the prefill: the fitter's device work and the 570 MB of host uploads per chunk in phases 2 and 3 on the main stream, 12 chunks). The version before was 44.0 - 44.2 s against production 43.4 - 43.8 s on another day, so the rest is at about the earlier cost; inside the budget of the wait + 1%. A 554-token follow-up prompt takes 1.10 s against 0.49 s in production: the end-of-prompt fit dominates short prompts. Generation is 1 - 8% faster than production in these sessions (MTP acceptance identical), as before. The first build failed the fit of r3's 152 rows after chunk 13 (metric not positive definite, see Statistics), and a failed fit stops the fitter; fixed, the final sessions above use the fix (and min_rows 256, so these 152 rows stayed precise).
+
+
+### Coding the reply rows on append (investigated, not built)
+
+Idea: a new row (generated token, or a prompt row) is coded at once with tables that exist (the current partial chunk's or group's), its q8_0 row goes to the host store, and the resident set serves it like any coded row; the next end of a prompt refits as before. The device keeps only a small precise window.
+
+Feasibility in the current structure:
+
+- The codes can be written by the fitter's CODE op (rotation and packing on the device, any row count); the rows go to the host store with the spill path. What is missing: the fwd tables of the last table set must stay on the device (16 layers x 4 kv heads x K/V x 256 x 256 fp32 = 33.5 MiB, or 17 MiB fp16), and the append step must run per ubatch.
+- The real obstacle is the graph: the packed graph has n_coarse in its shapes (`kc`/`vc` views, mask width, top-k input, score output), and `can_reuse` rebuilds the graph when n_coarse changes. Appending one row per token rebuilds the graph every token (about 1 - 3 ms of CPU per token against 8 ms per token at 125 t/s). To avoid it the op would need n_coarse as a runtime value with fixed-size views and masks (a change of `ggml_kvq_attn` and the prefetch graph), or the rows would be appended in blocks (every W tokens, one graph rebuild per block; that is the fold with existing tables, below).
+- Ring floor: the generation window would be the rows too new for the prefetch (the early query runs 2 layers ahead, so rows of the current ubatch), the MTP rollback depth (up to 7) and the most recent positions (a few dozen; W for block appends): a few hundred cells. But the prefill places a whole batch in the ring (`tail_wait` before `prepare_batch`), so the floor is set by the batch: n_batch + 256 = 4352 cells = 144.5 MiB at -b 4096 (the smallest ring the code accepts today, see Results), 1280 cells = 42.5 MiB if the slots were placed per ubatch of 1024 (not built). Coding on append does not lower the floor below one prefill batch; it removes the in-line folds of a long generation.
+- Cost per generated token (estimate, not measured): per attention layer one rotation (256 x 256 x n rows, K and V) and one CODE kernel, about 32 small kernels per token at 5 - 10 us each = 0.2 - 0.3 ms per token if done per token (2 - 4%); with blocks of 64 rows, one fold of about 1 ms device work and one graph rebuild per 64 tokens, under 0.05 ms per token. Plus 35 KB of rows per token to the host (async).
+
+Quality, measured as a proxy (LLAMA_KVQ_FOLD_EVERY=64 with LLAMA_KVQ_FOLD_FIXED=1: every 64 reply rows are coded with the existing tables of the partial chunk, the last up to 63 stay precise; and without FOLD_FIXED: refitted every 64 rows instead), see Results.
+
+### Before the ring redesign
 
 Server, ctx 230000, 100k prompt, MTP with 3 drafts:
 
@@ -136,7 +242,7 @@ Quality, KL against the q8_0 reference (q8_0 cache without rotation, `ref/row*.q
 
 int8 tables cost about 0.15 ms per token in kvq-eval (fp16 build 16.71 ms in the same hour). nsys: the kernels that read the tables got faster (prep 12.2 -> 11.0 us, combine 7.8 -> 6.0 us), but the attention op of a layer takes 111 instead of 99 us: the resident precise rows (side stream) now take the SMs first and delay the coarse kernel, which is on the critical path (coarse 66 -> 81 us, precise 59 -> 25 us). Forking the side stream after prep made it worse (17.33 ms). The overlap of the two streams is fragile; a fix is open.
 
-VRAM as allocated at ctx 230000 (MiB): coarse rows 1400, tables 235 (459 with fp16 tables), tail ring 689, scratch 519, resident and other 52; together about 2880 (about 2.0 GiB at 150k). Main compute buffer 1642. MTP context: f16 cache 899 (production uses f16 there too), compute 586. Host: 7.6 GB pinned store.
+VRAM as allocated at ctx 230000 before the ring redesign (MiB): coarse rows 1400, tables 235 (459 with fp16 tables), tail ring 689, scratch 519, resident and other 52; together about 2880 (about 2.0 GiB at 150k). Main compute buffer 1642. MTP context: f16 cache 899 (production uses f16 there too), compute 586. Host: 7.6 GB pinned store. After the redesign see the ring table above.
 
 Per format at 150k, main model only (arithmetic): f16 9.16 GiB, q8_0 4.86 GiB, q4_0 2.57 GiB.
 
@@ -179,24 +285,30 @@ What this means for the quality numbers: the model itself moves by about the sam
 - Prefill uses exact q8_0 rows, not the two-tier attention: two-tier prefill was never measured for quality.
 - Inverse tables as int8 with one scale per component (2026-11-16): halves the tables (459 -> 235 MiB at ctx 230000). Offline on one chunk the codec error in the metric grows 0.8% mean, 3.2% worst for K and 0.0% for V; KL inside the run-to-run noise (see Results). One scale per whole table costs 5x the error on K, 6 bits costs 10 - 50% on K.
 - Copies between GPU graph launches go on a separate copy stream: a memcpy on the compute stream stalled the GPU 55 - 65 us each, about 47 times per token.
+- Ring redesign (2026-11-16, owner's decisions): no deliberate precise tail of recent prompt positions (quality flat from 8 to 8,100 precise recent positions); the fixed chunk grid stays; the rows after the last complete chunk are fitted at the end of every prompt from scratch and prefill waits for it (stability over about 0.3 - 0.6 s per prompt); the reply stays precise until the next end of a prompt (25 - 37% of the attention mass is on generated tokens; coding them with the existing tables cost 16 - 29% KL in one run per trace, see Results).
+- Rollback into the coded region leaves the rows in the host store and refits at the next end of a prompt (instead of copying them back into the ring): a ring smaller than a chunk could not take them, and the server always processes a prompt after a rollback.
+- The resident set is emptied at the end of every prompt: the decoding after it depends only on the memory state, which makes multi-turn equal to one prefill and a slot restore equal to the original run. Cost: the first verify batch after a prompt starts cold.
+- `--kvq-min-rows 256` (own): no quality difference measured between fitting and keeping precise 10 - 1000 rows; 256 is the rank limit of the covariance (D + 1 = 257 rows).
+- `own` stays the default for now; `merge` is implemented and checked, the choice waits for the 16k-chunk test (another agent, `kvq-scratch/chunk16/res/`).
 
 ## Open bottlenecks, largest first
 
-1. Prefill: 44.0 - 44.2 s against 43.4 - 43.8 s at 100k; the fitter no longer stalls it. What is left per chunk: 35 ms of device work on the main stream, two synchronizes (statistics readback, join), the D2H of the q8_0 rows on the main stream. A second stream (or the copy stream for the D2H) could hide most of it.
-2. The latency of a job is set by the polls (one per ubatch): after the CPU tasks, a job needs one or two more ubatches. With 1 thread and -ub 2048 (kvq-eval) 3 batches still waited 0.35 s at 100k.
-3. Main compute buffer 1.64 GB: mostly the F16 copies of K and V that flash attention makes at full length.
-4. MTP context cache: 899 MiB f16 for the full context.
-5. No speed gain from the packed path at 100k: a 4-token verify fetches 43k - 48k rows (65 - 73% of the request misses the resident set), GPU idle at the joins 1.7 - 2.2 ms per round.
-6. Tables: 235 MiB at ctx 230000; 16k chunks would halve them.
-7. Overlap of the precise and coarse kernels in the attention op: with int8 tables the op is 12 us slower per layer, see Results.
+1. Prefill: 44.93 s against 44.01 s of production the same day at 100k (0.55 s of it the end-of-prompt fit); the fitter does not stall it. What is left per chunk: the device work and 570 MB of host uploads of phases 2 and 3 on the main stream, two synchronizes (statistics readback, join), the D2H of the q8_0 rows. A second stream (or the copy stream for the transfers) could hide most of it; V-only rows in phase 2 would save a quarter of the uploads.
+2. The end-of-prompt fit: 0.55 s per prompt on 4 threads whatever the row count (the 256 x 256 problems); it dominates short follow-up prompts (554 tokens: 1.10 s against 0.49 s). More threads at the end of the prompt, or a device eigen solver, would shorten it.
+3. The latency of a job is set by the polls (one per ubatch): after the CPU tasks, a job needs one or two more ubatches. With 1 thread and -ub 2048 (kvq-eval) 3 batches still waited 0.35 s at 100k.
+4. Main compute buffer 1.64 GB: mostly the F16 copies of K and V that flash attention makes at full length.
+5. MTP context cache: 899 MiB f16 for the full context.
+6. No speed gain from the packed path at 100k: a 4-token verify fetches 43k - 48k rows (65 - 73% of the request misses the resident set), GPU idle at the joins 1.7 - 2.2 ms per round.
+7. Tables: 243 MiB at ctx 230000; 16k chunks would halve them.
+8. Overlap of the precise and coarse kernels in the attention op: with int8 tables the op is 12 us slower per layer, see Results.
 
 ## Optimisation ideas (not started, nothing measured, except item 2)
 
 Sizes are for ctx 230000 as allocated today.
 
-1. 16k chunks. Halves the tables (235 -> about 120 MiB); chunk size 4k to 16k made no quality difference. Catch: the ring is sized 2 chunks + n_batch, so with the current rule it grows from 689 to about 1230 MiB and the net result is worse. It only pays off together with a ring that does not scale with the chunk (item 3), or by fitting 8k chunks first and merging two of them into one 16k table in the background later.
+1. 16k chunks. Halves the tables (243 -> about 125 MiB); chunk size 4k to 16k made no quality difference. The default ring is now chunk + n_batch + 256 (16k: 20,736 cells, 689 MiB), but a ring of one batch (144.5 MiB) works for any chunk size, so the ring no longer blocks it; the fitter stage and graph buffers double (about 17 + 63 MiB more).
 2. Done: 8-bit tables instead of fp16 (see Decisions).
-3. Do not wait for the fitter. With the GPU fitter prefill no longer waits at 100k on this machine, so this matters only for a slower GPU or CPU, or a ring smaller than 2 chunks. Idea: rows that do not fit in the ring go to the host store uncompressed, prefill reads them through the scratch like the installed region, and the fitter replaces the full version by the compressed one during generation. Open point: generation needs those rows precise in VRAM until their chunk is fitted (a per-token upload is too expensive), so they need a place there; item 4 is the candidate. With the CPU fitter on 16 threads the backlog was about one chunk, 285 MB of rows.
+3. Partly done (ring redesign): rows that do not fit in the ring go to the host store uncompressed (spill), prefill reads them through the scratch; the fit is done before generation (at the end of the prompt), not during it. Open point: generation needs those rows precise in VRAM until their chunk is fitted (a per-token upload is too expensive), so they need a place there; item 4 is the candidate. With the CPU fitter on 16 threads the backlog was about one chunk, 285 MB of rows.
 4. Reuse the prefill buffers during generation. The scratch (519 MiB) and the flash attention F16 copies in the compute buffer (most of 1642 MiB) are only used by large ubatches and sit idle during generation. Candidates to live there: the not yet fitted rows of item 3, a larger resident set, or the ring itself, so that this memory is allocated once and used by both phases.
 5. From the bottleneck list: chunked flash attention to shrink the F16 copies, a compressed or q8_0 cache for the MTP context, lower fetch traffic for multi-token verify batches.
 
@@ -205,9 +317,12 @@ Sizes are for ctx 230000 as allocated today.
 - Quality is measured on few traces: the final library path on one 100k trace, earlier stages on four (12k to 100k). Nothing was run at 150k or above, which is the target length. A wider check over more traces and lengths is needed.
 - Speed of the final build was measured only at 100k. Not measured at 24k / 50k and at 150k+.
 - Slot save and restore and the RAM prompt cache work (see Results), checked at 24k and 100k only, not at 150k+ (about 10 GiB per state at 230k, estimated). A kvq state is about 29% larger than the plain one. The launcher must give kvq snapshots their own directory (its snapshot directory hash does not know `--kvq`), plain snapshots cannot be loaded.
-- Reproducibility: the packed path is deterministic from the same state (see Reproducibility). Not covered: a chunk that joins the coarse region during generation (a session that grows past a chunk boundary) joins at a time set by the fitter threads, so the tokens after it can differ from run to run.
+- Reproducibility: the packed path is deterministic from the same state (see Reproducibility). A chunk can no longer join during generation at a time set by the fitter threads: no job starts during generation, small batches wait for the jobs in flight, and a fold happens at a position set by the token count. Not checked: a fold in a real server session (needs a reply longer than the ring, about 12k tokens).
+- Batch independence holds only for the same batch boundaries (multi-turn with turn ends at batch boundaries is byte-identical to one prefill); with other boundaries the model's own rows differ in rounding (plain q8_0 moves by 1.6e-4 at 100k).
 - CUDA only. The attention op and the fit op have a CPU reference and a CUDA kernel, nothing for Metal or Vulkan; the fit mode refuses to start when the device cannot run the fit graphs. The fitter needs about 2 CPU-seconds per 8k chunk (one core is enough at 100k on this GPU, see Results).
-- The fitter's device work runs on the main stream between ubatches. A second stream would hide its ~35 ms per chunk, not built.
+- The fitter's device work runs on the main stream between ubatches, now with 570 MB of host uploads per 8k chunk (phases 2 and 3 read the rows from the host store; phase 2 uploads K too). A second stream or V-only uploads would hide or halve it, not built.
+- With a ring of one batch (`--kvq-tail` = n_batch + 256) a long reply folds every ring size of tokens (about 4k at -b 4096, 0.3 - 0.6 s each in line); with the default ring every 12k. Not measured in the server.
+- The slots of a batch are placed for the whole batch at once, so the ring cannot be smaller than one batch (per-ubatch placement would allow n_ubatch + 256, not built).
 - Host memory: 7.6 GB of pinned RAM at ctx 230000, per sequence.
 - Deferred tuning: resident capacity (1024 vs 4096), top-up rules and thresholds, lead, prefetch size.
 - No automated tests for the store, the fitter, the ring cache or the server flows; only the codec and the kernel have tests. The session flows were checked by hand once.

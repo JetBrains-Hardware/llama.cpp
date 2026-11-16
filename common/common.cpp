@@ -1394,9 +1394,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         llama_model_set_kvq_packed(model, true);
         llama_model_set_attn_rot(model, false);
 
-        // the device cache holds the chunk being fitted, the chunk being filled and a batch
-        const int32_t chunk = llama_kvq_fit_params().chunk;
-        const int32_t tail  = params.kvq.tail >= 0 ? params.kvq.tail : GGML_PAD(2*chunk + params.n_batch + 256, 256);
+        // the device cache holds the chunk being filled and a batch; a chunk leaves it when its job starts
+        const int32_t chunk = params.kvq.chunk;
+        const int32_t tail  = params.kvq.tail >= 0 ? params.kvq.tail : GGML_PAD(chunk + params.n_batch + 256, 256);
         llama_model_set_kvq_tail(model, (uint32_t) tail);
     }
 
@@ -1410,6 +1410,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         llama_kvq_fit_params fp;
         fp.v_tables  = params.kvq.v_tables;
         fp.n_threads = params.kvq.n_threads > 0 ? params.kvq.n_threads : std::min(4, common_cpu_get_num_math());
+        fp.chunk     = params.kvq.chunk;
+        fp.rem       = params.kvq.rem;
+        fp.min_rows  = params.kvq.min_rows;
 
         llama_kvq_params kp;
         kp.enabled      = true;
@@ -1425,8 +1428,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             llama_free(lctx);
             return;
         }
-        COM_INF("%s: two-tier KV cache: chunks of %d rows, K%dV%d, %d fit threads, prefetch_n = %d, resident_cap = %d, lead = %d\n", __func__,
-                fp.chunk, fp.bits_k, fp.bits_v, fp.n_threads, kp.prefetch_n, kp.resident_cap, kp.lead);
+        COM_INF("%s: two-tier KV cache: chunks of %d rows, K%dV%d, %d fit threads, prefetch_n = %d, resident_cap = %d, lead = %d, rows after the last chunk: %s\n", __func__,
+                fp.chunk, fp.bits_k, fp.bits_v, fp.n_threads, kp.prefetch_n, kp.resident_cap, kp.lead, fp.rem == LLAMA_KVQ_REM_MERGE ? "merge" : "own");
     }
 
     pimpl->context.reset(lctx);

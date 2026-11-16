@@ -392,7 +392,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     if (kv.get_n_stream() != 1) {
         throw std::runtime_error("packed two-tier mode needs a single KV stream");
     }
-    if (n_rows <= 0 || n_chunk_rows <= 0 || n_rows % n_chunk_rows != 0 || n_sink < 0 || n_sink >= n_chunk_rows) {
+    if (n_rows <= 0 || n_chunk_rows <= 0 || (fill && n_rows % n_chunk_rows != 0) || n_sink < 0 || n_sink >= n_chunk_rows) {
         throw std::runtime_error("packed two-tier mode: bad coarse region");
     }
     if (bits_k < 1 || bits_k > 4 || bits_v < 1 || bits_v > 4 || (!all_resident && resident_cap <= 0) || (all_resident && !fill)) {
@@ -400,7 +400,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
 
     this->n_sink = n_sink;
-    n_chunk = n_rows/n_chunk_rows;
+    n_chunk = (n_rows + n_chunk_rows - 1)/n_chunk_rows;
+    n_host_ = n_coarse_;
     nwk     = (bits_k*(int32_t) D + 31)/32;
     nwv     = (bits_v*(int32_t) D + 31)/32;
     cap     = all_resident ? n_rows - n_sink : resident_cap;
@@ -720,7 +721,7 @@ void llama_kvq_store::synchronize() {
 }
 
 void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async) {
-    GGML_ASSERT(!filled && c >= 0 && c < n_chunk && (int64_t) c*n_crow >= n_coarse_ && g >= 0 && g < G);
+    GGML_ASSERT(!filled && c >= 0 && c < n_chunk && g >= 0 && g < G);
     GGML_ASSERT(!async || backend_main);
     const layer_tensors & t = get_layer(il);
     const int64_t m = (int64_t) c*2*G + 2*g + (is_v ? 1 : 0);
@@ -733,8 +734,13 @@ void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t 
     }
 }
 
+void llama_kvq_store::set_n_host(int32_t n) {
+    GGML_ASSERT(!filled && n >= n_coarse_ && n <= n_rows_);
+    n_host_ = n;
+}
+
 void llama_kvq_store::set_n_coarse(int32_t n) {
-    GGML_ASSERT(!filled && n >= 0 && n <= n_rows_ && n % n_crow == 0);
+    GGML_ASSERT(!filled && n >= 0 && n <= n_rows_ && n <= std::max(n_host_, n_coarse_));
     if (n == n_coarse_) {
         return;
     }
@@ -767,9 +773,9 @@ void llama_kvq_store::set_n_coarse(int32_t n) {
 void llama_kvq_store::state_write_meta(llama_io_write_i & io) const {
     GGML_ASSERT(!filled);
     const layer_tensors & t = layers[0].t;
-    const int32_t v[12] = {
+    const int32_t v[13] = {
         (int32_t) layers.size(), G, (int32_t) D, (int32_t) ROW, n_crow, nwk, nwv, n_coarse_,
-        (int32_t) t.tinv->type, (int32_t) t.tinv->nb[2], (int32_t) t.taux->type, (int32_t) t.taux->nb[2],
+        (int32_t) t.tinv->type, (int32_t) t.tinv->nb[2], (int32_t) t.taux->type, (int32_t) t.taux->nb[2], n_host_,
     };
     io.write(v, sizeof(v));
     for (const auto & l : layers) {
@@ -777,10 +783,10 @@ void llama_kvq_store::state_write_meta(llama_io_write_i & io) const {
     }
 }
 
-int32_t llama_kvq_store::state_read_meta(llama_io_read_i & io) const {
+void llama_kvq_store::state_read_meta(llama_io_read_i & io, int32_t & n_out, int32_t & n_host_out) const {
     GGML_ASSERT(!filled);
     const layer_tensors & t = layers[0].t;
-    int32_t v[12];
+    int32_t v[13];
     io.read(v, sizeof(v));
     if (v[0] != (int32_t) layers.size() || v[1] != G || v[2] != (int32_t) D || v[3] != (int32_t) ROW) {
         throw std::runtime_error(format("kvq state of %d attention layers with %d kv heads of %d, this context: %d, %d, %d",
@@ -795,8 +801,9 @@ int32_t llama_kvq_store::state_read_meta(llama_io_read_i & io) const {
                 v[8], v[10], v[9], v[11], (int) t.tinv->type, (int) t.taux->type, (int) t.tinv->nb[2], (int) t.taux->nb[2]));
     }
     const int32_t n = v[7];
-    if (n < 0 || n % n_crow != 0 || n > n_rows_) {
-        throw std::runtime_error(format("kvq state with a coarse region of %d rows, this context holds %d", n, n_rows_));
+    const int32_t h = v[12];
+    if (n < 0 || h < n || h > n_rows_) {
+        throw std::runtime_error(format("kvq state with a coarse region of %d rows and %d host rows, this context holds %d", n, h, n_rows_));
     }
     for (const auto & l : layers) {
         int32_t il = -1;
@@ -805,7 +812,8 @@ int32_t llama_kvq_store::state_read_meta(llama_io_read_i & io) const {
             throw std::runtime_error(format("kvq state with attention layer %d where this context has layer %d", il, l.il));
         }
     }
-    return n;
+    n_out      = n;
+    n_host_out = h;
 }
 
 // per layer: the host rows of each kv head, the codes of each kv head, the tables of the chunks
@@ -813,12 +821,12 @@ void llama_kvq_store::state_write_data(llama_io_write_i & io) {
     GGML_ASSERT(!filled);
     synchronize();
     const int32_t n = n_coarse_;
-    if (n == 0) {
-        return;
-    }
     for (auto & l : layers) {
-        for (int32_t g = 0; g < G; ++g) {
-            io.write(l.store + (size_t) g*n_rows_*2*ROW, (size_t) n*2*ROW);
+        for (int32_t g = 0; g < G && n_host_ > 0; ++g) {
+            io.write(l.store + (size_t) g*n_rows_*2*ROW, (size_t) n_host_*2*ROW);
+        }
+        if (n == 0) {
+            continue;
         }
         for (ggml_tensor * rows : { l.t.kc, l.t.vc }) {
             for (int32_t g = 0; g < G; ++g) {
@@ -826,21 +834,21 @@ void llama_kvq_store::state_write_data(llama_io_write_i & io) {
             }
         }
         for (ggml_tensor * tab : { l.t.tinv, l.t.taux }) {
-            io.write_tensor(tab, 0, (size_t) (n/n_crow)*tab->nb[3]);
+            io.write_tensor(tab, 0, (size_t) ((n + n_crow - 1)/n_crow)*tab->nb[3]);
         }
     }
 }
 
-void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n) {
-    GGML_ASSERT(!filled && n_coarse_ == 0 && n % n_crow == 0 && n <= n_rows_);
-    if (n == 0) {
-        return;
-    }
+void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n, int32_t h) {
+    GGML_ASSERT(!filled && n_coarse_ == 0 && n <= h && h <= n_rows_);
     drop_pending();
     synchronize();
     for (auto & l : layers) {
-        for (int32_t g = 0; g < G; ++g) {
-            io.read(l.store + (size_t) g*n_rows_*2*ROW, (size_t) n*2*ROW);
+        for (int32_t g = 0; g < G && h > 0; ++g) {
+            io.read(l.store + (size_t) g*n_rows_*2*ROW, (size_t) h*2*ROW);
+        }
+        if (n == 0) {
+            continue;
         }
         for (ggml_tensor * rows : { l.t.kc, l.t.vc }) {
             for (int32_t g = 0; g < G; ++g) {
@@ -848,10 +856,11 @@ void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n) {
             }
         }
         for (ggml_tensor * tab : { l.t.tinv, l.t.taux }) {
-            io.read_tensor(tab, 0, (size_t) (n/n_crow)*tab->nb[3]);
+            io.read_tensor(tab, 0, (size_t) ((n + n_crow - 1)/n_crow)*tab->nb[3]);
         }
     }
     // the sink rows are read from the host store now
+    n_host_ = h;
     set_n_coarse(n);
 }
 
@@ -964,7 +973,21 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         }
     }
 
+    reset_resident();
+    reset_counters();
+
+    LLAMA_LOG_INFO("%s: max_batch = %d, prefetch_n = %d, resident = %d, lead = %d, sync = %d (m = %d, min hits = %d), stats = %d, all resident = %d\n", __func__,
+            p.max_batch, p.prefetch_n, cap, p.lead, p.sync_mode, p.sync_m, p.sync_min_hits, p.stats, p.all_resident);
+    return true;
+}
+
+void llama_kvq_store::reset_resident() {
+    drop_pending();
+    if (backend_cp) {
+        ggml_backend_synchronize(backend_cp.get());
+    }
     for (auto & l : layers) {
+        l.up_rec = false;
         std::fill(l.ridx.begin(), l.ridx.end(), -1);
         std::fill(l.row_slot.begin(), l.row_slot.end(), -1);
         std::fill(l.row_seen.begin(), l.row_seen.end(), kvq_seen{ 0, 0 });
@@ -997,12 +1020,6 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
             upload_pinned(l, n_pin);
         }
     }
-
-    reset_counters();
-
-    LLAMA_LOG_INFO("%s: max_batch = %d, prefetch_n = %d, resident = %d, lead = %d, sync = %d (m = %d, min hits = %d), stats = %d, all resident = %d\n", __func__,
-            p.max_batch, p.prefetch_n, cap, p.lead, p.sync_mode, p.sync_m, p.sync_min_hits, p.stats, p.all_resident);
-    return true;
 }
 
 // rows [0, n_pin) of the host store to the slots [0, n_pin) of rkv, which is [kv][g][slot][ROW]
@@ -1425,7 +1442,7 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
         ggml_backend_t cp = backend_cp.get();
         ggml_backend_event_record(l.ev_su.get(), backend);
         ggml_backend_event_wait(cp, l.ev_su.get());
-        const size_t n = (size_t) n_coarse_*2*ROW;
+        const size_t n = (size_t) n_host_*2*ROW;
         for (int32_t g = 0; g < G && n > 0; ++g) {
             ggml_backend_tensor_set_async(cp, scr, l.store + (size_t) g*n_rows_*2*ROW, g*scr->nb[3], n);
         }

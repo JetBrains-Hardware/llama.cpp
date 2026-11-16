@@ -2489,7 +2489,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KVQ_LEAD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kvq-tail"}, "N",
-        "two-tier KV cache: cells of the q8_0 cache on the device (a ring of the positions after the coarse region), 0 = one cell per position (default: 2*8192 + batch size + 256)",
+        "two-tier KV cache: cells of the q8_0 cache on the device (a ring of the positions that are not coded yet), 0 = one cell per position (default: chunk + batch size + 256)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -2497,6 +2497,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kvq.tail = value;
         }
     ).set_env("LLAMA_ARG_KVQ_TAIL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-chunk"}, "N",
+        string_format("two-tier KV cache: rows per chunk, each chunk gets its own K and V tables (default: %d)", params.kvq.chunk),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.chunk = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-rem"}, "{own,merge}",
+        "two-tier KV cache: the rows after the last complete chunk at the end of a prompt, fitted as a chunk of their own\n"
+        "or merged with the last complete chunk into one group (default: own)",
+        [](common_params & params, const std::string & value) {
+            if (value == "own") {
+                params.kvq.rem = 0;
+            } else if (value == "merge") {
+                params.kvq.rem = 1;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_KVQ_REM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-min-rows"}, "N",
+        string_format("two-tier KV cache, --kvq-rem own: the fewest rows after the last complete chunk that get a chunk of their own, fewer stay precise (default: %d)", params.kvq.min_rows),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.min_rows = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_MIN_ROWS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

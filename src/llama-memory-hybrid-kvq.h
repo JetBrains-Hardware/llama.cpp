@@ -65,8 +65,7 @@ public:
     void clear(bool data) override;
 
     // packed: the coarse region cannot be removed
-    // fit mode: the end of the sequence only, see llama_kvq_fit_params
-    // tail: the positions of the removed coarse chunks before p0 go back to the ring from the host store
+    // fit mode: the end of the sequence only, see llama_kvq_fit_params; the rows before p0 that leave the coarse region stay in the host store
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
     // two-tier mode: abort (seq_keep: unless it keeps sequence 0)
@@ -75,12 +74,12 @@ public:
     void seq_add (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override;
 
-    // tail: the ring is empty when the sequence ends with the coarse region
+    // tail: the ring is empty when the sequence ends with the rows of the host store
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
-    // fit mode with the tail: the state of sequence 0 (see state_write in the .cpp), the save waits until every complete chunk is coarse
+    // fit mode with the tail: the state of sequence 0 (see state_write in the .cpp), the save waits for the jobs in flight
     // the partial state is the recurrent one; other two-tier modes: a state write or read of the K/V throws
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
@@ -102,8 +101,9 @@ public:
 
     bool fit_enable(const llama_kvq_fit_params & fparams, const llama_kvq_params & params);
 
-    // fit mode, the decode thread before each ubatch (see llama_kvq_fitter::poll)
-    void fit_poll();
+    // fit mode, the decode thread before each ubatch of n_tokens tokens (see llama_kvq_fitter::poll)
+    void fit_poll(uint32_t n_tokens);
+    // the end of a prompt, see llama_memory_kvq_fit_wait
     bool fit_wait();
     bool fit_get_progress(llama_kvq_fit_progress & out) const;
     bool fit_set_hold(bool hold);
@@ -128,19 +128,31 @@ private:
     const uint32_t n_ctx_max; // positions of the context
     const bool     tail;
 
-    // tail: the positions [0, n_released) are not in the ring (the coarse region)
+    // tail: the positions [0, n_released) are not in the ring (their rows are in the host store)
     llama_pos n_released = 0;
 
     int32_t n_tail_wait = 0;
     double  t_tail_wait = 0.0;
+    int32_t n_fold      = 0;
+    double  t_fold      = 0.0;
+    int32_t n_settle    = 0;
+    double  t_settle    = 0.0;
+    int32_t fold_every  = 0; // LLAMA_KVQ_FOLD_EVERY (experiment): fold the reply rows when this many follow the coarse region
 
-    // tail: removes the new coarse rows from the ring
+    // positions in the sequence: the ring, or the host store when the ring is empty
+    llama_pos n_pos() const;
+
+    // tail: removes the rows of the host store from the ring
     void tail_release();
 
-    // tail: positions [n_coarse, min(p0, n_released)) back into the ring, after the coarse region shrank
-    void tail_restore(llama_pos p0);
+    // tail: host store rows [p_lo, p_hi) back into the ring, the host store ends at p_lo
+    bool tail_restore(llama_pos p_lo, llama_pos p_hi);
 
-    // tail: before the batch is placed, waits for the fitter until its positions fit the ring
+    // the layout of the positions [0, n) (llama_kvq_fitter::settle), the rows after its coarse region in the ring
+    bool settle(llama_pos n);
+
+    // tail: before the batch is placed: the room in the ring for its positions (large batches: the jobs of the complete chunks, then
+    // a spill of the ring rows to the host store; small batches: the jobs in flight are added first, a fold at a position set by p0)
     bool tail_wait(const llama_batch_allocr & balloc);
 
     // throws if the K/V state cannot be saved or loaded
@@ -201,8 +213,8 @@ public:
     // early (if not null): the same without the positions of the ubatch and later
     void set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, int32_t n_coarse) const;
 
-    // tail: mask F16 [n_rows, n_tokens] over the scratch rows, row r = position r: the coarse rows kept, the others causal if the ring has them
-    void set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_coarse) const;
+    // tail: mask F16 [n_rows, n_tokens] over the scratch rows, row r = position r: the rows of the host store [0, n_host) kept, the others causal if the ring has them
+    void set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_host) const;
 
 private:
     const llama_kv_cache * kv_attn = nullptr;

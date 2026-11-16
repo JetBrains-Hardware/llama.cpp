@@ -617,7 +617,10 @@ struct common_params {
         int32_t     prefetch_n   = 1024; // rows per (kv head, position) of the early query
         int32_t     resident_cap = 1024; // resident rows per (layer, kv head)
         int32_t     lead         = 2;    // layers between the early query and its attention
-        int32_t     tail         = -1;   // cells of the device cache (a ring), 0: one per position, -1: 2*chunk + n_batch + 256
+        int32_t     tail         = -1;   // cells of the device cache (a ring), 0: one per position, -1: chunk + n_batch + 256
+        int32_t     chunk        = 8192; // rows per chunk (one table set)
+        int32_t     rem          = 0;    // llama_kvq_rem: the rows after the last complete chunk, 0 own chunk, 1 merged into the last complete chunk
+        int32_t     min_rows     = 256;  // own: the smallest chunk of these rows, fewer stay precise
     } kvq;
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers

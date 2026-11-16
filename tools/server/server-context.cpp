@@ -845,9 +845,10 @@ struct server_slot {
         if (!llama_memory_kvq_fit_get_progress(mem, fp)) {
             return;
         }
-        SLT_INF(*this, "kvq: coarse rows = %d (%d chunks), jobs running = %d, ready = %d, cancelled = %d, chunks dropped = %d, failed = %d, fit CPU = %.1f s, "
-                "batches waiting for the fit = %d (%.2f s)\n",
-                fp.n_coarse, fp.n_chunk, fp.n_running, fp.n_ready, fp.n_cancel, fp.n_drop, fp.failed, fp.t_cpu, fp.n_tail_wait, fp.t_tail_wait);
+        SLT_INF(*this, "kvq: coarse rows = %d (%d chunks), host rows = %d, jobs running = %d, ready = %d, cancelled = %d, drops = %d, failed = %d, fit CPU = %.1f s, "
+                "batches that made room in the ring = %d (%.2f s), spills = %d, folds = %d (%.2f s), end-of-prompt fits = %d (%.2f s)\n",
+                fp.n_coarse, fp.n_chunk, fp.n_host, fp.n_running, fp.n_ready, fp.n_cancel, fp.n_drop, fp.failed, fp.t_cpu, fp.n_tail_wait, fp.t_tail_wait,
+                fp.n_spill, fp.n_fold, fp.t_fold, fp.n_settle, fp.t_settle);
 
         llama_kvq_counters_all ca;
         if (!llama_memory_kvq_get_counters(mem, ca)) {
@@ -1170,30 +1171,28 @@ private:
     common_speculative_init_result_ptr spec_init;
 
     // --kvq: progress of the fitter at the previous log
-    int32_t kvq_n_chunk_last = 0;
-    int32_t kvq_n_drop_last  = 0;
-    bool    kvq_failed_last  = false;
+    int32_t kvq_n_coarse_last = 0;
+    int32_t kvq_n_drop_last   = 0;
+    bool    kvq_failed_last   = false;
 
-    // --kvq: a log line when chunks join or leave the coarse region (cheap, no sync)
+    // --kvq: a log line when the coarse region changes (cheap, no sync)
     void kvq_log_progress() {
         llama_kvq_fit_progress fp;
         if (!llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), fp)) {
             return;
         }
         if (fp.n_drop != kvq_n_drop_last) {
-            SRV_INF("kvq: %d chunks dropped from the coarse region, %d rows left (%d chunks dropped so far)\n",
-                    fp.n_drop - kvq_n_drop_last, fp.n_coarse, fp.n_drop);
-        }
-        if (fp.n_chunk > kvq_n_chunk_last - (fp.n_drop - kvq_n_drop_last) && !fp.t_job.empty()) {
+            SRV_INF("kvq: the coarse region dropped back to %d rows (%d drops so far)\n", fp.n_coarse, fp.n_drop);
+        } else if (fp.n_coarse != kvq_n_coarse_last && !fp.t_job.empty()) {
             SRV_INF("kvq: coarse region = %d rows (%d chunks), last job %.2f s (%.2f s since its statistics), %d jobs running\n",
                     fp.n_coarse, fp.n_chunk, fp.t_job.back(), fp.t_wall.back(), fp.n_running);
         }
         if (fp.failed && !kvq_failed_last) {
             SRV_WRN("%s", "kvq: the fit failed, the coarse region does not grow\n");
         }
-        kvq_n_chunk_last = fp.n_chunk;
-        kvq_n_drop_last  = fp.n_drop;
-        kvq_failed_last  = fp.failed;
+        kvq_n_coarse_last = fp.n_coarse;
+        kvq_n_drop_last   = fp.n_drop;
+        kvq_failed_last   = fp.failed;
     }
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -5002,11 +5001,13 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                // --kvq: the prompt is done when every complete chunk is in the coarse region
+                // --kvq: the prompt is done when it is fitted up to its end (the rows after the last complete chunk too) and no fit work runs
                 if (params_base.kvq.enabled) {
                     const int64_t t_wait_start = ggml_time_us();
                     llama_memory_kvq_fit_wait(llama_get_memory(ctx_tgt));
-                    SLT_INF(slot, "kvq: waited %.3f s for the fitter at the end of the prompt\n", (ggml_time_us() - t_wait_start)*1e-6);
+                    llama_kvq_fit_progress fp;
+                    llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), fp);
+                    SLT_INF(slot, "kvq: waited %.3f s for the fitter at the end of the prompt, coarse region %d rows\n", (ggml_time_us() - t_wait_start)*1e-6, fp.n_coarse);
                 }
 
                 if (slot.can_speculate()) {
