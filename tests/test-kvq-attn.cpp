@@ -49,7 +49,7 @@ struct kvq_problem {
     std::vector<float>       q;    // [L][H][D]
     std::vector<int32_t>     kc;   // [G][n_coarse][nwk]
     std::vector<int32_t>     vc;   // [G][n_coarse][nwv + 1]
-    std::vector<ggml_fp16_t> tinv; // [n_chunk][2G][D*D]
+    std::vector<int8_t>      tinv; // [n_chunk][2G][D*D]
     std::vector<float>       taux; // [n_chunk][2G][3*D]
     std::vector<uint8_t>     k, v; // [n_tail][G][row], cache layout
     std::vector<uint8_t>     rkv;  // [2][G][cap][row]
@@ -123,7 +123,7 @@ static kvq_graph * build_kvq(ggml_backend_t backend, const kvq_problem & P, int 
             vc = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, P.nwv + 1, P.n_coarse, P.G);
             ggml_set_name(vc, "vc");
         }
-        tinv = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, D, 2*P.G, P.n_chunk);
+        tinv = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, D, D, 2*P.G, P.n_chunk);
         taux = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 3, 2*P.G, P.n_chunk);
         ggml_set_name(tinv, "tinv");
         ggml_set_name(taux, "taux");
@@ -160,7 +160,7 @@ static kvq_graph * build_kvq(ggml_backend_t backend, const kvq_problem & P, int 
     set_named(ctx, "q", P.q.data(), P.q.size()*sizeof(float));
     set_named(ctx, "kc", P.kc.data(), P.kc.size()*sizeof(int32_t));
     set_named(ctx, "vc", P.vc.data(), P.vc.size()*sizeof(int32_t));
-    set_named(ctx, "tinv", P.tinv.data(), P.tinv.size()*sizeof(ggml_fp16_t));
+    set_named(ctx, "tinv", P.tinv.data(), P.tinv.size());
     set_named(ctx, "taux", P.taux.data(), P.taux.size()*sizeof(float));
     set_named(ctx, "k", P.k.data(), P.k.size());
     set_named(ctx, "v", P.v.data(), P.v.size());
@@ -362,7 +362,7 @@ struct eq_case {
 };
 
 // coarse rows from fitted codec tables, reference from llama_kvq_decode
-static void build_equivalence(const eq_case & ec, kvq_problem & P, kvq_reference & R_f16, kvq_reference & R_f32) {
+static void build_equivalence(const eq_case & ec, kvq_problem & P, kvq_reference & R_i8, kvq_reference & R_f32) {
     P = kvq_problem();
     P.G = ec.G;
     P.L = ec.L;
@@ -387,7 +387,7 @@ static void build_equivalence(const eq_case & ec, kvq_problem & P, kvq_reference
     }
 
     std::vector<float> kx((size_t) P.G*P.n_coarse*D), vx((size_t) P.G*P.n_coarse*D);
-    R_f16.kd.resize(kx.size()); R_f16.vd.resize(vx.size());
+    R_i8.kd.resize(kx.size());  R_i8.vd.resize(vx.size());
     R_f32.kd.resize(kx.size()); R_f32.vd.resize(vx.size());
     P.kc.assign((size_t) P.G*P.n_coarse*P.nwk, 0);
     P.vc.assign((size_t) P.G*P.n_coarse*(P.nwv + 1), 0);
@@ -438,12 +438,20 @@ static void build_equivalence(const eq_case & ec, kvq_problem & P, kvq_reference
                     gv = ggml_fp16_to_fp32(ggml_fp32_to_fp16(gv));
                 }
                 float * out32 = (kv ? R_f32.vd.data() : R_f32.kd.data()) + ((size_t) g*P.n_coarse + (size_t) t*P.n_crow)*D;
-                float * out16 = (kv ? R_f16.vd.data() : R_f16.kd.data()) + ((size_t) g*P.n_coarse + (size_t) t*P.n_crow)*D;
+                float * out8  = (kv ? R_i8.vd.data() : R_i8.kd.data()) + ((size_t) g*P.n_coarse + (size_t) t*P.n_crow)*D;
                 llama_kvq_decode(tab, codes.data(), gain.data(), P.n_crow, out32, 8);
-                for (auto & e : tab.inv) {
-                    e = ggml_fp16_to_fp32(ggml_fp32_to_fp16(e));
+                // the op reads inv[c][:] as int8 with one scale per component
+                for (int c = 0; c < D; ++c) {
+                    float * row = tab.inv.data() + (size_t) c*D;
+                    float   mx  = 0.0f;
+                    for (int i = 0; i < D; ++i) {
+                        mx = std::max(mx, std::fabs(row[i]));
+                    }
+                    for (int i = 0; i < D; ++i) {
+                        row[i] = mx > 0.0f ? std::nearbyint(row[i]/(mx/127.0f))*(mx/127.0f) : 0.0f;
+                    }
                 }
-                llama_kvq_decode(tab, codes.data(), gain.data(), P.n_crow, out16, 8);
+                llama_kvq_decode(tab, codes.data(), gain.data(), P.n_crow, out8, 8);
             }
         }
     }
@@ -517,7 +525,7 @@ static void build_equivalence(const eq_case & ec, kvq_problem & P, kvq_reference
         }
     }
 
-    reference(P, R_f16);
+    reference(P, R_i8);
     reference(P, R_f32);
 }
 
@@ -536,20 +544,20 @@ static void test_equivalence(ggml_backend_t cpu, ggml_backend_t gpu) {
 
     for (const eq_case & ec : cases) {
         kvq_problem P;
-        kvq_reference R16, R32;
+        kvq_reference R8, R32;
         printf("  case %-18s G=%d L=%d C=%d n_chunk=%d n_tail=%d cap=%d n_res=%d tail=%s res=%s\n", ec.name, ec.G, ec.L, ec.n_crow,
             ec.n_chunk, ec.n_tail, ec.cap, ec.n_res, ggml_type_name(ec.type_tail), ggml_type_name(ec.type_res));
-        build_equivalence(ec, P, R16, R32);
+        build_equivalence(ec, P, R8, R32);
 
-        const size_t na = R16.attn.size();
-        const size_t ns = R16.score.size();
+        const size_t na = R8.attn.size();
+        const size_t ns = R8.score.size();
 
         for (ggml_backend_t be : { cpu, gpu }) {
             if (!be) {
                 continue;
             }
             const bool is_cpu = be == cpu;
-            // CPU: same f16 tables in double, only rounding differs; GPU: f16 qt and f16 weights in the mma
+            // CPU: same int8 tables in double, only rounding differs; GPU: f16 qt and f16 weights in the mma
             const double tol_a = is_cpu ? 1e-9 : 2e-5;
             const double tol_s = is_cpu ? 1e-9 : 2e-5;
 
@@ -558,7 +566,7 @@ static void test_equivalence(ggml_backend_t cpu, ggml_backend_t gpu) {
                 printf("    %-5s not supported\n", ggml_backend_name(be));
                 continue;
             }
-            const double ea   = nmse(a.data(), R16.attn.data(), na);
+            const double ea   = nmse(a.data(), R8.attn.data(), na);
             const double ea32 = nmse(a.data(), R32.attn.data(), na);
             printf("    %-5s attn  nmse %.2e (f32 tables: %.2e)", ggml_backend_name(be), ea, ea32);
             CHECK(ea < tol_a, "%s %s attn nmse %e", ec.name, ggml_backend_name(be), ea);
@@ -566,8 +574,8 @@ static void test_equivalence(ggml_backend_t cpu, ggml_backend_t gpu) {
             if (P.n_coarse > 0) {
                 std::vector<float> s  = run_kvq(be, P, GGML_KVQ_SCORE);
                 std::vector<float> as = run_kvq(be, P, GGML_KVQ_ATTN | GGML_KVQ_SCORE);
-                const double es  = nmse(s.data(), R16.score.data(), ns);
-                const double eas = std::max(nmse(as.data(), R16.attn.data(), na), nmse(as.data() + na, R16.score.data(), ns));
+                const double es  = nmse(s.data(), R8.score.data(), ns);
+                const double eas = std::max(nmse(as.data(), R8.attn.data(), na), nmse(as.data() + na, R8.score.data(), ns));
                 printf(", score nmse %.2e, both %.2e", es, eas);
                 CHECK(es < tol_s, "%s %s score nmse %e", ec.name, ggml_backend_name(be), es);
                 CHECK(eas < std::max(tol_a, tol_s), "%s %s attn+score nmse %e", ec.name, ggml_backend_name(be), eas);
@@ -651,7 +659,7 @@ static void build_bench(kvq_problem & P, int n_kv, int L, int cap, ggml_type typ
     }
     P.tinv.resize((size_t) P.n_chunk*2*P.G*D*D);
     for (auto & x : P.tinv) {
-        x = ggml_fp32_to_fp16(nd(rng)/16.0f);
+        x = (int8_t) std::clamp(std::lround(32.0f*nd(rng)), -127L, 127L);
     }
     P.taux.resize((size_t) P.n_chunk*2*P.G*3*D);
     for (int t = 0; t < P.n_chunk; ++t) {
@@ -659,7 +667,7 @@ static void build_bench(kvq_problem & P, int n_kv, int L, int cap, ggml_type typ
             float * aux = P.taux.data() + ((size_t) t*2*P.G + m)*3*D;
             const std::vector<uint8_t> & b = m % 2 ? bv[m/2] : bk[m/2];
             for (int c = 0; c < D; ++c) {
-                aux[c] = b[c] ? gauss_step[b[c]]*std::exp(-0.02f*c) : 0.0f;
+                aux[c] = b[c] ? gauss_step[b[c]]*std::exp(-0.02f*c)/512.0f : 0.0f; // 1/512: the table scale
                 aux[D + c] = 0.1f*nd(rng);
                 aux[2*D + c] = b[c];
             }
@@ -843,7 +851,7 @@ static void bench(ggml_backend_t gpu, const std::string & tables, bool quick) {
         kvq_problem P;
         build_bench(P, 150000, 1, 1024, GGML_TYPE_Q8_0, bk, bv);
         const double codes  = (double) P.G*P.n_coarse*(P.nwk + P.nwv + 1)*4;
-        const double tabs   = (double) 2*P.G*(D*D*2 + 3*D*4);
+        const double tabs   = (double) 2*P.G*(D*D + 3*D*4);
         printf("\nVRAM per layer at n_kv = 150000 (n_coarse %d, %d chunks): codes %.1f MB, tables %.2f MB per chunk, %.1f MB total\n",
             P.n_coarse, P.n_chunk, codes/1e6, tabs/1e6, (codes + P.n_chunk*tabs)/1e6);
     }
@@ -898,7 +906,7 @@ int main(int argc, char ** argv) {
             bench(gpu, tables, quick);
         }
     } else {
-        printf("equivalence with decode-then-attend (llama_kvq_decode with the f16 inverse of the op; f32 for information)\n");
+        printf("equivalence with decode-then-attend (llama_kvq_decode with the int8 inverse of the op; f32 for information)\n");
         test_equivalence(cpu, gpu);
     }
 

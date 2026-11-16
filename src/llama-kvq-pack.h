@@ -20,5 +20,6 @@ LLAMA_API int32_t llama_kvq_pack_words(const llama_kvq_table & t);
 // n_words >= llama_kvq_pack_words(t), the unused high bits are 0
 LLAMA_API void llama_kvq_pack_rows(const llama_kvq_table & t, int32_t n_words, const int8_t * codes, const float * gain, int64_t n_tok, int32_t * rows);
 
-// one table in the layout of ggml_kvq_attn: inv [t.n*t.n] f16 (one i2 slice of tab_inv), aux [3*t.n] f32 (one i2 slice of tab_aux)
-LLAMA_API void llama_kvq_pack_table(const llama_kvq_table & t, ggml_fp16_t * inv, float * aux);
+// one table in the layout of ggml_kvq_attn: inv [t.n*t.n] i8 (one i2 slice of tab_inv), aux [3*t.n] f32 (one i2 slice of tab_aux)
+// row inv[c][:] is stored as int8 with one scale per component, the stored step holds the scale
+LLAMA_API void llama_kvq_pack_table(const llama_kvq_table & t, int8_t * inv, float * aux);

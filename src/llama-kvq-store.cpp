@@ -446,7 +446,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         layer_tensors & t = l.t;
         t.kc   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, nwk, n_rows, G);
         t.vc   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, nwv + 1, n_rows, G);
-        t.tinv = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_F16, D, D, 2*G, n_chunk);
+        t.tinv = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_I8, D, D, 2*G, n_chunk);
         t.taux = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_F32, D, 3, 2*G, n_chunk);
         t.rkv  = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, D, cap_tot, G, 2);
         t.ridx = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, cap_tot, G + 1);
@@ -699,7 +699,7 @@ void llama_kvq_store::synchronize() {
     }
 }
 
-void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const ggml_fp16_t * inv, const float * aux, bool async) {
+void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async) {
     GGML_ASSERT(!filled && c >= 0 && c < n_chunk && (int64_t) c*n_crow >= n_coarse_ && g >= 0 && g < G);
     GGML_ASSERT(!async || backend_main);
     const layer_tensors & t = get_layer(il);
@@ -754,7 +754,7 @@ bool llama_kvq_store::set_codes(int32_t il, int32_t g, bool is_v, const std::vec
     const int32_t nwr = nw + (is_v ? 1 : 0);
 
     std::vector<int32_t>     rows((size_t) n_coarse_*nwr);
-    std::vector<ggml_fp16_t> inv((size_t) D*D);
+    std::vector<int8_t>      inv((size_t) D*D);
     std::vector<float>       aux((size_t) 3*D);
     for (int32_t c = 0; c < n_chunk; ++c) {
         const llama_kvq_table & tab = tabs[c];

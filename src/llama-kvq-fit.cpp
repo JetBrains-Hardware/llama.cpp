@@ -75,7 +75,7 @@ struct llama_kvq_fitter::job {
     float       * hstat = nullptr; // per (layer index, K or V): cov [G][D*D], mu [G][D]
     float       * hpar  = nullptr; // per (layer index, K or V, kv head): [KVQ_NP][D]
     float       * hsig  = nullptr; // per (layer index, kv head): V scale of the shape [D]
-    ggml_fp16_t * htinv = nullptr; // per task [D*D]
+    int8_t      * htinv = nullptr; // per task [D*D]
     float       * htaux = nullptr; // per task [3*D]
 
     // per-chunk V: the tables between the fit and the bits tasks, per (layer index, kv head)
@@ -113,7 +113,7 @@ llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_
     }
 
     // the offline V tables are the same for every chunk, so all table slots get them now
-    std::vector<ggml_fp16_t> inv(KVQ_D*KVQ_D);
+    std::vector<int8_t>      inv(KVQ_D*KVQ_D);
     std::vector<float>       aux(3*KVQ_D);
     for (int32_t il : layer_ids) {
         for (int32_t g = 0; !v_fit && g < G; ++g) {
@@ -676,7 +676,7 @@ void llama_kvq_fitter::take(const llama_kv_cache & kv) {
     const int32_t n_pair = (int32_t) layer_ids.size()*G;
     const int32_t n_task = 2*n_pair;
     const size_t  n_b    = (size_t) G*C*sizeof(int32_t) + (size_t) n_task*(KVQ_D*KVQ_D + KVQ_D)*sizeof(float) + (size_t) n_task*KVQ_NP*KVQ_D*sizeof(float) +
-                           (size_t) n_pair*KVQ_D*sizeof(float) + (size_t) n_task*KVQ_D*KVQ_D*sizeof(ggml_fp16_t) + (size_t) n_task*3*KVQ_D*sizeof(float);
+                           (size_t) n_pair*KVQ_D*sizeof(float) + (size_t) n_task*KVQ_D*KVQ_D*sizeof(int8_t) + (size_t) n_task*3*KVQ_D*sizeof(float);
     if (!free_bufs.empty()) {
         jb->buf = std::move(free_bufs.back());
         free_bufs.pop_back();
@@ -694,7 +694,7 @@ void llama_kvq_fitter::take(const llama_kv_cache & kv) {
     jb->hstat = (float *) hb;                         hb += (size_t) n_task*(KVQ_D*KVQ_D + KVQ_D)*sizeof(float);
     jb->hpar  = (float *) hb;                         hb += (size_t) n_task*KVQ_NP*KVQ_D*sizeof(float);
     jb->hsig  = (float *) hb;                         hb += (size_t) n_pair*KVQ_D*sizeof(float);
-    jb->htinv = (ggml_fp16_t *) hb;                   hb += (size_t) n_task*KVQ_D*KVQ_D*sizeof(ggml_fp16_t);
+    jb->htinv = (int8_t *) hb;                        hb += (size_t) n_task*KVQ_D*KVQ_D*sizeof(int8_t);
     jb->htaux = (float *) hb;
     for (int32_t g = 0; g < G; ++g) {
         for (int32_t r = 0; r < C; ++r) {

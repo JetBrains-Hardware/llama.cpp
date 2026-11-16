@@ -11673,7 +11673,7 @@ void ggml_compute_forward_kvq_attn(
     auto inv_at = [&](int64_t c, int64_t i, int64_t m, int64_t t) -> float {
         const int64_t i0 = m % 2 == 0 ? c : i;
         const int64_t i1 = m % 2 == 0 ? i : c;
-        return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) tinv->data + i0*tinv->nb[0] + i1*tinv->nb[1] + m*tinv->nb[2] + t*tinv->nb[3]));
+        return *(const int8_t *) ((const char *) tinv->data + i0*tinv->nb[0] + i1*tinv->nb[1] + m*tinv->nb[2] + t*tinv->nb[3]);
     };
     auto row_f32 = [&](const ggml_tensor * t, int64_t i1, int64_t i2, int64_t i3, float * y) {
         ggml_get_type_traits(t->type)->to_float((const char *) t->data + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3], y, D);

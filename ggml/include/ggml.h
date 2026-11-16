@@ -2529,8 +2529,9 @@ extern "C" {
     // q:       [D, n_head, L]                  f32, n_head % G == 0, head h reads kv head h/(n_head/G), rows contiguous
     // kc:      [nwk, n_coarse, G]              i32, packed K row of each (row, kv head), any nb1/nb2; NULL: n_coarse = 0
     // vc:      [nwv + 1, n_coarse, G]          i32, packed V row in words [0, nwv), V gain in the low 16 bits (f16) of word nwv
-    // tab_inv: [D, D, 2*G, >= n_chunk]         f16, inverse transforms, (K, V) of kv head g at i2 = 2*g + (0, 1), chunk t at i3 = t
+    // tab_inv: [D, D, 2*G, >= n_chunk]         i8, inverse transforms, (K, V) of kv head g at i2 = 2*g + (0, 1), chunk t at i3 = t
     //            K: element [c, i] = inv[c][i] (i0 = component), V: element [i, c] = inv[c][i] (i0 = dim)
+    //            the scale of inv[c][:] is part of step[c] (src/llama-kvq-pack.h: one scale per component, max |inv[c][:]| -> 127)
     // tab_aux: [D, 3, 2*G, >= n_chunk]         f32, i1 = 0: step[c], 1: mu[i], 2: bits[c] (0..8, as float), same i2/i3
     // k, v:    [D, n_tail, G]                  f16 or q8_0 (same type), tail K/V (any nb1/nb2, e.g. a permuted cache view),
     //                                          v not transposed; n_tail >= 1, tail row r is cache row n_coarse + r

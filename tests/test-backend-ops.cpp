@@ -9910,7 +9910,7 @@ struct test_kvq_attn : public test_case {
                 vc = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nwv + 1, n_coarse, G);
                 ggml_set_name(vc, "vc");
             }
-            tinv = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, D, 2*G, n_chunk);
+            tinv = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, D, D, 2*G, n_chunk);
             taux = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 3, 2*G, n_chunk);
             ggml_set_name(tinv, "tinv");
             ggml_set_name(taux, "taux");
@@ -9990,19 +9990,19 @@ struct test_kvq_attn : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "tinv") == 0) {
-                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                std::vector<int8_t> data(ggml_nelements(t));
                 for (auto & x : data) {
-                    x = ggml_fp32_to_fp16(uf(gen)/8.0f);
+                    x = (int8_t) std::lround(127.0f*uf(gen));
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "taux") == 0) {
-                // step so that (code + 0.5)*step is in [-1, 1], 0 for 0-bit components
+                // step so that (code + 0.5)*step is in [-1, 1] times the table scale 1/(8*127), 0 for 0-bit components
                 std::vector<float> data(ggml_nelements(t));
                 for (int64_t m = 0; m < n_chunk*2*G; ++m) {
                     const std::vector<int> b = random_bits(m % 2 ? nwv : nwk);
                     float * aux = data.data() + m*3*D;
                     for (int64_t c = 0; c < D; ++c) {
-                        aux[c]       = b[c] ? (1.5f + 0.5f*uf(gen))/(float) (1 << (b[c] - 1)) : 0.0f;
+                        aux[c]       = b[c] ? (1.5f + 0.5f*uf(gen))/(float) (1 << (b[c] - 1))/(8.0f*127.0f) : 0.0f;
                         aux[D + c]   = 0.5f*uf(gen);
                         aux[2*D + c] = (float) b[c];
                     }

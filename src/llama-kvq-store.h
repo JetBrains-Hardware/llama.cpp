@@ -55,7 +55,7 @@ public:
     struct layer_tensors {
         ggml_tensor * kc    = nullptr; // i32 [nwk, n_rows, G]
         ggml_tensor * vc    = nullptr; // i32 [nwv + 1, n_rows, G]
-        ggml_tensor * tinv  = nullptr; // f16 [D, D, 2*G, n_chunk]
+        ggml_tensor * tinv  = nullptr; // i8 [D, D, 2*G, n_chunk]
         ggml_tensor * taux  = nullptr; // f32 [D, 3, 2*G, n_chunk]
         ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2]
         ggml_tensor * rkv_h = nullptr; // f16 [ROW/2, 2*G*cap_tot], alias of rkv, row (kv*G + g)*cap_tot + slot
@@ -82,7 +82,7 @@ public:
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
     // only for chunks at or after the coarse region; the decode thread, between graphs
     // async: a copy on the main stream, the memory must stay valid until the next synchronize (pinned memory for a real async copy)
-    void set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const ggml_fp16_t * inv, const float * aux, bool async = false);
+    void set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async = false);
 
     // fit mode: the coarse region becomes [0, n), n a multiple of n_chunk_rows; new chunks must have rows, tables and host rows set
     // the resident rows at or after n are dropped; the decode thread, between graphs

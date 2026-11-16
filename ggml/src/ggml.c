@@ -6639,7 +6639,7 @@ static struct ggml_tensor * ggml_kvq_attn_impl(
         const int64_t n_chunk = (n_coarse + n_chunk_rows - 1)/n_chunk_rows;
 
         GGML_ASSERT(kc->type == GGML_TYPE_I32 && kc->ne[2] == G && kc->ne[3] == 1);
-        GGML_ASSERT(tab_inv && tab_inv->type == GGML_TYPE_F16);
+        GGML_ASSERT(tab_inv && tab_inv->type == GGML_TYPE_I8);
         GGML_ASSERT(tab_inv->ne[0] == D && tab_inv->ne[1] == D && tab_inv->ne[2] == 2*G && tab_inv->ne[3] >= n_chunk);
         GGML_ASSERT(tab_aux && tab_aux->type == GGML_TYPE_F32);
         GGML_ASSERT(tab_aux->ne[0] == D && tab_aux->ne[1] == 3 && tab_aux->ne[2] == 2*G && tab_aux->ne[3] >= n_chunk);

@@ -41,7 +41,7 @@ struct kvq_args {
     const float * q; int64_t q_nb1, q_nb2;          // in elements
     const char  * kc; int64_t kc_nb1, kc_nb2;
     const char  * vc; int64_t vc_nb1, vc_nb2;
-    const half  * tinv; int64_t tinv_nb2, tinv_nb3; // in elements
+    const int8_t * tinv; int64_t tinv_nb2, tinv_nb3; // in elements
     const float * taux; int64_t taux_nb2, taux_nb3; // in elements
     const int32_t * ridx; int64_t ridx_nb1;         // in elements
     const half  * mask; int64_t mask_nb1;           // in elements
@@ -248,7 +248,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
     float * s_q   = (float *) kvq_smem;   // [N][D]
     float * s_acc = s_q + N*KVQ_D;        // [N][32]
 
-    const half  * invk = a.tinv + t*a.tinv_nb3 + (2*g)*a.tinv_nb2;
+    const int8_t * invk = a.tinv + t*a.tinv_nb3 + (2*g)*a.tinv_nb2;
     const float * auxk = a.taux + t*a.taux_nb3 + (2*g)*a.taux_nb2;
     const float * auxv = auxk + a.taux_nb2;
 
@@ -277,7 +277,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
         float x[WARP_SIZE];
 #pragma unroll
         for (int ii = 0; ii < WARP_SIZE; ++ii) {
-            x[ii] = __half2float(invk[c + KVQ_D*(WARP_SIZE*w + ii)]);
+            x[ii] = (float) invk[c + KVQ_D*(WARP_SIZE*w + ii)];
         }
 #pragma unroll
         for (int ii = 0; ii < WARP_SIZE; ++ii) {
@@ -1087,7 +1087,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
     __shared__ float s_y[8][KVQ_D];
     __shared__ float s_out[8][WARP_SIZE];
 
-    const half  * inv = a.tinv + t*a.tinv_nb3 + (2*g + 1)*a.tinv_nb2;
+    const int8_t * inv = a.tinv + t*a.tinv_nb3 + (2*g + 1)*a.tinv_nb2;
     const float * aux = a.taux + t*a.taux_nb3 + (2*g + 1)*a.taux_nb2;
 
     const int64_t ic = (int64_t) g*a.n_chunk + t;
@@ -1096,7 +1096,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
     float x[WARP_SIZE];
 #pragma unroll
     for (int k = 0; k < WARP_SIZE; ++k) {
-        x[k] = __half2float(inv[i + KVQ_D*(WARP_SIZE*w + k)]);
+        x[k] = (float) inv[i + KVQ_D*(WARP_SIZE*w + k)];
     }
 
     for (int n0 = 0; n0 < N; n0 += 8) {
@@ -1433,7 +1433,7 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     a.q_nb2 = q->nb[2]/sizeof(float);
     if (kc) {
         a.kc = (const char *) kc->data; a.kc_nb1 = kc->nb[1]; a.kc_nb2 = kc->nb[2];
-        a.tinv = (const half *) tinv->data; a.tinv_nb2 = tinv->nb[2]/sizeof(half); a.tinv_nb3 = tinv->nb[3]/sizeof(half);
+        a.tinv = (const int8_t *) tinv->data; a.tinv_nb2 = tinv->nb[2]; a.tinv_nb3 = tinv->nb[3];
         a.taux = (const float *) taux->data; a.taux_nb2 = taux->nb[2]/sizeof(float); a.taux_nb3 = taux->nb[3]/sizeof(float);
         if (attn) {
             a.vc = (const char *) vc->data; a.vc_nb1 = vc->nb[1]; a.vc_nb2 = vc->nb[2];
