@@ -60,9 +60,6 @@ public:
     // the positions [p0, inf) were removed: cancels the jobs with rows there, the coarse region drops back to the chunk of p0
     void remove(llama_pos p0);
 
-    // experiment (LLAMA_KVQ_FOLD_FIXED): the rows [n_coarse, p) coded with the tables of the last fit, no new fit; false if the
-    // last fit does not end at n_coarse or p is in another chunk
-    bool extend(const llama_kv_cache & kv, llama_pos p);
 
     bool has_jobs() const { return !jobs_empty(); }
 
@@ -121,11 +118,6 @@ private:
     int32_t            acc_pos = -1;
     std::vector<float> acc_gram;
     std::vector<float> acc_gsum;
-
-    // LLAMA_KVQ_FOLD_FIXED: the device parameters of the last fit and its range
-    bool               fold_fixed = false;
-    range              last_fit;
-    std::vector<float> last_par;
 
     bool failed = false;
     bool hold   = false;

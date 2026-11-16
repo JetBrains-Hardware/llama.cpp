@@ -140,6 +140,7 @@ struct kvq_args {
     bool        lib_nowait  = false;
     bool        lib_busy    = false;
     bool        rm_test     = false;
+    bool        rb_test     = false; // --kvq-rb-test: ring rollbacks with and without an earlier rollback, also without --kvq-lib
     int32_t     scr_check   = 0;
     bool        lib_full    = false;
     bool        lib_hold    = false;
@@ -338,6 +339,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.lib_busy = true;
         } else if (a == "--kvq-rm-test") {
             args.rm_test = true;
+        } else if (a == "--kvq-rb-test") {
+            args.rb_test = true;
         } else if (a == "--kvq-scr-check" && has_val) {
             args.scr_check = std::stoi(argv[++i]);
         } else if (a == "--kvq-lib-full") {
@@ -1623,6 +1626,57 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
     return ok;
 }
 
+// --kvq-rb-test: a 4-token batch at b = C + 501, removal of its last 3 positions, the 3 decoded again; the logits at b + 3
+// are compared; before it, with or without an earlier removal of the same kind at a = C + 497
+static bool kvq_rb_test(llama_context * ctx, const std::vector<llama_token> & ids, int32_t C, int32_t n_vocab, bool lib) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    const int32_t n_batch = (int32_t) llama_n_batch(ctx);
+    const int32_t a = C + 497;
+    const int32_t b = a + 4;
+    if ((int32_t) ids.size() < b + 8) {
+        return false;
+    }
+    auto wait = [&]() { return !lib || llama_memory_kvq_fit_wait(mem); };
+    for (int prior = 0; prior < 2; ++prior) {
+        std::vector<float> la, lb, lx;
+        llama_memory_clear(mem, true);
+        if (!kvq_prefill(ctx, ids, a, n_batch) || !wait() || !kvq_decode_last(ctx, ids, a, a + 4, n_vocab, lx) || !wait()) {
+            return false;
+        }
+        if (prior && (!llama_memory_seq_rm(mem, 0, a + 1, -1) || !kvq_decode_last(ctx, ids, a + 1, a + 4, n_vocab, lx) || !wait())) {
+            return false;
+        }
+        if (!kvq_decode_last(ctx, ids, b, b + 4, n_vocab, la) || !llama_memory_seq_rm(mem, 0, b + 1, -1) ||
+            !kvq_decode_last(ctx, ids, b + 1, b + 4, n_vocab, lb)) {
+            return false;
+        }
+        bool same = false;
+        const double kl = kvq_kl_logits(la, lb, same);
+        LOG("kvq: rb-test: %s, earlier removal %d: logits at b + 3 before and after the removal: KL %.3e, same top-1 %d\n",
+                lib ? "two-tier" : "plain cache", prior, kl, same ? 1 : 0);
+    }
+    // no removal: the same positions as [b, b + 1) and then [b + 1, b + 4), against [b, b + 4) in one batch
+    {
+        std::vector<float> la, lb, lx;
+        for (int split = 0; split < 2; ++split) {
+            llama_memory_clear(mem, true);
+            if (!kvq_prefill(ctx, ids, a, n_batch) || !wait() || !kvq_decode_last(ctx, ids, a, a + 4, n_vocab, lx) || !wait()) {
+                return false;
+            }
+            std::vector<float> & out = split ? lb : la;
+            if (split ? !kvq_decode_last(ctx, ids, b, b + 1, n_vocab, lx) || !kvq_decode_last(ctx, ids, b + 1, b + 4, n_vocab, out)
+                      : !kvq_decode_last(ctx, ids, b, b + 4, n_vocab, out)) {
+                return false;
+            }
+        }
+        bool same = false;
+        const double kl = kvq_kl_logits(la, lb, same);
+        LOG("kvq: rb-test: %s, no removal: logits at b + 3 from one batch of 4 and from batches of 1 and 3: KL %.3e, same top-1 %d\n",
+                lib ? "two-tier" : "plain cache", kl, same ? 1 : 0);
+    }
+    return true;
+}
+
 // the prefix in turns, see --kvq-turns: the memory is empty
 static bool kvq_turns(llama_context * ctx, const std::vector<llama_token> & ids, const std::vector<int32_t> & turns, int32_t n_gen, int32_t n_batch, int32_t n_vocab, bool lib) {
     llama_memory_t mem = llama_get_memory(ctx);
@@ -1729,7 +1783,7 @@ int main(int argc, char ** argv) {
         const int32_t ring = args.lib_ring > 0 ? args.lib_ring : GGML_PAD(args.fit_chunk + params.n_batch + 256, 256);
         llama_model_set_kvq_tail(model, args.lib() && !args.lib_full ? ring : 0);
         llama_context_params cparams = common_context_params_to_llama(params);
-        if (args.rm_test) {
+        if (args.rm_test || args.rb_test) {
             // recurrent snapshots for a seq_rm into the last ubatch
             cparams.n_rs_seq = 4;
         }
@@ -1844,6 +1898,10 @@ int main(int argc, char ** argv) {
         if (args.rm_test) {
             return kvq_rm_test(ctx, ids, args.fit_chunk, n_vocab, args.lib_rem, args.lib_min_rows, tp_packed.prefetch_n + tp_packed.n_sink) ? 0 : 1;
         }
+    }
+
+    if (args.rb_test) {
+        return kvq_rb_test(ctx, ids, args.fit_chunk > 0 ? args.fit_chunk : 8192, n_vocab, args.lib()) ? 0 : 1;
     }
 
     const int32_t ckpt = args.state_ckpt;

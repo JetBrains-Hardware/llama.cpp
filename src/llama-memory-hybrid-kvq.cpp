@@ -128,9 +128,7 @@ bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
     if ((!room() || fold_now) && small) {
         // the rows after the last complete chunk are fitted in line
         const int64_t t1 = ggml_time_us();
-        if (fold_now && fitter->extend(kv, p0)) {
-            tail_release();
-        } else if (!settle(p0)) {
+        if (!settle(p0)) {
             return false;
         }
         n_fold++;
@@ -217,9 +215,7 @@ bool llama_memory_hybrid_kvq::settle(llama_pos n) {
         }
     }
     // the decoding after a prompt depends on the memory state, not on the resident rows of an earlier reply
-    if (!getenv("LLAMA_KVQ_DIAG_NORESET")) {
-        store->reset_resident();
-    }
+    store->reset_resident();
     return true;
 }
 

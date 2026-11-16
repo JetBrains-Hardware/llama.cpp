@@ -211,7 +211,6 @@ llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_
         compute_wo_gram_dev();
     }
     prof = getenv("LLAMA_KVQ_FIT_SYNC") != nullptr && atoi(getenv("LLAMA_KVQ_FIT_SYNC")) != 0;
-    fold_fixed = getenv("LLAMA_KVQ_FOLD_FIXED") != nullptr && atoi(getenv("LLAMA_KVQ_FOLD_FIXED")) != 0;
 
     for (int i = 0; i < fparams.n_threads; ++i) {
         threads.emplace_back([this]() { loop(); });
@@ -881,25 +880,6 @@ void llama_kvq_fitter::spill(const llama_kv_cache & kv, llama_pos p) {
     LLAMA_LOG_INFO("%s: ring rows of the positions [%d, %d) to the host store\n", __func__, h0, (int) p);
 }
 
-bool llama_kvq_fitter::extend(const llama_kv_cache & kv, llama_pos p) {
-    const int32_t C  = store.n_chunk_rows();
-    const int32_t n0 = store.n_coarse();
-    if (!fold_fixed || failed || last_fit.r1 != n0 || n0 == 0 || p <= n0 || (p - 1)/C != (n0 - 1)/C || store.n_host() > n0 || !jobs_empty()) {
-        return false;
-    }
-    spill(kv, p);
-    job jb;
-    jb.r0   = n0;
-    jb.r1   = p;
-    jb.h1   = p;
-    jb.hpar = last_par.data();
-    queue_phase(jb, 3);
-    store.set_n_coarse(p);
-    last_fit.r1 = p;
-    LLAMA_LOG_INFO("%s: rows [%d, %d) coded with the tables of the rows [%d, %d)\n", __func__, n0, (int) p, last_fit.r0, n0);
-    return true;
-}
-
 // decode thread: the jobs whose tasks are done get their next phase
 //   V fit tasks done: phase 2 and the V bits tasks (per-chunk V); all tasks done: phase 3
 void llama_kvq_fitter::advance() {
@@ -987,10 +967,6 @@ void llama_kvq_fitter::install(bool all) {
             store.set_n_coarse(jb->r1);
         } else {
             store.synchronize();
-        }
-        if (fold_fixed) {
-            last_fit = { jb->r0, jb->r1 };
-            last_par.assign(jb->hpar, jb->hpar + (size_t) 2*layer_ids.size()*G*KVQ_NP*KVQ_D);
         }
 
         const double t1 = kvq_fit_now();
