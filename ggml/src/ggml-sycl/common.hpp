@@ -13,6 +13,7 @@
 #ifndef GGML_SYCL_COMMON_HPP
 #define GGML_SYCL_COMMON_HPP
 
+#include <memory>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -443,6 +444,8 @@ struct ggml_tensor_extra_gpu {
   dpct::event_ptr events[GGML_SYCL_MAX_DEVICES]
                         [GGML_SYCL_MAX_STREAMS]; // events for synchronizing multiple GPUs
   optimize_feature optimized_feature;
+  // max over the rows of |W[:, d]| for the int8 prompt-batch GEMM (int8-gemm.hpp), filled on first use
+  std::shared_ptr<float> int8_wcolmax;
 };
 
 extern int g_ggml_sycl_use_level_zero_api;
