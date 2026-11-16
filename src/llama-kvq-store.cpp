@@ -138,6 +138,25 @@ static double kvq_now() {
     return ggml_time_us()*1e-6;
 }
 
+// by row (distinct rows), LSD radix sort with 8-bit digits; std::sort cost 1.5 ms per 4-token verify ubatch in the server (measured)
+static void kvq_sort_rows(std::vector<kvq_cand> & u, int32_t n_rows) {
+    thread_local std::vector<kvq_cand> tmp;
+    tmp.resize(u.size());
+    for (int sh = 0; sh < 32 && (n_rows - 1) >> sh > 0; sh += 8) {
+        uint32_t cnt[257] = { 0 };
+        for (const kvq_cand & c : u) {
+            cnt[((uint32_t) c.row >> sh & 255) + 1]++;
+        }
+        for (int i = 0; i < 256; ++i) {
+            cnt[i + 1] += cnt[i];
+        }
+        for (const kvq_cand & c : u) {
+            tmp[cnt[(uint32_t) c.row >> sh & 255]++] = c;
+        }
+        u.swap(tmp);
+    }
+}
+
 // the gather of one request over n_th threads, the helpers sleep on a condition variable
 struct llama_kvq_store::gather_pool {
     std::vector<std::thread> threads;
@@ -1193,9 +1212,14 @@ void llama_kvq_store::plan_prefetch(layer & l) {
             }
         }
         if ((int64_t) u.size() > n_u) {
-            std::nth_element(u.begin(), u.begin() + n_u, u.end(), [](const kvq_cand & a, const kvq_cand & b) { return a.val > b.val; });
+            std::nth_element(u.begin(), u.begin() + n_u, u.end(), [](const kvq_cand & a, const kvq_cand & b) {
+                return a.val > b.val || (a.val == b.val && a.row < b.row);
+            });
             u.resize(n_u);
         }
+        // the order of top_k on the device is not fixed (atomics), the slots of the rows and the sums of the attention over
+        // the slots would follow it: by row
+        kvq_sort_rows(u, n_rows_);
         cnt.pf_req += u.size();
 
         // the resident rows first, so that the victims of the missing ones are older than this request
@@ -1226,6 +1250,13 @@ void llama_kvq_store::plan_topup(layer & l) {
     const int64_t n_top = l.n_top;
     const int64_t L     = l.n_pos;
     const int32_t * sel = l.h_sel;
+
+    // by row, as in plan_prefetch: the touches and the victims follow this order
+    if (params.sync_mode != LLAMA_KVQ_SYNC_OFF) {
+        for (int64_t r = 0; r < G*L; ++r) {
+            std::sort(l.h_sel + r*n_top, l.h_sel + (r + 1)*n_top);
+        }
+    }
 
     const uint32_t now = ++l.stamp;
     l.fetch.clear();

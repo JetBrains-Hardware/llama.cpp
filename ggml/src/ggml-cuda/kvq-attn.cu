@@ -246,7 +246,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
 
     extern __shared__ __align__(16) char kvq_smem[];
     float * s_q   = (float *) kvq_smem;   // [N][D]
-    float * s_acc = s_q + N*KVQ_D;        // [N][32]
+    float * s_acc = s_q + N*KVQ_D;        // [D/32][N][32], per warp
 
     const int8_t * invk = a.tinv + t*a.tinv_nb3 + (2*g)*a.tinv_nb2;
     const float * auxk = a.taux + t*a.taux_nb3 + (2*g)*a.taux_nb2;
@@ -261,9 +261,6 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
             qv = a.q[i + h*a.q_nb1 + (n / a.n_rep)*a.q_nb2];
         }
         s_q[e] = qv;
-    }
-    for (int e = tid; e < N*WARP_SIZE; e += KVQ_D) {
-        s_acc[e] = 0.0f;
     }
     __syncthreads();
 
@@ -288,7 +285,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
         }
 #pragma unroll
         for (int n = 0; n < N; ++n) {
-            atomicAdd(&s_acc[n*WARP_SIZE + lane], acc[n]);
+            s_acc[(w*N + n)*WARP_SIZE + lane] = acc[n];
         }
     }
     __syncthreads();
@@ -297,7 +294,13 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
         const int   c    = WARP_SIZE*slice + lane;
         const float step = auxk[2*KVQ_D + c] > 0.0f ? auxk[c] : 0.0f;
         for (int n = w; n < N; n += KVQ_D/WARP_SIZE) {
-            const float qt = s_acc[n*WARP_SIZE + lane]*step;
+            // the sums of the warps in a fixed order, the same bits from run to run (float atomics add in the order of arrival)
+            float sa = 0.0f;
+#pragma unroll
+            for (int ww = 0; ww < KVQ_D/WARP_SIZE; ++ww) {
+                sa += s_acc[(ww*N + n)*WARP_SIZE + lane];
+            }
+            const float qt = sa*step;
             a.qtf[((int64_t) tab*N + n)*KVQ_D + c] = qt;
             const float mx = warp_reduce_max(fabsf(qt));
             if (lane == 0) {
@@ -1085,7 +1088,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
     const int w     = tid / WARP_SIZE;
 
     __shared__ float s_y[8][KVQ_D];
-    __shared__ float s_out[8][WARP_SIZE];
+    __shared__ float s_out[KVQ_D/WARP_SIZE][8][WARP_SIZE]; // per warp, summed in a fixed order
 
     const int8_t * inv = a.tinv + t*a.tinv_nb3 + (2*g + 1)*a.tinv_nb2;
     const float * aux = a.taux + t*a.taux_nb3 + (2*g + 1)*a.taux_nb2;
@@ -1103,7 +1106,6 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
         for (int e = tid; e < 8*KVQ_D; e += KVQ_D) {
             s_y[e / KVQ_D][e % KVQ_D] = a.cy[(ic*N + n0)*KVQ_D + e];
         }
-        s_out[w][lane] = 0.0f;
         __syncthreads();
 
         float acc[8] = { 0.0f };
@@ -1116,12 +1118,17 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
         }
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            atomicAdd(&s_out[j][lane], acc[j]);
+            s_out[w][j][lane] = acc[j];
         }
         __syncthreads();
 
         const int n = n0 + w;
-        a.co[(ic*N + n)*KVQ_D + i] = s_out[w][lane] + a.cz[ic*N + n]*aux[KVQ_D + i];
+        float o = 0.0f;
+#pragma unroll
+        for (int ww = 0; ww < KVQ_D/WARP_SIZE; ++ww) {
+            o += s_out[ww][w][lane];
+        }
+        a.co[(ic*N + n)*KVQ_D + i] = o + a.cz[ic*N + n]*aux[KVQ_D + i];
         __syncthreads();
     }
 }
@@ -1345,7 +1352,7 @@ static void kvq_launch(const kvq_args & a, const bool attn, const bool score,
 
     if (a.n_chunk > 0) {
         kvq_set_smem<kvq_prep<N>>();
-        kvq_prep<N><<<dim3(a.n_chunk*a.G, KVQ_D/WARP_SIZE), KVQ_D, (N*KVQ_D + N*WARP_SIZE)*sizeof(float), stream>>>(a, attn);
+        kvq_prep<N><<<dim3(a.n_chunk*a.G, KVQ_D/WARP_SIZE), KVQ_D, (N*KVQ_D + KVQ_D/WARP_SIZE*N*WARP_SIZE)*sizeof(float), stream>>>(a, attn);
 
         const int    ld_st = (a.nrk + (attn ? a.nrv : 0))*KVQ_LDR;
         const size_t smem  = kvq_coarse_smem(N, ld_st, a.L);

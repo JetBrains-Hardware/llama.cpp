@@ -107,7 +107,7 @@ Server, ctx 230000, 100k prompt, MTP with 3 drafts:
 | Generation, first request | 125.9 - 129.6 t/s | 128 - 129 / 122 - 124 t/s | 109 - 112 t/s | 120.5 t/s |
 | Generation, follow-up request | 123.8 - 126.8 t/s | 125.5 - 127.5 / 126.2 t/s | 122.2 t/s | 124.3 t/s |
 
-int8 tables: two sessions (2026-11-16), token ids matched production on every request of both. GPU fitter: two sessions per thread count (2026-11-16); prefill never waited for the fitter (no batch waited for the ring, also with 1 thread). The production numbers are from another day and were not run again, so the gain over production in generation is not established. Generated token ids matched production on every request in three of the four sessions (265, 1500, 300 tokens); in one session the first request diverged at token 211 of 265. The packed decode is not deterministic from run to run, because the coarse region depends on fitter timing.
+int8 tables: two sessions (2026-11-16), token ids matched production on every request of both. GPU fitter: two sessions per thread count (2026-11-16); prefill never waited for the fitter (no batch waited for the ring, also with 1 thread). The production numbers are from another day and were not run again, so the gain over production in generation is not established. Generated token ids matched production on every request in three of the four sessions (265, 1500, 300 tokens); in one session the first request diverged at token 211 of 265 (before the packed path was made deterministic, see Reproducibility).
 
 GPU fitter cost per 8k chunk at 100k (kvq-eval, -ub 2048; device time with `LLAMA_KVQ_FIT_SYNC`, the GPU otherwise idle):
 
@@ -120,13 +120,15 @@ GPU fitter cost per 8k chunk at 100k (kvq-eval, -ub 2048; device time with `LLAM
 
 Against the CPU fitter on the same chunk (chunk 5 of the 100k trace, all 128 tasks): q8_0 rows and K metric identical, V metric max relative difference 2e-6 (o_proj grams on the GPU), means identical, covariance max relative difference 4.1e-6, bits identical, steps 3e-5, 300 of 32768 eigenvectors with a flipped sign, sign-aligned inverse tables max difference 0.4% of the largest entry, codes 0.34% different, 3.0e-5 after the sign alignment, V gains 139 of 524288 differ by one f16 step.
 
-Quality, KL against the q8_0 reference, 471 scored tokens, 1 token per decode:
+Quality, KL against the q8_0 reference (q8_0 cache without rotation, `ref/row*.q8c1`), 471 scored tokens, 1 token per decode. The rows before 2026-11-16 (evening) are single runs of the non-deterministic packed path, each one draw with a spread of about +-2e-5 (see Reproducibility):
 
 | Cache | KL | ms/token |
 |---|---|---|
 | Two-tier, library path, CPU fitter | 1.32e-4 | 16.86 |
 | Two-tier, library path, GPU fitter (5 runs: 4 or 8 threads, 1 thread) | 1.25e-4 - 1.40e-4 | 16.69 - 16.73 |
 | Two-tier, library path, GPU fitter, int8 tables (3 runs) | 1.24e-4 - 1.41e-4 | 16.87 - 16.97 |
+| Two-tier, deterministic packed path, fp16 tables (from a saved state, `--kvq-lib-hold`) | 1.254e-4 | 17.01 - 17.06 (median 16.80) |
+| q8_0, 1 against 4 tokens per decode (both deterministic, only the rounding differs) | 5.1e-5 | |
 | q8_0 with rotation on (two q8_0 configurations against each other) | 1.5e-4 | 17.70 |
 | Two-tier with offline V tables from another conversation | 4.4e-4 | 16.88 |
 | Plain q4_0, rotation on | 1.17e-3 | 24.15 |
@@ -147,9 +149,24 @@ Save and restore at 100k (2026-11-16, measured; the files were read back right a
 | RAM prompt cache entry (with the draft) | 4863 MiB, saved in 0.52 s | not run |
 
 - Restore is exact: a restored state saved again is byte-identical to the file (24k and 100k), and two saves of the same state are identical. Logits of a run continued from a restored state are bit-identical to the run that saved it when the scoring uses ubatches of 64 tokens (scratch attention); this holds also for a rollback to a recurrent checkpoint at 90000 (two coarse chunks dropped and fitted again) after the restore, and for a load into a context with a larger ring (`-b 4096`).
-- With one token per decode (packed attention) two runs are never bit-identical, also two runs from the same restored file: `ggml_kvq_attn` sums with float atomics. Between two identical runs KL is about 4.5e-5 mean, the same as between the saving run and the restored run (24k, 245 positions, top-1 equal at 244). The fit itself is deterministic: two runs wrote identical state files.
+- With one token per decode (packed attention) the logits of a run from a restored state are bit-identical to the run that saved it and to every other load of the file (24k and 100k, since the packed path is deterministic, see Reproducibility). The fit itself is deterministic: two runs wrote identical state files.
 - The wait at the end of the prompt: 0.011 - 0.015 s in the server after a 100k prompt (the last chunk was nearly done), 0.41 - 0.48 s in kvq-eval (-ub 2048). First-request generation 128.9 t/s (two sessions), the same as before the change. A save while a chunk was in flight waited 0.435 s for it.
 - Server sequence: 100k request, trim to the confirmed prefix (`n_predict` 0), slot save, process restart, restore, continuation of 600 + 300 tokens: generated ids equal to the continuation without the restart, 300 of 300, also after a restore into a non-empty slot and after a switch through the RAM prompt cache.
+
+## Reproducibility
+
+Measured 2026-11-16 with kvq-eval from saved states (24k: row310, 245 positions; 100k: row2660, 471 positions; 1 token per decode, `--kvq-lib-hold`).
+
+Before, two loads of the same state never gave the same logits: KL between two runs 5.1e-5 (24k) and 5.7e-5 (100k), max |difference of a log-prob| 5.9 - 9.0 (rare tokens), median over positions 0.2, top-1 different at 0 or 1 position. Two sources, each enough on its own for the whole effect:
+
+1. `ggml_top_k` on CUDA (radix select, 4 rows) writes the rows above the threshold with a global atomic counter, so the order of the selection changes from run to run. The plan assigned the missing rows to the LRU slots in that order, so the row of each resident slot, and with it the order of the sums of the precise attention, changed. The selected set itself was the same.
+2. `ggml_kvq_attn` summed the partials of the 8 warps with shared-memory float atomics in `kvq_prep` (qt, used by SCORE and ATTN) and `kvq_combine` (coarse output). The kernel gave different bits on identical inputs in every repeated call (test-kvq-attn).
+
+Each difference is a rounding, but it grows: after the first token the scores of later layers differ, the top 1024 near the cut change, and from then on 70 - 93% of the selections (per layer, kv head and token) differ between two runs. With only one source left (selection sorted with the atomic sums, or the kernel fixed with the device order) the KL between two runs was still 3.4e-5 - 5.2e-5; with only `kvq_combine` atomic 2.0e-5, the first 16 positions identical.
+
+Fix: the plan sorts the selection by row (radix sort, ties of the MTP union broken by row), the kernel writes the warp partials to shared memory and sums them in a fixed order. Now two loads give bit-identical logits and identical selections and slot maps at 24k and 100k, and the kernel gives the same bits on repeated calls. Cost: kvq-eval 24k median 16.08 - 16.14 against 16.07 - 16.12 ms/token (alternating runs); 100k median 16.80 against 16.70 (mean 17.01 - 17.06 against 16.90), not alternated, so up to 0.1 ms per token (0.6%). Server (100k prompt, MTP 3 drafts, alternating sessions): 125.5 / 127.0 t/s first request and 124.8 / 125.5 follow-up, against 126.5 / 126.9 and 125.3 / 125.6 for the old code; the final build 128.0 and 126.7 t/s in one more session. Generated ids equal in all sessions, old code included. A std::sort instead of the radix sort cost 5% in the server (1.5 ms of plan per verify ubatch).
+
+What this means for the quality numbers: the model itself moves by about the same amount when only the rounding changes. Plain q8_0 with 1 against 4 tokens per decode, both deterministic: KL 3.6e-5 (24k), 5.1e-5 (100k). Against the q8_0 reference the deterministic two-tier path gives 5.09e-5 (24k) and 1.254e-4 (100k); 13 earlier runs at 24k gave 3.6e-5 - 5.7e-5, two at 100k 1.34e-4 and 1.48e-4. So at 24k the loss of the two-tier cache is not distinguishable from rounding noise; at 100k a real loss of about 1e-4 is left, and the earlier spread (1.06e-4 - 1.48e-4) is the run-to-run noise. A deterministic run is still one draw of that rounding: a change in any kernel can move the KL by a few 1e-5, so compare configurations on more traces, not on a single number.
 
 ## Decisions taken, with the reason
 
@@ -188,7 +205,7 @@ Sizes are for ctx 230000 as allocated today.
 - Quality is measured on few traces: the final library path on one 100k trace, earlier stages on four (12k to 100k). Nothing was run at 150k or above, which is the target length. A wider check over more traces and lengths is needed.
 - Speed of the final build was measured only at 100k. Not measured at 24k / 50k and at 150k+.
 - Slot save and restore and the RAM prompt cache work (see Results), checked at 24k and 100k only, not at 150k+ (about 10 GiB per state at 230k, estimated). A kvq state is about 29% larger than the plain one. The launcher must give kvq snapshots their own directory (its snapshot directory hash does not know `--kvq`), plain snapshots cannot be loaded.
-- Output is not reproducible from run to run: the coarse region depends on fitter timing during a prompt, and the packed attention sums with float atomics, so even a fixed coarse region gives slightly different logits (KL about 4.5e-5 between two runs).
+- Reproducibility: the packed path is deterministic from the same state (see Reproducibility). Not covered: a chunk that joins the coarse region during generation (a session that grows past a chunk boundary) joins at a time set by the fitter threads, so the tokens after it can differ from run to run.
 - CUDA only. The attention op and the fit op have a CPU reference and a CUDA kernel, nothing for Metal or Vulkan; the fit mode refuses to start when the device cannot run the fit graphs. The fitter needs about 2 CPU-seconds per 8k chunk (one core is enough at 100k on this GPU, see Results).
 - The fitter's device work runs on the main stream between ubatches. A second stream would hide its ~35 ms per chunk, not built.
 - Host memory: 7.6 GB of pinned RAM at ctx 230000, per sequence.

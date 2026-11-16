@@ -580,6 +580,22 @@ static void test_equivalence(ggml_backend_t cpu, ggml_backend_t gpu) {
                 CHECK(es < tol_s, "%s %s score nmse %e", ec.name, ggml_backend_name(be), es);
                 CHECK(eas < std::max(tol_a, tol_s), "%s %s attn+score nmse %e", ec.name, ggml_backend_name(be), eas);
             }
+
+            // the same inputs give the same bits (no order of float atomics in the result)
+            int n_diff = 0;
+            const int modes[] = { GGML_KVQ_ATTN, GGML_KVQ_SCORE, GGML_KVQ_ATTN | GGML_KVQ_SCORE };
+            for (int mode : modes) {
+                if (mode != GGML_KVQ_ATTN && P.n_coarse == 0) {
+                    continue;
+                }
+                const std::vector<float> r0 = run_kvq(be, P, mode);
+                for (int rep = 0; rep < 8; ++rep) {
+                    const std::vector<float> r = run_kvq(be, P, mode);
+                    n_diff += r.size() != r0.size() || memcmp(r.data(), r0.data(), r0.size()*sizeof(float)) != 0;
+                }
+            }
+            printf(", repeats differ %d", n_diff);
+            CHECK(n_diff == 0, "%s %s: %d repeated calls differ from the first", ec.name, ggml_backend_name(be), n_diff);
             printf("\n");
         }
     }
