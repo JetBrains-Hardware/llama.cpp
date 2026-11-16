@@ -9206,6 +9206,35 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     }
 };
 
+// the mask of a prompt batch at the end of the KV cache: query i is token n_used - nb + i, it sees the keys
+// 0 .. n_used - nb + i; the last PAD rows of K/V are padding. Backends may special-case this mask.
+template <int PAD>
+struct test_flash_attn_ext_causal : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",causal_pad=" + std::to_string(PAD);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        GGML_ASSERT(m != nullptr && m->type == GGML_TYPE_F16 && kv - PAD >= nb);
+        const int64_t n_used = kv - PAD;
+        std::vector<float>       data_f32(ggml_nelements(m));
+        std::vector<ggml_fp16_t> data_f16(ggml_nelements(m));
+        for (int64_t i3 = 0; i3 < m->ne[3]; i3++) {
+            for (int64_t i = 0; i < nb; i++) {
+                for (int64_t j = 0; j < kv; j++) {
+                    data_f32[(i3 * nb + i) * kv + j] = j <= n_used - nb + i ? 0.0f : -INFINITY;
+                }
+            }
+        }
+        ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), (int64_t) data_f32.size());
+        ggml_backend_tensor_set(m, data_f16.data(), 0, data_f16.size() * sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
 struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t hs;
@@ -13317,6 +13346,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+
+    // prompt batch at the end of the cache: bottom right causal mask, with and without padding rows
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext_causal<0>  (256, 256, 4, {6, 1}, 2048, 512, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_causal<100>(256, 256, 4, {6, 1}, 2048, 512, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_causal<0>  (256, 256, 4, {6, 1}, 1024, 1024, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_causal<37> (128, 128, 8, {4, 1}, 1280, 75, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext_causal<255>(64, 64, 16, {1, 1}, 4096, 33, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
