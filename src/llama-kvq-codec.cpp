@@ -9,6 +9,10 @@
 #include <limits>
 #include <thread>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 // step in units of sigma of the MSE-optimal uniform quantizer for a Gaussian, by bits (Max 1960)
 static const float kvq_gauss_step[9] = { 0.0f, 1.596f, 0.9957f, 0.5860f, 0.3352f, 0.1881f, 0.1041f, 0.0569f, 0.0308f };
 
@@ -37,25 +41,121 @@ static void kvq_parallel_for(int64_t n, int n_threads, const F & f) {
     }
 }
 
-// c[n_rows*m] = a[n_rows*k] b[k*m]
-static void kvq_matmul(const float * a, int64_t n_rows, int32_t k, const float * b, int32_t m, float * c, int n_threads) {
-    kvq_parallel_for(n_rows, n_threads, [&](int, int64_t r0, int64_t r1) {
-        for (int64_t r = r0; r < r1; r++) {
-            const float * ar = a + r*k;
-            float       * cr = c + r*m;
-            std::fill(cr, cr + m, 0.0f);
-            for (int32_t i = 0; i < k; i++) {
-                const float v = ar[i];
-                if (v == 0.0f) {
-                    continue;
+// rows [r0, r1) of c[n_rows*m] = a[n_rows*k] b[k*m]
+// plain arguments, not lambda captures: the compiler cannot vectorize through captured references
+static void kvq_matmul_rows(const float * a, int64_t r0, int64_t r1, int32_t k, const float * b, int32_t m, float * c) {
+    int64_t r = r0;
+#if defined(__AVX2__)
+    // 4 rows x 32 columns in registers, the same sums in the same order (mul, then add)
+    if (m % 32 == 0) {
+        for (; r + 4 <= r1; r += 4) {
+            for (int32_t j0 = 0; j0 < m; j0 += 32) {
+                __m256 acc[4][4];
+                for (int q = 0; q < 4; q++) {
+                    for (int u = 0; u < 4; u++) {
+                        acc[q][u] = _mm256_setzero_ps();
+                    }
                 }
-                const float * bi = b + (int64_t) i*m;
-                for (int32_t j = 0; j < m; j++) {
-                    cr[j] += v*bi[j];
+                for (int32_t i = 0; i < k; i++) {
+                    const float * bi = b + (int64_t) i*m + j0;
+                    const __m256 b0 = _mm256_loadu_ps(bi);
+                    const __m256 b1 = _mm256_loadu_ps(bi + 8);
+                    const __m256 b2 = _mm256_loadu_ps(bi + 16);
+                    const __m256 b3 = _mm256_loadu_ps(bi + 24);
+                    for (int q = 0; q < 4; q++) {
+                        const __m256 v = _mm256_broadcast_ss(a + (r + q)*k + i);
+                        acc[q][0] = _mm256_add_ps(acc[q][0], _mm256_mul_ps(v, b0));
+                        acc[q][1] = _mm256_add_ps(acc[q][1], _mm256_mul_ps(v, b1));
+                        acc[q][2] = _mm256_add_ps(acc[q][2], _mm256_mul_ps(v, b2));
+                        acc[q][3] = _mm256_add_ps(acc[q][3], _mm256_mul_ps(v, b3));
+                    }
+                }
+                for (int q = 0; q < 4; q++) {
+                    float * cr = c + (r + q)*m + j0;
+                    for (int u = 0; u < 4; u++) {
+                        _mm256_storeu_ps(cr + 8*u, acc[q][u]);
+                    }
                 }
             }
         }
+    }
+#endif
+    for (; r < r1; r++) {
+        const float * ar = a + r*k;
+        float       * cr = c + r*m;
+        std::fill(cr, cr + m, 0.0f);
+        for (int32_t i = 0; i < k; i++) {
+            const float v = ar[i];
+            if (v == 0.0f) {
+                continue;
+            }
+            const float * bi = b + (int64_t) i*m;
+            for (int32_t j = 0; j < m; j++) {
+                cr[j] += v*bi[j];
+            }
+        }
+    }
+}
+
+// c[n_rows*m] = a[n_rows*k] b[k*m]
+static void kvq_matmul(const float * a, int64_t n_rows, int32_t k, const float * b, int32_t m, float * c, int n_threads) {
+    kvq_parallel_for(n_rows, n_threads, [&](int, int64_t r0, int64_t r1) {
+        kvq_matmul_rows(a, r0, r1, k, b, m, c);
     });
+}
+
+// part[i*n + j], j >= i, = sum over the rows [r0, r1) of x[r][i] x[r][j] in float, in row order (the lower triangle is undefined)
+static void kvq_gram_block(const float * x, int64_t r0, int64_t r1, int32_t n, int64_t stride, float * part) {
+#if defined(__AVX2__)
+    // 4 x 32 tiles in registers, the same sums in the same order (mul, then add)
+    if (n % 32 == 0) {
+        for (int32_t i0 = 0; i0 < n; i0 += 4) {
+            for (int32_t j0 = (i0/32)*32; j0 < n; j0 += 32) {
+                __m256 acc[4][4];
+                for (int q = 0; q < 4; q++) {
+                    for (int u = 0; u < 4; u++) {
+                        acc[q][u] = _mm256_setzero_ps();
+                    }
+                }
+                for (int64_t r = r0; r < r1; r++) {
+                    const float * xr = x + r*stride;
+                    const __m256 y0 = _mm256_loadu_ps(xr + j0);
+                    const __m256 y1 = _mm256_loadu_ps(xr + j0 + 8);
+                    const __m256 y2 = _mm256_loadu_ps(xr + j0 + 16);
+                    const __m256 y3 = _mm256_loadu_ps(xr + j0 + 24);
+                    for (int q = 0; q < 4; q++) {
+                        const __m256 v = _mm256_broadcast_ss(xr + i0 + q);
+                        acc[q][0] = _mm256_add_ps(acc[q][0], _mm256_mul_ps(v, y0));
+                        acc[q][1] = _mm256_add_ps(acc[q][1], _mm256_mul_ps(v, y1));
+                        acc[q][2] = _mm256_add_ps(acc[q][2], _mm256_mul_ps(v, y2));
+                        acc[q][3] = _mm256_add_ps(acc[q][3], _mm256_mul_ps(v, y3));
+                    }
+                }
+                for (int q = 0; q < 4; q++) {
+                    float * pi = part + (size_t) (i0 + q)*n + j0;
+                    for (int u = 0; u < 4; u++) {
+                        _mm256_storeu_ps(pi + 8*u, acc[q][u]);
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
+    std::fill(part, part + (size_t) n*n, 0.0f);
+    for (int64_t r = r0; r < r1; r++) {
+        const float * xr = x + r*stride;
+        for (int32_t i = 0; i < n; i++) {
+            const float v = xr[i];
+            if (v == 0.0f) {
+                continue;
+            }
+            float * pi = part + (size_t) i*n;
+            for (int32_t j = i; j < n; j++) {
+                pi[j] += v*xr[j];
+            }
+        }
+    }
 }
 
 void llama_kvq_gram(const float * x, int64_t n_rows, int32_t n, int64_t stride, double * out, int n_threads) {
@@ -70,23 +170,11 @@ void llama_kvq_gram(const float * x, int64_t n_rows, int32_t n, int64_t stride, 
         ad.assign(nn, 0.0);
         std::vector<float> part(nn);
         for (int64_t b = b0; b < b1; b++) {
-            std::fill(part.begin(), part.end(), 0.0f);
-            const int64_t r1 = std::min(n_rows, (b + 1)*blk);
-            for (int64_t r = b*blk; r < r1; r++) {
-                const float * xr = x + r*stride;
-                for (int32_t i = 0; i < n; i++) {
-                    const float v = xr[i];
-                    if (v == 0.0f) {
-                        continue;
-                    }
-                    float * pi = part.data() + (size_t) i*n;
-                    for (int32_t j = i; j < n; j++) {
-                        pi[j] += v*xr[j];
-                    }
+            kvq_gram_block(x, b*blk, std::min(n_rows, (b + 1)*blk), n, stride, part.data());
+            for (int32_t i = 0; i < n; i++) {
+                for (int32_t j = i; j < n; j++) {
+                    ad[(size_t) i*n + j] += part[(size_t) i*n + j];
                 }
-            }
-            for (size_t i = 0; i < nn; i++) {
-                ad[i] += part[i];
             }
         }
     });
@@ -112,7 +200,14 @@ bool llama_kvq_eigh(int32_t n, std::vector<double> & a, std::vector<double> & w)
     if (n <= 0 || a.size() != (size_t) n*n) {
         return false;
     }
-    auto V = [&](int i, int j) -> double & { return a[(size_t) i*n + j]; };
+    // tred2 runs on the transpose, so that its inner loops over k read contiguous memory; it reads the lower triangle of V,
+    // which is the upper triangle of a: mirror the lower one there, then the arithmetic is that of the plain layout
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < i; j++) {
+            a[(size_t) j*n + i] = a[(size_t) i*n + j];
+        }
+    }
+    auto V = [&](int i, int j) -> double & { return a[(size_t) j*n + i]; };
 
     std::vector<double> & d = w;
     std::vector<double> e(n, 0.0);
@@ -213,13 +308,8 @@ bool llama_kvq_eigh(int32_t n, std::vector<double> & a, std::vector<double> & w)
     V(n - 1, n - 1) = 1.0;
     e[0] = 0.0;
 
-    // tql2 works on the transpose, so that the rotations read contiguous rows
+    // tql2 works on the transpose too, so that the rotations read contiguous rows
     auto T = [&](int i, int j) -> double & { return a[(size_t) j*n + i]; };
-    for (int i = 0; i < n; i++) {
-        for (int j = i + 1; j < n; j++) {
-            std::swap(a[(size_t) i*n + j], a[(size_t) j*n + i]);
-        }
-    }
 
     // tql2
     for (int i = 1; i < n; i++) {
@@ -520,22 +610,36 @@ static bool kvq_fit_impl(llama_kvq_table & t, const float * x, int64_t n_tok, in
     const std::vector<double> linv = kvq_lower_inverse(n, l);
     t.fwd.assign(nn, 0.0f);
     t.inv.assign(nn, 0.0f);
-    for (int i = 0; i < n; i++) {
-        for (int c = 0; c < n; c++) {
-            double vf = 0.0;
+    // the sums run over k in increasing order as in a plain dot product, the loops over the output are inside
+    {
+        std::vector<double> acc(n);
+        for (int i = 0; i < n; i++) {
+            std::fill(acc.begin(), acc.end(), 0.0);
             for (int k = 0; k <= i; k++) {
-                vf += l[(size_t) i*n + k]*u[(size_t) k*n + c];
+                const double v = l[(size_t) i*n + k];
+                const double * uk = u.data() + (size_t) k*n;
+                double * pa = acc.data();
+                for (int c = 0; c < n; c++) {
+                    pa[c] += v*uk[c];
+                }
             }
-            t.fwd[(size_t) i*n + c] = (float) vf;
+            for (int c = 0; c < n; c++) {
+                t.fwd[(size_t) i*n + c] = (float) acc[c];
+            }
         }
-    }
-    for (int c = 0; c < n; c++) {
-        for (int j = 0; j < n; j++) {
-            double vi = 0.0;
-            for (int k = j; k < n; k++) {
-                vi += u[(size_t) k*n + c]*linv[(size_t) k*n + j];
+        for (int c = 0; c < n; c++) {
+            std::fill(acc.begin(), acc.end(), 0.0);
+            for (int k = 0; k < n; k++) {
+                const double v = u[(size_t) k*n + c];
+                const double * lk = linv.data() + (size_t) k*n;
+                double * pa = acc.data();
+                for (int j = 0; j <= k; j++) {
+                    pa[j] += v*lk[j];
+                }
             }
-            t.inv[(size_t) c*n + j] = (float) vi;
+            for (int j = 0; j < n; j++) {
+                t.inv[(size_t) c*n + j] = (float) acc[j];
+            }
         }
     }
 
@@ -636,14 +740,21 @@ void llama_kvq_encode(const llama_kvq_table & t, const float * x, int64_t n_tok,
     GGML_ASSERT(!t.is_v || gain != nullptr);
 
     kvq_parallel_for(n_tok, n_threads, [&](int, int64_t r0, int64_t r1) {
-        std::vector<float> xc(n);
-        std::vector<float> y(n);
-        for (int64_t r = r0; r < r1; r++) {
-            for (int i = 0; i < n; i++) {
-                xc[i] = x[r*n + i] - t.mu[i];
+        // blocks of rows for the matrix product
+        const int64_t blk = 64;
+        std::vector<float> xc(blk*n);
+        std::vector<float> y(blk*n);
+        for (int64_t b0 = r0; b0 < r1; b0 += blk) {
+            const int64_t nb = std::min(blk, r1 - b0);
+            for (int64_t r = 0; r < nb; r++) {
+                for (int i = 0; i < n; i++) {
+                    xc[r*n + i] = x[(b0 + r)*n + i] - t.mu[i];
+                }
             }
-            kvq_matmul(xc.data(), 1, n, t.fwd.data(), n, y.data(), 1);
-            kvq_code_row(t, y.data(), codes + r*n, gain ? gain + r : nullptr);
+            kvq_matmul_rows(xc.data(), 0, nb, n, t.fwd.data(), n, y.data());
+            for (int64_t r = 0; r < nb; r++) {
+                kvq_code_row(t, y.data() + r*n, codes + (b0 + r)*n, gain ? gain + b0 + r : nullptr);
+            }
         }
     });
 }
