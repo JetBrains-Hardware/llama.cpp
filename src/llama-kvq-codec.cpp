@@ -524,9 +524,7 @@ static std::vector<double> kvq_lower_inverse(int n, const std::vector<double> & 
     return r;
 }
 
-// y_out: V only, the transformed rows (x - mu) fwd
-static bool kvq_fit_impl(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v,
-        std::vector<float> * y_out, int n_threads) {
+bool llama_kvq_fit_cov(llama_kvq_table & t, const float * mu, const double * cov, int64_t n_tok, int32_t n, const double * metric, bool is_v) {
     if (n_tok < 1 || n < 1) {
         return false;
     }
@@ -547,30 +545,7 @@ static bool kvq_fit_impl(llama_kvq_table & t, const float * x, int64_t n_tok, in
 
     t.n    = n;
     t.is_v = is_v;
-    t.mu.assign(n, 0.0f);
-    {
-        std::vector<double> mu(n, 0.0);
-        for (int64_t r = 0; r < n_tok; r++) {
-            for (int i = 0; i < n; i++) {
-                mu[i] += x[r*n + i];
-            }
-        }
-        for (int i = 0; i < n; i++) {
-            t.mu[i] = (float) (mu[i]/n_tok);
-        }
-    }
-
-    std::vector<float> xc((size_t) n_tok*n);
-    kvq_parallel_for(n_tok, n_threads, [&](int, int64_t r0, int64_t r1) {
-        for (int64_t r = r0; r < r1; r++) {
-            for (int i = 0; i < n; i++) {
-                xc[r*n + i] = x[r*n + i] - t.mu[i];
-            }
-        }
-    });
-
-    std::vector<double> cov(nn, 0.0);
-    llama_kvq_gram(xc.data(), n_tok, n, n, cov.data(), n_threads);
+    t.mu.assign(mu, mu + n);
 
     // S = L^T cov L / n_tok
     std::vector<double> tmp(nn, 0.0);
@@ -655,7 +630,62 @@ static bool kvq_fit_impl(llama_kvq_table & t, const float * x, int64_t n_tok, in
             den += (double) t.sigma[c]*t.sigma[c];
         }
         t.gain_den = (float) den;
+    }
 
+    return true;
+}
+
+void llama_kvq_fit_bits(llama_kvq_table & t, float avg_bits) {
+    const int n = t.n;
+    std::vector<double> var(n);
+    for (int c = 0; c < n; c++) {
+        var[c] = (double) t.sigma[c]*t.sigma[c];
+    }
+    t.bits = llama_kvq_alloc_bits(var, avg_bits);
+    t.step.resize(n);
+    for (int c = 0; c < n; c++) {
+        t.step[c] = kvq_gauss_step[t.bits[c]]*t.sigma[c];
+    }
+}
+
+// y_out: V only, the transformed rows (x - mu) fwd
+static bool kvq_fit_impl(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v,
+        std::vector<float> * y_out, int n_threads) {
+    if (n_tok < 1 || n < 1) {
+        return false;
+    }
+    const size_t nn = (size_t) n*n;
+
+    std::vector<float> mu(n);
+    {
+        std::vector<double> s(n, 0.0);
+        for (int64_t r = 0; r < n_tok; r++) {
+            for (int i = 0; i < n; i++) {
+                s[i] += x[r*n + i];
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            mu[i] = (float) (s[i]/n_tok);
+        }
+    }
+
+    std::vector<float> xc((size_t) n_tok*n);
+    kvq_parallel_for(n_tok, n_threads, [&](int, int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; r++) {
+            for (int i = 0; i < n; i++) {
+                xc[r*n + i] = x[r*n + i] - mu[i];
+            }
+        }
+    });
+
+    std::vector<double> cov(nn, 0.0);
+    llama_kvq_gram(xc.data(), n_tok, n, n, cov.data(), n_threads);
+
+    if (!llama_kvq_fit_cov(t, mu.data(), cov.data(), n_tok, n, metric, is_v)) {
+        return false;
+    }
+
+    if (is_v) {
         std::vector<float> y_tmp;
         std::vector<float> & y = y_out ? *y_out : y_tmp;
         y.resize((size_t) n_tok*n);
@@ -690,15 +720,7 @@ static bool kvq_fit_impl(llama_kvq_table & t, const float * x, int64_t n_tok, in
         }
     }
 
-    std::vector<double> var(n);
-    for (int c = 0; c < n; c++) {
-        var[c] = (double) t.sigma[c]*t.sigma[c];
-    }
-    t.bits = llama_kvq_alloc_bits(var, avg_bits);
-    t.step.resize(n);
-    for (int c = 0; c < n; c++) {
-        t.step[c] = kvq_gauss_step[t.bits[c]]*t.sigma[c];
-    }
+    llama_kvq_fit_bits(t, avg_bits);
 
     return true;
 }

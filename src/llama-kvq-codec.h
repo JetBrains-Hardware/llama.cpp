@@ -41,6 +41,13 @@ LLAMA_API std::vector<uint8_t> llama_kvq_alloc_bits(const std::vector<double> & 
 // fit a table on x[n_tok*n] with error metric[n*n]
 LLAMA_API bool llama_kvq_fit(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v, int n_threads);
 
+// the fit from the moments of the rows: mu [n] the mean of the n_tok rows, cov [n*n] the sum over the rows of (x - mu)(x - mu)^T
+// sets all but bits and step; V: sigma is the scale of y before the gain split, the shape scale replaces it before llama_kvq_fit_bits
+LLAMA_API bool llama_kvq_fit_cov(llama_kvq_table & t, const float * mu, const double * cov, int64_t n_tok, int32_t n, const double * metric, bool is_v);
+
+// bits (reverse water-filling of sigma^2) and step from sigma
+LLAMA_API void llama_kvq_fit_bits(llama_kvq_table & t, float avg_bits);
+
 // llama_kvq_fit, then llama_kvq_encode of the same rows (V: the fit's transformed rows are used again)
 LLAMA_API bool llama_kvq_fit_encode(llama_kvq_table & t, const float * x, int64_t n_tok, int32_t n, const double * metric, float avg_bits, bool is_v,
         int8_t * codes, float * gain, int n_threads);

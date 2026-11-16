@@ -699,18 +699,18 @@ void llama_kvq_store::synchronize() {
     }
 }
 
-void llama_kvq_store::set_chunk_rows(int32_t il, int32_t g, bool is_v, int32_t c, const int32_t * rows) {
+void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const ggml_fp16_t * inv, const float * aux, bool async) {
     GGML_ASSERT(!filled && c >= 0 && c < n_chunk && (int64_t) c*n_crow >= n_coarse_ && g >= 0 && g < G);
-    ggml_tensor * dst = is_v ? get_layer(il).vc : get_layer(il).kc;
-    ggml_backend_tensor_set(dst, rows, g*dst->nb[2] + (size_t) c*n_crow*dst->nb[1], (size_t) n_crow*dst->nb[1]);
-}
-
-void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const ggml_fp16_t * inv, const float * aux) {
-    GGML_ASSERT(!filled && c >= 0 && c < n_chunk && (int64_t) c*n_crow >= n_coarse_ && g >= 0 && g < G);
+    GGML_ASSERT(!async || backend_main);
     const layer_tensors & t = get_layer(il);
     const int64_t m = (int64_t) c*2*G + 2*g + (is_v ? 1 : 0);
-    ggml_backend_tensor_set(t.tinv, inv, m*t.tinv->nb[2], t.tinv->nb[2]);
-    ggml_backend_tensor_set(t.taux, aux, m*t.taux->nb[2], t.taux->nb[2]);
+    if (async) {
+        ggml_backend_tensor_set_async(backend_main, t.tinv, inv, m*t.tinv->nb[2], t.tinv->nb[2]);
+        ggml_backend_tensor_set_async(backend_main, t.taux, aux, m*t.taux->nb[2], t.taux->nb[2]);
+    } else {
+        ggml_backend_tensor_set(t.tinv, inv, m*t.tinv->nb[2], t.tinv->nb[2]);
+        ggml_backend_tensor_set(t.taux, aux, m*t.taux->nb[2], t.taux->nb[2]);
+    }
 }
 
 void llama_kvq_store::set_n_coarse(int32_t n) {

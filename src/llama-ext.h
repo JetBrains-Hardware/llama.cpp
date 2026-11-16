@@ -261,11 +261,12 @@ LLAMA_API bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_me
 //   the graph sums q q^T of the queries (after q_norm and RoPE) per (attention layer, kv head) on the device;
 //   a ubatch counts for the chunk of its first position
 //   when the positions [c*chunk, (c+1)*chunk) are in the cache, the decode thread reads the sums; max(64, max_batch) positions later
-//   (a draft rollback does not reach the chunk) it reads the rows of the chunk and starts a job on CPU threads:
+//   (a draft rollback does not reach the chunk) it starts a job, see llama_kvq_fitter: the work on the rows runs on the device
+//   between the ubatches, the fit of the tables from the moments of the rows on a few CPU threads:
 //   K table fitted on the chunk's rows with the metric of the chunk's queries, V table fitted on the chunk's rows with the o_proj
 //   columns scaled by the chunk's mean sigmoid(gate) (also summed on the device), or one offline V table set for every chunk;
-//   K and V rows coded, packed, and the q8_0 rows copied to the host store
-//   a finished chunk joins the coarse region on the decode thread before the next ubatch (the chunks in order)
+//   K and V rows coded and packed on the device, and the q8_0 rows copied to the host store
+//   a finished chunk joins the coarse region on the decode thread before a later ubatch (the chunks in order)
 //   the positions after the coarse region attend precisely (the q8_0 cache)
 //   tail (llama_model_set_kvq_tail): the positions of a chunk leave the ring when it joins; a batch that does not fit the ring
 //   waits for the fitter in llama_decode, an error if no job can free the room
@@ -277,7 +278,7 @@ struct llama_kvq_fit_params {
     int32_t     bits_k    = 2;
     int32_t     bits_v    = 1;
     std::string v_tables;      // empty: V fitted per chunk; else llama_kvq_save file with a V table for each (attention layer, kv head), used for every chunk
-    int32_t     n_threads = 8; // CPU threads of the jobs, the chunks are fitted in order
+    int32_t     n_threads = 4; // CPU threads of the fit of the tables (about 2 CPU seconds per chunk of 8192)
 };
 
 // the memory must be empty and created in packed mode; params as for llama_memory_kvq_set_params (packed = true)
@@ -292,11 +293,12 @@ struct llama_kvq_fit_progress {
     int32_t n_cancel  = 0; // jobs cancelled by seq_rm or clear
     int32_t n_drop    = 0; // chunks removed from the coarse region by seq_rm or clear
     bool    failed    = false; // a job failed, no more chunks join the coarse region
-    std::vector<double> t_job;  // seconds per job that joined the coarse region: from the start of the job to its end
-    std::vector<double> t_wall; // seconds per job that joined: from the readback of the statistics to its end (with the queue)
+    std::vector<double> t_job;  // seconds per job that joined the coarse region: from the start of the job to the join
+    std::vector<double> t_wall; // seconds per job that joined: from the readback of the statistics to the join (with the margin)
     double  t_cpu     = 0.0;    // CPU seconds of the tasks of these jobs
-    double  t_take    = 0.0;    // decode thread seconds of the readbacks of the statistics (with the wait for the queued ubatches)
-    double  t_install = 0.0;    // decode thread seconds of the installs
+    double  t_take    = 0.0;    // decode thread seconds of the readbacks of the statistics (with the wait for the queued ubatches) and of phase 1
+    double  t_install = 0.0;    // decode thread seconds of the later phases and of the joins
+    double  t_dev     = 0.0;    // LLAMA_KVQ_FIT_SYNC only: seconds of the device phases of these jobs, synchronized
     int32_t n_tail_wait = 0;    // tail mode: batches that waited for the fitter before they fit the ring
     double  t_tail_wait = 0.0;  // decode thread seconds of these waits
 };

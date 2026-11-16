@@ -1409,7 +1409,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.kvq.enabled) {
         llama_kvq_fit_params fp;
         fp.v_tables  = params.kvq.v_tables;
-        fp.n_threads = params.kvq.n_threads > 0 ? params.kvq.n_threads : common_cpu_get_num_math();
+        fp.n_threads = params.kvq.n_threads > 0 ? params.kvq.n_threads : std::min(4, common_cpu_get_num_math());
 
         llama_kvq_params kp;
         kp.enabled      = true;

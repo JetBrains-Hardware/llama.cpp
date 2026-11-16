@@ -11884,6 +11884,140 @@ void ggml_compute_forward_kvq_attn(
     }
 }
 
+// ggml_compute_forward_kvq_fit
+
+// V gain of a row (llama-kvq-codec.cpp), 1 for K (den == 0)
+static float kvq_fit_gain(const float * y, int64_t D, float den) {
+    if (den == 0.0f) {
+        return 1.0f;
+    }
+    double ss = 0.0;
+    for (int64_t c = 0; c < D; c++) {
+        ss += (double) y[c]*y[c];
+    }
+    return (float) sqrt(ss/den) + 1e-8f;
+}
+
+// reference implementation, the arithmetic of the CPU codec
+void ggml_compute_forward_kvq_fit(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * par  = dst->src[1];
+    const ggml_tensor * rows = dst->src[2];
+
+    const int32_t mode = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t D = x->ne[0];
+    const int64_t n = x->ne[1];
+    const int64_t B = x->ne[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    auto xrow = [&](int64_t b, int64_t r) { return (const float *) ((const char *) x->data + b*x->nb[2] + r*x->nb[1]); };
+    auto prow = [&](int64_t b, int64_t j) { return (const float *) ((const char *) par->data + b*par->nb[2] + j*par->nb[1]); };
+
+    // per column (MEAN, COV, GAIN) or per row (ROT, CODE) of each task
+    const bool    per_col = mode == GGML_KVQ_FIT_MEAN || mode == GGML_KVQ_FIT_COV || mode == GGML_KVQ_FIT_GAIN;
+    const int64_t n_item  = B*(per_col ? D : n);
+    const int64_t dr      = (n_item + nth - 1)/nth;
+    const int64_t i0      = dr*ith;
+    const int64_t i1      = MIN(i0 + dr, n_item);
+
+    std::vector<float> g;
+    int64_t g_task = -1;
+
+    for (int64_t it = i0; it < i1; it++) {
+        const int64_t b = per_col ? it/D : it/n;
+        const int64_t j = per_col ? it%D : it%n;
+        switch (mode) {
+            case GGML_KVQ_FIT_MEAN: {
+                double s = 0.0;
+                for (int64_t r = 0; r < n; r++) {
+                    s += xrow(b, r)[j];
+                }
+                ((float *) ((char *) dst->data + b*dst->nb[2]))[j] = (float) (s/n);
+            } break;
+            case GGML_KVQ_FIT_COV: {
+                float * out = (float *) ((char *) dst->data + b*dst->nb[2] + j*dst->nb[1]);
+                for (int64_t i = 0; i < D; i++) {
+                    out[i] = 0.0f;
+                }
+                for (int64_t r = 0; r < n; r++) {
+                    const float * xr = xrow(b, r);
+                    for (int64_t i = 0; i < D; i++) {
+                        out[i] += xr[j]*xr[i];
+                    }
+                }
+            } break;
+            case GGML_KVQ_FIT_ROT: {
+                const float * xr  = xrow(b, j);
+                float       * out = (float *) ((char *) dst->data + b*dst->nb[2] + j*dst->nb[1]);
+                for (int64_t c = 0; c < D; c++) {
+                    out[c] = 0.0f;
+                }
+                for (int64_t i = 0; i < D; i++) {
+                    const float * fi = prow(b, i);
+                    for (int64_t c = 0; c < D; c++) {
+                        out[c] += xr[i]*fi[c];
+                    }
+                }
+            } break;
+            case GGML_KVQ_FIT_GAIN: {
+                const float den = prow(b, 3)[0];
+                if (g_task != b) {
+                    g.resize(n);
+                    for (int64_t r = 0; r < n; r++) {
+                        g[r] = kvq_fit_gain(xrow(b, r), D, den);
+                    }
+                    g_task = b;
+                }
+                double a = 0.0;
+                for (int64_t r = 0; r < n; r++) {
+                    const float v = xrow(b, r)[j]/g[r];
+                    a += (double) v*v;
+                }
+                ((float *) ((char *) dst->data + b*dst->nb[2]))[j] = (float) sqrt(a/n);
+            } break;
+            case GGML_KVQ_FIT_CODE: {
+                const float * step = prow(b, 0);
+                const float * bits = prow(b, 1);
+                const float * offs = prow(b, 2);
+                const float   den  = prow(b, 3)[0];
+                const int64_t nw   = rows->ne[0];
+                const float * yr   = xrow(b, j);
+                uint32_t    * row  = (uint32_t *) ((char *) dst->data + b*dst->nb[2] + j*dst->nb[1]);
+                const float   gr   = kvq_fit_gain(yr, D, den);
+                for (int64_t w = 0; w < nw; w++) {
+                    row[w] = 0;
+                }
+                for (int64_t c = 0; c < D; c++) {
+                    const int nb = (int) bits[c];
+                    if (nb == 0) {
+                        continue;
+                    }
+                    const float   half = (float) (1 << (nb - 1));
+                    const float   v    = den != 0.0f ? yr[c]/gr : yr[c];
+                    const float   q    = floorf(v/step[c]);
+                    const int32_t code = (int32_t) MIN(MAX(q, -half), half - 1.0f);
+                    const uint32_t u   = (uint32_t) (code + (1 << (nb - 1))) & ((1u << nb) - 1);
+                    const int32_t  o   = (int32_t) offs[c];
+                    row[o/32] |= u << (o % 32);
+                    if (o % 32 + nb > 32) {
+                        row[o/32 + 1] |= u >> (32 - o % 32);
+                    }
+                }
+                if (den != 0.0f) {
+                    row[nw - 1] = GGML_CPU_FP32_TO_FP16(gr);
+                }
+            } break;
+            default:
+                GGML_ABORT("unknown kvq_fit mode %d", mode);
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

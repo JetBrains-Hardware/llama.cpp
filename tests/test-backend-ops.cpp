@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -10068,6 +10069,113 @@ struct test_kvq_attn : public test_case {
     }
 };
 
+// GGML_OP_KVQ_FIT
+struct test_kvq_fit : public test_case {
+    const int     mode;
+    const int64_t n;    // rows per task
+    const int64_t B;    // tasks
+    const int64_t nw;   // CODE: words of a packed row (with the gain word for V)
+    const bool    is_v; // CODE, GAIN: V (gain split)
+    const int64_t D = 256;
+
+    std::string vars() override {
+        return VARS_TO_STR5(mode, n, B, nw, is_v);
+    }
+
+    // COV, ROT: f32 sums in another order; the other modes give the same values
+    double max_nmse_err() override {
+        return 1e-9;
+    }
+
+    test_kvq_fit(int mode = GGML_KVQ_FIT_MEAN, int64_t n = 300, int64_t B = 4, int64_t nw = 16, bool is_v = false)
+        : mode(mode), n(n), B(B), nw(nw), is_v(is_v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n, B);
+        ggml_set_name(x, "x");
+
+        // the fitter's layout: fwd, mu, step, bits, offsets, den per task
+        ggml_tensor * par_all = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, D + 5, B);
+        ggml_set_name(par_all, "par");
+        ggml_tensor * par = nullptr;
+        if (mode == GGML_KVQ_FIT_ROT) {
+            par = ggml_view_3d(ctx, par_all, D, D, B, par_all->nb[1], par_all->nb[2], 0);
+        } else if (mode == GGML_KVQ_FIT_GAIN || mode == GGML_KVQ_FIT_CODE) {
+            par = ggml_view_3d(ctx, par_all, D, 4, B, par_all->nb[1], par_all->nb[2], (D + 1)*par_all->nb[1]);
+        }
+
+        // CODE: the rows of a chunk in a larger code tensor
+        ggml_tensor * rows = nullptr;
+        if (mode == GGML_KVQ_FIT_CODE) {
+            ggml_tensor * rows_all = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, nw, 2*n, B);
+            ggml_set_name(rows_all, "rows");
+            rows = ggml_view_3d(ctx, rows_all, nw, n, B, rows_all->nb[1], rows_all->nb[2], n*rows_all->nb[1]);
+        }
+
+        ggml_tensor * out = ggml_kvq_fit(ctx, mode, x, par, rows);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x4B57);
+        std::uniform_int_distribution<uint32_t> ud;
+        std::uniform_real_distribution<float>   uf(-1.0f, 1.0f);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "par") == 0) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                const int64_t nb_code = 32*(nw - (is_v ? 1 : 0));
+                for (int64_t b = 0; b < B; ++b) {
+                    float * p = data.data() + b*D*(D + 5);
+                    for (int64_t j = 0; j < D*D; ++j) {
+                        p[j] = uf(gen)/16.0f;
+                    }
+                    // bits in 0..8 summing to at most nb_code, packed in a random order of the components
+                    std::vector<int> bits(D, 0);
+                    int64_t left = nb_code - ud(gen) % 8;
+                    bits[0] = 8;
+                    left -= 8;
+                    while (left > 0) {
+                        const int64_t c = 1 + ud(gen) % (D - 1);
+                        if (bits[c] < 8) {
+                            bits[c]++;
+                            left--;
+                        }
+                    }
+                    std::shuffle(bits.begin(), bits.end(), gen);
+                    std::vector<int> order(D);
+                    std::iota(order.begin(), order.end(), 0);
+                    std::shuffle(order.begin(), order.end(), gen);
+                    std::vector<int> offs(D, 0);
+                    int o = 0;
+                    for (int c : order) {
+                        offs[c] = o;
+                        o += bits[c];
+                    }
+                    for (int64_t c = 0; c < D; ++c) {
+                        // steps so that the codes reach the clamp now and then
+                        p[(D + 1)*D + c] = bits[c] ? (0.6f + 0.4f*uf(gen))*2.0f/(float) (1 << bits[c]) : 0.0f;
+                        p[(D + 2)*D + c] = (float) bits[c];
+                        p[(D + 3)*D + c] = (float) offs[c];
+                    }
+                    p[(D + 4)*D] = is_v ? D/3.0f : 0.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "rows") == 0) {
+                std::vector<uint32_t> data(ggml_nelements(t));
+                for (auto & w : data) {
+                    w = ud(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -10908,6 +11016,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int run : {0, 1}) {
         test_cases.emplace_back(new test_kvq_attn(2, 512, 100, 4, 256, 100, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, GGML_KVQ_ATTN | GGML_KVQ_COND, run));
     }
+
+    // fit steps of the two-tier cache: mode, rows, tasks, words, V; K2 (16 words) and V1 (8 + 1 words) as the fitter
+    for (int mode : {(int) GGML_KVQ_FIT_MEAN, (int) GGML_KVQ_FIT_COV, (int) GGML_KVQ_FIT_ROT}) {
+        test_cases.emplace_back(new test_kvq_fit(mode, 300, 4));
+        test_cases.emplace_back(new test_kvq_fit(mode, 8192, 4));
+    }
+    for (bool is_v : {false, true}) {
+        test_cases.emplace_back(new test_kvq_fit(GGML_KVQ_FIT_CODE, 300, 4, is_v ? 9 : 16, is_v));
+        test_cases.emplace_back(new test_kvq_fit(GGML_KVQ_FIT_CODE, 8192, 4, is_v ? 9 : 16, is_v));
+        test_cases.emplace_back(new test_kvq_fit(GGML_KVQ_FIT_CODE, 77, 2, is_v ? 33 : 32, is_v)); // 8 bits per value, a partial block
+    }
+    test_cases.emplace_back(new test_kvq_fit(GGML_KVQ_FIT_GAIN, 300, 4, 9, true));
+    test_cases.emplace_back(new test_kvq_fit(GGML_KVQ_FIT_GAIN, 8192, 4, 9, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

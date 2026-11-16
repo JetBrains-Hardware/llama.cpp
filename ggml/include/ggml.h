@@ -414,6 +414,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
         GGML_OP_KVQ_ATTN,
+        GGML_OP_KVQ_FIT,
 
         GGML_OP_UNARY,
 
@@ -2598,6 +2599,37 @@ extern "C" {
             struct ggml_tensor  * mask,
             float                 scale,
             int                   n_chunk_rows);
+
+    // device steps of the kvq codec fit (src/llama-kvq-codec.cpp): B tasks of n rows of D values, f32, rows contiguous
+    //
+    // x:    [D, n, B]      the rows of each task, nb1 == D*sizeof(float), any nb2
+    // par:  [D, >= k, B]   f32, rows contiguous, any nb2; ROT: k = D, the forward transform, element [c, i] = fwd[i][c]
+    //                      GAIN and CODE: k = 4, i1 = 0: step[c] (0 for 0 bits), 1: bits[c] (0..8), 2: bit offset of component c
+    //                      in a packed row, 3: element 0 = den, the V gain denominator (0: K, no gain)
+    // rows: [nw, n, B]     i32, CODE only, any nb1/nb2
+    //
+    // GGML_KVQ_FIT_MEAN: res [D, 1, B], mean of the rows, summed in double
+    // GGML_KVQ_FIT_COV:  res [D, D, B], sum over the rows of x x^T, f32 products (no TF32 or lower precision)
+    // GGML_KVQ_FIT_ROT:  res [D, n, B], y[c] = sum_i x[i]*fwd[i][c], f32 products as COV
+    // GGML_KVQ_FIT_GAIN: x = y; res [D, 1, B], sigma[c] = sqrt(mean over the rows of (y[c]/g)^2), g = sqrt(sum_c y[c]^2/den) + 1e-8 per row
+    //                    (sums in double, the operations of the CPU codec)
+    // GGML_KVQ_FIT_CODE: x = y; writes rows in place: code_c = clamp(floor(y[c]/g/step[c]), -2^(b-1), 2^(b-1) - 1) for bits b > 0,
+    //                    field code_c + 2^(b-1) at the bit offset of c (layout of ggml_kvq_attn), the unused bits 0;
+    //                    den > 0: g as GAIN, the low 16 bits of word nw - 1 hold g as f16; den == 0: g = 1
+    enum ggml_kvq_fit_mode {
+        GGML_KVQ_FIT_MEAN = 0,
+        GGML_KVQ_FIT_COV  = 1,
+        GGML_KVQ_FIT_ROT  = 2,
+        GGML_KVQ_FIT_GAIN = 3,
+        GGML_KVQ_FIT_CODE = 4,
+    };
+
+    GGML_API struct ggml_tensor * ggml_kvq_fit(
+            struct ggml_context * ctx,
+            int                   mode,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * par,   // ROT, GAIN, CODE
+            struct ggml_tensor  * rows); // CODE
 
     // custom operators
 

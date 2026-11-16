@@ -1,6 +1,6 @@
 # Two-tier KV cache for qwen35 (kvq) - prototype state
 
-State of branch `kvq-two-tier-cache` at commit cefce74bc (2026-11-13). The branch starts from ggml-org/master 951d465f5 and is pushed to the JetBrains-Hardware fork. This file is the starting point for the next work session.
+State of branch `kvq-two-tier-cache` at commit cefce74bc (2026-11-13), with the GPU fitter (2026-11-16) on top of 7604e664e. The CPU fitter is kept on branch `kvq-fit-cpu`. The branch starts from ggml-org/master 951d465f5 and is pushed to the JetBrains-Hardware fork. This file is the starting point for the next work session.
 
 Research background, codec definition and the original plan are in the `qwen3.8-exp` repository: `notes/kvq_implementation_plan.md`, `notes/kv_prefetch_results.md`, `src/qexp/kvcodec.py`, `experiments/14_kv_prefetch.py`.
 
@@ -17,7 +17,16 @@ Model facts used everywhere: 64 trunk blocks, 16 attention layers (il = 3, 7, ..
 
 ## How it works
 
-Chunks. The sequence is cut in chunks of 8192 positions. When a chunk is complete (plus a margin of 64 positions), background CPU threads fit a K table and a V table per (layer, kv head) on the chunk's own rows, encode the rows, and the decode thread installs codes and tables between two decodes. Then the chunk's rows leave the device cache.
+Chunks. The sequence is cut in chunks of 8192 positions. When a chunk is complete (plus a margin of 64 positions), the fitter fits a K table and a V table per (layer, kv head) on the chunk's own rows, codes the rows, and the chunk joins the coarse region. Then the chunk's rows leave the device cache.
+
+Fitter (`llama_kvq_fitter`). The work on the rows runs on the GPU, on the main stream between two ubatches; only the small 256 x 256 problem per (layer, kv head, K or V) runs on CPU threads. A job is a small state machine over several polls of the decode thread (before each ubatch), one graph per attention layer and phase:
+
+1. Phase 1, when the job starts: the chunk's q8_0 rows are read from the ring (`get_rows`, wrap-around by index), copied to the pinned host store (device relayout, one download per (layer, kv head)), and their mean and covariance (`ggml_kvq_fit`) go to the host, 33 MiB per chunk.
+2. CPU tasks (`--kvq-threads`, low priority), the V tasks first: metric (from `qacc` / `gacc`), `llama_kvq_fit_cov` (Cholesky, `L^T cov L`, eigen solver, fwd/inv tables), for K also bits, steps and the packed table. The tasks wait for the event of phase 1, not the decode thread.
+3. Phase 2, at the first poll after the V tasks (the K tasks may still run): V fwd tables up, rows rotated, the scale of the shape (gain per row, column statistics) goes to the host. CPU tasks for V: bits, steps, packed table.
+4. Phase 3 and install, at the first poll after all tasks: fwd tables up, rows rotated, K and V codes packed straight into `kc` and `vc`, the tables uploaded, `set_n_coarse` (one synchronize per chunk, as before).
+
+The decode thread never waits in a poll for device work it queued in the same poll. The packed codes never go through the host. The eigen step is the function `llama_kvq_fit_cov`, a device eigen solver could replace it. The o_proj grams of the V metric are computed once on the GPU when the fit mode starts.
 
 - K metric: second moment of the queries at the chunk's own positions, summed on the device during decoding (`qacc`), read back once per chunk.
 - V metric: o_proj columns scaled by the chunk's mean sigmoid(gate), summed on the device (`gacc`).
@@ -40,15 +49,16 @@ Rollback. Removing the end of the sequence is cheap when it stays in the tail (M
 |---|---|
 | Codec (fit, encode, decode, tables) | `src/llama-kvq-codec.{h,cpp}`, `src/llama-kvq-pack.{h,cpp}` |
 | Attention op, CPU reference and CUDA | `ggml_kvq_attn` in `ggml/include/ggml.h`, `ggml/src/ggml-cuda/kvq-attn.{cu,cuh}` |
+| Fit op (mean, covariance, rotation, V gain statistics, code and pack), CPU reference and CUDA | `ggml_kvq_fit` in `ggml/include/ggml.h`, `ggml_compute_forward_kvq_fit` in `ggml/src/ggml-cpu/ops.cpp`, `ggml/src/ggml-cuda/kvq-fit.{cu,cuh}` |
 | Host store, resident cache, prefetch worker, scratch uploads | `src/llama-kvq-store.{h,cpp}` |
-| Background fitter | `src/llama-kvq-fit.{h,cpp}` |
+| Fitter (device phases, CPU tasks) | `src/llama-kvq-fit.{h,cpp}` |
 | Memory (hybrid subclass), ring-shaped device cache | `src/llama-memory-hybrid-kvq.{h,cpp}`, `src/llama-kv-cache.{h,cpp}` |
 | Graph | `src/models/qwen35.cpp` |
 | Scheduler: copy callback before the wait | `ggml_backend_sched_set_copy_callback_early` in `ggml/src/ggml-backend.cpp` |
 | Internal API | `src/llama-ext.h` (`llama_kvq_params`, `llama_kvq_fit_params`, `llama_memory_kvq_*`, `llama_model_set_kvq_*`) |
 | Server options and forced settings | `common/arg.cpp`, `common/common.cpp`, `tools/server/server.cpp`, `tools/server/server-context.cpp` |
 | Evaluation tool | `tools/kvq-eval` |
-| Tests | `tests/test-kvq-codec.cpp`, `tests/test-kvq-attn.cpp`, `KVQ_ATTN` cases in `tests/test-backend-ops.cpp` |
+| Tests | `tests/test-kvq-codec.cpp`, `tests/test-kvq-attn.cpp`, `KVQ_ATTN` and `KVQ_FIT` cases in `tests/test-backend-ops.cpp` |
 
 ## How to run
 
@@ -58,7 +68,7 @@ Server, production configuration plus `--kvq`:
 llama-server --fit off -m Qwen3.8-3.6-27B-blend-Q4_K_M.gguf --ctx-size 230000 --n-gpu-layers all --parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --jinja --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-type-k f16 --spec-draft-type-v f16 --batch-size 4096 --ubatch-size 1024 --kvq
 ```
 
-Options: `--kvq`, `--kvq-threads N` (fitter threads, default physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (1024), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default 2 * 8192 + n_batch + 256, 0 = full device cache), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
+Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (1024), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default 2 * 8192 + n_batch + 256, 0 = full device cache), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
 
 With `--kvq` the server forces, with a warning: 1 slot, RAM prompt cache off, slot save path cleared, context shift and cache reuse off, flash attention on, q8_0 K/V, draft n_max <= 7. It refuses to start for a model that is not qwen35, `--mmproj`, embeddings. Attention rotation of quantized caches is turned off for the model (also for the MTP context). `--fit` does not count the kvq memory.
 
@@ -70,7 +80,7 @@ llama-kvq-eval -m MODEL -ngl 99 -fa on -fit off -b 2048 -ub 2048 -ctk q8_0 -ctv 
 
 `--kvq-lib` is the library path (same as the server), `--kvq-lib-full` keeps the full device cache, `--kvq-rm-test` checks the removal cases, `--kvq-scr-check N` compares scratch and cache prefill logits bit for bit. The older `--kvq-variant`, `--kvq-two-tier`, `--kvq-packed` modes are tool-driven experiments from earlier stages.
 
-Environment variables for debugging: `LLAMA_KVQ_SCHED_SYNC`, `LLAMA_KVQ_GATHER_THREADS`, `LLAMA_KVQ_IDLE_PROBE`, `LLAMA_KVQ_SCRATCH`, `LLAMA_SERVER_GEN_TIMES`.
+Environment variables for debugging: `LLAMA_KVQ_SCHED_SYNC`, `LLAMA_KVQ_GATHER_THREADS`, `LLAMA_KVQ_IDLE_PROBE`, `LLAMA_KVQ_SCRATCH`, `LLAMA_SERVER_GEN_TIMES`, `LLAMA_KVQ_FIT_SYNC` (synchronize around the device phases of the fitter, logs the device time per chunk and phase).
 
 ## Results
 
@@ -78,20 +88,32 @@ Machine: RTX 5090 32 GB, Ryzen 9950X3D, Windows 11, CUDA 12.9. One trace of 100k
 
 Server, ctx 230000, 100k prompt, MTP with 3 drafts:
 
-| | Two-tier | Production (q8_0, flash attention) |
-|---|---|---|
-| Total VRAM | 24.06 GB | 28.4 GB |
-| Prefill | 47.9 s | 43.4 - 43.8 s |
-| Generation, first request (fitter busy) | 109 - 112 t/s | 120.5 t/s |
-| Generation, follow-up request | 122.2 t/s | 124.3 t/s |
+| | Two-tier, GPU fitter, 4 / 1 CPU threads | Two-tier, CPU fitter (16 threads, before the codec speed fix) | Production (q8_0, flash attention) |
+|---|---|---|---|
+| Total VRAM (nvidia-smi after the request) | 23.02 GB | 24.06 GB | 28.4 GB |
+| Prefill | 44.0 - 44.2 s / 44.2 s | 47.9 s | 43.4 - 43.8 s |
+| Generation, first request | 128 - 129 / 122 - 124 t/s | 109 - 112 t/s | 120.5 t/s |
+| Generation, follow-up request | 125.5 - 127.5 / 126.2 t/s | 122.2 t/s | 124.3 t/s |
 
-Generated token ids matched production on every request in one session (265, 1500, 300, 55 tokens); in another session the first request diverged at token 211 of 265. The packed decode is not deterministic from run to run, because the coarse region depends on fitter timing.
+GPU fitter: two sessions per thread count (2026-11-16); prefill never waited for the fitter (no batch waited for the ring, also with 1 thread). The production numbers are from another day and were not run again, so the gain over production in generation is not established. Generated token ids matched production on every request in three of the four sessions (265, 1500, 300 tokens); in one session the first request diverged at token 211 of 265. The packed decode is not deterministic from run to run, because the coarse region depends on fitter timing.
+
+GPU fitter cost per 8k chunk at 100k (kvq-eval, -ub 2048; device time with `LLAMA_KVQ_FIT_SYNC`, the GPU otherwise idle):
+
+- Device: 35 ms (phase 1 20 ms with the 285 MB download of the q8_0 rows to the host store, phase 2 9 - 10 ms, phase 3 6 ms).
+- CPU: 2.0 s on one core (2.1 s on 4 threads), the eigen solver about half of it. A job takes 2.1 - 2.6 s with 1 thread and 0.6 - 1.0 s with 4 threads in the server (statistics to join 2.2 - 3.2 s / 0.9 - 1.1 s); prefill makes a chunk about every 3.6 s.
+- Decode thread: 60 - 85 ms in the snapshot and phase 1 (mostly the existing synchronize of the statistics readback), 25 - 50 ms in the later phases and the join (the synchronize of `set_n_coarse`).
+- PCIe: 285 MB q8_0 rows, 34 MB moments device to host; 51 MB parameters (fwd tables), 17 MB packed tables host to device. The codes do not cross.
+- Memory: 83 MiB device (fitter tensors 20 MiB, graph buffer 63 MiB), about 85 MB pinned host per job in flight (the CPU fitter used 285 MB per job).
+- The o_proj grams of the V metric: 0.08 s on the GPU once, at the start (about 4 CPU-seconds on the first chunk before).
+
+Against the CPU fitter on the same chunk (chunk 5 of the 100k trace, all 128 tasks): q8_0 rows and K metric identical, V metric max relative difference 2e-6 (o_proj grams on the GPU), means identical, covariance max relative difference 4.1e-6, bits identical, steps 3e-5, 300 of 32768 eigenvectors with a flipped sign, sign-aligned inverse tables max difference 0.4% of the largest entry, codes 0.34% different, 3.0e-5 after the sign alignment, V gains 139 of 524288 differ by one f16 step.
 
 Quality, KL against the q8_0 reference, 471 scored tokens, 1 token per decode:
 
 | Cache | KL | ms/token |
 |---|---|---|
-| Two-tier, library path | 1.32e-4 | 16.86 |
+| Two-tier, library path, CPU fitter | 1.32e-4 | 16.86 |
+| Two-tier, library path, GPU fitter (5 runs: 4 or 8 threads, 1 thread) | 1.25e-4 - 1.40e-4 | 16.69 - 16.73 |
 | q8_0 with rotation on (two q8_0 configurations against each other) | 1.5e-4 | 17.70 |
 | Two-tier with offline V tables from another conversation | 4.4e-4 | 16.88 |
 | Plain q4_0, rotation on | 1.17e-3 | 24.15 |
@@ -114,8 +136,8 @@ Per format at 150k, main model only (arithmetic): f16 9.16 GiB, q8_0 4.86 GiB, q
 
 ## Open bottlenecks, largest first
 
-1. Generation while the fitter works (after a long prefill or a restore): 109 - 112 t/s against 120 - 125. Steady state is about 98% of production.
-2. Prefill waits for the fitter: about 3.4 s of the extra 4 s at 100k. A chunk takes 3.4 - 3.8 s on 16 threads (about 56 CPU-seconds), prefill produces one about every 3.6 s.
+1. Prefill: 44.0 - 44.2 s against 43.4 - 43.8 s at 100k; the fitter no longer stalls it. What is left per chunk: 35 ms of device work on the main stream, two synchronizes (statistics readback, join), the D2H of the q8_0 rows on the main stream. A second stream (or the copy stream for the D2H) could hide most of it.
+2. The latency of a job is set by the polls (one per ubatch): after the CPU tasks, a job needs one or two more ubatches. With 1 thread and -ub 2048 (kvq-eval) 3 batches still waited 0.35 s at 100k.
 3. Main compute buffer 1.64 GB: mostly the F16 copies of K and V that flash attention makes at full length.
 4. MTP context cache: 899 MiB f16 for the full context.
 5. No speed gain from the packed path at 100k: a 4-token verify fetches 43k - 48k rows (65 - 73% of the request misses the resident set), GPU idle at the joins 1.7 - 2.2 ms per round.
@@ -127,7 +149,7 @@ Sizes are for ctx 230000 as allocated today.
 
 1. 16k chunks. Halves the tables (459 -> about 230 MiB); chunk size 4k to 16k made no quality difference. Catch: the ring is sized 2 chunks + n_batch, so with the current rule it grows from 689 to about 1230 MiB and the net result is worse. It only pays off together with a ring that does not scale with the chunk (item 3), or by fitting 8k chunks first and merging two of them into one 16k table in the background later.
 2. 8-bit tables instead of fp16. Halves the tables again. Needs a quality check, the K inverse transform goes straight into the logits.
-3. Do not wait for the fitter. Today prefill stops when the ring is full (about 3.4 s on a 100k prompt). Idea: rows that do not fit in the ring go to the host store uncompressed, prefill reads them through the scratch like the installed region, and the fitter replaces the full version by the compressed one during generation. Open point: generation needs those rows precise in VRAM until their chunk is fitted (a per-token upload is too expensive), so they need a place there; item 4 is the candidate. The backlog on 16 threads is about one chunk, 285 MB of rows.
+3. Do not wait for the fitter. With the GPU fitter prefill no longer waits at 100k on this machine, so this matters only for a slower GPU or CPU, or a ring smaller than 2 chunks. Idea: rows that do not fit in the ring go to the host store uncompressed, prefill reads them through the scratch like the installed region, and the fitter replaces the full version by the compressed one during generation. Open point: generation needs those rows precise in VRAM until their chunk is fitted (a per-token upload is too expensive), so they need a place there; item 4 is the candidate. With the CPU fitter on 16 threads the backlog was about one chunk, 285 MB of rows.
 4. Reuse the prefill buffers during generation. The scratch (519 MiB) and the flash attention F16 copies in the compute buffer (most of 1642 MiB) are only used by large ubatches and sit idle during generation. Candidates to live there: the not yet fitted rows of item 3, a larger resident set, or the ring itself, so that this memory is allocated once and used by both phases.
 5. From the bottleneck list: chunked flash attention to shrink the F16 copies, a compressed or q8_0 cache for the MTP context, lower fetch traffic for multi-token verify batches.
 
@@ -137,7 +159,8 @@ Sizes are for ctx 230000 as allocated today.
 - Speed of the final build was measured only at 100k. Not measured at 24k / 50k and at 150k+.
 - Slot save and the RAM prompt cache do not work (full state save aborts). The production launch passes `--slot-save-path`, so saving and restoring a session is lost with `--kvq`.
 - Output is not reproducible from run to run (the coarse region depends on fitter timing). A deterministic install rule would be needed for exact comparisons.
-- CUDA only. The attention op has a CPU reference and a CUDA kernel, nothing for Metal or Vulkan. The fitter wants many cores (about 56 CPU-seconds per 8k chunk).
+- CUDA only. The attention op and the fit op have a CPU reference and a CUDA kernel, nothing for Metal or Vulkan; the fit mode refuses to start when the device cannot run the fit graphs. The fitter needs about 2 CPU-seconds per 8k chunk (one core is enough at 100k on this GPU, see Results).
+- The fitter's device work runs on the main stream between ubatches. A second stream would hide its ~35 ms per chunk, not built.
 - Host memory: 7.6 GB of pinned RAM at ctx 230000, per sequence.
 - Deferred tuning: resident capacity (1024 vs 4096), top-up rules and thresholds, lead, prefetch size.
 - No automated tests for the store, the fitter, the ring cache or the server flows; only the codec and the kernel have tests. The session flows were checked by hand once.

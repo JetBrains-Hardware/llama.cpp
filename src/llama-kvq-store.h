@@ -79,10 +79,10 @@ public:
 
     bool set_codes(int32_t il, int32_t g, bool is_v, const std::vector<llama_kvq_table> & tabs, const int8_t * codes, const float * gain);
 
-    // fit mode: the rows (llama_kvq_pack_rows) and the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
+    // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
     // only for chunks at or after the coarse region; the decode thread, between graphs
-    void set_chunk_rows (int32_t il, int32_t g, bool is_v, int32_t c, const int32_t * rows);
-    void set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const ggml_fp16_t * inv, const float * aux);
+    // async: a copy on the main stream, the memory must stay valid until the next synchronize (pinned memory for a real async copy)
+    void set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const ggml_fp16_t * inv, const float * aux, bool async = false);
 
     // fit mode: the coarse region becomes [0, n), n a multiple of n_chunk_rows; new chunks must have rows, tables and host rows set
     // the resident rows at or after n are dropped; the decode thread, between graphs
@@ -93,6 +93,11 @@ public:
 
     // waits for the main stream and the copy stream
     void synchronize();
+
+    // the main backend (set_backend), the device and the buffer type of the device tensors
+    ggml_backend_t             backend() const { return backend_main; }
+    ggml_backend_dev_t         device()  const { return dev; }
+    ggml_backend_buffer_type_t dev_buft() const { return buft; }
 
     // host precise store of layer il: [G][n_rows][2*ROW], K row then V row
     uint8_t * host_rows(int32_t il) const;

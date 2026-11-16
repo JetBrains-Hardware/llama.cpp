@@ -108,6 +108,8 @@ bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
     if (waited) {
         n_tail_wait++;
         t_tail_wait += (ggml_time_us() - t0)*1e-6;
+        LLAMA_LOG_INFO("%s: the batch up to position %d waited %.3f s for the fitter (%d batches, %.2f s in all)\n", __func__,
+                p_end, (ggml_time_us() - t0)*1e-6, n_tail_wait, t_tail_wait);
     }
     return true;
 }

@@ -1364,9 +1364,12 @@ static void kvq_print_progress(llama_memory_t mem) {
         LOG("kvq: fit: %d batches waited %.2f s for the fitter before they fit the ring of the tail\n", pr.n_tail_wait, pr.t_tail_wait);
     }
     if (!pr.t_job.empty()) {
-        LOG("kvq: fit: %.2f s CPU per chunk; decode thread per chunk: readback %.1f ms (with the wait for the queued ubatches), install %.1f ms; "
-            "s per job run/with queue: %s\n",
+        LOG("kvq: fit: %.2f s CPU per chunk; decode thread per chunk: readback and phase 1 %.1f ms (with the wait for the queued ubatches), "
+            "later phases and install %.1f ms; s per job since its start/since the statistics: %s\n",
                 pr.t_cpu/pr.t_job.size(), 1e3*pr.t_take/pr.t_job.size(), 1e3*pr.t_install/pr.t_job.size(), tj.c_str());
+        if (pr.t_dev > 0.0) {
+            LOG("kvq: fit: device phases %.1f ms per chunk (LLAMA_KVQ_FIT_SYNC)\n", 1e3*pr.t_dev/pr.t_job.size());
+        }
     }
 }
 
