@@ -165,7 +165,7 @@ struct llama_kvq_params {
     int32_t max_batch     = 8;
     int32_t max_tail      = 0;    // more cells than this after the coarse region (fit mode: the fit lags): the normal attention, 0: no limit
     int32_t prefetch_n    = 1024; // rows per (kv head, position) requested by the early query
-    int32_t resident_cap  = 1024; // evictable resident slots per (layer, kv head), the sinks have their own, least recently selected eviction; more slots cost attention time
+    int32_t resident_cap  = 0;    // evictable resident slots per (layer, kv head), the sinks have their own; 0: max_batch*prefetch_n (llama_kvq_resident_slots); more slots cost attention time
     int32_t lead          = 2;    // the early query of layer il runs at the input of layer il - lead, 0: no prefetch
     int32_t sync_mode     = LLAMA_KVQ_SYNC_OFF;
     int32_t sync_m        = 64;
@@ -173,6 +173,12 @@ struct llama_kvq_params {
     bool    all_resident  = false; // debug: every coarse row resident, no prefetch and no top-up
     bool    scratch       = true;  // fit mode: the other ubatches attend over the scratch (coarse region from the host store), false: over the cache
 };
+
+// the evictable resident slots of the parameters; the default holds the whole prefetch request of every packed ubatch,
+// with fewer slots a request of more distinct rows is cut by the max score over the positions
+static inline int32_t llama_kvq_resident_slots(const llama_kvq_params & p) {
+    return p.resident_cap > 0 ? p.resident_cap : p.max_batch*p.prefetch_n;
+}
 
 // false if the memory has no coarse copy or does not support the parameters (single stream only)
 // the coarse copy is written only in two-tier mode: the caller sets the coarse rows of the cells that exist before the switch
@@ -208,6 +214,9 @@ struct llama_kvq_counters {
     int64_t n_pf       = 0; // prefetch calls
     int64_t pf_req     = 0; // rows requested (union over the positions, per kv head)
     int64_t pf_fetch   = 0; // rows fetched (not resident)
+    int64_t pf_sel     = 0; // rows of the selections of the positions, (kv head, position) lists x prefetch_n
+    int64_t pf_cut     = 0; // (prefetch call, kv head) requests cut to the resident slots
+    int64_t pf_lost    = 0; // rows of the selections of the positions that are not resident after a cut
     int64_t n_tu       = 0; // top-up calls
     int64_t n_pos      = 0; // (layer, position) executions with a top-up check
     int64_t tu_check   = 0; // (kv head, position) checks

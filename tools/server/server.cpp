@@ -173,7 +173,7 @@ static bool server_kvq_prepare_params(common_params & params) {
     if (common_speculative_n_max(&params.speculative) > kvq_max_batch - 1) {
         SRV_WRN("--kvq: drafts of more than %d tokens are verified with the flash attention over the scratch\n", kvq_max_batch - 1);
     }
-    if (params.kvq.prefetch_n > params.kvq.resident_cap) {
+    if (params.kvq.resident_cap > 0 && params.kvq.prefetch_n > params.kvq.resident_cap) {
         SRV_WRN("--kvq: the prefetch must fit the resident rows, setting --kvq-resident-cap %d (was %d)\n", params.kvq.prefetch_n, params.kvq.resident_cap);
         params.kvq.resident_cap = params.kvq.prefetch_n;
     }

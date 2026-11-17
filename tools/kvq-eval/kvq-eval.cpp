@@ -31,7 +31,7 @@
 //   coarse region = the full chunks of C rows that end at or before s - --kvq-protect, coded from the q8_0 rows (sinks included)
 //   the q8_0 cache is not changed, its rows of the coarse region are copied to the host store
 //   ubatches of up to 8 tokens attend through the packed path, larger ones through flash attention over the q8_0 cache
-//   --kvq-pf-n 1024, --kvq-cap 1024, --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
+//   --kvq-pf-n 1024, --kvq-cap 0 (8 x pf-n), --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
 //   --kvq-all-resident (debug: every coarse row resident), --kvq-pk-stats (top-m counters with sync off)
 // --kvq-no-rot: attention rotation off (for references of the packed mode)
 // --kvq-perf: no logits processing, decode times per chunk only
@@ -123,7 +123,7 @@ struct kvq_args {
 
     bool    packed          = false;
     int32_t pk_pf_n         = 1024;
-    int32_t pk_cap          = 1024;
+    int32_t pk_cap          = 0;
     int32_t pk_lead         = 2;
     int32_t pk_sync         = LLAMA_KVQ_SYNC_OFF;
     int32_t pk_sync_m       = 64;
@@ -387,7 +387,7 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
                 "       [--kvq-variant exact|q8_0|aff8|K<b>V<b>|K<b>|V<b>] [--kvq-sinks 4] [--kvq-recent 0] [--kvq-qwin 2048] [--kvq-fit-chunk 0 [--kvq-kmetric own|last]]\n"
                 "       [--kvq-save-tables tables.bin] [--kvq-load-tables tables.bin [--kvq-load-only k|v] [--kvq-own-mean-k]] [--kvq-stats]\n"
                 "       [--kvq-two-tier all-precise|all-coarse|none|<N> [--kvq-protect 512] [--kvq-precise aff8|exact] [--kvq-tt-stats]]\n"
-                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 1024] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
+                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 0][--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
                 "                     [--kvq-all-resident] [--kvq-pk-stats]] [--kvq-no-rot] [--kvq-perf]\n"
                 "       [--kvq-lib [--kvq-lib-vtab vtab.bin] [--kvq-fit-threads 8] [--kvq-lib-nowait] [--kvq-lib-busy] [--kvq-rm-test]] [common args]\n", argv[0]);
         return false;
@@ -932,7 +932,10 @@ static bool kvq_apply(llama_context * ctx, const kvq_args & args, const kvq_capt
             LOG_ERR("%s: the prefix of %d tokens has no full chunk of %d before the last %d\n", __func__, s, fc, args.tt_protect);
             return false;
         }
-        if (!llama_memory_kvq_packed_alloc(mem, n_chunk*fc, fc, args.k_bits, args.v_bits, args.pk_cap, args.pk_all_res, args.sinks)) {
+        llama_kvq_params cp;
+        cp.prefetch_n   = args.pk_pf_n;
+        cp.resident_cap = args.pk_cap;
+        if (!llama_memory_kvq_packed_alloc(mem, n_chunk*fc, fc, args.k_bits, args.v_bits, llama_kvq_resident_slots(cp), args.pk_all_res, args.sinks)) {
             LOG_ERR("%s: cannot allocate the packed state\n", __func__);
             return false;
         }
@@ -1357,6 +1360,7 @@ static void kvq_print_counters(const llama_kvq_counters_all & c, int64_t n_decod
         t.n_pf += l.n_pf; t.pf_req += l.pf_req; t.pf_fetch += l.pf_fetch; t.n_tu += l.n_tu; t.n_pos += l.n_pos;
         t.tu_check += l.tu_check; t.tu_fire += l.tu_fire; t.tu_stall += l.tu_stall; t.tu_redo += l.tu_redo; t.tu_fetch += l.tu_fetch;
         t.top_hit += l.top_hit; t.top_n += l.top_n; t.evict += l.evict; t.bytes += l.bytes;
+        t.pf_sel += l.pf_sel; t.pf_cut += l.pf_cut; t.pf_lost += l.pf_lost;
         t.n_join += l.n_join;
         t.t_idle += l.t_idle;
         t.t_wait += l.t_wait; t.t_read += l.t_read; t.t_plan += l.t_plan; t.t_gather += l.t_gather; t.t_join += l.t_join; t.t_upload += l.t_upload;
@@ -1367,6 +1371,8 @@ static void kvq_print_counters(const llama_kvq_counters_all & c, int64_t n_decod
             (long long) t.n_pf, t.pf_req/(double) std::max<int64_t>(1, t.n_pf), t.pf_fetch/(double) std::max<int64_t>(1, t.n_pf),
             (long long) t.tu_check, t.tu_check ? 100.0*t.tu_fire/t.tu_check : NAN, t.n_pos ? 100.0*t.tu_stall/t.n_pos : NAN,
             t.n_tu ? 100.0*t.tu_redo/t.n_tu : NAN, t.tu_fire ? (double) t.tu_fetch/t.tu_fire : NAN, t.top_n ? 100.0*t.top_hit/t.top_n : NAN);
+    LOG("kvq: total   : selected rows of the positions resident after the prefetch %.4f%% (%lld of %lld lost in %lld cut requests)\n",
+            t.pf_sel ? 100.0 - 100.0*t.pf_lost/t.pf_sel : 100.0, (long long) t.pf_lost, (long long) t.pf_sel, (long long) t.pf_cut);
     LOG("kvq: per token: rows fetched %.1f (prefetch %.1f, top-up %.1f), %.3f MiB host->device, evictions %.1f\n",
             (t.pf_fetch + t.tu_fetch)/nt, t.pf_fetch/nt, t.tu_fetch/nt, t.bytes/1048576.0/nt, t.evict/nt);
     // the prefetch plan and gather run on the worker, the top-up ones in the callback

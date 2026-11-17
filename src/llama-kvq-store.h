@@ -18,14 +18,16 @@ class llama_io_read_i;
 
 // packed two-tier state of the attention layers of one sequence (see llama_kvq_params::packed)
 //   device: packed coarse rows and tables of the coarse region, resident precise rows (rkv, ridx) per layer, top-k bias
-//   host:   precise store (the q8_0 K/V rows of the coarse region), LRU state of the resident slots
+//   host:   precise store (the q8_0 K/V rows of the coarse region), slot state and row bitmaps of the resident slots
 // the tensors and host arrays are allocated for n_rows coarse rows, the coarse region is [0, n_coarse)
 //
-// resident slots of a (layer, kv head): [0, n_sink) hold the sinks, then cap evictable slots, then one trash slot
+// resident slots of a (layer, kv head): [0, n_sink) hold the sinks, then cap evictable slots, then one unused slot (the trash slot of the scatter before the trash rows)
 // the host fills the slots in the scheduler copy callbacks of host trigger tensors, each read by a get_rows:
 //   prefetch: top prefetch_n of the early query of layer il, built at the input of layer il - lead
 //             the callback reads the selection back and returns, a worker thread plans the slots and gathers the rows
-//   join:     before the attention of layer il, waits for the worker and uploads the rows, their slot list and ridx
+//             the request is the union of the selections of the positions; with more rows than cap it is cut by the max score
+//             a slot is free if its row is not in the request; the missing rows go to the free slots of the oldest requests
+//   join:    before the attention of layer il, waits for the worker and uploads the rows, their slot list and ridx
 //   top-up:   top sync_m of the true query of layer il, before ggml_kvq_attn_cond, plans, gathers and uploads in the callback
 // a set_rows after the join and top-up triggers scatters the staging rows into rkv
 // the callbacks run before the scheduler waits for the GPU (ggml_backend_sched_set_copy_callback_early)
@@ -59,11 +61,11 @@ public:
         ggml_tensor * vc    = nullptr; // i32 [nwv + 1, n_rows, G]
         ggml_tensor * tinv  = nullptr; // i8 [D, D, 2*G, n_chunk]
         ggml_tensor * taux  = nullptr; // f32 [D, 3, 2*G, n_chunk]
-        ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2]
-        ggml_tensor * rkv_h = nullptr; // f16 [ROW/2, 2*G*cap_tot], alias of rkv, row (kv*G + g)*cap_tot + slot
+        ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2], alias of the start of rkv_h
+        ggml_tensor * rkv_h = nullptr; // f32 [ROW/4, 2*G*cap_tot + N_TRASH], row (kv*G + g)*cap_tot + slot, then the trash rows
         ggml_tensor * ridx  = nullptr; // i32 [cap_tot, G + 1], column G holds the flag of ggml_kvq_attn_cond
-        ggml_tensor * stage = nullptr; // f16 [ROW/2, n_stage], rows to scatter (set by enable)
-        ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest is the trash slot
+        ggml_tensor * stage = nullptr; // f32 [ROW/4, n_stage], rows to scatter (set by enable)
+        ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest trash rows (trash_row)
         ggml_tensor * trig[KIND_COUNT] = {}; // host f32 [1], per kind
         ggml_tensor * qacc  = nullptr; // f32 [D, D, G], sum of q q^T over the query heads of each kv head (fit mode)
         ggml_tensor * gacc  = nullptr; // f32 [n_gate], sum of sigmoid(gate) over the tokens (fit mode with n_gate > 0)
@@ -203,7 +205,9 @@ private:
     int32_t cap       = 0; // evictable slots
     int32_t n_sink    = 0;
     int32_t cap_tot   = 0;
+    int64_t n_bmw     = 0; // 64-bit words of a row bitmap
     bool    all_res   = false;
+    bool    cut_warn  = false;
 
     llama_kvq_params params;
 
@@ -255,10 +259,19 @@ private:
     bool                         probe = false;
 
     // rows per kv head of one request
-    int64_t n_req(int k, int64_t n_top, int64_t L) const;
+    int64_t n_req(int64_t n_top, int64_t L) const;
+
+    // the entries of the slot list after the fetched rows write to trash rows after rkv in rkv_h, spread so that the writes do not wait on one row
+    static constexpr int64_t N_TRASH = 1024;
+    int32_t trash_row(int64_t j) const { return (int32_t) (2*G*cap_tot + j % N_TRASH); }
+
+    // the prefetch of L positions needs the scores of the selection: the union can have more rows than the slots
+    bool pf_scores(int64_t n_top, int64_t L) const { return n_top*L > cap; }
 
     void flush_ubatch();
-    void select(const layer & l, const ggml_tensor * dst, ggml_cgraph * graph, const ggml_tensor ** ids, const ggml_tensor ** vals) const;
+    void select(const layer & l, const ggml_tensor * dst, ggml_cgraph * graph, const ggml_tensor ** ids, const ggml_tensor ** anchor) const;
+    void cut_request(layer & l, int32_t g, int64_t n_u);
+    void place(layer & l, int32_t g, uint32_t now);
     void plan_prefetch(layer & l);
     void plan_topup(layer & l);
     void gather(layer & l, int64_t n_rows);

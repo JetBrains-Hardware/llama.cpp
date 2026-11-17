@@ -1429,7 +1429,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             return;
         }
         COM_INF("%s: two-tier KV cache: chunks of %d rows, K%dV%d, %d fit threads, prefetch_n = %d, resident_cap = %d, lead = %d, rows after the last chunk: %s\n", __func__,
-                fp.chunk, fp.bits_k, fp.bits_v, fp.n_threads, kp.prefetch_n, kp.resident_cap, kp.lead, fp.rem == LLAMA_KVQ_REM_MERGE ? "merge" : "own");
+                fp.chunk, fp.bits_k, fp.bits_v, fp.n_threads, kp.prefetch_n, llama_kvq_resident_slots(kp), kp.lead, fp.rem == LLAMA_KVQ_REM_MERGE ? "merge" : "own");
     }
 
     pimpl->context.reset(lctx);

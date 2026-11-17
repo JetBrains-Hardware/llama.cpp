@@ -23,16 +23,22 @@ struct kvq_fetch {
     int32_t row;
 };
 
-struct kvq_seen {
-    uint32_t mark; // stamp of the last request that listed the row
-    int32_t  upos; // index in the union of that request
-};
-
 struct kvq_cand {
     int32_t row;
-    int32_t slot;
     float   val;
 };
+
+bool kvq_bit(const uint64_t * b, int32_t row) {
+    return (b[row >> 6] >> (row & 63)) & 1;
+}
+
+void kvq_bit_set(uint64_t * b, int32_t row) {
+    b[row >> 6] |= 1ull << (row & 63);
+}
+
+void kvq_bit_clear(uint64_t * b, int32_t row) {
+    b[row >> 6] &= ~(1ull << (row & 63));
+}
 
 }
 
@@ -47,14 +53,16 @@ struct llama_kvq_store::layer {
     uint8_t * store = nullptr; // [G][n_rows][2*ROW], K row then V row
 
     std::vector<int32_t>  ridx;       // [G + 1][cap_tot], mirror of t.ridx
-    std::vector<int32_t>  row_slot;   // [G][n_rows], -1 if not resident
-    std::vector<kvq_seen> row_seen;   // [G][n_rows], one load per row for the union
-    std::vector<uint32_t> slot_stamp; // [G][cap_tot], stamp of the last selection
-    std::vector<float>    slot_val;   // [G][cap_tot], score of the last selection
-    std::vector<int32_t>  prev;       // [G][cap_tot], LRU list of the evictable slots, -1 at the ends
-    std::vector<int32_t>  next;
-    std::vector<int32_t>  head;       // [G], least recently selected
-    std::vector<int32_t>  tail;       // [G]
+    std::vector<uint64_t> res;        // [G][n_bmw], bitmap of the resident rows of the evictable slots
+    std::vector<uint64_t> req;        // [G][n_bmw], bitmap of the rows of the request being planned, 0 between plans
+    std::vector<uint32_t> slot_stamp; // [G][cap_tot], stamp of the last request that listed the row of the slot
+
+    // plan scratch
+    std::vector<int32_t> miss;     // requested rows that are not resident, by row
+    std::vector<int32_t> free_s;   // slots whose row is not requested, by slot
+    std::vector<uint8_t> free_age; // their age in requests, 255 for 255 and more and for empty slots
+    std::vector<int32_t> pick;     // the free slots that take the missing rows
+    std::vector<kvq_cand> cand;    // cut: the union with the max score of each row
 
     uint32_t stamp    = 0; // selection clock
     uint32_t pf_stamp = 0; // stamp of the last prefetch
@@ -100,37 +108,27 @@ struct llama_kvq_store::layer {
 
     llama_kvq_counters cnt;
 
-    void touch(int32_t g, int32_t s, float v, int32_t cap_tot, int32_t n_sink) {
+    void assign(int32_t g, int32_t s, int32_t row, int32_t cap_tot, int64_t n_bmw) {
         const size_t o = (size_t) g*cap_tot;
-        slot_stamp[o + s] = stamp;
-        slot_val[o + s]   = v;
-        if (s < n_sink || s == tail[g]) {
-            return;
-        }
-        // unlink, then append at the tail
-        if (prev[o + s] >= 0) {
-            next[o + prev[o + s]] = next[o + s];
-        } else {
-            head[g] = next[o + s];
-        }
-        prev[o + next[o + s]] = prev[o + s];
-        prev[o + s] = tail[g];
-        next[o + s] = -1;
-        next[o + tail[g]] = s;
-        tail[g] = s;
-    }
-
-    void assign(int32_t g, int32_t s, int32_t row, float v, int32_t cap_tot, int32_t n_sink, int32_t n_rows) {
-        const size_t o = (size_t) g*cap_tot;
+        uint64_t * rb = res.data() + g*n_bmw;
         const int32_t old = ridx[o + s];
         if (old >= 0) {
-            row_slot[(size_t) g*n_rows + old] = -1;
+            kvq_bit_clear(rb, old);
             cnt.evict++;
         }
         ridx[o + s] = row;
-        row_slot[(size_t) g*n_rows + row] = s;
-        touch(g, s, v, cap_tot, n_sink);
+        kvq_bit_set(rb, row);
+        slot_stamp[o + s] = stamp;
         fetch.push_back({ g, s, row });
+    }
+
+    // the slot becomes empty
+    void forget(int32_t g, int32_t s, int32_t cap_tot, int64_t n_bmw) {
+        int32_t & row = ridx[(size_t) g*cap_tot + s];
+        if (row >= 0) {
+            kvq_bit_clear(res.data() + g*n_bmw, row);
+            row = -1;
+        }
     }
 };
 
@@ -379,11 +377,10 @@ struct llama_kvq_store::worker {
 };
 
 static int kvq_popcount(uint64_t x) {
-    int n = 0;
-    for (; x; x &= x - 1) {
-        n++;
-    }
-    return n;
+    x = x - ((x >> 1) & 0x5555555555555555ull);
+    x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
+    x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0full;
+    return (int) ((x*0x0101010101010101ull) >> 56);
 }
 
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
@@ -406,6 +403,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     nwv     = (bits_v*(int32_t) D + 31)/32;
     cap     = all_resident ? n_rows - n_sink : resident_cap;
     cap_tot = n_sink + cap + 1;
+    n_bmw   = (n_rows + 63)/64;
 
     const auto ids = kv.get_layer_ids();
     GGML_ASSERT(!ids.empty());
@@ -469,14 +467,16 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         t.vc   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, nwv + 1, n_rows, G);
         t.tinv = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_I8, D, D, 2*G, n_chunk);
         t.taux = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_F32, D, 3, 2*G, n_chunk);
-        t.rkv  = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, D, cap_tot, G, 2);
-        t.ridx = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, cap_tot, G + 1);
-        ggml_format_name(t.kc,   "kvq_kc-%d",   l.il);
-        ggml_format_name(t.vc,   "kvq_vc-%d",   l.il);
-        ggml_format_name(t.tinv, "kvq_tinv-%d", l.il);
-        ggml_format_name(t.taux, "kvq_taux-%d", l.il);
-        ggml_format_name(t.rkv,  "kvq_rkv-%d",  l.il);
-        ggml_format_name(t.ridx, "kvq_ridx-%d", l.il);
+        // the resident rows (rkv, an alias at its start) and the trash rows of the scatter
+        // sized for the worst case, the union of max_batch positions (279 MiB at 8192 slots, against 34.5 MiB at 1024), not optimised yet
+        t.rkv_h = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_F32, ROW/4, 2*(int64_t) G*cap_tot + N_TRASH);
+        t.ridx  = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, cap_tot, G + 1);
+        ggml_format_name(t.kc,    "kvq_kc-%d",    l.il);
+        ggml_format_name(t.vc,    "kvq_vc-%d",    l.il);
+        ggml_format_name(t.tinv,  "kvq_tinv-%d",  l.il);
+        ggml_format_name(t.taux,  "kvq_taux-%d",  l.il);
+        ggml_format_name(t.rkv_h, "kvq_rkv_h-%d", l.il);
+        ggml_format_name(t.ridx,  "kvq_ridx-%d",  l.il);
         if (!fill) {
             t.qacc = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, D, D, G);
             ggml_format_name(t.qacc, "kvq_qacc-%d", l.il);
@@ -510,12 +510,12 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     // as weights: the ops that read these tensors run on their device
     ggml_backend_buffer_set_usage(buf_dev.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // set_rows has no q8_0 to q8_0 copy, so the scatter writes the rows of rkv as f16 pairs of bytes
+    // set_rows has no q8_0 to q8_0 copy, so the scatter writes the rows of rkv as groups of 4 bytes (f32, half the threads of f16)
     for (auto & l : layers) {
-        l.t.rkv_h = ggml_new_tensor_2d(ctx_alias.get(), GGML_TYPE_F16, ROW/2, 2*(int64_t) G*cap_tot);
-        GGML_ASSERT(ggml_nbytes(l.t.rkv_h) == ggml_nbytes(l.t.rkv));
-        ggml_format_name(l.t.rkv_h, "kvq_rkv_h-%d", l.il);
-        if (ggml_backend_tensor_alloc(buf_dev.get(), l.t.rkv_h, l.t.rkv->data) != GGML_STATUS_SUCCESS) {
+        l.t.rkv = ggml_new_tensor_4d(ctx_alias.get(), GGML_TYPE_Q8_0, D, cap_tot, G, 2);
+        GGML_ASSERT(ggml_nbytes(l.t.rkv) == (size_t) 2*G*cap_tot*ROW);
+        ggml_format_name(l.t.rkv, "kvq_rkv-%d", l.il);
+        if (ggml_backend_tensor_alloc(buf_dev.get(), l.t.rkv, l.t.rkv_h->data) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("failed to alias the resident rows");
         }
     }
@@ -601,14 +601,9 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
 
     for (auto & l : layers) {
         l.ridx.assign((size_t) (G + 1)*cap_tot, -1);
-        l.row_slot.assign((size_t) G*n_rows, -1);
-        l.row_seen.assign((size_t) G*n_rows, { 0, 0 });
+        l.res.assign((size_t) G*n_bmw, 0);
+        l.req.assign((size_t) G*n_bmw, 0);
         l.slot_stamp.assign((size_t) G*cap_tot, 0);
-        l.slot_val.assign((size_t) G*cap_tot, 0.0f);
-        l.prev.assign((size_t) G*cap_tot, -1);
-        l.next.assign((size_t) G*cap_tot, -1);
-        l.head.assign(G, -1);
-        l.tail.assign(G, -1);
         l.ev_sel.reset(ggml_backend_event_new(dev));
         l.ev_read.reset(ggml_backend_event_new(dev));
         l.ev_up.reset(ggml_backend_event_new(dev));
@@ -751,10 +746,8 @@ void llama_kvq_store::set_n_coarse(int32_t n) {
         for (auto & l : layers) {
             for (int32_t g = 0; g < G; ++g) {
                 for (int32_t s = n_sink; s < cap_tot; ++s) {
-                    int32_t & row = l.ridx[(size_t) g*cap_tot + s];
-                    if (row >= n) {
-                        l.row_slot[(size_t) g*n_rows_ + row] = -1;
-                        row = -1;
+                    if (l.ridx[(size_t) g*cap_tot + s] >= n) {
+                        l.forget(g, s, cap_tot, n_bmw);
                     }
                 }
             }
@@ -897,7 +890,7 @@ bool llama_kvq_store::set_codes(int32_t il, int32_t g, bool is_v, const std::vec
 }
 
 bool llama_kvq_store::enable(const llama_kvq_params & p) {
-    if (p.n_sink != n_sink || (!all_res && p.resident_cap != cap) || p.all_resident != all_res) {
+    if (p.n_sink != n_sink || (!all_res && llama_kvq_resident_slots(p) != cap) || p.all_resident != all_res) {
         LLAMA_LOG_ERROR("%s: n_sink, resident_cap and all_resident must match the allocation (%d, %d, %d)\n", __func__, n_sink, cap, all_res);
         return false;
     }
@@ -912,6 +905,11 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         LLAMA_LOG_ERROR("%s: bad prefetch_n or sync_m/sync_min_hits for %d slots and %d candidates\n", __func__, cap, n_cand);
         return false;
     }
+    if (!all_res && pf_scores(p.prefetch_n, p.max_batch) && !cut_warn) {
+        LLAMA_LOG_WARN("%s: %d resident slots are fewer than max_batch x prefetch_n = %d: a ubatch of more than %d positions can lose rows of their own top %d\n",
+                __func__, cap, p.max_batch*p.prefetch_n, cap/p.prefetch_n, p.prefetch_n);
+        cut_warn = true;
+    }
     drop_pending();
     params = p;
 
@@ -921,7 +919,8 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
     }
     buf_pin.reset();
     if (!all_res) {
-        const int64_t n_rows = 2*G*std::max(n_req(KIND_PREFETCH, p.prefetch_n, p.max_batch), n_req(KIND_TOPUP, p.sync_m, p.max_batch));
+        // the staging rows (device and pinned host) hold a full fetch of every slot (285 MB each at 8192 slots), not optimised yet
+        const int64_t n_rows = 2*G*std::max(n_req(p.prefetch_n, p.max_batch), n_req(p.sync_m, p.max_batch));
         const int64_t n_sel  = (int64_t) std::max(p.prefetch_n, p.sync_m)*G*p.max_batch;
 
         // a graph that is reused keeps the tensors, so they change only with the parameters that change the graph
@@ -931,7 +930,7 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
             ggml_init_params ip = { layers.size()*2*ggml_tensor_overhead(), nullptr, true };
             ctx_stage.reset(ggml_init(ip));
             for (auto & l : layers) {
-                l.t.stage = ggml_new_tensor_2d(ctx_stage.get(), GGML_TYPE_F16, ROW/2, n_stage);
+                l.t.stage = ggml_new_tensor_2d(ctx_stage.get(), GGML_TYPE_F32, ROW/4, n_stage);
                 l.t.slots = ggml_new_tensor_1d(ctx_stage.get(), GGML_TYPE_I32, n_stage);
                 ggml_format_name(l.t.stage, "kvq_stage-%d", l.il);
                 ggml_format_name(l.t.slots, "kvq_slots-%d", l.il);
@@ -943,8 +942,10 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
             }
             ggml_backend_buffer_set_usage(buf_stage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
-        // the trash entry: slot cap_tot - 1 of kv head 0, K
-        std::vector<int32_t> trash(n_stage, cap_tot - 1);
+        std::vector<int32_t> trash(n_stage);
+        for (int64_t j = 0; j < n_stage; ++j) {
+            trash[j] = trash_row(j);
+        }
         for (auto & l : layers) {
             ggml_backend_tensor_set(l.t.slots, trash.data(), 0, ggml_nbytes(l.t.slots));
             l.slots_hi = 0;
@@ -978,6 +979,10 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
 
     LLAMA_LOG_INFO("%s: max_batch = %d, prefetch_n = %d, resident = %d, lead = %d, sync = %d (m = %d, min hits = %d), stats = %d, all resident = %d\n", __func__,
             p.max_batch, p.prefetch_n, cap, p.lead, p.sync_mode, p.sync_m, p.sync_min_hits, p.stats, p.all_resident);
+    if (!all_res) {
+        LLAMA_LOG_INFO("%s: staging: device %.1f MiB, pinned host %.1f MiB\n", __func__,
+                ggml_backend_buffer_get_size(buf_stage.get())/1048576.0, ggml_backend_buffer_get_size(buf_pin.get())/1048576.0);
+    }
     return true;
 }
 
@@ -989,29 +994,18 @@ void llama_kvq_store::reset_resident() {
     for (auto & l : layers) {
         l.up_rec = false;
         std::fill(l.ridx.begin(), l.ridx.end(), -1);
-        std::fill(l.row_slot.begin(), l.row_slot.end(), -1);
-        std::fill(l.row_seen.begin(), l.row_seen.end(), kvq_seen{ 0, 0 });
+        std::fill(l.res.begin(), l.res.end(), 0);
         std::fill(l.slot_stamp.begin(), l.slot_stamp.end(), 0);
-        std::fill(l.slot_val.begin(), l.slot_val.end(), 0.0f);
         l.stamp    = 0;
         l.pf_stamp = 0;
         l.fetch.clear();
 
-        // pinned rows: the sinks, or every row
+        // pinned rows: the sinks, or every row; they are never requested, so they are not in the bitmap
         const int32_t n_pin = all_res ? n_coarse_ : n_sink;
         for (int32_t g = 0; g < G; ++g) {
             for (int32_t s = 0; s < n_pin; ++s) {
-                l.ridx[(size_t) g*cap_tot + s]      = s;
-                l.row_slot[(size_t) g*n_rows_ + s] = s;
+                l.ridx[(size_t) g*cap_tot + s] = s;
             }
-            // LRU list of the evictable slots, in slot order
-            const size_t o = (size_t) g*cap_tot;
-            for (int32_t s = n_sink; s < n_sink + cap; ++s) {
-                l.prev[o + s] = s > n_sink ? s - 1 : -1;
-                l.next[o + s] = s + 1 < n_sink + cap ? s + 1 : -1;
-            }
-            l.head[g] = all_res ? -1 : n_sink;
-            l.tail[g] = all_res ? -1 : n_sink + cap - 1;
         }
         ggml_backend_tensor_set(l.t.ridx, l.ridx.data(), 0, ggml_nbytes(l.t.ridx));
 
@@ -1043,9 +1037,8 @@ void llama_kvq_store::drop_pending() {
     }
 }
 
-int64_t llama_kvq_store::n_req(int k, int64_t n_top, int64_t L) const {
-    // prefetch: the union over the positions is cut at two requests, the other slots keep older rows
-    return std::min<int64_t>(cap, k == KIND_TOPUP ? n_top*L : n_top*std::min<int64_t>(L, 2));
+int64_t llama_kvq_store::n_req(int64_t n_top, int64_t L) const {
+    return std::min<int64_t>(cap, n_top*L);
 }
 
 void llama_kvq_store::flush_ubatch() {
@@ -1083,7 +1076,7 @@ static ggml_backend_t kvq_backend(ggml_backend_sched_t sched, ggml_backend_dev_t
     return backend;
 }
 
-// the callback of the trigger fills rows [0, n) of the staging tensor and the slot list, the rest of the list is the trash slot
+// the callback of the trigger fills rows [0, n) of the staging tensor and the slot list, the rest of the list points to trash rows
 static void kvq_build_scatter(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * rkv_h, ggml_tensor * staging, ggml_tensor * slots, int64_t n_rows, int k, int32_t il) {
     GGML_ASSERT(staging != nullptr && n_rows <= staging->ne[1]);
     ggml_tensor * src = ggml_view_2d(ctx, staging, staging->ne[0], n_rows, staging->nb[1], 0);
@@ -1109,21 +1102,28 @@ void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_bac
     // read in the copy callback of a later split, after its last use in the graph
     ggml_set_output(ids);
 
-    // the scores of the selected rows, to rank the union over the positions
-    ggml_tensor * vals = ggml_get_rows(ctx, ggml_reshape_3d(ctx, sc, 1, n_coarse_, G*L), ids); // [1, n_top, G*L]
-    ggml_format_name(vals, "kvq_vals%d-%d", (int) k, il);
-
-    // read back from a copy stream after the trigger, so they are outputs
-    ggml_set_output(vals);
+    // the trigger reads a get_rows of the selection (anchor), so it runs after the selection
+    ggml_tensor * sc3    = ggml_reshape_3d(ctx, sc, 1, n_coarse_, G*L);
+    ggml_tensor * anchor = nullptr;
+    if (k == KIND_PREFETCH && pf_scores(n_top, L)) {
+        // the scores of the selected rows, to cut the union over the positions; read back from a copy stream, so an output
+        anchor = ggml_get_rows(ctx, sc3, ids); // [1, n_top, G*L]
+        ggml_format_name(anchor, "kvq_vals%d-%d", (int) k, il);
+        ggml_set_output(anchor);
+    } else {
+        // only the rows are read back, the anchor is the score of one row
+        anchor = ggml_get_rows(ctx, ggml_view_3d(ctx, sc3, 1, n_coarse_, 1, sc3->nb[1], sc3->nb[2], 0), ggml_view_2d(ctx, ids, 1, 1, ids->nb[1], 0));
+        ggml_format_name(anchor, "kvq_anchor%d-%d", (int) k, il);
+    }
 
     // the trigger value is not set, the result is not used
-    ggml_tensor * trig = ggml_add(ctx, ggml_view_1d(ctx, vals, 1, 0), t.trig[k]);
+    ggml_tensor * trig = ggml_add(ctx, ggml_view_1d(ctx, anchor, 1, 0), t.trig[k]);
     ggml_format_name(trig, "kvq_trig%d-%d", (int) k, il);
     ggml_backend_sched_set_tensor_backend(sched, trig, kvq_backend(sched, dev));
     ggml_build_forward_expand(gf, trig);
 
     if (k == KIND_TOPUP) {
-        kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(k, n_top, L), k, il);
+        kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(n_top, L), k, il);
     }
 }
 
@@ -1135,7 +1135,7 @@ void llama_kvq_store::build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_back
     ggml_backend_sched_set_tensor_backend(sched, trig, kvq_backend(sched, dev));
     ggml_build_forward_expand(gf, trig);
 
-    kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(KIND_PREFETCH, n_top, L), KIND_JOIN, il);
+    kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(n_top, L), KIND_JOIN, il);
 }
 
 static void kvq_build_trigger(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_dev_t dev,
@@ -1170,8 +1170,8 @@ ggml_tensor * llama_kvq_store::build_scr_copy(ggml_context * ctx, int32_t il, bo
     return ggml_cpy(ctx, src, dst);
 }
 
-void llama_kvq_store::select(const layer & l, const ggml_tensor * dst, ggml_cgraph * graph, const ggml_tensor ** ids, const ggml_tensor ** vals) const {
-    // trig = add(view(vals), trigger), vals = get_rows(scores, ids)
+void llama_kvq_store::select(const layer & l, const ggml_tensor * dst, ggml_cgraph * graph, const ggml_tensor ** ids, const ggml_tensor ** anchor) const {
+    // trig = add(view(anchor), trigger), anchor = get_rows(scores, ids or a view of ids)
     ggml_cgraph * gr = graph;
     const int n_nodes = ggml_graph_n_nodes(gr);
     const ggml_tensor * trig = nullptr;
@@ -1182,16 +1182,121 @@ void llama_kvq_store::select(const layer & l, const ggml_tensor * dst, ggml_cgra
         }
     }
     GGML_ASSERT(trig != nullptr);
-    *vals = trig->src[0]->view_src;
-    GGML_ASSERT(*vals != nullptr && (*vals)->op == GGML_OP_GET_ROWS);
-    *ids = (*vals)->src[1];
+    *anchor = trig->src[0]->view_src;
+    GGML_ASSERT(*anchor != nullptr && (*anchor)->op == GGML_OP_GET_ROWS);
+    *ids = (*anchor)->src[1]->view_src ? (*anchor)->src[1]->view_src : (*anchor)->src[1];
+    GGML_ASSERT((*ids)->op == GGML_OP_TOP_K);
     for (int i = 0; i < n_nodes; ++i) {
         const ggml_tensor * node = ggml_graph_node(gr, i);
-        if (node == *vals || node == *ids) {
+        if (node == *anchor || node == *ids) {
             GGML_ABORT("the selection of layer %d is computed in the same split as its trigger", l.il);
         }
     }
-    GGML_ASSERT(ggml_is_contiguous(*ids) && ggml_is_contiguous(*vals) && (*ids)->type == GGML_TYPE_I32 && (*vals)->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(*ids) && ggml_is_contiguous(*anchor) && (*ids)->type == GGML_TYPE_I32 && (*anchor)->type == GGML_TYPE_F32);
+}
+
+// more requested rows than slots: the n_u rows with the largest max score over the positions stay requested, ties by row
+void llama_kvq_store::cut_request(layer & l, int32_t g, int64_t n_u) {
+    uint64_t * rq = l.req.data() + g*n_bmw;
+    int64_t n = 0;
+    for (int64_t w = 0; w < n_bmw; ++w) {
+        n += kvq_popcount(rq[w]);
+    }
+    if (n <= n_u) {
+        return;
+    }
+    const int64_t n_top = l.n_top;
+    const int64_t L     = l.n_pos;
+    std::vector<kvq_cand> & u = l.cand;
+    u.clear();
+    for (int64_t p = 0; p < L; ++p) {
+        const int64_t o = (g + G*p)*n_top;
+        for (int64_t i = 0; i < n_top; ++i) {
+            u.push_back({ l.h_sel[o + i], l.h_val[o + i] });
+        }
+    }
+    kvq_sort_rows(u, n_rows_);
+    size_t m = 0;
+    for (const kvq_cand & c : u) {
+        if (m > 0 && u[m - 1].row == c.row) {
+            u[m - 1].val = std::max(u[m - 1].val, c.val);
+        } else {
+            u[m++] = c;
+        }
+    }
+    u.resize(m);
+    std::nth_element(u.begin(), u.begin() + n_u, u.end(), [](const kvq_cand & a, const kvq_cand & b) {
+        return a.val > b.val || (a.val == b.val && a.row < b.row);
+    });
+    std::fill(rq, rq + n_bmw, 0);
+    for (int64_t i = 0; i < n_u; ++i) {
+        kvq_bit_set(rq, u[i].row);
+    }
+    l.cnt.pf_cut++;
+    for (int64_t p = 0; p < L; ++p) {
+        const int64_t o = (g + G*p)*n_top;
+        for (int64_t i = 0; i < n_top; ++i) {
+            l.cnt.pf_lost += !kvq_bit(rq, l.h_sel[o + i]);
+        }
+    }
+}
+
+// the rows of l.miss (by row, not resident) go to free slots: a slot is free if its row is not in l.req
+// the free slots of the oldest requests first, then by slot, so the slot of a row does not depend on the order of the selection
+// the slots of the requested rows get the stamp now; l.req is cleared
+void llama_kvq_store::place(layer & l, int32_t g, uint32_t now) {
+    uint64_t * rq = l.req.data() + g*n_bmw;
+    const size_t o = (size_t) g*cap_tot;
+
+    // without branches on the request: about 40% of the slots are requested, in no order
+    l.free_s.resize(cap + 1);
+    l.free_age.resize(cap + 1);
+    int32_t  * fs = l.free_s.data();
+    uint8_t  * fa = l.free_age.data();
+    uint32_t * ss = l.slot_stamp.data() + o;
+    int64_t    nf = 0;
+    for (int32_t s = n_sink; s < n_sink + cap; ++s) {
+        const int32_t  row = l.ridx[o + s];
+        const bool     in  = (row >= 0) & kvq_bit(rq, std::max(row, 0));
+        const uint32_t st  = ss[s];
+        ss[s]  = in ? now : st;
+        fs[nf] = s;
+        fa[nf] = row < 0 ? 255 : (uint8_t) std::min<uint32_t>(255, now - st);
+        nf += !in;
+    }
+    std::fill(rq, rq + n_bmw, 0);
+
+    const int64_t n_miss = (int64_t) l.miss.size();
+    GGML_ASSERT(nf >= n_miss);
+    if (n_miss == 0) {
+        return;
+    }
+    // the age a of the youngest free slot that is taken
+    int64_t hist[256] = { 0 };
+    for (int64_t j = 0; j < nf; ++j) {
+        hist[fa[j]]++;
+    }
+    int     a     = 255;
+    int64_t n_old = 0;
+    while (n_old + hist[a] < n_miss) {
+        n_old += hist[a--];
+    }
+    // the free slots older than a, then the first ones of age a, each in slot order
+    l.pick.resize(cap + 1);
+    int32_t * pk = l.pick.data();
+    int64_t   np = 0;
+    for (int64_t j = 0; j < nf; ++j) {
+        pk[np] = fs[j];
+        np += fa[j] > a;
+    }
+    for (int64_t j = 0; j < nf; ++j) {
+        pk[np] = fs[j];
+        np += (fa[j] == a) & (np < n_miss);
+    }
+    GGML_ASSERT(np == n_miss);
+    for (int64_t k = 0; k < n_miss; ++k) {
+        l.assign(g, pk[k], l.miss[k], cap_tot, n_bmw);
+    }
 }
 
 void llama_kvq_store::plan_prefetch(layer & l) {
@@ -1199,64 +1304,39 @@ void llama_kvq_store::plan_prefetch(layer & l) {
 
     const int64_t n_top = l.n_top;
     const int64_t L     = l.n_pos;
-    const int64_t n_u   = n_req(KIND_PREFETCH, n_top, L);
+    const bool    cut   = pf_scores(n_top, L);
 
     const uint32_t now = ++l.stamp;
     l.fetch.clear();
 
     cnt.n_pf++;
+    cnt.pf_sel += G*L*n_top;
     l.pf_stamp = now;
-    std::vector<kvq_cand> u;
     for (int32_t g = 0; g < G; ++g) {
-        // union over the positions, the max score of a row; the rows of one position are distinct
-        u.clear();
+        // the union over the positions; the order of top_k on the device is not fixed (atomics), the bitmap does not keep it
+        uint64_t * rq = l.req.data() + g*n_bmw;
         for (int64_t p = 0; p < L; ++p) {
-            const int64_t o = (g + G*p)*n_top;
+            const int32_t * sel = l.h_sel + (g + G*p)*n_top;
             for (int64_t i = 0; i < n_top; ++i) {
-                const int32_t row = l.h_sel[o + i];
-                GGML_ASSERT(row >= n_sink && row < n_coarse_);
-                if (L == 1) {
-                    u.push_back({ row, -1, l.h_val[o + i] });
-                    continue;
-                }
-                kvq_seen & e = l.row_seen[(size_t) g*n_rows_ + row];
-                if (e.mark != now) {
-                    e = { now, (int32_t) u.size() };
-                    u.push_back({ row, -1, l.h_val[o + i] });
-                } else {
-                    u[e.upos].val = std::max(u[e.upos].val, l.h_val[o + i]);
-                }
+                GGML_ASSERT(sel[i] >= n_sink && sel[i] < n_coarse_);
+                kvq_bit_set(rq, sel[i]);
             }
         }
-        if ((int64_t) u.size() > n_u) {
-            std::nth_element(u.begin(), u.begin() + n_u, u.end(), [](const kvq_cand & a, const kvq_cand & b) {
-                return a.val > b.val || (a.val == b.val && a.row < b.row);
-            });
-            u.resize(n_u);
+        if (cut) {
+            cut_request(l, g, n_req(n_top, L));
         }
-        // the order of top_k on the device is not fixed (atomics), the slots of the rows and the sums of the attention over
-        // the slots would follow it: by row
-        kvq_sort_rows(u, n_rows_);
-        cnt.pf_req += u.size();
-
-        // the resident rows first, so that the victims of the missing ones are older than this request
-        // independent loads first, the cache misses overlap
-        const int32_t * rs = l.row_slot.data() + (size_t) g*n_rows_;
-        for (auto & c : u) {
-            c.slot = rs[c.row];
-        }
-        for (const auto & c : u) {
-            if (c.slot >= 0) {
-                l.touch(g, c.slot, c.val, cap_tot, n_sink);
+        const uint64_t * rb = l.res.data() + g*n_bmw;
+        l.miss.clear();
+        for (int64_t w = 0; w < n_bmw; ++w) {
+            if (rq[w] == 0) {
+                continue;
+            }
+            cnt.pf_req += kvq_popcount(rq[w]);
+            for (uint64_t m = rq[w] & ~rb[w]; m != 0; m &= m - 1) {
+                l.miss.push_back((int32_t) (64*w + ctz64(m)));
             }
         }
-        for (const auto & c : u) {
-            if (c.slot < 0) {
-                const int32_t s = l.head[g];
-                GGML_ASSERT(s >= 0 && l.slot_stamp[(size_t) g*cap_tot + s] != now);
-                l.assign(g, s, c.row, c.val, cap_tot, n_sink, n_rows_);
-            }
-        }
+        place(l, g, now);
     }
     cnt.pf_fetch += l.fetch.size();
 }
@@ -1267,13 +1347,6 @@ void llama_kvq_store::plan_topup(layer & l) {
     const int64_t n_top = l.n_top;
     const int64_t L     = l.n_pos;
     const int32_t * sel = l.h_sel;
-
-    // by row, as in plan_prefetch: the touches and the victims follow this order
-    if (params.sync_mode != LLAMA_KVQ_SYNC_OFF) {
-        for (int64_t r = 0; r < G*L; ++r) {
-            std::sort(l.h_sel + r*n_top, l.h_sel + (r + 1)*n_top);
-        }
-    }
 
     const uint32_t now = ++l.stamp;
     l.fetch.clear();
@@ -1286,62 +1359,43 @@ void llama_kvq_store::plan_topup(layer & l) {
 
     std::vector<int32_t> hits(G*L, 0);
     for (int64_t r = 0; r < G*L; ++r) {
-        const int32_t g = (int32_t) (r % G);
+        const uint64_t * rb = l.res.data() + (r % G)*n_bmw;
         for (int64_t i = 0; i < n_top; ++i) {
-            hits[r] += l.row_slot[(size_t) g*n_rows_ + sel[r*n_top + i]] >= 0;
+            GGML_ASSERT(sel[r*n_top + i] >= n_sink && sel[r*n_top + i] < n_coarse_);
+            hits[r] += kvq_bit(rb, sel[r*n_top + i]);
         }
         cnt.top_hit += hits[r];
     }
     cnt.top_n    += n_top*G*L;
     cnt.tu_check += G*L;
 
-    // slots of this step's prefetch by ascending score, the victims once the older slots are used up
-    std::vector<std::vector<int32_t>> cand(G);
-    std::vector<size_t> cand_pos(G, 0);
-    std::vector<bool>   cand_init(G, false);
-    auto victim = [&](int32_t g) {
-        const size_t o = (size_t) g*cap_tot;
-        const int32_t s = l.head[g];
-        if (l.slot_stamp[o + s] < l.pf_stamp || l.pf_stamp == 0) {
-            return s;
-        }
-        if (!cand_init[g]) {
-            cand_init[g] = true;
-            for (int32_t t = n_sink; t < n_sink + cap; ++t) {
-                if (l.slot_stamp[o + t] != now) {
-                    cand[g].push_back(t);
+    // the missing rows of the firing positions; the slots of the rows of every position are kept
+    // the victims are the free slots of the oldest requests, the slots of this step's prefetch last
+    uint64_t stall = 0;
+    for (int32_t g = 0; g < G && do_fetch; ++g) {
+        uint64_t       * rq = l.req.data() + g*n_bmw;
+        const uint64_t * rb = l.res.data() + g*n_bmw;
+        l.miss.clear();
+        for (int64_t p = 0; p < L; ++p) {
+            const int64_t   r    = p*G + g;
+            const int32_t * rows = sel + r*n_top;
+            for (int64_t i = 0; i < n_top; ++i) {
+                kvq_bit_set(rq, rows[i]);
+            }
+            if (hits[r] >= thr) {
+                continue;
+            }
+            cnt.tu_fire++;
+            stall |= 1ull << p;
+            for (int64_t i = 0; i < n_top; ++i) {
+                if (!kvq_bit(rb, rows[i])) {
+                    l.miss.push_back(rows[i]);
                 }
             }
-            std::sort(cand[g].begin(), cand[g].end(), [&](int32_t a, int32_t b) { return l.slot_val[o + a] < l.slot_val[o + b]; });
         }
-        while (cand_pos[g] < cand[g].size() && l.slot_stamp[o + cand[g][cand_pos[g]]] == now) {
-            cand_pos[g]++;
-        }
-        GGML_ASSERT(cand_pos[g] < cand[g].size());
-        return cand[g][cand_pos[g]++];
-    };
-
-    uint64_t stall = 0;
-    for (int64_t r = 0; r < G*L && do_fetch; ++r) {
-        const int32_t g = (int32_t) (r % G);
-        const int64_t p = r / G;
-        const int32_t * rows = sel + r*n_top;
-        for (int64_t i = 0; i < n_top; ++i) {
-            const int32_t s = l.row_slot[(size_t) g*n_rows_ + rows[i]];
-            if (s >= 0) {
-                l.touch(g, s, INFINITY, cap_tot, n_sink);
-            }
-        }
-        if (hits[r] >= thr) {
-            continue;
-        }
-        cnt.tu_fire++;
-        stall |= 1ull << p;
-        for (int64_t i = 0; i < n_top; ++i) {
-            if (l.row_slot[(size_t) g*n_rows_ + rows[i]] < 0) {
-                l.assign(g, victim(g), rows[i], INFINITY, cap_tot, n_sink, n_rows_);
-            }
-        }
+        std::sort(l.miss.begin(), l.miss.end());
+        l.miss.erase(std::unique(l.miss.begin(), l.miss.end()), l.miss.end());
+        place(l, g, now);
     }
     cnt.tu_stall += kvq_popcount(stall);
     ub_fired |= stall;
@@ -1377,7 +1431,9 @@ void llama_kvq_store::gather(layer & l, int64_t n_rows) {
 void llama_kvq_store::upload(ggml_backend_t backend, layer & l) {
     const int64_t n      = (int64_t) l.fetch.size();
     const int64_t n_list = std::max<int64_t>(2*n, l.slots_hi);
-    std::fill(l.h_slots + 2*n, l.h_slots + n_list, cap_tot - 1);
+    for (int64_t j = 2*n; j < n_list; ++j) {
+        l.h_slots[j] = trash_row(j);
+    }
 
     if (n > 0) {
         ggml_backend_tensor_set_async(backend, l.t.stage, l.h_stage, 0, 2*n*ROW);
@@ -1400,7 +1456,7 @@ void llama_kvq_store::run_prefetch(layer & l) {
     const double t0 = kvq_now();
     plan_prefetch(l);
     const double t1 = kvq_now();
-    gather(l, 2*G*n_req(KIND_PREFETCH, l.n_top, l.n_pos));
+    gather(l, 2*G*n_req(l.n_top, l.n_pos));
     const double t2 = kvq_now();
     l.cnt.t_plan   += t1 - t0;
     l.cnt.t_gather += t2 - t1;
@@ -1416,8 +1472,7 @@ void llama_kvq_store::wait(layer & l) {
 void llama_kvq_store::drop(layer & l) {
     wait(l);
     for (const auto & f : l.fetch) {
-        l.ridx[(size_t) f.g*cap_tot + f.slot] = -1;
-        l.row_slot[(size_t) f.g*n_rows_ + f.row] = -1;
+        l.forget(f.g, f.slot, cap_tot, n_bmw);
     }
     l.fetch.clear();
     ggml_backend_synchronize(backend_cp.get());
@@ -1491,9 +1546,9 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
         cnt.t_join   += t1 - t0;
         cnt.t_upload += t2 - t1;
     } else {
-        const ggml_tensor * ids  = nullptr;
-        const ggml_tensor * vals = nullptr;
-        select(l, dst, graph, &ids, &vals);
+        const ggml_tensor * ids    = nullptr;
+        const ggml_tensor * anchor = nullptr;
+        select(l, dst, graph, &ids, &anchor);
 
         const int64_t n_top = ids->ne[0];
         const int64_t L     = ids->ne[1]/G;
@@ -1504,24 +1559,26 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
         l.n_pos = L;
 
         if (kind == KIND_PREFETCH) {
-            // the readback on the copy stream, after the selection on the main stream
+            // the readback on the copy stream, after the selection on the main stream; the scores only for a cut
             ggml_backend_t cp = backend_cp.get();
             ggml_backend_event_record(l.ev_sel.get(), backend);
             ggml_backend_event_wait(cp, l.ev_sel.get());
-            ggml_backend_tensor_get_async(cp, ids,  l.h_sel, 0, ggml_nbytes(ids));
-            ggml_backend_tensor_get_async(cp, vals, l.h_val, 0, ggml_nbytes(vals));
+            ggml_backend_tensor_get_async(cp, ids, l.h_sel, 0, ggml_nbytes(ids));
+            if (pf_scores(n_top, L)) {
+                GGML_ASSERT(ggml_nelements(anchor) == ggml_nelements(ids));
+                ggml_backend_tensor_get_async(cp, anchor, l.h_val, 0, ggml_nbytes(anchor));
+            }
             ggml_backend_event_record(l.ev_read.get(), cp);
             l.pending = true;
             work->submit(l);
             cnt.t_read += kvq_now() - t0;
         } else {
-            ggml_backend_tensor_get_async(backend, ids,  l.h_sel, 0, ggml_nbytes(ids));
-            ggml_backend_tensor_get_async(backend, vals, l.h_val, 0, ggml_nbytes(vals));
+            ggml_backend_tensor_get_async(backend, ids, l.h_sel, 0, ggml_nbytes(ids));
             ggml_backend_synchronize(backend);
             const double t1 = kvq_now();
             plan_topup(l);
             const double t2 = kvq_now();
-            gather(l, 2*G*n_req(KIND_TOPUP, n_top, L));
+            gather(l, 2*G*n_req(n_top, L));
             const double t3 = kvq_now();
             upload(backend, l);
             const double t4 = kvq_now();
@@ -1575,11 +1632,10 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     for (const auto & l : layers) {
         mi.codes      += ggml_nbytes(l.t.kc) + ggml_nbytes(l.t.vc);
         mi.tables     += ggml_nbytes(l.t.tinv) + ggml_nbytes(l.t.taux);
-        mi.resident   += ggml_nbytes(l.t.rkv) + ggml_nbytes(l.t.ridx);
+        mi.resident   += ggml_nbytes(l.t.rkv_h) + ggml_nbytes(l.t.ridx);
         mi.host_store += (size_t) G*n_rows_*2*ROW;
         mi.other_dev  += (l.t.qacc ? ggml_nbytes(l.t.qacc) : 0) + (l.t.gacc ? ggml_nbytes(l.t.gacc) : 0);
-        mi.host_other += l.ridx.size()*sizeof(int32_t) + l.row_slot.size()*sizeof(int32_t) + l.row_seen.size()*sizeof(kvq_seen) +
-                         (l.slot_stamp.size() + l.slot_val.size() + l.prev.size() + l.next.size())*sizeof(int32_t);
+        mi.host_other += (l.ridx.size() + l.slot_stamp.size())*sizeof(int32_t) + (l.res.size() + l.req.size())*sizeof(uint64_t);
     }
     mi.other_dev += ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
     mi.scratch    = scr ? ggml_nbytes(scr) : 0;

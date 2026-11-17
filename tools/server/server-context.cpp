@@ -872,6 +872,9 @@ struct server_slot {
             s.n_pf     += l.n_pf;
             s.pf_req   += l.pf_req;
             s.pf_fetch += l.pf_fetch;
+            s.pf_sel   += l.pf_sel;
+            s.pf_cut   += l.pf_cut;
+            s.pf_lost  += l.pf_lost;
             s.bytes    += l.bytes;
             s.t_wait   += l.t_wait;
             s.t_plan   += l.t_plan;
@@ -882,6 +885,8 @@ struct server_slot {
         }
         SLT_INF(*this, "kvq: packed ubatches = %" PRId64 " (%" PRId64 " tokens), rows requested = %" PRId64 ", fetched = %" PRId64 ", %.1f MiB uploaded\n",
                 ca.n_ubatch, ca.n_tokens, s.pf_req, s.pf_fetch, s.bytes/1048576.0);
+        SLT_INF(*this, "kvq: selected rows of the positions resident after the prefetch: %.4f%% (%" PRId64 " of %" PRId64 " rows lost in %" PRId64 " cut requests)\n",
+                s.pf_sel ? 100.0 - 100.0*s.pf_lost/s.pf_sel : 100.0, s.pf_lost, s.pf_sel, s.pf_cut);
         SLT_INF(*this, "kvq: per packed ubatch: wait %.2f ms, join %.2f ms, upload %.2f ms (decode thread); plan %.2f ms, gather %.2f ms (worker); GPU idle at the joins %.2f ms (LLAMA_KVQ_IDLE_PROBE)\n",
                 1e3*s.t_wait/ca.n_ubatch, 1e3*s.t_join/ca.n_ubatch, 1e3*s.t_upload/ca.n_ubatch, 1e3*s.t_plan/ca.n_ubatch, 1e3*s.t_gather/ca.n_ubatch,
                 1e3*s.t_idle/ca.n_ubatch);

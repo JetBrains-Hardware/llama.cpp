@@ -534,7 +534,7 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
     try {
         const int32_t n_rows = (int32_t) n_ctx_max;
         const int32_t n_gate = v_tabs.empty() ? n_head*(int32_t) llama_kvq_store::D : 0;
-        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, p.resident_cap, false, p.n_sink, false, n_gate);
+        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, llama_kvq_resident_slots(p), false, p.n_sink, false, n_gate);
         store->set_backend(backends);
         if (tail && !store->scratch_ok()) {
             throw std::runtime_error("the tail mode needs the scratch attention (pinned host memory, LLAMA_KVQ_SCRATCH not 0)");
