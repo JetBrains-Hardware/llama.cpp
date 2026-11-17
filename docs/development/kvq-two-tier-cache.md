@@ -139,6 +139,34 @@ Not built or not kept:
 
 Scripts and logs: `kvq-scratch\mem\comb` (`part1-table.txt`, `acc-per-request.txt`, `m*.txt`, `runs\TAG`, `op\TAG`, `acc\runs`, `dfl\runs`, `comb.diff`).
 
+### Against plain f16, q8_0 and q4_0 caches (2026-11-17, build 2758a0a64)
+
+The same binary with four caches: A plain f16 K/V, B plain q8_0 (default attention rotation, as the server runs it), C `--kvq` (defaults), D plain q4_0 (default rotation). IQ3_S target. Full tables with the intervals, t/s and the replies: `kvq-cache-comparison.md`; raw numbers: `kvq-scratch\mem\comb\final-compare.txt`.
+
+Quality (kvq-eval, teacher forced on the recorded replies, teacher A at one token per decode; KL at 1 per decode / 8 per batch, top-1 flips at 1 per decode):
+
+| Context (scored positions) | A, 8 per batch (floor) | B q8_0 | C --kvq | D q4_0 | C against q8_0 without rotation |
+|---|---|---|---|---|---|
+| 24k (245) | 6.2e-5 | 1.30e-4 / 9.3e-5, 0 | 1.07e-4 / 1.07e-4, 0 | 8.9e-4 / 1.02e-3, 2 | 4.5e-5 / 3.7e-5 |
+| 50k (289) | 6.5e-5 | 1.77e-4 / 1.83e-4, 2 | 2.30e-4 / 2.27e-4, 3 | 1.73e-3 / 1.81e-3, 4 | 1.17e-4 / 1.09e-4 |
+| 100k (471) | 6.7e-5 | 1.77e-4 / 1.78e-4, 1 | 1.23e-4 / 1.34e-4, 1 | 1.01e-3 / 1.02e-3, 2 | 8.1e-5 / 8.9e-5 |
+
+Against f16 the two-tier cache is about as far as plain q8_0 (lower at 24k and 100k, higher at 50k, all intervals overlap); q4_0 is 5 - 10x further. Plain q8_0 with the rotation is worse than without it at 24k and 100k (1.02e-4 and 1.22e-4 without).
+
+Speed (llama-server with the DFlash2 drafter, n_ctx 102400, real prefill, 300 tokens, two sessions each; decode ms per verify batch at n_max 7 / n_max 3, difference to A):
+
+| Context | A f16 | B q8_0 | C --kvq | D q4_0 |
+|---|---|---|---|---|
+| 24k | 16.57 / 14.01 | +1.2 / +1.0 | +4.6 / +3.4 | +1.6 / +1.5 |
+| 50k | 17.53 / 15.05 | +3.0 / +2.9 | +5.0 / +3.1 | +3.1 / +3.2 |
+| 100k | 19.64 / 17.17 | +6.7 / +6.5 | +6.0 / +2.8 | +6.4 / +6.4 |
+
+Prefill against A: C +0.8 / +1.8 / +3.5 s, B and D 0 / +0.2 / +2.2 s at 24k / 50k / 100k. The continuations differ between the caches in most cells, so t/s (in the file) compares different replies.
+
+Memory (dedicated usage of the process, MiB): at n_ctx 102400 in generation A 22,023, B 19,345, C 17,802, D 17,745 (against A: -2,678, -4,221, -4,278); after load at 51200 / 204800: A 18,538 / 28,439, B 17,160 / 23,161, C 16,788 / 19,107, D 16,360 / 19,961, so per 1000 positions of n_ctx A 64.5, B 39.1, C 15.1, D 23.4 MiB. C also pins the q8_0 store in host RAM (about 4.3 GB at 102400).
+
+So against q4_0, the other way to shrink the cache: the same VRAM at 102400 (C 57 MiB more), 854 MiB less at 204800, 7 - 8x lower KL against f16; decode faster than q4_0 at 100k (-0.4 / -3.6 ms) and slower at 24k (+3.0 / +1.9 ms) and 50k (+1.9 / 0). The f16 cache is the fastest at every length (no dequantize in the attention).
+
 ### Precise rows in blocks of 256 (2026-11-17, not bit-identical)
 
 Owner's decision: variants that change the summation order are allowed if they add little to the error of `--kvq`. `kvq_precise_m` takes the q8_0 resident rows in blocks of 256 rows (4 tiles with an online softmax inside the block; V of a tile is fetched during K . q, K of the next tile during P V), so the 8192 slots give 32 partials per kv head instead of 128; tail rows and f16 resident rows keep `kvq_precise` with 64 rows. Per call at 8192 slots and 48 columns: kvq_precise_m 31 us + kvq_final 7 us against 51 + 17 us (128 / 192 / 512 rows per block: 42 / 42 / 53 us, 256 is the fastest). Per round (nsys): 8 tokens 0.94 + 0.61 ms against 1.24 + 0.76 ms (kvq_precise, kvq_final with merge and combine), 4 tokens 0.89 + 0.39 against 1.05 + 0.45, 24k and 4 tokens 0.80 + 0.30 against 0.98 + 0.35.
