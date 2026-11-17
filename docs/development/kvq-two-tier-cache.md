@@ -1,6 +1,6 @@
 # Two-tier KV cache for qwen35 (kvq) - prototype state
 
-State of branch `kvq-two-tier-cache` at commit cefce74bc (2026-11-13), with the GPU fitter (2026-11-16) on top of 7604e664e, and the ring redesign (2026-11-16 evening, on top of fa865aee3, not committed when this was written: the rows after the last complete chunk are fitted at the end of every prompt, the ring holds only rows that are not coded yet). The CPU fitter is kept on branch `kvq-fit-cpu`. The branch starts from ggml-org/master 951d465f5 and is pushed to the JetBrains-Hardware fork. This file is the starting point for the next work session.
+State of branch `kvq-two-tier-cache` at commit cefce74bc (2026-11-13), with the GPU fitter (2026-11-16) on top of 7604e664e, and the ring redesign (2026-11-16 evening, on top of fa865aee3, not committed when this was written: the rows after the last complete chunk are fitted at the end of every prompt, the ring holds only rows that are not coded yet). On top of 209ab7775, not committed (2026-11-17, worktree `kvq-wt-comb`, branch `kvq-comb`): the whole union of the verify batch and the attention op kernel changes (see Results). The CPU fitter is kept on branch `kvq-fit-cpu`. The branch starts from ggml-org/master 951d465f5 and is pushed to the JetBrains-Hardware fork. This file is the starting point for the next work session.
 
 Research background, codec definition and the original plan are in the `qwen3.8-exp` repository: `notes/kvq_implementation_plan.md`, `notes/kv_prefetch_results.md`, `src/qexp/kvcodec.py`, `experiments/14_kv_prefetch.py`.
 
@@ -10,7 +10,7 @@ A KV cache for Qwen3.8-27B (GGUF arch `qwen35`) that keeps most of the attention
 
 - Coarse tier, VRAM: every row of a fitted chunk as transform-coded low-bit codes (K 2 bit, V 1 bit plus a gain). The attention is computed on the packed codes by a custom op.
 - Precise tier, system RAM: the q8_0 rows of the same positions in a pinned host store.
-- Resident set, VRAM: 1024 precise rows per (layer, kv head), selected per token by an early query and fetched from RAM while the GPU runs the two layers before the attention.
+- Resident set, VRAM: 8192 precise rows per (layer, kv head) (8 positions x 1024), selected per position by an early query and fetched from RAM while the GPU runs the two layers before the attention; every position of a packed ubatch has all of its own top 1024 rows resident.
 - Ring, VRAM: q8_0 rows of the positions whose rows are not in the host store yet: the reply since the end of the last prompt, and the rows of a prompt while it is processed (ring-shaped device cache, `--kvq-tail`, default one batch + 256 cells, at least 4352).
 
 Model facts used everywhere: 64 trunk blocks, 16 attention layers (il = 3, 7, ..., 63), 24 query heads, 4 kv heads, head dim 256. The MTP block (block 64) runs in its own context with its own plain cache and does not use any of this.
@@ -48,7 +48,10 @@ Ring overflow. Before a batch is placed (`tail_wait`), the ring needs room for i
 Generation and MTP verify (ubatch <= 8 tokens), per attention layer il:
 
 1. At the input of layer il - 2 the graph computes layer il's query from the earlier hidden state, scores all coarse rows, and takes the top 1024 per (kv head, position).
-2. A scheduler split with a copy callback queues the readback of the selection on a copy stream. A worker thread plans the resident slots (least recently selected eviction) and gathers the rows from the host store. The GPU keeps running layers il - 2 and il - 1.
+2. A scheduler split with a copy callback queues the readback of the selection (the row indices only; the scores only when the request can be cut, see below) on a copy stream. A worker thread plans the resident slots and gathers the rows from the host store. The GPU keeps running layers il - 2 and il - 1.
+   - The request of a kv head is the union of the selections of all positions of the ubatch, deduplicated in a bitmap of n_coarse bits (set the bits of the L lists, the word scan gives the distinct rows in row order; and-not with the bitmap of the resident rows gives the missing rows).
+   - A slot is free if its row is not in the request. The missing rows (in row order) go to the free slots of the oldest requests (a per-slot stamp of the last request that listed its row; age in requests, 255 and older and empty slots count as 255), ties by slot. So the row of every slot depends only on the sets, not on the order the GPU wrote the selection or on thread timing.
+   - The default capacity, `--kvq-resident-cap 0` = max_batch x prefetch_n = 8192, holds the whole request of the largest packed ubatch, so nothing is cut. With a smaller capacity a request of more distinct rows than slots is cut to the rows with the largest max score over the positions (ties by row, the scores are read back for this case only; logged once at enable, counted as `pf_cut` / `pf_lost`).
 3. Before layer il's attention a join uploads the rows and scatters them into the resident tensor.
 4. `ggml_kvq_attn` computes the attention over coarse rows + resident precise rows + the ring.
 
@@ -91,7 +94,7 @@ Server, production configuration plus `--kvq`:
 llama-server --fit off -m Qwen3.8-3.6-27B-blend-Q4_K_M.gguf --ctx-size 230000 --n-gpu-layers all --parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --jinja --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-type-k f16 --spec-draft-type-v f16 --batch-size 4096 --ubatch-size 1024 --kvq
 ```
 
-Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (1024), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default max(n_batch, 4096) + 256 = one batch, 0 = full device cache; not below n_batch + 256), `--kvq-chunk N` (rows per chunk, 8192), `--kvq-rem own|merge` (the rows after the last complete chunk, default own), `--kvq-min-rows N` (own: fewer rows after the last complete chunk stay precise, default 256), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
+Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (0 = 8 x prefetch_n = 8192, the whole request of a verify batch of 8), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default max(n_batch, 4096) + 256 = one batch, 0 = full device cache; not below n_batch + 256), `--kvq-chunk N` (rows per chunk, 8192), `--kvq-rem own|merge` (the rows after the last complete chunk, default own), `--kvq-min-rows N` (own: fewer rows after the last complete chunk stay precise, default 256), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
 
 With `--kvq` the server forces, with a warning: 1 slot, context shift and cache reuse off, flash attention on, q8_0 K/V, draft n_max <= 7; with `--kvq-tail 0` also the RAM prompt cache off and the slot save path cleared. At the end of each prompt the server waits until the prompt is fitted up to its end (log line `kvq: waited ... at the end of the prompt, coarse region N rows`); no fit work runs during the reply. It refuses to start for a model that is not qwen35, `--mmproj`, embeddings. Attention rotation of quantized caches is turned off for the model (also for the MTP context). `--fit` does not count the kvq memory.
 
@@ -108,6 +111,85 @@ Environment variables for debugging: `LLAMA_KVQ_SCHED_SYNC`, `LLAMA_KVQ_GATHER_T
 ## Results
 
 Machine: RTX 5090 32 GB, Ryzen 9950X3D, Windows 11, CUDA 12.9. One trace of 100k tokens unless noted; treat single runs as such.
+
+### Attention op kernels at verify batches of 8 (2026-11-17)
+
+Target IQ3_S with the DFlash2 drafter, n_ctx 102400, restored 100k slot (99,395 coarse rows), on top of the whole union below (8192 resident slots). All changes are in `kvq-attn.cu` and bit-identical: the op test outputs and the hashes of 24 large problems (`test-kvq-attn --hash`, 20k / 100k rows, capacity 1024 and 8192) are equal, kvq-eval logits from one saved state are equal at 8, 4 and 1 tokens per decode, and the server ids are equal.
+
+- Coarse kernel in column groups (`kvq_launch_coarse`): at 48 columns ATTN as 3 x 16 (168 registers, no stack; before 255 registers and a 72 B stack), SCORE as 2 x 24, at 32 columns SCORE as 2 x 16. The groups of one launch take the same rows in adjacent blocks, so the codes are read once from DRAM.
+- `kvq_score`: 2-byte loads of rows 96 B apart thrashed L1 at 48 columns; the score scratch has rows of N halves now and a thread reads its row in 16-byte loads.
+- `kvq_prep_c` (from 16 columns): one thread per component, 8 or 4 columns per block, the same summation order as `kvq_prep` (before, the prep of 48 columns had 222 registers, 96 KB of shared memory and one block per SM).
+- `kvq_final`: the loads of 32 precise partials are issued before their sums (same order). Against the plain loop at 8192 slots (same binary, alternating sessions): one token per decode 0.17 ms faster (6 of 6 pairs), n_max 3 0.20 ms, n_max 7 0.45 ms; isolated op 9.2 / 9.9 / 16.5 us against 28.3 / 32.7 / 55.3 us at 6 / 24 / 48 columns. Batches of 16 were 1 - 2 us slower than 32. (At 1024 slots the change looked like +0.1 ms at one token per decode, inside the noise.)
+- `kvq_precise`: the columns in groups of 8, 4 warps per group, all groups of a block share the K and V tile (each group computes its columns as a block of 8 columns would, so the sums are the same); K is fetched (cp.async into the q8_0 staging) while q is staged, V while K . q is computed. Per call at 8192 slots: 52 us at 48 columns, 38 us at 24 (76 us before), 30 us at 12 (48 us), 36 us at 6 (37 us). The overlap of the loads alone gave 1 - 2%; the column groups give the rest (more warps per SM: the block of 84 KB of shared memory is one per SM). Per round at 8 tokens 3.72 -> 1.24 ms, at 4 tokens 1.96 -> 1.05 ms.
+- Not kept: the q8_0 rows through registers without the staging buffer (so that two blocks fit per SM). The SM has 100 KB of shared memory (1 KB reserved per block), so two blocks fit only up to 16 columns; that variant took 77 us at 6 columns (255 registers with spills) against 36 us, 48 us against 38 us at 24 columns. The diff is in `kvq-scratch\mem\comb\kvq-attn-p2b-nost.cu`.
+
+Per round (nsys, ms, 4 tokens / 8 tokens per verify, final build): early-q projection 0.457 / 0.451, prep 0.352 + 0.345 / 0.445 + 0.452, SCORE pass 1.082 / 1.971, kvq_score 0.156 / 0.370, top-k 0.597 / 0.735, ATTN pass 2.100 / 2.978, kvq_precise 1.046 / 1.242, kvq_final + merge + combine 0.453 / 0.764, scatter 0.378 / 0.646, idle at the trigger splits 0.371 / 0.390, round 20.53 / 26.24. Only kvq_score is above 2x from 4 to 8 tokens (2.37: its work is per row and column, and its scratch rows are twice as wide). Before the kernel changes (209ab7775 code with the whole union): ATTN 5.43, SCORE 2.73, kvq_score 1.34, the two preps 1.90 ms at 8 tokens.
+
+Server, decode ms per verify batch (2 - 6 sessions each, `LLAMA_KVQ_IDLE_PROBE=1`): n_max 7 25.96 - 26.43 (whole union only: 33.34 - 33.69 at cap 1024 / 32.7 at 8192 in the union tree; plain cache 26.3 - 27.8 from the plain slot, 26.08 after a real prefill), n_max 3 20.33 - 20.89 (before 21.4 - 21.9, plain 23.6 - 25.4), one token per decode 14.77 - 14.86 (before 14.73 - 14.89, plain 15.6 - 15.7). Real prefill, n_max 7: 25.95 ms, 146.7 t/s against plain 26.08 ms, 143.2 t/s; prompt 43.1 s against 42.0 s. GPU idle at the joins 0.02 - 0.09 ms. VRAM in generation 17,820 MiB (dedicated usage of the process), the same as the whole union alone.
+
+Shorter contexts: the two-tier cost does not shrink with the context. 24k prompt (real prefill, n_max 7): 21.6 ms per verify batch against 17.45 ms for plain. Acceptance set, ms per verify step with the drafter (two-tier / ggml-org master a49db739f): 25.1 / 22.0 at 12k, 25.8 / 21.3 at 24k, 26.6 / 24.0 at 50k, 29.3 / 26.6 at 65k, 30.0 / 30.2 at 99k. The fixed part per round is about 4 ms: kvq_precise over the 8192 resident slots (1.2 ms at any context; at 12k they are 70% of the rows), kvq_final over the partials of the slots, the early-q projection (0.45), the scatter (0.65), the trigger splits (0.39), the preps and top-k (top-k over n_coarse, but 10 kernels of about 4 us each per layer).
+
+Acceptance set with the final build: 3506 tokens, tau 4.399 [4.07, 4.77], 161.8 t/s (whole union with the 209ab7775 kernels 140.6, ggml-org master 178.0), ids equal on 12 of 12 requests; paired tau difference to ggml-org master +0.005 [-0.246, +0.225].
+
+Not built or not kept:
+
+- Single-pass top-k (one block per row, passes of 12, 12 and 8 bits, the same set and tie rule as the radix select): correct (test-backend-ops TOP_K incl. ties, bit-identical logits), but 1.52 ms per round at 8 tokens against 0.73 for the 10-kernel radix select, decode 1.0 ms slower at 8, 4 and 1 tokens. One SM per row reads the row 4 times and the warp aggregation of the histogram atomics (`__match_any_sync`) dominates. A faster version needs several blocks per row (a cluster with the histograms in distributed shared memory); not attempted. Diff: `kvq-scratch\mem\comb\topk-row-failed.diff`.
+- The trigger splits (0.39 ms of GPU idle per round): the trigger is a host tensor added to a view of the selection, so the scheduler ends the GPU split there and calls the copy callback; the next split is launched afterwards. Without the split the readback needs a new ggml op (a device-to-host copy of the selection into the pinned buffer and a host function node that wakes the worker, with a CPU implementation, CUDA graph capture of both, and the copy on a side stream joined back into the graph) and the store would have to drop its trigger tensors; that is a change of the ggml core API, not done.
+- Early-query projection on the query rows only (owner's experiment, not in the tree): a copy of the query rows of wq per attention layer for the early query took the projection from 0.45 to 0.30 ms per round (matmul and quantize, nsys), +188 MiB of VRAM with the IQ3_S target; the server ids differ at n_max 7 with IQ3_S (the half matrix gives other bits at 8 columns), equal at n_max 3 and one token per decode. The code is kept outside the repository as `kvq-scratch\mem\comb\eq-half.diff`.
+
+Scripts and logs: `kvq-scratch\mem\comb` (`part1-table.txt`, `acc-per-request.txt`, `m*.txt`, `runs\TAG`, `op\TAG`, `acc\runs`, `dfl\runs`, `comb.diff`).
+
+### Whole union of the verify batch (2026-11-17)
+
+Problem (DFlash2 drafter, `--spec-draft-n-max 7`, verify batches of up to 8 positions, n_ctx 102400, 99,395-token prompt): the request of a kv head was cut to 1024 rows by max score (`min(cap, prefetch_n x min(L, 2))`), while the 8 positions want about 3,230 distinct rows (max seen 6,230). Each position had on average 52% of its own top 1024 resident (worst 11%), KL at 8 tokens per batch 2.87e-4 against 1.35e-4 at one per decode. The merge (stamp table with random lookups) took about 300 us of the 470 us plan per layer, and the GPU waited at the joins.
+
+Change (owner's decision): the request is the whole union, the default capacity is max_batch x prefetch_n = 8192 (`--kvq-resident-cap 0`), the plan works on bitmaps, the slot choice is oldest request first, the readback is the row indices only, the scatter of the join writes 4-byte groups and its trash entries go to 1024 trash rows after rkv. Smaller capacities keep the cut by max score as a fallback (logged once at enable).
+
+- Slot choice: the free slots of the oldest requests first, ties by slot, against plain slot order (first free slots). Missing rows per (kv head, verify round): 719 against 1,185 at n_max 7, 112 against 469 at one token per decode (no drafter); uploads 26.8 against 42.5 MiB per round. With slot order the low slots churn every round and rows needed again a round later are gone. The age is the stamp of the last request that listed the slot's row, 8 bits (255 and older and empty slots are equal, then slot order), so the slot of every row is a function of the sets only.
+- Scatter: the join's set_rows runs over the whole static slot list, 2 x G x min(cap, prefetch_n x L) = 65,536 entries per layer at L = 8, nearly all of them trash entries. With one trash slot every trash write went to the same 272 bytes; k_set_rows took 3.06 ms per round (f16 view; 2.85 with the f32 view). With the trash entries spread over 1024 trash rows (4.25 MiB more VRAM) it takes 0.406 ms per round (0.355 ms before the change at cap 1024). A scatter that covers only the fetched rows needs the row count on the device (a set_rows that skips negative indices or a kvq scatter op), a kernel change that was not made.
+- Readback: the scores (`vals`) are read back only when the request can be cut (cap < prefetch_n x L); otherwise the trigger is anchored on a get_rows of one score, which waits for the selection. 2 MiB per round at n_max 7 instead of 4 MiB.
+- Top-up modes (`count`, `always`, not default): they work, but their victims are now the free slots of the oldest requests and, when those are used up, the slots of this step's prefetch in slot order; before, the latter were taken by the lowest early-query score. The top-up readback is indices only (the scores were never used there).
+
+Server, slot restore of the 99,394-token state, prompt 99,395, 300 tokens, `LLAMA_KVQ_IDLE_PROBE=1 LLAMA_SERVER_GEN_TIMES=1`, 2 - 3 sessions each (spread within 0.25 ms of decode), before = ours at 209ab7775 (cap 1024), after = the final build; per packed ubatch (16 layers) unless noted:
+
+| | n_max 7 before | n_max 7 after | n_max 3 before | n_max 3 after | no drafter before | no drafter after |
+|---|---|---|---|---|---|---|
+| decode ms per batch | 33.74 - 33.82 | 32.70 - 32.95 | 21.81 - 21.96 | 21.41 - 21.51 | 14.73 - 14.89 | 14.92 - 14.99 |
+| generation t/s | 115.4 - 115.6 | 116.8 - 117.3 | 128.9 - 129.4 | 129.5 - 130.3 | 66.2 - 67.0 | 65.9 - 66.3 |
+| GPU idle at the joins, ms | 1.71 - 1.79 | 0.06 - 0.08 | 0.53 - 0.62 | 0.02 | 0.02 | 0.02 |
+| plan ms (worker) | 7.45 - 7.53 | 2.37 - 2.39 | 4.91 - 4.96 | 1.99 - 2.01 | 1.19 - 1.25 | 1.56 - 1.57 |
+| gather ms (worker) | 1.59 - 1.60 | 2.23 - 2.25 | 1.50 - 1.52 | 1.35 - 1.36 | 1.25 - 1.28 | 0.52 - 0.53 |
+| requested rows per kv head | 1024 (cut) | 3,218 | 1024 (cut) | 2,150 | 1024 | 1024 |
+| fetched rows per kv head | 517 | 719 | 525 | 410 | 469 | 112 |
+| MiB uploaded | 17.8 | 26.8 | 18.0 | 16.4 | 16.2 | 6.3 |
+| own top 1024 resident | 52% mean (investigator) | 100% | | 100% | 100% | 100% |
+
+Plain cache (ours without `--kvq`, investigator's sessions): 26.1 / 23.35 / 15.65 ms per batch. Plan per layer after (profiling build, n_max 7 / 3 / no drafter): 161 / 131 / 102 us = union bits 41 / 23 / 6 + missing scan 26 / 21 / 13 + slot scan 45 / 42 / 40 + choice and assign 49 / 46 / 42. The first bitmap build (branches in the slot scan) took 213 us at n_max 7, the slot scan alone 111 us. Lead 3 (n_max 7): 32.97 ms per batch, idle 0.30 ms, 984 fetched rows per kv head, no gain; 8 / 12 gather threads (intermediate build): idle 0.13 / 0.08 against 0.17 ms, decode unchanged.
+
+Kernel time per verify round (nsys, target stream): n_max 7 before / after: kvq_precise 1.708 / 3.276 ms, kvq_final 0.183 / 0.883 ms, k_set_rows 0.355 / 0.406 ms, total target kernels 34.73 / 36.25 ms; n_max 3: kvq_precise 1.012 / 1.920, kvq_final 0.150 / 0.475, k_set_rows 0.339 / 0.246. kvq_precise and kvq_final grow with the resident rows (8192 slots, all of them filled after a few rounds); they were kernel work, done since (see the attention op kernels above: kvq_precise 1.24 ms, kvq_final 0.76 ms per round at 8 tokens). The decode time still went down because the GPU no longer waits at the joins.
+
+8 against 4 tokens per verify (n_max 7 / n_max 3, after; before in brackets): plan 1.19 (1.52), union bits 1.81, missing scan 1.27, slot scan 1.07, choice and assign 1.07, gather 1.65 (1.06), distinct rows 1.50 (1.00, cut), fetched rows 1.75 (0.98), MiB uploaded 1.63 (0.99), HtoD copy time 1.61 (1.02), k_set_rows 1.65 (1.05), readback 2.0 (2.0, linear in the positions), idle 3.5 (3.0; 0.07 against 0.02 ms), decode 1.52 (1.54). Only the idle is above 2, at a level that is noise (under 0.1 ms per round).
+
+Quality (kvq-eval, row2660 100k, 471 positions, against the q8_0 teacher):
+
+| | 8 tokens per batch | 1 token per decode |
+|---|---|---|
+| before (cap 1024, cut at two requests) | 2.87e-4 | 1.35e-4 |
+| investigator's switch (whole union, cap 8192, LRU) | 7.5e-5 | |
+| after, first bitmap build | 7.04e-5 [5.12, 9.48], 469 / 471 top-1 | 8.53e-5 [6.33, 10.9], 470 / 471 |
+| after, final build | 8.01e-5 [6.01, 10.3], 470 / 471 | 7.91e-5 [5.70, 10.4], 470 / 471 |
+| after, lead 3 | 1.04e-4 [0.76, 1.34] | 1.11e-4 [0.81, 1.46] |
+| after, `--kvq-cap 1024` (fallback, cut at 1024 by max score) | 2.83e-4, coverage of the own top 1024: 53.6% | |
+
+The two after builds differ only in the order the chosen slots take the missing rows (rounding of the sums over the slots); their intervals overlap. At one token per decode the resident set now keeps up to 8192 rows of the recent rounds, so more rows of each step are precise (112 instead of 469 fetched per kv head, KL 8.5e-5 against 1.35e-4); decode is 0.1 - 0.2 ms slower there (the precise kernel over more filled slots).
+
+Reproducibility: two server sessions from the same slot file give the same ids hash on every configuration (n_max 7, 3, no drafter, lead 3); kvq-eval from one saved state: logits of the run that saved and two loads bit-identical at 8 tokens per batch, two loads bit-identical at 1 per decode (both the first bitmap build and the final build); test-kvq-codec, test-kvq-attn, `--kvq-rm-test` (own and merge) and `--kvq-rb-test` pass. Save / restore: the state format is unchanged; the resident set starts empty after a load as before; the slot file saved by the old build restores into the new one.
+
+Memory (n_ctx 102400, launch line of `dflash2-vram-baseline.md` with `--kvq`): resident 274.7 MiB (+4.25 MiB trash rows in the final build) against 34.5 MiB, staging device 276.0 MiB, pinned host staging 282.5 MiB (before about 36 MiB each). VRAM during generation 17,820 MiB (dedicated usage, r1 of the memory session) against 17,315.5 MiB, +504.5 MiB. These buffers are sized for the worst case (the union of 8 positions with nothing resident, every slot fetched in one round) and can be made smaller later: they can live in the prefill scratch (217 - 486 MiB, idle during generation), the fetch can be uploaded in pieces, or they can be sized by the largest verify batch in use (n_max + 1). Not done.
+
+Acceptance set (12 requests, ours with `--kvq`, n_max 7): before 3979 tokens, rate 0.502, tau 4.500 [4.17, 4.89], 138.4 t/s; after 3506 tokens, rate 0.488, tau 4.399 [4.07, 4.77], 140.6 / 140.5 t/s (two runs, identical ids on all 12 requests); paired tau difference -0.101 [-0.226, +0.038], not significant. The ids differ from before on most requests (other rounding in the target), so the replies have other lengths. Lead 3 against lead 2 (intermediate build): tau +0.001 [-0.087, +0.072], 128.8 against 125.8 t/s with fewer generated tokens (3584 against 3976).
+
+Scripts and logs: `kvq-scratch\mem\union` (`matrix*.txt`, `runs\TAG`, `logs\`, `acc\runs`, `dfl\runs`, `union.diff`).
 
 ### Ring redesign (2026-11-16 evening)
 
@@ -334,7 +416,7 @@ Before, two loads of the same state never gave the same logits: KL between two r
 
 Each difference is a rounding, but it grows: after the first token the scores of later layers differ, the top 1024 near the cut change, and from then on 70 - 93% of the selections (per layer, kv head and token) differ between two runs. With only one source left (selection sorted with the atomic sums, or the kernel fixed with the device order) the KL between two runs was still 3.4e-5 - 5.2e-5; with only `kvq_combine` atomic 2.0e-5, the first 16 positions identical.
 
-Fix: the plan sorts the selection by row (radix sort, ties of the MTP union broken by row), the kernel writes the warp partials to shared memory and sums them in a fixed order. Now two loads give bit-identical logits and identical selections and slot maps at 24k and 100k, and the kernel gives the same bits on repeated calls. Cost: kvq-eval 24k median 16.08 - 16.14 against 16.07 - 16.12 ms/token (alternating runs); 100k median 16.80 against 16.70 (mean 17.01 - 17.06 against 16.90), not alternated, so up to 0.1 ms per token (0.6%). Server (100k prompt, MTP 3 drafts, alternating sessions): 125.5 / 127.0 t/s first request and 124.8 / 125.5 follow-up, against 126.5 / 126.9 and 125.3 / 125.6 for the old code; the final build 128.0 and 126.7 t/s in one more session. Generated ids equal in all sessions, old code included. A std::sort instead of the radix sort cost 5% in the server (1.5 ms of plan per verify ubatch).
+Fix: the plan sorts the selection by row (radix sort, ties of the MTP union broken by row; since 2026-11-17 a bitmap, which has no order, and the slot choice by age and slot, see Generation and MTP verify), the kernel writes the warp partials to shared memory and sums them in a fixed order. Now two loads give bit-identical logits and identical selections and slot maps at 24k and 100k, and the kernel gives the same bits on repeated calls. Cost: kvq-eval 24k median 16.08 - 16.14 against 16.07 - 16.12 ms/token (alternating runs); 100k median 16.80 against 16.70 (mean 17.01 - 17.06 against 16.90), not alternated, so up to 0.1 ms per token (0.6%). Server (100k prompt, MTP 3 drafts, alternating sessions): 125.5 / 127.0 t/s first request and 124.8 / 125.5 follow-up, against 126.5 / 126.9 and 125.3 / 125.6 for the old code; the final build 128.0 and 126.7 t/s in one more session. Generated ids equal in all sessions, old code included. A std::sort instead of the radix sort cost 5% in the server (1.5 ms of plan per verify ubatch).
 
 What this means for the quality numbers: the model itself moves by about the same amount when only the rounding changes. Plain q8_0 with 1 against 4 tokens per decode, both deterministic: KL 3.6e-5 (24k), 5.1e-5 (100k). Against the q8_0 reference the deterministic two-tier path gives 5.09e-5 (24k) and 1.254e-4 (100k); 13 earlier runs at 24k gave 3.6e-5 - 5.7e-5, two at 100k 1.34e-4 and 1.48e-4. So at 24k the loss of the two-tier cache is not distinguishable from rounding noise; at 100k a real loss of about 1e-4 is left, and the earlier spread (1.06e-4 - 1.48e-4) is the run-to-run noise. A deterministic run is still one draw of that rounding: a change in any kernel can move the KL by a few 1e-5, so compare configurations on more traces, not on a single number.
 
@@ -345,7 +427,7 @@ What this means for the quality numbers: the model itself moves by about the sam
 - V fitted per chunk too: offline V tables cost 3.5x KL at 100k.
 - Early query with lead 2: twice the fetch time of lead 1, KL difference inside the noise.
 - Synchronous top-up off: no KL gain measured, it costs a scheduler split. `count` and `always` stay as settings.
-- Resident capacity 1024: 4096 halves the KL but costs 0.6 - 0.8 ms per token in the attention kernel.
+- Resident capacity 1024: 4096 halves the KL but costs 0.6 - 0.8 ms per token in the attention kernel. Replaced 2026-11-17 (owner's decision): every position of a packed ubatch gets all of its own top 1024 rows, so the capacity is max_batch x prefetch_n = 8192 by default and the request is the whole union (see Results, whole union).
 - Prefill uses exact q8_0 rows, not the two-tier attention: two-tier prefill was never measured for quality.
 - Inverse tables as int8 with one scale per component (2026-11-16): halves the tables (459 -> 235 MiB at ctx 230000). Offline on one chunk the codec error in the metric grows 0.8% mean, 3.2% worst for K and 0.0% for V; KL inside the run-to-run noise (see Results). One scale per whole table costs 5x the error on K, 6 bits costs 10 - 50% on K.
 - Copies between GPU graph launches go on a separate copy stream: a memcpy on the compute stream stalled the GPU 55 - 65 us each, about 47 times per token.
@@ -364,7 +446,7 @@ What this means for the quality numbers: the model itself moves by about the sam
 3. The latency of a job is set by the polls (one per ubatch): after the CPU tasks, a job needs one or two more ubatches. With 1 thread and -ub 2048 (kvq-eval) 3 batches still waited 0.35 s at 100k.
 4. Main compute buffer 1.64 GB: mostly the F16 copies of K and V that flash attention makes at full length.
 5. MTP context cache: 899 MiB f16 for the full context.
-6. No speed gain from the packed path at 100k: a 4-token verify fetches 43k - 48k rows (65 - 73% of the request misses the resident set), GPU idle at the joins 1.7 - 2.2 ms per round.
+6. Verify batches of 8 (DFlash2): 26.0 ms per batch at 100k, the same as the plain cache (26.1), but about 4 ms per round that do not shrink with the context (21.6 against 17.45 ms at 24k; see Results, attention op kernels): kvq_precise over the 8192 resident slots, kvq_final, the early-q projection, the scatter, the trigger splits and the 10 top-k kernels per layer. The resident and staging buffers are sized for the worst case (about 550 MiB of VRAM, 280 MiB pinned).
 7. Tables: 243 MiB at ctx 230000; 16k chunks would halve them.
 8. Overlap of the precise and coarse kernels in the attention op: with int8 tables the op is 12 us slower per layer, see Results.
 
@@ -390,7 +472,7 @@ Sizes are for ctx 230000 as allocated today.
 - With the ring of one batch (the default) a long reply folds every ring size of tokens (about 4.3k at -b 4096, 0.57 s each in line with 4 threads, measured in two server sessions with identical ids); with `--kvq-tail 12544` every 12k.
 - The slots of a batch are placed for the whole batch at once, so the ring cannot be smaller than one batch (per-ubatch placement would allow n_ubatch + 256, not built).
 - Host memory: 7.6 GB of pinned RAM at ctx 230000, per sequence.
-- Deferred tuning: resident capacity (1024 vs 4096), top-up rules and thresholds, lead, prefetch size.
+- Deferred tuning: top-up rules and thresholds, prefetch size. Lead 3 was measured with the whole union (no gain, worse KL); the resident capacity follows the largest verify batch.
 - No automated tests for the store, the fitter, the ring cache or the server flows; only the codec and the kernel have tests. The session flows were checked by hand once.
 - No long session was run (hours, many rollbacks and refits).
 - The code was written by agents and reviewed only at the level of reports, diffs of the scheduler change and test results. It needs a real review before anyone depends on it.
@@ -401,7 +483,7 @@ Sizes are for ctx 230000 as allocated today.
 
 - Two-tier without MTP, drafts of 7 tokens on the packed path, model reload after sleep, a chat-endpoint conversation with user-message checkpoints.
 - Save and restore: a load into a smaller context or ring than the state needs, the full-context state API (`llama_state_save_file`), a sequence that ends exactly at a chunk boundary (empty ring, handled by `seq_pos_max`), the launcher itself with `--kvq`.
-- Top-up modes `count` / `always`, lead 1 and 3 after the async prefetch change.
+- Top-up modes `count` / `always` (their victim order changed with the whole union, see Results), lead 1 after the async prefetch change.
 - The server with `--kvq-tail 0` or other tail sizes, the hard error when the ring is too small.
 - The tool-driven `--kvq-packed` modes of kvq-eval after the tail-mode change.
 - The offline V path after the K/V task split.
