@@ -2,6 +2,8 @@
 //
 // usage: test-kvq-attn                             equivalence tests on the CPU and, if present, the GPU
 //        test-kvq-attn --bench [--quick] [--tables FILE]  GPU timings; FILE: codec tables (llama_kvq_save) for real bit allocations
+//                      [--bench-l 1,4] [--bench-nkv N [--bench-cap C]] [--no-fa] [--no-idle-wait]  positions per call, one row count and resident capacity, no flash attention timings, no wait for an idle GPU
+//        test-kvq-attn --hash                      hashes of the GPU outputs of large problems (compare two builds bit for bit)
 
 #include "../src/llama-kvq-codec.h"
 #include "../src/llama-kvq-pack.h"
@@ -540,6 +542,9 @@ static void test_equivalence(ggml_backend_t cpu, ggml_backend_t gpu) {
         { "L4 empty res",       4, 4, 384, 3,      70,    64,  0,    F16, Q8, false, false, false },
         { "L4 cap 1024 mixed",  2, 4, 640, 2,      300,   1024, 700, Q8,  F16, true, true,  false },
         { "L1 no mask",         2, 1, 512, 1,      65,    64,  64,   F16, Q8, false, false, true  },
+        { "L5 cap 1024",        4, 5, 512, 2,      150,   1024, 600, Q8,  Q8, true,  true,  false },
+        { "L7 cap 1024",        4, 7, 512, 2,      150,   1024, 600, Q8,  Q8, true,  true,  false },
+        { "L8 cap 1024",        4, 8, 640, 2,      300,   1024, 900, Q8,  Q8, true,  true,  false },
     };
 
     for (const eq_case & ec : cases) {
@@ -718,8 +723,14 @@ static void build_bench(kvq_problem & P, int n_kv, int L, int cap, ggml_type typ
     }
 }
 
+static bool no_idle_wait = false;
+
 // the GPU is shared: wait until nvidia-smi reports it idle for 2 samples (at most 120 s)
+// --no-idle-wait: skip it (the caller holds the GPU; under nsys every nvidia-smi call is slow)
 static void wait_idle() {
+    if (no_idle_wait) {
+        return;
+    }
     int n_idle = 0;
     for (int i = 0; i < 120 && n_idle < 2; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -829,7 +840,7 @@ static double time_fa(ggml_backend_t backend, int n_kv_real, int L, ggml_type ty
     return t;
 }
 
-static void bench(ggml_backend_t gpu, const std::string & tables, bool quick) {
+static void bench(ggml_backend_t gpu, const std::string & tables, bool quick, const std::vector<int> & Ls, int nkv, int cap, bool no_fa) {
     std::vector<std::vector<uint8_t>> bk, bv;
     bench_bits(tables, 4, 1.0f, bk, bv);
 
@@ -840,14 +851,18 @@ static void bench(ggml_backend_t gpu, const std::string & tables, bool quick) {
         n_kvs = { 150000 };
         caps  = { 1024 };
     }
+    if (nkv > 0) {
+        n_kvs = { nkv };
+        caps  = { cap > 0 ? cap : 1024 };
+    }
 
     printf("\nms per call; %d calls per graph, minimum of 7 runs after an idle GPU\n", reps);
     printf("| n_kv | L | cap | score | score+top1024 | top1024 | attn | attn+score | FA q8_0 | FA f16 |\n");
     printf("|---|---|---|---|---|---|---|---|---|---|\n");
     for (int n_kv : n_kvs) {
-        for (int L : { 1, 4 }) {
-            const double fa_q8  = time_fa(gpu, n_kv, L, GGML_TYPE_Q8_0, reps);
-            const double fa_f16 = time_fa(gpu, n_kv, L, GGML_TYPE_F16, reps);
+        for (int L : Ls) {
+            const double fa_q8  = no_fa ? 0.0 : time_fa(gpu, n_kv, L, GGML_TYPE_Q8_0, reps);
+            const double fa_f16 = no_fa ? 0.0 : time_fa(gpu, n_kv, L, GGML_TYPE_F16, reps);
             for (int cap : caps) {
                 kvq_problem P;
                 build_bench(P, n_kv, L, cap, GGML_TYPE_Q8_0, bk, bv);
@@ -891,10 +906,42 @@ static void profile(ggml_backend_t gpu, const std::string & tables) {
     }
 }
 
+// FNV-1a of the output bits of every mode, synthetic problems as in the benchmark
+static void hash_outputs(ggml_backend_t gpu) {
+    std::vector<std::vector<uint8_t>> bk, bv;
+    bench_bits("", 4, 1.0f, bk, bv);
+    for (int n_kv : { 20000, 100000, -100000 }) {
+        for (int L = 1; L <= 8; ++L) {
+            // -100000: 100000 rows with 8192 resident slots
+            const int cap = n_kv < 0 ? 8192 : 1024;
+            kvq_problem P;
+            build_bench(P, std::abs(n_kv), L, cap, GGML_TYPE_Q8_0, bk, bv);
+            printf("  n_kv %6d cap %4d L %d:", std::abs(n_kv), cap, L);
+            const int modes[] = { GGML_KVQ_ATTN, GGML_KVQ_SCORE, GGML_KVQ_ATTN | GGML_KVQ_SCORE };
+            for (int mode : modes) {
+                const std::vector<float> r = run_kvq(gpu, P, mode);
+                uint64_t h = 1469598103934665603ull;
+                const uint8_t * b = (const uint8_t *) r.data();
+                for (size_t i = 0; i < r.size()*sizeof(float); ++i) {
+                    h = (h ^ b[i])*1099511628211ull;
+                }
+                printf(" %016llx", (unsigned long long) h);
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     bool do_bench = false;
     bool do_prof  = false;
+    bool do_hash  = false;
     bool quick    = false;
+    bool no_fa    = false;
+    int  nkv      = 0;
+    int  cap      = 0;
+    std::vector<int> Ls = { 1, 4 };
     std::string tables;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--bench") == 0) {
@@ -905,6 +952,27 @@ int main(int argc, char ** argv) {
             quick = true;
         } else if (strcmp(argv[i], "--tables") == 0 && i + 1 < argc) {
             tables = argv[++i];
+        } else if (strcmp(argv[i], "--hash") == 0) {
+            do_hash = true;
+        } else if (strcmp(argv[i], "--no-fa") == 0) {
+            no_fa = true;
+        } else if (strcmp(argv[i], "--no-idle-wait") == 0) {
+            no_idle_wait = true;
+        } else if (strcmp(argv[i], "--bench-nkv") == 0 && i + 1 < argc) {
+            nkv = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bench-cap") == 0 && i + 1 < argc) {
+            cap = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bench-l") == 0 && i + 1 < argc) {
+            Ls.clear();
+            for (const char * p = argv[++i]; *p; ) {
+                Ls.push_back(atoi(p));
+                while (*p && *p != ',') {
+                    ++p;
+                }
+                if (*p) {
+                    ++p;
+                }
+            }
         }
     }
 
@@ -914,12 +982,14 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(cpu);
     printf("backends: %s%s%s\n", ggml_backend_name(cpu), gpu ? ", " : "", gpu ? ggml_backend_name(gpu) : "");
 
-    if (do_bench || do_prof) {
+    if (do_bench || do_prof || do_hash) {
         GGML_ASSERT(gpu && "the benchmark needs a GPU");
         if (do_prof) {
             profile(gpu, tables);
+        } else if (do_hash) {
+            hash_outputs(gpu);
         } else {
-            bench(gpu, tables, quick);
+            bench(gpu, tables, quick, Ls, nkv, cap, no_fa);
         }
     } else {
         printf("equivalence with decode-then-attend (llama_kvq_decode with the int8 inverse of the op; f32 for information)\n");
