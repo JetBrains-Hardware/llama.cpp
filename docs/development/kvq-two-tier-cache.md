@@ -10,8 +10,8 @@ A KV cache for Qwen3.8-27B (GGUF arch `qwen35`) that keeps most of the attention
 
 - Coarse tier, VRAM: every row of a fitted chunk as transform-coded low-bit codes (K 2 bit, V 1 bit plus a gain). The attention is computed on the packed codes by a custom op.
 - Precise tier, system RAM: the q8_0 rows of the same positions in a pinned host store.
-- Resident set, VRAM: 8192 precise rows per (layer, kv head) (8 positions x 1024), selected per position by an early query and fetched from RAM while the GPU runs the two layers before the attention; every position of a packed ubatch has all of its own top 1024 rows resident.
-- Ring, VRAM: q8_0 rows of the positions whose rows are not in the host store yet: the reply since the end of the last prompt, and the rows of a prompt while it is processed (ring-shaped device cache, `--kvq-tail`, default one batch + 256 cells, at least 4352).
+- Resident set: 8192 precise rows per (layer, kv head), selected per position by an early query (top 1024) and fetched from RAM while the GPU runs the two layers before the attention; the union of the positions of a packed ubatch is requested, cut by the max score when it has more distinct rows than slots. Since 2026-11-18 (not committed) the rows of each layer live in a pinned host mirror and are uploaded per round into one of two rotating device buffers (see Results, resident rows from pinned host memory).
+- Ring, VRAM: q8_0 rows of the positions whose rows are not in the host store yet: the reply since the end of the last prompt, and the rows of a prompt while it is processed (ring-shaped device cache, `--kvq-tail`, default one batch + 256 cells, at least 4352). Since 2026-11-18 (not committed) the ring cells are pinned host memory and each attention layer uploads its occupied cells into one of four rotating device tail buffers (see Results, the ring in pinned host memory).
 
 Model facts used everywhere: 64 trunk blocks, 16 attention layers (il = 3, 7, ..., 63), 24 query heads, 4 kv heads, head dim 256. The MTP block (block 64) runs in its own context with its own plain cache and does not use any of this.
 
@@ -51,8 +51,8 @@ Generation and MTP verify (ubatch <= 8 tokens), per attention layer il:
 2. A scheduler split with a copy callback queues the readback of the selection (the row indices only; the scores only when the request can be cut, see below) on a copy stream. A worker thread plans the resident slots and gathers the rows from the host store. The GPU keeps running layers il - 2 and il - 1.
    - The request of a kv head is the union of the selections of all positions of the ubatch, deduplicated in a bitmap of n_coarse bits (set the bits of the L lists, the word scan gives the distinct rows in row order; and-not with the bitmap of the resident rows gives the missing rows).
    - A slot is free if its row is not in the request. The missing rows (in row order) go to the free slots of the oldest requests (a per-slot stamp of the last request that listed its row; age in requests, 255 and older and empty slots count as 255), ties by slot. So the row of every slot depends only on the sets, not on the order the GPU wrote the selection or on thread timing.
-   - The default capacity, `--kvq-resident-cap 0` = max_batch x prefetch_n = 8192, holds the whole request of the largest packed ubatch, so nothing is cut. With a smaller capacity a request of more distinct rows than slots is cut to the rows with the largest max score over the positions (ties by row, the scores are read back for this case only; logged once at enable, counted as `pf_cut` / `pf_lost`).
-3. Before layer il's attention a join uploads the rows and scatters them into the resident tensor.
+   - The default capacity, `--kvq-resident-cap 0` = max_batch x prefetch_n = 8192, holds the whole request of the largest packed ubatch (6144 is as good at 8 per batch and saves 71 MB of pinned memory, cap sweep 2026-11-18; 8192 kept because it is 0.4 ms faster at n_max 7 and keeps the output of the earlier builds). A request of more distinct rows than slots is cut to the rows with the largest max score over the positions (ties by row, the scores are read back for this case only; logged once at enable, counted as `pf_cut` / `pf_lost`).
+3. Before layer il's attention a join uploads the rows and scatters them into the resident tensor. The resident tensor is one of two rotating device buffers (layer index mod 2); the worker queues the upload of the whole pinned mirror of the next layer into the other buffer right after the join uploads (a base stream, one copy of 13.4 MB), and the join of that layer waits for it before its own rows. The worker writes the fetched rows into the mirror after the gather.
 4. `ggml_kvq_attn` computes the attention over coarse rows + resident precise rows + the ring.
 
 Prefill (larger ubatches), per attention layer: the rows [0, n_host) are uploaded from the pinned host store into one device scratch buffer (4 async uploads on the copy stream, overlapping the layers before), the ring rows after them are copied in on the device, and normal flash attention runs over the scratch. Logits are bit-identical to attention over a full device cache.
@@ -94,7 +94,7 @@ Server, production configuration plus `--kvq`:
 llama-server --fit off -m Qwen3.8-3.6-27B-blend-Q4_K_M.gguf --ctx-size 230000 --n-gpu-layers all --parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --jinja --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-type-k f16 --spec-draft-type-v f16 --batch-size 4096 --ubatch-size 1024 --kvq
 ```
 
-Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (0 = 8 x prefetch_n = 8192, the whole request of a verify batch of 8), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default max(n_batch, 4096) + 256 = one batch, 0 = full device cache; not below n_batch + 256), `--kvq-chunk N` (rows per chunk, 8192), `--kvq-rem own|merge` (the rows after the last complete chunk, default own), `--kvq-min-rows N` (own: fewer rows after the last complete chunk stay precise, default 256), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
+Options: `--kvq`, `--kvq-threads N` (CPU threads of the table fit, default 4, at most the physical cores), `--kvq-prefetch-n` (1024), `--kvq-resident-cap` (0 = max_batch x prefetch_n = 8192, the whole request of a verify batch of 8; a larger union is cut by the max score), `--kvq-lead` (2), `--kvq-tail N` (ring cells, default max(n_batch, 4096) + 256 = one batch, 0 = full device cache; not below n_batch + 256), `--kvq-chunk N` (rows per chunk, 8192), `--kvq-rem own|merge` (the rows after the last complete chunk, default own), `--kvq-min-rows N` (own: fewer rows after the last complete chunk stay precise, default 256), `--kvq-v-tables FNAME` (offline V tables, only for comparison).
 
 With `--kvq` the server forces, with a warning: 1 slot, context shift and cache reuse off, flash attention on, q8_0 K/V, draft n_max <= 7; with `--kvq-tail 0` also the RAM prompt cache off and the slot save path cleared. At the end of each prompt the server waits until the prompt is fitted up to its end (log line `kvq: waited ... at the end of the prompt, coarse region N rows`); no fit work runs during the reply. It refuses to start for a model that is not qwen35, `--mmproj`, embeddings. Attention rotation of quantized caches is turned off for the model (also for the MTP context). `--fit` does not count the kvq memory.
 
@@ -111,6 +111,66 @@ Environment variables for debugging: `LLAMA_KVQ_SCHED_SYNC`, `LLAMA_KVQ_GATHER_T
 ## Results
 
 Machine: RTX 5090 32 GB, Ryzen 9950X3D, Windows 11, CUDA 12.9. One trace of 100k tokens unless noted; treat single runs as such.
+
+### The ring in pinned host memory (2026-11-18, worktree `kvq-wt-comb`, branch `kvq-mem`, not committed)
+
+Owner's goal: the ring (the q8_0 rows of the positions after the host store, 4352 cells, 144.5 MiB of VRAM for 16 layers) leaves the device like the resident rows, with one wait point per attention layer on the main stream, no kernel change, and no cost at verify batches of 4 and 8 at PCIe 5.0 / 4.0. Mode name in the code: host ring (tail mode with the rotating buffers); `--kvq-tail 0` keeps the old on-device path.
+
+- The ring cells of the attention cache move to pinned host memory at `fit_enable` (`llama_kv_cache::move_bufs`); cells, masks, `find_slot`, the state format and the spill and fold logic are unchanged. The device has 4 rotating tail buffers (36.1 MiB), buffer = attention layer index mod 4, each with the layout of the cache tensors, so the op reads the tail rows with the same strides and block partition as before (needed for bit identity).
+- Why 4 buffers and not the `[tail | resident]` block of the phase 1 notes: the early query of layer i (at the input of layer il - lead) scores against the ring K of layer i, so its tail must be on the device one layer before the resident rows. The main stream waits for it at the join of layer i - 1 (the same callback as the join wait); the worker uploads it after the join of layer i - 3 (`ev_sel` of that prefetch is after the attention of layer i - 4, the previous user of the buffer, plus the readback event of that layer). Consecutive users must be at least 3 layers apart cyclically, which 3 buffers cannot do over 16 layers.
+- Upload: the occupied cells [n_host, end) of K and V (two copies, four on a wrap), i.e. the reply so far. All 4352 cells (9 MiB per layer) cost +0.25 - 1.0 ms per verify batch at PCIe 5.0 and about +2 ms at the PCIe 4.0 emulation, rejected.
+- New rows: the cpy nodes write the K/V of the ubatch into the tail buffer (same set_rows as the cache); the join reads those cells back into the host ring on the copy stream (two small copies after the delta upload, after an event of the main stream at the join).
+- Prefill (the scratch path, now every non-packed ubatch): the K/V of the ubatch go straight into the scratch rows of their positions, read back into the host store per kv head at the next scratch up (before the uploads of the next layer; a trigger after the last attention layer); the scratch up uploads the store rows [0, p0). So the host store holds every row after a large ubatch and the fitter no longer copies ring rows on the device (phase 1 of a job uploads all its rows from the store, a spill only moves n_host); the host ring holds the rows after a packed ubatch; the missing side is copied on the host at the switch. Without host rows (the first ubatches of a prompt, before: the normal attention over the cache) the scratch uses the cells as rows and the cache's mask.
+
+| | before (phase 1) | after |
+|---|---|---|
+| ring on the device | 144.5 MiB | 36.1 MiB (4 tail buffers) |
+| ring in pinned host memory | - | 144.5 MiB |
+| VRAM in generation (process, n_ctx 102400), n_max 7 / 3 | 17,286 - 17,300 / 16,676 - 16,678 MiB | 17,188 - 17,196 / 16,572 - 16,584 (-94 to -104 MiB) |
+| host to device per round (300-token replies) | 285 MB base + 15 - 40 MiB delta | + 2 - 5.6 MiB tail |
+
+Bit identity (kvq-eval logits files, against the phase 1 build): six rows from the states at k8 and k1 (cap 6144, also equal to the build before phase 1), five rows at k8 at the default cap, folds (`LLAMA_KVQ_FOLD_EVERY=64`), state save / load with a checkpoint and rollback, turns with 300 generated tokens, `--kvq-rb-test`, `--kvq-lib-full`; fresh prefills of 20k and 100k give byte-identical state files. Server ids equal in every cell (24k / 50k / 100k, n_max 7 and 3, slow-bus emulation, 3000-token replies). test-kvq-attn and test-backend-ops KVQ_ATTN / KVQ_FIT pass.
+
+Server, DFlash2, real prefill, decode ms per verify batch (phase 1 build / this build, ids equal):
+
+| | 24k n_max 7 / 3 | 50k n_max 7 / 3 | 100k n_max 7 / 3 |
+|---|---|---|---|
+| 300 tokens or EOS, 2 sessions each | 21.47 - 21.50 / 17.59 - 17.60 against 21.51 - 21.64 / 17.51 - 17.65 | 22.66 - 22.72 / 18.35 - 18.36 against 22.68 - 22.75 / 18.28 - 18.37 | 25.77 - 25.91 / 20.13 - 20.14 against 25.78 - 25.89 / 20.06 - 20.14 |
+| prompt s | 7.30 - 7.37 against 7.22 - 7.24 | 16.80 - 16.87 against 16.61 - 16.64 | 43.23 - 43.31 against 42.69 - 42.78 |
+
+kvq-eval (row1830, ms per token): 4 per batch 4.518 / 4.523 against 4.498 / 4.501, 8 per batch 3.060 / 3.068 against 3.062 / 3.047. Slow bus (`LLAMA_KVQ_UP_REPEAT=k`, base and tail uploads repeated): k = 2 equal (server 50k 23.15 / 18.97 against 23.15 / 19.03); k = 3 +0.2 - 0.8 ms per verify batch (24.67 / 21.53 against 24.90 - 25.31 / 22.09 - 22.35), the tail bytes on a bus the resident base already fills. Long replies (3000 tokens, `ignore_eos`, the ring fills to 3000 cells, the tail adds about 47 MB per round on average): +0.32 ms per verify batch at n_max 7 (24.13 against 24.45), +0.12 at n_max 3, +0.63 at k = 2, +1.6 at k = 3. Numbers, scripts and the design notes (race argument, alternatives): `kvq-scratch\mem\vram\tail` (`RESULTS.md`, `NOTES.md`).
+
+### Resident rows from pinned host memory (2026-11-18, worktree `kvq-wt-comb`, branch `kvq-mem`, not committed)
+
+Owner's design: the whole union of the verify batch stays the request, the capacity was to go to 6144 (the cap sweep: p1024 c6144 k8 as good as c8192 at 20k - 100k; the default stays 8192, see the decision below), and the resident rows no longer live on the device for all 16 attention layers. Per layer the rows live in a pinned host mirror `[2][G][cap_tot][ROW]` (13.4 MB at 6144 slots, 204 MiB for 16 layers); the device has two rotating buffers, buffer = attention layer index mod 2. Per round and layer: the base upload of the whole mirror into the buffer, then the delta as before (plan on the bitmaps, gather, one upload, set_rows scatter), the attention op reads the buffer (no kernel change, the graph passes the buffer's rkv / ridx). The slot assignment is unchanged, so at the same capacity the logits are bit-identical to the build before.
+
+- Base upload of layer i + 1: queued by the worker on a third stream of the device right after the join uploads of layer i (the copy engine takes the copies in order), after the event of layer i's prefetch, which the main stream records after the attention of layer i - 1, the previous reader of the buffer (needs lead 1 - 3; enable refuses others now). General n_buf works (checked bit-identical with 3 and 4 buffers). The join of layer i + 1 waits for it on the copy stream before its own upload; the main stream still waits only at the join.
+- Mirror: the worker copies the fetched rows from the staging into the mirror after the job (the join does not wait for it). The base upload of the same round may read the mirror meanwhile: those slots are scattered from the staging after it. The next base upload of the layer comes from the worker after this job.
+- One staging block for all layers, device `[ridx | slot list | rows]` (13.1 MiB) and the same layout pinned (17.1 MiB): a join is one copy. A layer's prefetch is read back after the join upload and the attention of the layer before, so the shared block is free.
+- Where the base goes was measured (kvq-eval, 4 tokens per batch, ms per token, base 4.43): at the prefetch of the layer before 4.60 (the delta upload of that layer queued behind the 13 MB copy), before the join uploads 4.77 - 5.07, right after them 4.50, after the mirror write 4.55, after the GPU passed the join 4.56; pieces of 2 MiB / 1 MiB / 256 KiB slower than one copy (4.55 / 4.67 / 5.08). With the DMA skipped (wrong logits) 4.43, so the cost is the copy itself: in nsys the kernel time is equal and the GPU gaps at the joins grow while a base copy is in flight (888 -> 1,398 us per round).
+
+| | before (8192 slots per layer on the device) | after (cap 6144, 2 buffers) |
+|---|---|---|
+| resident + device staging | 278.9 + 276.0 MiB | 26.1 + 13.1 MiB |
+| pinned host (staging, mirrors) | 282.5 MiB | 17.1 + 204.2 MiB |
+| VRAM in generation (process, n_ctx 102400) | 17,788 - 17,802 MiB (n_max 7), 17,180 (n_max 3) | 17,274 - 17,288, 16,666 (-514 MiB) |
+| host to device per round | 14 - 38 MiB of fetched rows | + 214 MB of base uploads (16 x 13.4 MB) |
+
+Server, DFlash2, real prefill, 300 tokens, decode ms per verify batch (2 sessions each, ids of the two builds):
+
+| | 24k n_max 7 / 3 | 50k n_max 7 / 3 | 100k n_max 7 / 3 |
+|---|---|---|---|
+| before (cap 8192) | 21.19 / 17.29 | 22.39 / 18.03 | 25.54 / 19.83 |
+| after (cap 6144) | 21.84 / 17.52 (ids equal) | 23.10 / 18.20 (ids differ) | 26.27 / 20.04 (ids equal) |
+| after, `--kvq-resident-cap 8192` | | 22.72 / - (ids equal) | 25.84 / 20.17 (ids equal) |
+
+The base uploads cost 0.25 - 0.35 ms per verify batch at equal replies (also 50k against the old build at `--kvq-resident-cap 6144`: +0.36 / +0.24 ms, ids equal); at n_max 7 the cap 6144 adds about 0.4 ms against cap 8192 (the cut path: the scores are read back, more rows are fetched). Prompt time unchanged, GPU idle at the joins 0.003 - 0.06 ms per ubatch (before 0.02 - 0.09). Cap 8192 with the rotating buffers costs 12 MiB more VRAM than 6144 and 71 MB more pinned. Owner's decisions (2026-11-18): the 0.3 ms per verify batch is accepted for the 514 MiB; the default capacity stays 8192 (faster at n_max 7, output equal to the builds before; VRAM is no longer the reason for 6144, which remains available through `--kvq-resident-cap`).
+
+Quality (kvq-eval from the saved states, KL to the f16 teacher): at cap 6144 the logits files of the new build and the old build at `--kvq-cap 6144` are identical on all six rows at 8 per batch and 1 per decode; the KL equals the c6144 row of the cap sweep: 8 per batch 2.30e-4 / 6.44e-5 / 2.21e-4 / 1.15e-5 / 3.38e-5 / 1.39e-4 at 20k / 40k / 50k / 60k / 80k / 100k (c8192: 2.57e-4 / 8.55e-5 / 2.27e-4 / 1.98e-5 / 3.61e-5 / 1.34e-4). At one token per decode cap 6144 is worse on all six (e.g. 7.7e-5 against 6.4e-5 at 40k), inside the intervals; not a production case.
+
+Slow bus (`LLAMA_KVQ_UP_REPEAT=k` issues every base upload k times): kvq-eval ms per verify batch over the old build, 4 / 8 tokens: k = 1 +0.30 / +0.37, k = 2 (PCIe 4.0-like) +0.64 / +1.24, k = 3 (PCIe 3.0-like) +1.61 / +3.22; server 50k k = 3: +2.38 ms at n_max 7 (GPU idle at the joins 1.05 ms), +1.24 at n_max 3. The traffic is linear in the cap; a smaller cap is the fallback on a slow bus (owner's decision: no layers kept on the device).
+
+Possible later improvements (owner's decisions: skipped for now). More than two rotating buffers (`LLAMA_KVQ_NBUF`, 17.8 MB of VRAM each at cap 8192): the base upload of a layer may then start earlier than the attention of the previous reader of its buffer, which widens the window for the copy on a slow bus; measured bit-identical with 3 and 4 buffers and no speed difference on this PCIe 5.0 machine, where the bytes per round, not the window, set the cost; worth a measurement on PCIe 4.0 / 3.0 hardware, together with the cap. The union bitmap and the compaction on the GPU, so the device knows the distinct row count of a verify batch and the staging and the scatter are sized exactly. The plan is not on the critical path (GPU idle at the joins 0.02 - 0.09 ms per verify batch), the shared staging is one 13 MiB block, so the gain is about 13 MiB of VRAM and 13 MiB of pinned memory plus the trash entries of the scatter; it needs the row count on the device (a set_rows that skips negative indices or a kvq scatter op, a ggml change) and, for a cut at cap < union, the max-score order on the device. Numbers, scripts and the design notes: `kvq-scratch\mem\vram` (`RESULTS.md`, `NOTES.md`).
 
 ### Attention op kernels at verify batches of 8 (2026-11-17)
 
@@ -491,7 +551,7 @@ What this means for the quality numbers: the model itself moves by about the sam
 3. The latency of a job is set by the polls (one per ubatch): after the CPU tasks, a job needs one or two more ubatches. With 1 thread and -ub 2048 (kvq-eval) 3 batches still waited 0.35 s at 100k.
 4. Main compute buffer 1.64 GB: mostly the F16 copies of K and V that flash attention makes at full length.
 5. MTP context cache: 899 MiB f16 for the full context.
-6. Verify batches of 8 (DFlash2): 26.0 ms per batch at 100k, the same as the plain cache (26.1), but about 4 ms per round that do not shrink with the context (21.6 against 17.45 ms at 24k; see Results, attention op kernels): kvq_precise over the 8192 resident slots, kvq_final, the early-q projection, the scatter, the trigger splits and the 10 top-k kernels per layer. The resident and staging buffers are sized for the worst case (about 550 MiB of VRAM, 280 MiB pinned).
+6. Verify batches of 8 (DFlash2): 26.0 ms per batch at 100k, the same as the plain cache (26.1), but about 4 ms per round that do not shrink with the context (21.6 against 17.45 ms at 24k; see Results, attention op kernels): kvq_precise over the 8192 resident slots, kvq_final, the early-q projection, the scatter, the trigger splits and the 10 top-k kernels per layer. The resident and staging buffers took about 550 MiB of VRAM; since 2026-11-18 39 MiB (rotating buffers, pinned mirrors), at a cost of 0.2 - 0.35 ms per verify batch for the uploads of the mirrors.
 7. Tables: 243 MiB at ctx 230000; 16k chunks would halve them.
 8. Overlap of the precise and coarse kernels in the attention op: with int8 tables the op is 12 us slower per layer, see Results.
 
