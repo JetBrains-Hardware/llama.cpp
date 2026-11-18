@@ -1480,7 +1480,7 @@ struct llm_graph_context {
             ggml_tensor * s,
             ggml_tensor * conv_x,
                 int64_t   n_cols,
-                 size_t   offs) const;
+                 size_t   offs, int64_t n_tokens = -1) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

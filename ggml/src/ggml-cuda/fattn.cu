@@ -241,6 +241,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    if constexpr (DKQ <= 256) {
+        static const int prefill_gqa = [] { const char * value = getenv("GGML_CUDA_FA_PREFILL_GQA"); return value ? atoi(value) : 0; }();
+        if (Q->ne[1] >= 64 && use_gqa_opt && GGML_CUDA_CC_IS_NVIDIA(cc)) {
+            if (prefill_gqa == 1) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+                return;
+            }
+            if (prefill_gqa == 2 && gqa_ratio % 2 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+                return;
+            }
+            if (prefill_gqa == 4 && gqa_ratio % 4 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+                return;
+            }
+        }
+    }
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {

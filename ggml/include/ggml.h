@@ -398,6 +398,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
+        GGML_OP_SSM_CONV_SPLIT,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
@@ -2296,6 +2297,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
+
+    // x: [tokens, channels, sequences], history: [kernel - 1, channels, sequences]
+    GGML_API struct ggml_tensor * ggml_ssm_conv_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * history);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,

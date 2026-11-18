@@ -9899,6 +9899,27 @@ static void ggml_compute_forward_ssm_conv_f32(
         ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0]; // conv_x
     const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
+    if (dst->op == GGML_OP_SSM_CONV_SPLIT) {
+        const ggml_tensor * history = dst->src[2];
+        const int64_t nc = src1->ne[0];
+        for (int64_t seq = 0; seq < dst->ne[2]; ++seq) {
+            for (int64_t ch = params->ith; ch < dst->ne[0]; ch += params->nth) {
+                for (int64_t t = 0; t < dst->ne[1]; ++t) {
+                    float sum = 0.0f;
+                    for (int64_t j = 0; j < nc; ++j) {
+                        const int64_t pos = t + j - (nc - 1);
+                        const ggml_tensor * input = pos < 0 ? history : src0;
+                        const int64_t col = pos < 0 ? pos + nc - 1 : pos;
+                        const float x = *(const float *) ((const char *) input->data + col*input->nb[0] + ch*input->nb[1] + seq*input->nb[2]);
+                        const float w = *(const float *) ((const char *) src1->data + j*src1->nb[0] + ch*src1->nb[1]);
+                        sum += x*w;
+                    }
+                    *(float *) ((char *) dst->data + ch*dst->nb[0] + t*dst->nb[1] + seq*dst->nb[2]) = sum;
+                }
+            }
+        }
+        return;
+    }
 
     const int ith = params->ith;
     const int nth = params->nth;

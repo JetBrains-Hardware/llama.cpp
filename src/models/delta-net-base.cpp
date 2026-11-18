@@ -56,7 +56,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         ggml_tensor *        qkv_mixed,
         int64_t              conv_kernel_size,
         int64_t              conv_channels,
-        int                  il) {
+        int                  il,
+        ggml_tensor **       separate_history) {
     const int64_t n_seqs = ubatch.n_seqs;
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
@@ -68,10 +69,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+    const bool separate = separate_history &&
+            qkv_mixed->ne[0] >= int64_t(cparams.n_rs_seq) + conv_kernel_size;
+    if (separate_history) {
+        *separate_history = separate ? ggml_dup(ctx0, conv_states) : nullptr;
+        if (separate) {
+            // Cache writes below can overwrite the old history before the convolution executes.
+            ggml_build_forward_expand(gf, *separate_history);
+        }
+    }
+    ggml_tensor * conv_input = separate ? qkv_mixed : ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
-    build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0);
+    build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0, separate ? qkv_mixed->ne[0] : -1);
 
     return conv_input;
 }

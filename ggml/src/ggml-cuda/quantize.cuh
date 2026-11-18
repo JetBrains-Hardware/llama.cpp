@@ -21,6 +21,11 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// GLU fused into the Q8_1 quantization for the MMQ path
+void quantize_glu_mmq_q8_1_cuda(
+        const ggml_tensor * glu, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
 // src1 of the few-row MMQ in the layout of the MMA fragments. Per channel, 256 values and group of MMQ_FEW_NCOLS columns:
 //   qs: int4[4][32], [j][lane] holds the B fragments of sub-blocks 2j and 2j+1 of lane (g, t): the values [4t, 4t + 4) and [16 + 4t, 16 + 4t + 4) of column g.
 //   ds: int4[4][4], [t][j] holds d (D4, float) or (d, sum) (DS4, half2) of the columns 2t and 2t+1 for sub-block 2j, then 2j+1.

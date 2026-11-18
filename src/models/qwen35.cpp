@@ -416,13 +416,22 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    static const bool split_conv = [] {
+        const char * value = getenv("GGML_CUDA_SSM_CONV_SPLIT");
+        return value && strcmp(value, "0") != 0;
+    }();
+    const auto layer_device = model.dev_layer(il);
+    const bool cuda_layer = layer_device && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(layer_device)), "CUDA") == 0;
+    ggml_tensor * separate_history = nullptr;
+    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il,
+            split_conv && cuda_layer && conv_kernel_size == 4 && conv_channels % 128 == 0 ? &separate_history : nullptr);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_output_proper = separate_history ?
+        ggml_ssm_conv_split(ctx0, conv_input, conv_kernel, separate_history) : ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

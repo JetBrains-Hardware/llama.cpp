@@ -158,6 +158,43 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
+template <int nc, bool silu>
+static __global__ void ssm_conv_split_f32(
+        const float * x, const float * history, const float * weight, const float * bias, float * out,
+        int64_t x0, int64_t x1, int64_t x2, int64_t h0, int64_t h1, int64_t h2, int64_t w0, int64_t w1,
+        int channels, int tokens) {
+    const int ch = blockIdx.x*blockDim.x + threadIdx.x;
+    if (ch >= channels) {
+        return;
+    }
+    const int seq = blockIdx.y;
+    const int begin = blockIdx.z*32;
+    const int end = min(begin + 32, tokens);
+    float values[nc], weights[nc];
+#pragma unroll
+    for (int j = 0; j < nc; ++j) {
+        const int pos = begin + j - (nc - 1);
+        values[j] = pos < 0 ? history[(pos + nc - 1)*h0 + ch*h1 + seq*h2] : x[pos*x0 + ch*x1 + seq*x2];
+        weights[j] = weight[j*w0 + ch*w1];
+    }
+    for (int t = begin; t < end; ++t) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < nc; ++j) {
+            sum += values[j]*weights[j];
+        }
+        sum += bias ? bias[ch] : 0.0f;
+        out[(int64_t(seq)*tokens + t)*channels + ch] = silu ? ggml_cuda_op_silu_single(sum) : sum;
+        if (t + 1 < end) {
+#pragma unroll
+            for (int j = 0; j < nc - 1; ++j) {
+                values[j] = values[j + 1];
+            }
+            values[nc - 1] = x[(t + 1)*x0 + ch*x1 + seq*x2];
+        }
+    }
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
@@ -177,6 +214,33 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     const int64_t nr  = src0->ne[1];                // d_inner
     const int64_t n_t = out->ne[1];                 // tokens per sequence
     const int64_t n_s = out->ne[2];                 // number of sequences in the batch
+
+    if (dst->op == GGML_OP_SSM_CONV_SPLIT) {
+        const ggml_tensor * h = dst->src[2];
+        const dim3 blocks((nr + 127)/128, n_s, (n_t + 31)/32);
+        auto launch = [&](auto NC, auto SILU) {
+            ssm_conv_split_f32<decltype(NC)::value, decltype(SILU)::value><<<blocks, 128, 0, ctx.stream()>>>(
+                    (const float *) src0->data, (const float *) h->data, (const float *) src1->data,
+                    bias ? (const float *) bias->data : nullptr, (float *) out->data,
+                    src0->nb[0]/4, src0->nb[1]/4, src0->nb[2]/4, h->nb[0]/4, h->nb[1]/4, h->nb[2]/4,
+                    src1->nb[0]/4, src1->nb[1]/4, nr, n_t);
+        };
+        auto select = [&](auto NC) {
+            if (fuse_silu) { launch(NC, std::true_type{}); }
+            else           { launch(NC, std::false_type{}); }
+        };
+        switch (nc) {
+            case 3:  select(std::integral_constant<int, 3>{}); break;
+            case 4:  select(std::integral_constant<int, 4>{}); break;
+            case 5:  select(std::integral_constant<int, 5>{}); break;
+            case 7:  select(std::integral_constant<int, 7>{}); break;
+            case 9:  select(std::integral_constant<int, 9>{}); break;
+            case 15: select(std::integral_constant<int, 15>{}); break;
+            default: GGML_ABORT("Unsupported split convolution kernel");
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     GGML_ASSERT(out->ne[0] == nr);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
