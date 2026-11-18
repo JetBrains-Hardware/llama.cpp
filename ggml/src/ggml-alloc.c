@@ -1004,6 +1004,18 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    // after ggml_gallocr_resize
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+            return true;
+        }
+        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+            if (ggml_vbuffer_chunk_size(galloc->buffers[i], c) < ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c)) {
+                return true;
+            }
+        }
+    }
+
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
@@ -1110,6 +1122,46 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+bool ggml_gallocr_resize(ggml_gallocr_t galloc, const size_t * sizes) {
+    bool ok = true;
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        // a buffer type used multiple times has one buffer, set by its first index
+        bool dup = false;
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                galloc->buffers[i] = galloc->buffers[j];
+                dup = true;
+                break;
+            }
+        }
+        if (dup || sizes[i] == SIZE_MAX) {
+            continue;
+        }
+        const size_t cur = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+        if (galloc->buffers[i] != NULL && cur == sizes[i]) {
+            continue;
+        }
+        ggml_vbuffer_free(galloc->buffers[i]);
+        galloc->buffers[i] = NULL;
+        // one chunk; a larger size is left to the next reserve
+        if (sizes[i] == 0 || sizes[i] > galloc->buf_tallocs[i]->max_chunk_size) {
+            continue;
+        }
+        struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
+        GGML_ASSERT(buf != NULL);
+        buf->chunks[0] = ggml_backend_buft_alloc_buffer(galloc->bufts[i], sizes[i]);
+        if (buf->chunks[0] == NULL) {
+            GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), sizes[i]);
+            free(buf);
+            ok = false;
+            continue;
+        }
+        ggml_backend_buffer_set_usage(buf->chunks[0], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        galloc->buffers[i] = buf;
+    }
+    return ok;
 }
 
 // utils

@@ -191,8 +191,17 @@ public:
 
     const layer_tensors & get_layer(int32_t il) const;
 
-    // fit mode: the scratch attention can be used (scratch allocated, pinned host store, LLAMA_KVQ_SCRATCH is not 0)
+    // fit mode: the scratch attention can be used (pinned host store, LLAMA_KVQ_SCRATCH is not 0)
     bool scratch_ok() const { return scr_ok; }
+
+    // fit mode: the device memory of the scratch, only the scratch attention needs it (allocated at the ctor)
+    // scr_alloc before a scratch graph: zeroed, false if the allocation failed; scr_free: after the queued work
+    // host ring, all layers rotate: the resident rows, the tail buffers and the staging block of the packed path hold no state from one
+    // round to the next, so they share the memory of the scratch (never freed): scr_alloc drops the queued prefetch, base and tail uploads
+    // (the next round queues them again) and zeroes the scratch, dec_alloc before a packed graph zeroes the resident and tail buffers
+    bool scr_alloc();
+    void scr_free();
+    bool dec_alloc();
 
     // the scratch triggers of layer il, see the class comment
     void build_scr_up  (ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
@@ -312,6 +321,7 @@ private:
     int64_t       n_stage = 0;       // rows of the staging tensors
     ggml_tensor * jblk    = nullptr; // i8, the device block [ridx | slot list | staging rows] of the rotating layers, one copy per join
     size_t      off_stage = 0;       // byte offset of the staging rows in jblk and in the pinned block at h_ridx
+    size_t      off_jblk  = 0;       // shared memory: byte offset of jblk in the scratch buffer
 
     // pinned staging [h_ridx | h_slots | h_stage] with the layout of jblk, shared by the layers (see gather)
     uint8_t * h_stage  = nullptr; // [n_stage][ROW], K and V row of each fetch
@@ -323,6 +333,12 @@ private:
     ggml_tensor * scr_h  = nullptr; // f16 [ROW/2, 2, n_scr, G], alias of scr
     int64_t       n_scr  = 0;
     bool          scr_ok = false;
+    ggml_context_ptr        ctx_scr;
+    ggml_backend_buffer_ptr buf_scr;
+
+    bool                    dec_sep  = false; // see scr_alloc
+    int                     scr_mode = 0;     // shared memory: set up for 1 the scratch, 2 the packed path, 0 neither
+    ggml_context_ptr        ctx_dec;          // the resident and tail buffers in the shared memory
 
 
     // fired positions of the current ubatch, for the clean token count

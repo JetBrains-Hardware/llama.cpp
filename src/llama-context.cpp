@@ -422,6 +422,12 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * LLAMA_PHASE_BUFFERS = getenv("LLAMA_PHASE_BUFFERS");
+        phase_off = LLAMA_PHASE_BUFFERS != nullptr && atoi(LLAMA_PHASE_BUFFERS) == 0;
+        if (phase_off) {
+            LLAMA_LOG_WARN("%s: LLAMA_PHASE_BUFFERS=0, one compute buffer for all ubatches\n", __func__);
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -660,8 +666,13 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (n_phase_switch > 0) {
+        LLAMA_LOG_INFO("%s: %d switches of the compute buffers between the pp and the tg phase, %.2f ms in all\n", __func__, n_phase_switch, t_phase_switch);
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.no_alloc() && !opt_ctx) {
+    // the phases change the sizes
+    if (!model.no_alloc() && !opt_ctx && !phase_on) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -859,6 +870,39 @@ void llama_context::sched_reserve() {
         /*.op_offload =*/ cparams.op_offload,
     });
 
+    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get());
+
+    // per-phase compute buffers, see phase_set
+    {
+        const bool has_dev = std::any_of(backend_buft.begin(), backend_buft.end(), [](ggml_backend_buffer_type_t b) { return !ggml_backend_buft_is_host(b); });
+
+        // a DFlash draft decodes one block per sequence (its n_outputs_max is n_batch)
+        const bool     dflash = model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_block_size > 0;
+        const uint32_t n_tg   = dflash ? model.hparams.dflash_block_size*cparams.n_seq_max : cparams.n_outputs_max;
+
+        // one sequence: prompt and generation ubatches do not alternate (several sequences can mix them in every batch)
+        n_tokens_tg = std::min(n_tg, n_tokens);
+        phase_on    = !phase_off && has_dev && !model.no_alloc() && !cparams.pipeline_parallel && !cparams.training && n_tokens_tg < n_tokens &&
+                      cparams.n_seq_max == 1;
+        phase_tg    = false;
+
+        phase_size_pp.assign(backend_ptrs.size(), SIZE_MAX);
+        phase_size_tg.assign(backend_ptrs.size(), SIZE_MAX);
+        if (phase_on) {
+            // the reserve below allocates the pp sizes exactly
+            const std::vector<size_t> sizes(backend_ptrs.size(), 0);
+            ggml_backend_sched_resize_buffers(sched.get(), sizes.data());
+        }
+    }
+
+    // the reserve graph of the two-tier cache reads the scratch
+    if (kvq && !kvq->prompt_bufs_alloc()) {
+        throw std::runtime_error("failed to allocate the scratch of the two-tier cache");
+    }
+
+    // a DFlash draft: the large ubatches are the injection batches, the token batches are tg ubatches
+    const bool pp_embd = phase_on && model.arch == LLM_ARCH_DFLASH;
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -891,7 +935,7 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
+                model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr, pp_embd);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -931,6 +975,24 @@ void llama_context::sched_reserve() {
         n_nodes_tg         = ggml_graph_n_nodes(gf);
         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_tg = this->n_input_tensors;
+
+        // the pp graph of a DFlash draft computes no logits
+        graph_has_logits = graph_has_logits || get_gf_res_reserve()->get_logits() != nullptr;
+    }
+
+    // the tg phase: the sizes of a tg graph; the two-tier cache reserves the scratch attention (the prompt path), so its tg sizes
+    // are the largest ones used (they grow in the first tg phase)
+    if (phase_on) {
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        if (!graph_reserve(n_tokens_tg, n_seqs, n_tokens_tg, mctx.get(), true, sizes.data())) {
+            throw std::runtime_error("failed to reserve the tg graph");
+        }
+        const bool tg_grow = kvq && kvq->fit_graph_kind() > 0;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (!ggml_backend_buft_is_host(backend_buft[i])) {
+                phase_size_tg[i] = tg_grow ? 0 : sizes[i];
+            }
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -947,7 +1009,7 @@ void llama_context::sched_reserve() {
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc(), nullptr, pp_embd);
         };
 
         if (!gf) {
@@ -961,10 +1023,18 @@ void llama_context::sched_reserve() {
         if (!model.no_alloc()) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
+        if (phase_on && !ggml_backend_buft_is_host(buft)) {
+            phase_size_pp[i] = backend_buf_exp_size[i];
+        }
         if (backend_buf_exp_size[i] > 1) {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
+        }
+        if (phase_on && phase_size_tg[i] != SIZE_MAX) {
+            LLAMA_LOG_INFO("%s: %10s compute buffer size of the tg phase (ubatches of up to %u tokens) = %8.2f MiB%s\n", __func__,
+                    ggml_backend_buft_name(buft), n_tokens_tg, phase_size_tg[i] / 1024.0 / 1024.0,
+                    phase_size_tg[i] == 0 ? " (grows to the largest tg graph)" : "");
         }
     }
 
@@ -1496,6 +1566,11 @@ void llama_context::set_embeddings_layer_inp_dev(bool value) {
     cparams.embeddings_layer_inp_dev = value;
 
     layer_inp_dev_alloc();
+
+    // the graphs write the layer inputs: reserve now, not at the first batch
+    if (sched) {
+        sched_reserve();
+    }
 }
 
 bool llama_context::supports_embd_row() const {
@@ -1532,6 +1607,14 @@ ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
 void llama_context::layer_inp_dev_alloc() {
     synchronize();
 
+    const int64_t t0 = ggml_time_us();
+
+    // the graphs hold views of the buffer, the reader context may still read it
+    gf_res_prev_active = nullptr;
+    if (ev_layer_inp_read && ev_layer_inp_read_recorded) {
+        ggml_backend_event_synchronize(ev_layer_inp_read.get());
+    }
+
     layer_inp_dev     = nullptr;
     layer_inp_dev_dev = nullptr;
     layer_inp_backend = nullptr;
@@ -1557,7 +1640,7 @@ void llama_context::layer_inp_dev_alloc() {
     };
     ctx_layer_inp_dev.reset(ggml_init(params));
 
-    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, cparams.n_batch);
+    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, layer_inp_rows > 0 ? layer_inp_rows : cparams.n_batch);
     ggml_set_name(layer_inp_dev, "layer_inp_dev");
 
     layer_inp_dev_dev = model.dev_output();
@@ -1574,8 +1657,9 @@ void llama_context::layer_inp_dev_alloc() {
         return;
     }
 
-    LLAMA_LOG_INFO("%s: %10s layer input buffer size = %8.2f MiB (%d layers)\n", __func__,
-            ggml_backend_buffer_name(buf_layer_inp_dev.get()), ggml_backend_buffer_get_size(buf_layer_inp_dev.get())/1024.0/1024.0, (int) n_layer_inp);
+    LLAMA_LOG_INFO("%s: %10s layer input buffer size = %8.2f MiB (%d layers, %lld rows) in %.2f ms\n", __func__,
+            ggml_backend_buffer_name(buf_layer_inp_dev.get()), ggml_backend_buffer_get_size(buf_layer_inp_dev.get())/1024.0/1024.0, (int) n_layer_inp,
+            (long long) layer_inp_dev->ne[1], (ggml_time_us() - t0)/1000.0);
 
     layer_inp_backend = layer_inp_dev_dev ? backend_from_dev(layer_inp_dev_dev) : nullptr;
     if (layer_inp_backend && !ev_layer_inp_written) {
@@ -1853,11 +1937,65 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::ubatch_tg(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) const {
+    if (ubatch.n_tokens > n_tokens_tg) {
+        return false;
+    }
+    const auto * kctx = dynamic_cast<const llama_memory_hybrid_kvq_context *>(mctx);
+    return kctx == nullptr || !kctx->prompt_path(ubatch);
+}
+
+void llama_context::phase_set(bool tg) {
+    if (tg == phase_tg) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+
+    size_t size0 = 0;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        const size_t s = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        size0 += phase_size_pp[i] != SIZE_MAX ? s : 0;
+        // the next tg phase starts with the sizes this one reached
+        if (!tg && phase_size_tg[i] != SIZE_MAX) {
+            phase_size_tg[i] = std::max(phase_size_tg[i], s);
+        }
+    }
+
+    // the copy streams of the two-tier cache read graph tensors
+    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()); kvq && kvq->get_store()) {
+        kvq->get_store()->synchronize();
+    }
+    for (auto * backend : backend_ptrs) {
+        ggml_backend_synchronize(backend);
+    }
+    const int64_t t1 = ggml_time_us();
+    if (!ggml_backend_sched_resize_buffers(sched.get(), tg ? phase_size_tg.data() : phase_size_pp.data())) {
+        LLAMA_LOG_WARN("%s: a compute buffer of the %s phase was not allocated, the next graph reserves it\n", __func__, tg ? "tg" : "pp");
+    }
+    gf_res_prev_active = nullptr;
+    phase_tg = tg;
+
+    size_t size1 = 0;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        size1 += phase_size_pp[i] != SIZE_MAX ? ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) : 0;
+    }
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    n_phase_switch++;
+    t_phase_switch += ms;
+    LLAMA_LOG_INFO("%s: %s phase, device compute buffers %.2f -> %.2f MiB in %.2f ms (%.2f ms of it the wait for the queued work)\n", __func__,
+            tg ? "tg" : "pp", size0/1048576.0, size1/1048576.0, ms, (t1 - t0)/1000.0);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // after apply: the two-tier cache can move the coarse region there
+    if (phase_on) {
+        phase_set(ubatch_tg(ubatch, mctx));
     }
 
     auto * res = get_gf_res_prev();
@@ -2273,6 +2411,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         synchronize();
     }
     embd_seq.clear();
+
+    // the layer input rows are batch rows: n_tokens_tg rows while the batches are that small
+    if (phase_on && layer_inp_dev) {
+        const int64_t n_rows = n_tokens_all <= n_tokens_tg ? (int64_t) n_tokens_tg : (int64_t) cparams.n_batch;
+        if (layer_inp_dev->ne[1] != n_rows) {
+            layer_inp_rows = n_rows;
+            layer_inp_dev_alloc();
+        }
+    }
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
@@ -3048,7 +3195,8 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        bool embd) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3076,6 +3224,16 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
+    // the values are not read by a reserve
+    std::vector<int32_t> embd_rows;
+    static float embd_dummy = 0.0f;
+    if (embd && supports_embd_row()) {
+        embd_rows.assign(ubatch.n_tokens, 0);
+        ubatch.embd_row = embd_rows.data();
+    } else if (embd) {
+        ubatch.embd = &embd_dummy;
+    }
+
     auto * res = gf_res_reserve.get();
 
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
@@ -3100,10 +3258,14 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-        GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
+    } else {
+        // the buffers can grow to the reserve: the next tg ubatch switches again
+        phase_tg = false;
+        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            GGML_ASSERT(!sizes);
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return nullptr;
+        }
     }
 
     return gf;

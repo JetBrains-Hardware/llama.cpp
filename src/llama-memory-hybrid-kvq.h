@@ -18,6 +18,13 @@
 // packed: no coarse cache, the packed state (llama_kvq_store) is created by llama_memory_kvq_packed_alloc or llama_memory_kvq_fit_enable
 // tail (packed, fit mode): the attention cache is a ring of tail cells, the positions of the coarse region are removed from it
 
+// packed mode: a ubatch of up to max_batch tokens attends through ggml_kvq_attn
+// fit mode: no coarse rows yet, or more than max_tail cells after them, the normal attention
+// tail mode: the ring has no coarse rows, always packed, unless the host store has rows after the coarse region (they are not in the ring)
+static inline bool llama_kvq_use_packed(const llama_kvq_params & p, uint32_t n_tokens, int32_t n_coarse, int32_t n_host, int64_t n_kv, bool tail) {
+    return p.enabled && n_tokens <= (uint32_t) p.max_batch && n_coarse > 0 && (tail ? n_host == n_coarse : (p.max_tail <= 0 || n_kv - n_coarse <= p.max_tail));
+}
+
 class llama_memory_hybrid_kvq : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_kvq(
@@ -121,6 +128,12 @@ public:
     // ggml_backend_sched copy callback, see llama_kvq_store::copy
     bool sched_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
+    // fit mode: the device buffers that only the prompt ubatches use (the scratch, the fitter stage)
+    // alloc: the scratch, for a reserve graph (the fitter allocates its own at its next phase)
+    // release: after the end of a prompt or a fold; the scratch only if the small ubatches take the packed path
+    bool prompt_bufs_alloc();
+    void prompt_bufs_release();
+
 private:
     const llama_model & model;
 
@@ -216,6 +229,9 @@ public:
 
     // tail: mask F16 [n_rows, n_tokens] over the scratch rows, row r = position r: the rows of the host store [0, n_host) kept, the others causal if the ring has them
     void set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_host) const;
+
+    // packed mode: the ubatch does not take the packed path (prompt ubatches; small ones after a rollback into the coarse region)
+    bool prompt_path(const llama_ubatch & ubatch) const;
 
 private:
     const llama_kv_cache * kv_attn = nullptr;

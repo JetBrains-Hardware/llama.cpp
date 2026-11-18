@@ -60,6 +60,10 @@ public:
     // the positions [p0, inf) were removed: cancels the jobs with rows there, the coarse region drops back to the chunk of p0
     void remove(llama_pos p0);
 
+    // the device stage and the graph allocator: allocated at the ctor and again by the first phase after dev_free
+    // dev_free: no jobs in flight, after the queued phases
+    void dev_free();
+    bool dev_allocated() const { return buf_dev != nullptr; }
 
     bool has_jobs() const { return !jobs_empty(); }
 
@@ -169,6 +173,7 @@ private:
     void cancel(const std::function<bool(const job &)> & pred);
     void advance();
     void install(bool all);
+    void dev_alloc();
     void upload_rows(int32_t il, int32_t r0, int32_t r1);
     void queue_phase(job & jb, int phase);
     ggml_cgraph * build_phase(const job & jb, int phase, int32_t li, ggml_context * ctx);

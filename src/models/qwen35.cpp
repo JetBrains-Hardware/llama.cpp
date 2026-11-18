@@ -142,13 +142,6 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
     return std::make_unique<graph>(params);
 }
 
-// packed mode: a ubatch of up to max_batch tokens attends through ggml_kvq_attn
-// fit mode: no coarse rows yet, or more than max_tail cells after them, the normal attention
-// tail mode: the ring has no coarse rows, always packed, unless the host store has rows after the coarse region (they are not in the ring)
-static bool kvq_use_packed(const llama_kvq_params & p, uint32_t n_tokens, int32_t n_coarse, int32_t n_host, int64_t n_kv, bool tail) {
-    return p.enabled && n_tokens <= (uint32_t) p.max_batch && n_coarse > 0 && (tail ? n_host == n_coarse : (p.max_tail <= 0 || n_kv - n_coarse <= p.max_tail));
-}
-
 // fit mode, the other ubatches with rows in the host store: flash attention over the scratch, see llama_kvq_store
 // host ring: every other ubatch (the cache cells are in host memory)
 static bool kvq_use_scratch(const llama_kvq_params & p, const llama_kvq_store * store, bool packed_small, int32_t n_host) {
@@ -216,7 +209,7 @@ public:
         if (res && params.enabled && params.packed) {
             res &= store == mctx->get_store();
             res &= store != nullptr && n_coarse == store->n_coarse() && n_host == store->n_host();
-            res &= packed_small == kvq_use_packed(p, gparams.ubatch.n_tokens, n_coarse, n_host, mctx->get_attn()->get_n_kv(), tail);
+            res &= packed_small == llama_kvq_use_packed(p, gparams.ubatch.n_tokens, n_coarse, n_host, mctx->get_attn()->get_n_kv(), tail);
             res &= scratch == kvq_use_scratch(p, store, packed_small, n_host);
             const int64_t n_mask = (tail ? n_coarse : 0) + mctx->get_attn()->get_n_kv();
             if (res && packed_small) {
@@ -456,7 +449,7 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
         inp->n_host       = inp->store->n_host();
         inp->fit          = inp->store->fit_mode();
         inp->tail         = inp->store->tail_mode();
-        inp->packed_small = kvq_use_packed(inp->params, n_tokens, inp->n_coarse, inp->n_host, n_kv, inp->tail);
+        inp->packed_small = llama_kvq_use_packed(inp->params, n_tokens, inp->n_coarse, inp->n_host, n_kv, inp->tail);
         inp->scratch      = kvq_use_scratch(inp->params, inp->store, inp->packed_small, inp->n_host);
         inp->scr_cells    = inp->scratch && inp->store->host_ring() && inp->n_host == 0;
 

@@ -367,6 +367,10 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
+    // waits for the backends, then sets the compute buffer of backend i to sizes[i] bytes (0: freed, SIZE_MAX: kept), see ggml_gallocr_resize
+    // the next graph is allocated again; a graph that does not fit reserves the buffers as usual
+    GGML_API bool                 ggml_backend_sched_resize_buffers(ggml_backend_sched_t sched, const size_t * sizes);
+
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 

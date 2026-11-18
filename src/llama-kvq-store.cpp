@@ -570,10 +570,18 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     ctx_alias = init_ctx(layers.size()*3 + 1);
     ctx_host  = init_ctx(layers.size()*KIND_COUNT);
 
+    // host ring, all layers rotate: the device buffers of the packed path hold nothing from one round to the next, they share
+    // the memory of the scratch (the prompt path), see scr_alloc and dec_alloc
+    dec_sep = hring && n_rot == n_att;
+    if (dec_sep) {
+        ctx_dec = init_ctx(n_bufs + 2*N_TBUF);
+    }
+    ggml_context * ctx_res = dec_sep ? ctx_dec.get() : ctx_dev.get();
+
     // the resident rows (rkv, an alias at its start) and the trash rows of the scatter, per device buffer
     bufs.resize(n_bufs);
     for (int32_t b = 0; b < n_bufs; ++b) {
-        bufs[b].rkv_h = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_F32, ROW/4, 2*(int64_t) G*cap_tot + N_TRASH);
+        bufs[b].rkv_h = ggml_new_tensor_2d(ctx_res, GGML_TYPE_F32, ROW/4, 2*(int64_t) G*cap_tot + N_TRASH);
         ggml_format_name(bufs[b].rkv_h, "kvq_rkv_h-b%d", b);
         // the rotating layers share one ridx with the staging (enable)
         if (b >= n_buf) {
@@ -584,8 +592,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     if (hring) {
         tbufs.resize(N_TBUF);
         for (int32_t b = 0; b < N_TBUF; ++b) {
-            tbufs[b].k = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_Q8_0, D*G, n_cell);
-            tbufs[b].v = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_Q8_0, D*G, n_cell);
+            tbufs[b].k = ggml_new_tensor_2d(ctx_res, GGML_TYPE_Q8_0, D*G, n_cell);
+            tbufs[b].v = ggml_new_tensor_2d(ctx_res, GGML_TYPE_Q8_0, D*G, n_cell);
             ggml_format_name(tbufs[b].k, "kvq_tail_k-b%d", b);
             ggml_format_name(tbufs[b].v, "kvq_tail_v-b%d", b);
         }
@@ -620,11 +628,16 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     bias    = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_rows);
     ggml_set_name(bias,    "kvq_bias");
 
-    // fit mode: the scratch of the large ubatches, one row per cache cell (tail: after the coarse rows)
+    // fit mode: the scratch of the large ubatches, one row per cache cell (tail: after the coarse rows), in a buffer of its own (scr_alloc)
     if (!fill) {
-        n_scr = (tail ? n_rows : 0) + cells.size();
-        scr   = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, D, 2, n_scr, G);
+        n_scr   = (tail ? n_rows : 0) + cells.size();
+        ctx_scr = init_ctx(2);
+        scr     = ggml_new_tensor_4d(ctx_scr.get(), GGML_TYPE_Q8_0, D, 2, n_scr, G);
         ggml_set_name(scr, "kvq_scr");
+        // the CUDA copy has no strided q8_0 to q8_0 copy, so the scratch rows are copied as f16 pairs of bytes too
+        scr_h = ggml_new_tensor_4d(ctx_scr.get(), GGML_TYPE_F16, ROW/2, 2, n_scr, G);
+        ggml_set_name(scr_h, "kvq_scr_h");
+        GGML_ASSERT(ggml_nbytes(scr_h) == ggml_nbytes(scr));
     }
 
     buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), buft));
@@ -641,7 +654,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         bufs[b].rkv = ggml_new_tensor_4d(ctx_alias.get(), GGML_TYPE_Q8_0, D, cap_tot, G, 2);
         GGML_ASSERT(ggml_nbytes(bufs[b].rkv) == (size_t) 2*G*cap_tot*ROW);
         ggml_format_name(bufs[b].rkv, "kvq_rkv-b%d", (int) b);
-        if (ggml_backend_tensor_alloc(buf_dev.get(), bufs[b].rkv, bufs[b].rkv_h->data) != GGML_STATUS_SUCCESS) {
+        if (!dec_sep && ggml_backend_tensor_alloc(buf_dev.get(), bufs[b].rkv, bufs[b].rkv_h->data) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("failed to alias the resident rows");
         }
     }
@@ -663,13 +676,36 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         }
     }
 
-    // the CUDA copy has no strided q8_0 to q8_0 copy, so the scratch rows are copied as f16 pairs of bytes too
     if (scr) {
-        scr_h = ggml_new_tensor_4d(ctx_alias.get(), GGML_TYPE_F16, ROW/2, 2, n_scr, G);
-        ggml_set_name(scr_h, "kvq_scr_h");
-        GGML_ASSERT(ggml_nbytes(scr_h) == ggml_nbytes(scr));
-        if (ggml_backend_tensor_alloc(buf_dev.get(), scr_h, scr->data) != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("failed to alias the scratch");
+        if (dec_sep) {
+            // the resident and tail buffers after each other, the staging block after them (enable), the scratch over all of it
+            const size_t align = ggml_backend_buft_get_alignment(buft);
+            std::vector<std::pair<ggml_tensor *, size_t>> place;
+            size_t off = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_dec.get()); t != nullptr; t = ggml_get_next_tensor(ctx_dec.get(), t)) {
+                place.emplace_back(t, off);
+                off += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+            }
+            off_jblk = off;
+            buf_scr.reset(ggml_backend_buft_alloc_buffer(buft, std::max(ggml_backend_buft_get_alloc_size(buft, scr), off)));
+            if (!buf_scr) {
+                throw std::runtime_error("failed to allocate the scratch");
+            }
+            ggml_backend_buffer_clear(buf_scr.get(), 0);
+            ggml_backend_buffer_set_usage(buf_scr.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf_scr.get());
+            bool ok = ggml_backend_tensor_alloc(buf_scr.get(), scr, base) == GGML_STATUS_SUCCESS && ggml_backend_tensor_alloc(buf_scr.get(), scr_h, base) == GGML_STATUS_SUCCESS;
+            for (const auto & [t, o] : place) {
+                ok = ok && ggml_backend_tensor_alloc(buf_scr.get(), t, base + o) == GGML_STATUS_SUCCESS;
+            }
+            for (auto & b : bufs) {
+                ok = ok && ggml_backend_tensor_alloc(buf_scr.get(), b.rkv, b.rkv_h->data) == GGML_STATUS_SUCCESS;
+            }
+            if (!ok) {
+                throw std::runtime_error("failed to place the scratch and the buffers of the packed path");
+            }
+        } else if (!scr_alloc()) {
+            throw std::runtime_error("failed to allocate the scratch");
         }
         // host ring: the cache moves to host memory, the graph does not read it
         for (auto & l : layers) {
@@ -1124,7 +1160,7 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         const size_t sz_sel   = pad(n_sel*sizeof(int32_t));
 
         // a graph that is reused keeps the tensors, so they change only with the parameters that change the graph
-        if (!buf_stage || n_rows != n_stage) {
+        if (!jblk || n_rows != n_stage) {
             n_stage   = n_rows;
             off_stage = sz_ridx + sz_slots;
             buf_stage.reset();
@@ -1132,12 +1168,21 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
             ctx_stage.reset(ggml_init(ip));
             jblk = ggml_new_tensor_1d(ctx_stage.get(), GGML_TYPE_I8, off_stage + sz_stage);
             ggml_set_name(jblk, "kvq_join");
-            buf_stage.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_stage.get(), buft));
-            if (!buf_stage) {
-                LLAMA_LOG_ERROR("%s: failed to allocate the staging tensors\n", __func__);
-                return false;
+            // after the resident and tail buffers in the memory of the scratch, if it has the room
+            if (dec_sep && off_jblk + ggml_backend_buft_get_alloc_size(buft, jblk) <= ggml_backend_buffer_get_size(buf_scr.get())) {
+                if (ggml_backend_tensor_alloc(buf_scr.get(), jblk, (uint8_t *) ggml_backend_buffer_get_base(buf_scr.get()) + off_jblk) != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: failed to place the staging tensors\n", __func__);
+                    return false;
+                }
+            } else {
+                buf_stage.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_stage.get(), buft));
+                if (!buf_stage) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate the staging tensors\n", __func__);
+                    return false;
+                }
+                ggml_backend_buffer_set_usage(buf_stage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             }
-            ggml_backend_buffer_set_usage(buf_stage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_t bs = jblk->buffer;
             ggml_tensor * ridx  = ggml_new_tensor_2d(ctx_stage.get(), GGML_TYPE_I32, cap_tot, G + 1);
             ggml_tensor * slots = ggml_new_tensor_1d(ctx_stage.get(), GGML_TYPE_I32, n_stage);
             ggml_tensor * stage = ggml_new_tensor_2d(ctx_stage.get(), GGML_TYPE_F32, ROW/4, n_stage);
@@ -1145,9 +1190,9 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
             ggml_set_name(slots, "kvq_slots");
             ggml_set_name(stage, "kvq_stage");
             uint8_t * base = (uint8_t *) jblk->data;
-            if (ggml_backend_tensor_alloc(buf_stage.get(), ridx,  base) != GGML_STATUS_SUCCESS ||
-                ggml_backend_tensor_alloc(buf_stage.get(), slots, base + sz_ridx) != GGML_STATUS_SUCCESS ||
-                ggml_backend_tensor_alloc(buf_stage.get(), stage, base + off_stage) != GGML_STATUS_SUCCESS) {
+            if (ggml_backend_tensor_alloc(bs, ridx,  base) != GGML_STATUS_SUCCESS ||
+                ggml_backend_tensor_alloc(bs, slots, base + sz_ridx) != GGML_STATUS_SUCCESS ||
+                ggml_backend_tensor_alloc(bs, stage, base + off_stage) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to place the staging tensors\n", __func__);
                 return false;
             }
@@ -1165,6 +1210,8 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         }
         ggml_backend_tensor_set(layers[0].t.slots, trash.data(), 0, ggml_nbytes(layers[0].t.slots));
         slots_hi = 0;
+        // the shared memory: the next ubatch sets it up for its path
+        scr_mode = 0;
 
         const size_t sz_all = off_stage + sz_stage + 2*sz_sel*layers.size();
         buf_pin.reset(ggml_backend_buft_alloc_buffer(buft_host, sz_all));
@@ -1191,7 +1238,7 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
             p.max_batch, p.prefetch_n, cap, p.lead, p.sync_mode, p.sync_m, p.sync_min_hits, p.stats, p.all_resident);
     if (!all_res) {
         LLAMA_LOG_INFO("%s: staging: device %.1f MiB, pinned host %.1f MiB; mirrors: pinned host %.1f MiB\n", __func__,
-                ggml_backend_buffer_get_size(buf_stage.get())/1048576.0, ggml_backend_buffer_get_size(buf_pin.get())/1048576.0,
+                ggml_nbytes(jblk)/1048576.0, ggml_backend_buffer_get_size(buf_pin.get())/1048576.0,
                 buf_mir ? ggml_backend_buffer_get_size(buf_mir.get())/1048576.0 : 0.0);
     }
     return true;
@@ -2180,6 +2227,87 @@ void llama_kvq_store::reset_counters() {
     n_clean   = 0;
 }
 
+bool llama_kvq_store::scr_alloc() {
+    if (scr == nullptr) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    if (dec_sep) {
+        if (scr_mode == 1) {
+            return true;
+        }
+        // the queued uploads of the packed path write to the same memory; the next round queues them again
+        if (scr_mode == 2) {
+            drop_pending();
+            reset_base();
+        }
+        synchronize();
+        // the masked rows of a scratch attention must not hold NaN
+        ggml_backend_tensor_memset(scr, 0, 0, ggml_nbytes(scr));
+        scr_mode = 1;
+        LLAMA_LOG_INFO("%s: the scratch (%.1f MiB) in the shared memory in %.2f ms\n", __func__, ggml_nbytes(scr)/1048576.0, (ggml_time_us() - t0)/1000.0);
+        return true;
+    }
+    if (buf_scr) {
+        return true;
+    }
+    buf_scr.reset(ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, scr)));
+    if (!buf_scr) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the scratch of %.1f MiB\n", __func__, ggml_nbytes(scr)/1048576.0);
+        return false;
+    }
+    void * base = ggml_backend_buffer_get_base(buf_scr.get());
+    if (ggml_backend_tensor_alloc(buf_scr.get(), scr, base) != GGML_STATUS_SUCCESS || ggml_backend_tensor_alloc(buf_scr.get(), scr_h, base) != GGML_STATUS_SUCCESS) {
+        GGML_ABORT("failed to place the scratch in its buffer");
+    }
+    // the masked rows of a scratch attention must not hold NaN
+    ggml_backend_buffer_clear(buf_scr.get(), 0);
+    // as weights: the ops that read the scratch run on its device
+    ggml_backend_buffer_set_usage(buf_scr.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    LLAMA_LOG_INFO("%s: scratch of %.1f MiB in %.2f ms\n", __func__, ggml_nbytes(scr)/1048576.0, (ggml_time_us() - t0)/1000.0);
+    return true;
+}
+
+void llama_kvq_store::scr_free() {
+    // shared: the memory stays for the packed path
+    if (!buf_scr || dec_sep) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    // the readbacks of the last scratch graph read it
+    synchronize();
+    buf_scr.reset();
+    for (ggml_tensor * t : { scr, scr_h }) {
+        t->data   = nullptr;
+        t->buffer = nullptr;
+    }
+    LLAMA_LOG_INFO("%s: scratch of %.1f MiB freed in %.2f ms\n", __func__, ggml_nbytes(scr)/1048576.0, (ggml_time_us() - t0)/1000.0);
+}
+
+bool llama_kvq_store::dec_alloc() {
+    if (!dec_sep || scr_mode == 2) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    // the readbacks of the last scratch graph read the same memory
+    synchronize();
+    // a slot that is not resident is skipped by the attention, but must not hold NaN
+    for (const auto & b : bufs) {
+        ggml_backend_tensor_memset(b.rkv_h, 0, 0, ggml_nbytes(b.rkv_h));
+    }
+    for (const auto & b : tbufs) {
+        ggml_backend_tensor_memset(b.k, 0, 0, ggml_nbytes(b.k));
+        ggml_backend_tensor_memset(b.v, 0, 0, ggml_nbytes(b.v));
+    }
+    // a join copies the whole pinned slot list (slots_hi is its state)
+    if (jblk) {
+        ggml_backend_tensor_set(layers[0].t.slots, h_slots, 0, ggml_nbytes(layers[0].t.slots));
+    }
+    scr_mode = 2;
+    LLAMA_LOG_INFO("%s: the resident, tail and staging buffers in the shared memory in %.2f ms\n", __func__, (ggml_time_us() - t0)/1000.0);
+    return true;
+}
+
 llama_kvq_memory_info llama_kvq_store::memory_info() const {
     llama_kvq_memory_info mi;
     for (const auto & l : layers) {
@@ -2207,6 +2335,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kvq_store::memory_breakdown()
     std::map<ggml_backend_buffer_type_t, size_t> res;
     if (buf_dev) {
         res[ggml_backend_buffer_get_type(buf_dev.get())] += ggml_backend_buffer_get_size(buf_dev.get());
+    }
+    if (buf_scr) {
+        res[ggml_backend_buffer_get_type(buf_scr.get())] += ggml_backend_buffer_get_size(buf_scr.get());
     }
     for (const auto & b : buf_store) {
         res[ggml_backend_buffer_get_type(b.get())] += ggml_backend_buffer_get_size(b.get());

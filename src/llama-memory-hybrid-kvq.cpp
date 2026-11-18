@@ -137,6 +137,7 @@ bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
         if (!settle(p0)) {
             return false;
         }
+        prompt_bufs_release();
         n_fold++;
         t_fold += (ggml_time_us() - t1)*1e-6;
         LLAMA_LOG_INFO("%s: fold at position %d: coarse region %d rows, %d positions in the ring, %.3f s (%d folds, %.2f s in all)\n", __func__,
@@ -614,7 +615,26 @@ bool llama_memory_hybrid_kvq::fit_wait() {
         n_settle++;
         t_settle += (ggml_time_us() - t0)*1e-6;
     }
+    if (ok) {
+        prompt_bufs_release();
+    }
     return ok;
+}
+
+bool llama_memory_hybrid_kvq::prompt_bufs_alloc() {
+    return !store || !store->fit_mode() || !store->scratch_ok() || store->scr_alloc();
+}
+
+void llama_memory_hybrid_kvq::prompt_bufs_release() {
+    if (!fitter || !store) {
+        return;
+    }
+    if (!fitter->has_jobs()) {
+        fitter->dev_free();
+    }
+    if (store->n_coarse() > 0 && (!tail || store->n_host() == store->n_coarse())) {
+        store->scr_free();
+    }
 }
 
 bool llama_memory_hybrid_kvq::fit_get_progress(llama_kvq_fit_progress & out) const {
@@ -768,7 +788,23 @@ bool llama_memory_hybrid_kvq_context::apply() {
         res = res & ctx_coarse->apply();
     }
 
+    // the scratch attention of a prompt ubatch, the resident and tail buffers of a packed one
+    if (res && mem_kvq && store && store->fit_mode()) {
+        if (prompt_path(get_ubatch())) {
+            res = !store->scratch_ok() || store->scr_alloc();
+        } else {
+            res = store->dec_alloc();
+        }
+    }
+
     return res;
+}
+
+bool llama_memory_hybrid_kvq_context::prompt_path(const llama_ubatch & ubatch) const {
+    if (!params.enabled || !params.packed || store == nullptr) {
+        return false;
+    }
+    return !llama_kvq_use_packed(params, ubatch.n_tokens, store->n_coarse(), store->n_host(), get_attn()->get_n_kv(), store->tail_mode());
 }
 
 llama_memory_status llama_memory_hybrid_kvq_context::get_status() const {

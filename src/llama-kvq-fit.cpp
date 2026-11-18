@@ -148,65 +148,8 @@ llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_
         }
     }
 
-    // device state, then the largest graphs once: the ops must run on the device, and the allocator does not grow later
-    {
-        ggml_init_params ip = { 3*ggml_tensor_overhead(), nullptr, true };
-        ctx_dev.reset(ggml_init(ip));
-        ggml_init_params ia = { ggml_tensor_overhead(), nullptr, true };
-        ctx_alias.reset(ggml_init(ia));
-        if (!ctx_dev || !ctx_alias) {
-            throw std::runtime_error("failed to create the fitter context");
-        }
-        idx   = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_stage, G);
-        par   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, KVQ_D, KVQ_NP, 2*G);
-        stage = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, KVQ_D, 2, n_stage, G);
-        ggml_set_name(idx,   "kvq_fit_idx");
-        ggml_set_name(par,   "kvq_fit_par");
-        ggml_set_name(stage, "kvq_fit_stage");
-        buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), store.dev_buft()));
-        if (!buf_dev) {
-            throw std::runtime_error("failed to allocate the fitter device buffer");
-        }
-        ggml_backend_buffer_clear(buf_dev.get(), 0);
-
-        // the CUDA copy has no strided q8_0 to q8_0 copy, so the ring rows go to the stage as f16 pairs of bytes
-        stage_h = ggml_new_tensor_4d(ctx_alias.get(), GGML_TYPE_F16, KVQ_ROW/2, 2, n_stage, G);
-        GGML_ASSERT(ggml_nbytes(stage_h) == ggml_nbytes(stage));
-        if (ggml_backend_tensor_alloc(buf_dev.get(), stage_h, stage->data) != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("failed to alias the fitter stage");
-        }
-
-        std::vector<int32_t> ids((size_t) n_stage*G);
-        for (size_t j = 0; j < ids.size(); ++j) {
-            ids[j] = (int32_t) (j % n_stage);
-        }
-        ggml_backend_tensor_set(idx, ids.data(), 0, ggml_nbytes(idx));
-
-        galloc.reset(ggml_gallocr_new(store.dev_buft()));
-        graph_meta.resize(ggml_tensor_overhead()*128 + ggml_graph_overhead());
-
-        job jb;
-        jb.r0 = 0;
-        jb.r1 = n_stage;
-        jb.h1 = n_stage;
-        for (int phase = 1; phase <= 3; ++phase) {
-            if (phase == 2 && !v_fit) {
-                continue;
-            }
-            ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
-            ggml_context_ptr ctx(ggml_init(gp));
-            ggml_cgraph * gf = build_phase(jb, phase, 0, ctx.get());
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                ggml_tensor * node = ggml_graph_node(gf, i);
-                if (node->op != GGML_OP_NONE && !ggml_backend_supports_op(store.backend(), node)) {
-                    throw std::runtime_error(format("the device does not run the fit op %s (%s)", ggml_op_desc(node), node->name));
-                }
-            }
-            if (!ggml_gallocr_reserve(galloc.get(), gf)) {
-                throw std::runtime_error("failed to allocate the fitter graphs");
-            }
-        }
-    }
+    graph_meta.resize(ggml_tensor_overhead()*128 + ggml_graph_overhead());
+    dev_alloc();
     if (v_fit) {
         compute_wo_gram_dev();
     }
@@ -244,6 +187,91 @@ llama_kvq_fitter::~llama_kvq_fitter() {
             ggml_backend_event_synchronize(ev.get());
         }
     }
+}
+
+// device state, then the largest graphs once: the ops must run on the device, and the allocator does not grow later
+void llama_kvq_fitter::dev_alloc() {
+    if (buf_dev) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    const int32_t G  = store.n_head_kv();
+
+    ggml_init_params ip = { 3*ggml_tensor_overhead(), nullptr, true };
+    ctx_dev.reset(ggml_init(ip));
+    ggml_init_params ia = { ggml_tensor_overhead(), nullptr, true };
+    ctx_alias.reset(ggml_init(ia));
+    if (!ctx_dev || !ctx_alias) {
+        throw std::runtime_error("failed to create the fitter context");
+    }
+    idx   = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_stage, G);
+    par   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, KVQ_D, KVQ_NP, 2*G);
+    stage = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, KVQ_D, 2, n_stage, G);
+    ggml_set_name(idx,   "kvq_fit_idx");
+    ggml_set_name(par,   "kvq_fit_par");
+    ggml_set_name(stage, "kvq_fit_stage");
+    buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), store.dev_buft()));
+    if (!buf_dev) {
+        throw std::runtime_error("failed to allocate the fitter device buffer");
+    }
+    ggml_backend_buffer_clear(buf_dev.get(), 0);
+
+    // the CUDA copy has no strided q8_0 to q8_0 copy, so the ring rows go to the stage as f16 pairs of bytes
+    stage_h = ggml_new_tensor_4d(ctx_alias.get(), GGML_TYPE_F16, KVQ_ROW/2, 2, n_stage, G);
+    GGML_ASSERT(ggml_nbytes(stage_h) == ggml_nbytes(stage));
+    if (ggml_backend_tensor_alloc(buf_dev.get(), stage_h, stage->data) != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("failed to alias the fitter stage");
+    }
+
+    std::vector<int32_t> ids((size_t) n_stage*G);
+    for (size_t j = 0; j < ids.size(); ++j) {
+        ids[j] = (int32_t) (j % n_stage);
+    }
+    ggml_backend_tensor_set(idx, ids.data(), 0, ggml_nbytes(idx));
+
+    galloc.reset(ggml_gallocr_new(store.dev_buft()));
+
+    job jb;
+    jb.r0 = 0;
+    jb.r1 = n_stage;
+    jb.h1 = n_stage;
+    for (int phase = 1; phase <= 3; ++phase) {
+        if (phase == 2 && !v_fit) {
+            continue;
+        }
+        ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
+        ggml_context_ptr ctx(ggml_init(gp));
+        ggml_cgraph * gf = build_phase(jb, phase, 0, ctx.get());
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_NONE && !ggml_backend_supports_op(store.backend(), node)) {
+                throw std::runtime_error(format("the device does not run the fit op %s (%s)", ggml_op_desc(node), node->name));
+            }
+        }
+        if (!ggml_gallocr_reserve(galloc.get(), gf)) {
+            throw std::runtime_error("failed to allocate the fitter graphs");
+        }
+    }
+    LLAMA_LOG_INFO("%s: %.1f MiB in %.2f ms\n", __func__,
+            (ggml_backend_buffer_get_size(buf_dev.get()) + ggml_gallocr_get_buffer_size(galloc.get(), 0))/1048576.0, (ggml_time_us() - t0)/1000.0);
+}
+
+void llama_kvq_fitter::dev_free() {
+    if (!buf_dev) {
+        return;
+    }
+    GGML_ASSERT(jobs_empty());
+    const int64_t t0 = ggml_time_us();
+    store.synchronize();
+    galloc.reset();
+    buf_dev.reset();
+    ctx_alias.reset();
+    ctx_dev.reset();
+    idx     = nullptr;
+    par     = nullptr;
+    stage   = nullptr;
+    stage_h = nullptr;
+    LLAMA_LOG_INFO("%s: the device stage and the graph allocator are freed in %.2f ms\n", __func__, (ggml_time_us() - t0)/1000.0);
 }
 
 int32_t llama_kvq_fitter::n_pair() const {
@@ -621,6 +649,8 @@ void llama_kvq_fitter::queue_phase(job & jb, int phase) {
     const int64_t  G       = store.n_head_kv();
     const size_t   n_par   = (size_t) G*KVQ_NP*KVQ_D; // floats per (layer index, K or V)
     const size_t   n_stat  = (size_t) G*(KVQ_D*KVQ_D + KVQ_D);
+
+    dev_alloc();
 
     double t0 = 0.0;
     if (prof) {
