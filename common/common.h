@@ -10,6 +10,7 @@
 
 #include <array>
 #include <list>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1332,6 +1333,33 @@ struct common_no_init_allocator : std::allocator<T> {
 // sequence state data, filled by llama_state_seq_get_data_ext()
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
 
+struct common_checkpoint_storage;
+
+class common_checkpoint_buffer {
+public:
+    common_checkpoint_buffer();
+    ~common_checkpoint_buffer();
+    common_checkpoint_buffer(const common_checkpoint_buffer & other);
+    common_checkpoint_buffer(common_checkpoint_buffer && other) noexcept;
+    common_checkpoint_buffer & operator=(const common_checkpoint_buffer & other);
+    common_checkpoint_buffer & operator=(common_checkpoint_buffer && other) noexcept;
+
+    size_t size() const;
+    bool empty() const { return size() == 0; }
+    uint8_t * data();
+    const uint8_t * data() const;
+    void clear();
+    void resize(size_t size);
+    // Discard the previous payload; the caller overwrites every byte.
+    void reset(size_t size, bool pin_host);
+
+private:
+    common_state_data bytes;
+    std::unique_ptr<common_checkpoint_storage> pinned;
+};
+
+struct llama_state_seq_snapshot;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1341,8 +1369,10 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    common_state_data data_tgt;
-    common_state_data data_dft;
+    mutable common_checkpoint_buffer data_tgt;
+    std::shared_ptr<llama_state_seq_snapshot> device_tgt;
+    mutable common_state_data data_dft;
+    std::shared_ptr<llama_state_seq_snapshot> device_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
@@ -1352,6 +1382,9 @@ struct common_prompt_checkpoint {
 
     bool empty() const;
     void clear();
+    const common_checkpoint_buffer & target_data() const;
+    const common_state_data & draft_data() const;
+    bool has_draft_state() const;
 
     void update_pos(
             int64_t n_tokens,
@@ -1361,12 +1394,14 @@ struct common_prompt_checkpoint {
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            bool device_storage = false);
 
     void update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            bool device_storage = false);
 
     // return false if the state could not be restored
     bool load_tgt(

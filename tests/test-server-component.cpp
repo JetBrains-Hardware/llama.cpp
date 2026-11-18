@@ -936,6 +936,39 @@ static void test_pcm_f32_to_s16(testing & t) {
     t.assert_true ("empty",          pcm_f32_to_s16(nullptr, 0).empty());
 }
 
+static void test_checkpoint_buffer(testing & t) {
+    std::vector<uint8_t> expected(1024);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected[i] = (uint8_t) i;
+    }
+    common_checkpoint_buffer active;
+    active.reset(expected.size(), true);
+    std::copy(expected.begin(), expected.end(), active.data());
+
+    auto cached = active;
+    active.clear();
+    active.reset(2048, true);
+    std::fill_n(active.data(), active.size(), 0x5a);
+    t.assert_equal("cached size", expected.size(), cached.size());
+    t.assert_true("cached bytes survive source reuse", std::equal(expected.begin(), expected.end(), cached.data()));
+
+    const auto * data = cached.data();
+    auto moved = std::move(cached);
+    t.assert_true("move retains allocation", data == moved.data());
+    moved.resize(expected.size() + 1);
+    t.assert_true("resize preserves bytes", std::equal(expected.begin(), expected.end(), moved.data()));
+    t.assert_equal("resize initializes new bytes", (uint8_t) 0, moved.data()[expected.size()]);
+
+    cached = active;
+    active.reset(4096, false);
+    std::fill_n(active.data(), active.size(), 0);
+    t.assert_equal("copy assignment size", (size_t) 2048, cached.size());
+    t.assert_true("copy assignment is independent", std::all_of(cached.data(), cached.data() + cached.size(),
+            [](uint8_t value) { return value == 0x5a; }));
+    active = std::move(moved);
+    t.assert_true("move assignment retains bytes", std::equal(expected.begin(), expected.end(), active.data()));
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -965,6 +998,7 @@ int main(int argc, char ** argv) {
     t.test("stop_strings",    test_stop_strings);
     t.test("speech_convert",  test_speech_convert);
     t.test("pcm_f32_to_s16",  test_pcm_f32_to_s16);
+    t.test("checkpoint_buffer", test_checkpoint_buffer);
 
     return t.summary();
 }

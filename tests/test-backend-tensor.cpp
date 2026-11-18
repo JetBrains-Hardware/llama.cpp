@@ -5,6 +5,7 @@
 
 #include "../ggml/src/ggml-backend-impl.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -608,6 +609,88 @@ static bool test_mock() {
         test_mock_grouping();
 }
 
+static bool test_input_staging(ggml_backend_dev_t dev) {
+    const char * enabled = std::getenv("GGML_CUDA_ASYNC_INPUTS");
+    if (!enabled || strcmp(enabled, "1") != 0) {
+        return true;
+    }
+    using copy_input_t = bool (*)(ggml_backend_t, const ggml_tensor *, ggml_tensor *);
+    auto copy_input = reinterpret_cast<copy_input_t>(ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_backend_copy_input_async"));
+    if (!copy_input) {
+        return true;
+    }
+    ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
+    if (!backend) {
+        return false;
+    }
+    constexpr int64_t capacity = 16384, copies = 130, side = 4096;
+    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead()*512 + ggml_graph_overhead(), nullptr, true}));
+    ggml_context_ptr host(ggml_init({ggml_tensor_overhead()*256, nullptr, true}));
+    auto * source = ggml_new_tensor_1d(host.get(), GGML_TYPE_F32, capacity + 1);
+    ggml_set_input(source);
+    auto * destination = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, copies*capacity);
+    auto * oversized = ggml_view_1d(ctx.get(), destination, capacity + 1, 0);
+    auto * strided_src = ggml_new_tensor_2d(host.get(), GGML_TYPE_F32, 2, 2);
+    strided_src->nb[1] = 4*sizeof(float);
+    strided_src->nb[2] = strided_src->nb[3] = 8*sizeof(float);
+    auto * strided_dst = ggml_view_2d(ctx.get(), destination, 2, 2, 4*sizeof(float), 0);
+    ggml_set_input(strided_src);
+    auto * a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, side, side);
+    auto * b = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, side, side);
+    auto * product = ggml_mul_mat(ctx.get(), a, b);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, product);
+    std::vector<ggml_tensor *> src, dst;
+    for (int64_t i = 0; i < copies; ++i) {
+        const int64_t count = i%3 == 0 ? 1 : (i%3 == 1 ? 2049 : capacity);
+        src.push_back(ggml_new_tensor_1d(host.get(), GGML_TYPE_F32, count));
+        dst.push_back(ggml_view_1d(ctx.get(), destination, count, i*capacity*sizeof(float)));
+        ggml_set_input(src.back());
+    }
+    ggml_backend_buffer_ptr data(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+    auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+    ggml_backend_buffer_ptr input(ggml_backend_alloc_ctx_tensors_from_buft(host.get(), host_buft ? host_buft : ggml_backend_cpu_buffer_type()));
+    if (!data || !input) {
+        return false;
+    }
+    if (host_buft && ggml_backend_buffer_get_type(input.get()) != host_buft) {
+        return !copy_input(backend.get(), src[0], dst[0]);
+    }
+    if (copy_input(backend.get(), source, oversized) || copy_input(backend.get(), strided_src, strided_dst)) {
+        return false;
+    }
+    std::vector<float> values(side*side, 1.0f/side);
+    ggml_backend_tensor_set(a, values.data(), 0, values.size()*sizeof(float));
+    ggml_backend_tensor_set(b, values.data(), 0, values.size()*sizeof(float));
+    for (int i = 0; i < 3; ++i) {
+        if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) return false;
+    }
+    // Allocate and warm all staging slots before queuing work that delays their copies.
+    *static_cast<float *>(src[0]->data) = -1.0f;
+    for (int i = 0; i < 64; ++i) {
+        if (!copy_input(backend.get(), src[0], dst[0])) return false;
+    }
+    ggml_backend_synchronize(backend.get());
+    for (int i = 0; i < 8; ++i) {
+        if (ggml_backend_graph_compute_async(backend.get(), graph) != GGML_STATUS_SUCCESS) return false;
+    }
+    for (int64_t i = 0; i < copies; ++i) {
+        std::fill_n(static_cast<float *>(src[i]->data), src[i]->ne[0], float(i) + 0.5f);
+        if (!copy_input(backend.get(), src[i], dst[i])) return false;
+        memset(src[i]->data, 0, ggml_nbytes(src[i]));
+    }
+    input.reset(); // the caller's memory may disappear while GPU copies are pending
+    ggml_backend_synchronize(backend.get());
+    for (int64_t i = 0; i < copies; ++i) {
+        std::vector<float> actual(dst[i]->ne[0]);
+        ggml_backend_tensor_get(dst[i], actual.data(), 0, actual.size()*sizeof(float));
+        for (float value : actual) if (value != float(i) + 0.5f) return false;
+    }
+    printf("%s input staging ownership and ring wrap PASSED\n", ggml_backend_dev_name(dev));
+    return true;
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -620,7 +703,7 @@ int main() {
         const char * name = ggml_backend_dev_name(dev);
         ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
 
-        const bool ok = test_buft(buft);
+        const bool ok = test_buft(buft) && test_input_staging(dev);
         printf("%s %s\n", name, ok ? "PASSED" : "FAILED");
         if (ok) {
             n_ok++;

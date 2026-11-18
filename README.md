@@ -25,6 +25,8 @@ The `llama.cpp` project is built on top of the [ggml](https://github.com/ggml-or
 
 ## Quick start
 
+For this branch's optimized CUDA tree configuration with the original UD-Q3_K_XL target, see the [Qwen3.8 DFlash2 tree launcher](docs/development/qwen-dflash2-tree.md).
+
 A few options to get `llama.cpp` installed on your machine:
 
 ```bash

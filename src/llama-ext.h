@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -119,6 +120,21 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
+// Independently owned C1 CUDA partial-state checkpoints, restored only into their source context.
+// Copies share immutable storage; unavailable or block-quantized storage returns null for host fallback.
+struct llama_state_seq_snapshot;
+using llama_state_seq_snapshot_ptr = std::shared_ptr<llama_state_seq_snapshot>;
+
+LLAMA_API llama_state_seq_snapshot_ptr llama_state_seq_snapshot_save(
+        llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags,
+        llama_state_seq_snapshot_ptr reusable = {});
+LLAMA_API bool llama_state_seq_snapshot_restore(
+        llama_context * ctx, const llama_state_seq_snapshot_ptr & snapshot,
+        llama_seq_id seq_id, llama_state_seq_flags flags);
+LLAMA_API size_t llama_state_seq_snapshot_size(const llama_state_seq_snapshot_ptr & snapshot);
+LLAMA_API size_t llama_state_seq_snapshot_export(
+        const llama_state_seq_snapshot_ptr & snapshot, uint8_t * dst, size_t size);
+
 // Turn the KV cache attention rotation on or off for the contexts created from this model.
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
@@ -140,6 +156,7 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
+LLAMA_API bool llama_supports_async_embd_row(const struct llama_context * ctx);
 //
 // model/context data extraction
 //

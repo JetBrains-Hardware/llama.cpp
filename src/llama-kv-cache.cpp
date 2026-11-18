@@ -1974,10 +1974,72 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
             set_input_attn_mask_impl<float>(args, (float *) dst->data, causal_attn);
         }
 
+        if (ubatch->tree_parent) {
+            GGML_ASSERT(this->n_stream == 1 && !attn_mask.block_uniform);
+            const auto & cells = v_cells[0];
+            const uint32_t width = ubatch->n_seq_tokens;
+            std::vector<uint32_t> ancestors(n_tokens);
+            for (uint32_t first = 0; first < n_tokens; first += width) {
+                for (uint32_t i = 0; i < width; ++i) {
+                    for (int32_t p = i; p >= 0; p = ubatch->tree_parent[first + p]) {
+                        ancestors[first + i] |= uint32_t(1) << p;
+                    }
+                }
+                const auto seq = ubatch->seq_id[first][0];
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const int32_t idx = rows ? rows[(first / n_tps) * n_kv + j] : j;
+                    if (idx < 0 || cells.is_empty(idx) || !cells.seq_has(idx, seq)) continue;
+                    const int32_t node = cells.pos_get(idx) - ubatch->pos[first];
+                    if (node < 0 || (uint32_t) node >= width) continue;
+                    for (uint32_t i = 0; i < width; ++i) {
+                        if (!(ancestors[first + i] & (uint32_t(1) << node))) {
+                            if (dst->type == GGML_TYPE_F16) {
+                                ((ggml_fp16_t *) dst->data)[(first + i) * n_kv + j] = ggml_fp32_to_fp16(-INFINITY);
+                            } else {
+                                ((float *) dst->data)[(first + i) * n_kv + j] = -INFINITY;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         //const int64_t t_end = ggml_time_us();
 
         //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
     }
+}
+
+bool llama_kv_cache::tree_commit(llama_seq_id seq_id, llama_pos pos0, const std::vector<int32_t> & parents, const int32_t * rows, int32_t n) {
+    auto & cells = v_cells[get_stream(seq_id)];
+    std::vector<uint32_t> idxs(parents.size(), UINT32_MAX);
+    for (const auto & entry : cells.seq_pos_get(seq_id)) {
+        const auto p = entry.first - pos0;
+        if (p >= 0 && (size_t) p < parents.size()) {
+            if (idxs[p] != UINT32_MAX || cells.seq_count(entry.second) != 1) {
+                return false;
+            }
+            idxs[p] = entry.second;
+        }
+    }
+    if (std::find(idxs.begin(), idxs.end(), UINT32_MAX) != idxs.end()) {
+        return false;
+    }
+    std::vector<llama_kv_cell_ext> kept;
+    for (int32_t i = 0; i < n; ++i) {
+        kept.push_back(cells.ext_get(idxs[rows[i]]));
+        kept.back().x = kept.back().y = pos0 + i;
+    }
+    for (const uint32_t idx : idxs) {
+        cells.rm(idx);
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        const uint32_t idx = idxs[rows[i]];
+        cells.pos_set(idx, pos0 + i);
+        cells.ext_set(idx, kept[i]);
+        cells.seq_add(idx, seq_id);
+    }
+    return true;
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

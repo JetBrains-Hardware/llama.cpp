@@ -1230,6 +1230,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    ggml_backend_sched_compute_callback callback_compute;
+    void * callback_compute_user_data;
+
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
@@ -2114,6 +2117,15 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        // This extension owns a host copy before returning, so the user may reuse the input immediately.
+        using copy_input_async_t = bool (*)(ggml_backend_t, const ggml_tensor *, ggml_tensor *);
+        auto * dev = ggml_backend_get_device(split_backend);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto copy_input = reg ? reinterpret_cast<copy_input_async_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_input_async")) : nullptr;
+        if (copy_input && copy_input(split_backend, input, input_cpy)) {
+            return;
+        }
+
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2247,6 +2259,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
                 ggml_backend_sched_copy_input(sched, split, input);
             }
+        }
+
+        if (sched->callback_compute) {
+            sched->callback_compute(split_backend, sched->callback_compute_user_data);
         }
 
         if (!sched->callback_eval) {
@@ -2510,6 +2526,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_compute_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_compute = callback;
+    sched->callback_compute_user_data = user_data;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {

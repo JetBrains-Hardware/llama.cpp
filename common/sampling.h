@@ -91,6 +91,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+std::vector<llama_token> common_sampler_sample_and_accept_tree(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<int32_t> & parents, std::vector<int32_t> & kept,
+        uint32_t seed, llama_pos pos0);
+
+llama_token common_sampler_sample_tree(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, uint32_t seed, llama_pos position);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

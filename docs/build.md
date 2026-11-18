@@ -325,6 +325,8 @@ May cause crashes or corrupted outputs for some motherboards and BIOS settings (
 
 ### Performance Tuning
 
+Eligible small `IQ4_NL` and `IQ4_XS` weight projections are calibrated on their first execution. The CUDA backend times vector and few-row matrix kernels using scratch activations and outputs, then caches the choice per backend context and matrix shape. Calibration runs before inference graph capture and adds one-time warmup work; it does not modify model weights. It measures CUDA graph replay when graphs are enabled and ordinary launches otherwise. The few-row path is selected only when its measured time is at least 3% lower.
+
 The following compilation options are also available to tweak performance:
 
 | Option                        | Legal values           | Default | Description                                                                                                                                                                                                                                                                                                                                                                      |

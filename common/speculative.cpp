@@ -4,11 +4,14 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
+#include "llama-tree.h"
 #include "log.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "speculative-tree.h"
 
 #include <algorithm>
 #include <cassert>
@@ -207,6 +210,8 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const common_batch & batch) = 0;
+
+    virtual bool can_process_async() const { return false; }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1236,7 +1241,8 @@ public:
                         const int32_t   row        = i_batch_beg[seq_id] + offset + i;
                         const llama_pos p          = batch_in.tokens[row].pos[0];
                         const llama_pos pos_arr[4] = { p, p, p, 0 };
-                        batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                        const int32_t mapped = batch_in.tokens[row].embd_row;
+                        batch_inject.add_embd_row(mapped >= 0 ? mapped : row, pos_arr, seq_id, false);
                     }
 
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
@@ -1258,7 +1264,9 @@ public:
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const int32_t row = i_batch_beg[seq_id] + offset + i;
+                        const int32_t mapped = batch_in.tokens[row].embd_row;
+                        const float * src = layer + (size_t) (mapped >= 0 ? mapped : row) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
@@ -1498,15 +1506,30 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 // DFlash2: walks the lattice of the selector over the top-k candidates of the block
 struct common_speculative_impl_draft_dflash2 final : public common_speculative_impl_draft_dflash {
     int32_t selector_top_k = 0;
+    bool tree_enabled = false;
 
     // probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
     std::vector<std::mt19937> dflash2_rng;
     std::vector<int64_t>      dflash2_seed;
 
+    bool can_process_async() const override {
+        return use_dev_features && llama_supports_async_embd_row(params.ctx_dft);
+    }
+
     common_speculative_impl_draft_dflash2(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2)
     {
         selector_top_k = llama_model_dflash_selector_top_k(llama_get_model(this->params.ctx_dft));
+        const char * tree_env = getenv("LLAMA_DFLASH_TREE");
+        tree_enabled = tree_env && std::atoi(tree_env) != 0;
+        if (tree_enabled) {
+            if (!llama_tree_supported(this->params.ctx_tgt) || this->params.n_max > 31 ||
+                    selector_top_k > 20 || n_embd_dec < 2 * selector_top_k * (selector_top_k + 1)) {
+                throw std::runtime_error("DFlash2 trees require a CUDA Qwen35 replay context and at most 31 draft nodes");
+            }
+            block_size = std::max(block_size, this->params.n_max + 1);
+            LOG_INF("%s: DFlash2 trees enabled: budget=%d, block=%d\n", __func__, this->params.n_max, block_size);
+        }
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
 
@@ -1581,6 +1604,22 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
 
             const float * lattice = llama_get_embeddings_nextn(ctx_dft);
             GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+            if (tree_enabled && dp.result_parents) {
+                const auto nodes = common_tree_grow(
+                        lattice + (size_t) beg * n_embd_dec, n_block_tokens, n_embd_dec,
+                        selector_top_k, params.n_max, dp.seed, dp.pos0, dp.temp);
+                auto & parents = *dp.result_parents;
+                parents.assign(1, -1);
+                for (const auto & node : nodes) {
+                    result.push_back(node.token);
+                    parents.push_back(node.parent);
+                }
+                if (result.empty()) {
+                    parents.clear();
+                }
+                continue;
+            }
 
             // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
             const bool sample = params.probabilistic && dp.result_q;
@@ -3415,6 +3454,12 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
+bool common_speculative_can_process_async(const common_speculative * spec) {
+    return spec && !spec->impls.empty() && std::all_of(spec->impls.begin(), spec->impls.end(), [](const auto & impl) {
+        return impl->can_process_async();
+    });
+}
+
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
     bool result = true;
 
@@ -3478,6 +3523,9 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+                        if (dp.result_parents && !dp.result_parents->empty()) {
+                            dp.result_parents->resize(dp.n_max + 1);
+                        }
 
                         // trim the candidates only if the drafter produced them (n-gram drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {

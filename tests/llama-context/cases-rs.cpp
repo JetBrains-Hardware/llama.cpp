@@ -487,9 +487,149 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// Compare every accepted verification prefix against native recurrent snapshots with the same batch shape.
+struct case_verify_prefix : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "verify_prefix"; }
+    const char * description() const override {
+        return "partial speculative acceptance matches native recurrent snapshots";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx = 512;
+        opts.n_batch = 128;
+        opts.n_ubatch = 128;
+        opts.n_seq_max = 1;
+        opts.n_rs_seq = 7;
+        auto tested = mr.ctx(opts);
+        CTX_REQUIRE(tested, "failed to create verification context");
+        if (llama_n_rs_seq(tested.get()) == 0) {
+            return case_result::skip("recurrent rollback is disabled");
+        }
+
+        // Deferred commit supports one sequence only; reserving two retains the snapshot reference.
+        // Both contexts process seq 0 with the same token batches.
+        opts.n_seq_max = 2;
+        auto reference = mr.ctx(opts);
+        CTX_REQUIRE(reference, "failed to create snapshot reference");
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        logits_diff total;
+        llama_pos pos = 64;
+        CTX_REQUIRE(decode_gen(tested.get(), n_vocab, 0, 0, pos) &&
+                    decode_gen(reference.get(), n_vocab, 0, 0, pos), "initial prefill failed");
+
+        for (llama_pos kept = 1; kept <= 8; ++kept) {
+            CTX_REQUIRE(decode_gen(tested.get(), n_vocab, 0, pos, pos + 8) &&
+                        decode_gen(reference.get(), n_vocab, 0, pos, pos + 8), "verification failed");
+            if (kept < 8) {
+                CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(tested.get()), 0, pos + kept, -1) &&
+                            llama_memory_seq_rm(llama_get_memory(reference.get()), 0, pos + kept, -1),
+                            "partial acceptance rollback failed");
+            }
+            pos += kept;
+            const auto token = gen_token(n_vocab, 0, pos);
+            CTX_REQUIRE(decode_one(tested.get(), token, pos) && decode_one(reference.get(), token, pos),
+                        "continuation failed");
+            total.add(llama_get_logits_ith(reference.get(), -1), llama_get_logits_ith(tested.get(), -1), n_vocab);
+            CTX_REQUIRE(total.nmse() <= NMSE_THRESHOLD, "accepted prefix logits differ, nmse " + std::to_string(total.nmse()));
+            ++pos;
+        }
+        TLOG_INF("%s: all accepted prefixes match, nmse %.9g, max diff %.9g\n", __func__, total.nmse(), total.diff_max);
+        return case_result::pass();
+    }
+};
+
+struct case_owned_checkpoint : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "owned_checkpoint"; }
+    const char * description() const override { return "independent device checkpoints, sharing, export, and restore"; }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx = 128;
+        opts.n_batch = 32;
+        opts.n_ubatch = 16;
+        opts.n_seq_max = 1;
+        opts.n_rs_seq = 8;
+        opts.kv_unified = 1;
+        auto ctx = mr.ctx(opts);
+        CTX_REQUIRE(ctx, "context creation failed");
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        const auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        const auto host_state = [&]() {
+            std::vector<uint8_t> data(llama_state_seq_get_size_ext(ctx.get(), 0, flags));
+            if (llama_state_seq_get_data_ext(ctx.get(), data.data(), data.size(), 0, flags) != data.size()) {
+                data.clear();
+            }
+            return data;
+        };
+        const auto export_equal = [](const llama_state_seq_snapshot_ptr & snapshot, const std::vector<uint8_t> & expected) {
+            std::vector<uint8_t> data(expected.size());
+            return llama_state_seq_snapshot_export(snapshot, data.data(), data.size()) == data.size() && data == expected;
+        };
+        CTX_REQUIRE(decode_gen(ctx.get(), n_vocab, 0, 0, 20), "prefix decode failed");
+        auto first = llama_state_seq_snapshot_save(ctx.get(), 0, flags);
+        if (!first) {
+            return case_result::skip("device checkpoint unavailable");
+        }
+        auto shared = first;
+        const auto initial = host_state();
+        CTX_REQUIRE(!initial.empty() && export_equal(first, initial), "initial export differs from host state");
+        CTX_REQUIRE(decode_gen(ctx.get(), n_vocab, 0, 20, 24), "continuation decode failed");
+        CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 22, -1), "rollback failed");
+        const auto pending = host_state();
+        auto second = llama_state_seq_snapshot_save(ctx.get(), 0, flags, std::move(first));
+        CTX_REQUIRE(second && export_equal(second, pending), "pending-rollback export differs");
+        CTX_REQUIRE(export_equal(shared, initial), "saving through a shared owner changed an older checkpoint");
+        std::vector<uint8_t> legacy(llama_state_seq_get_size_ext(ctx.get(), 0, flags | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+        CTX_REQUIRE(llama_state_seq_get_data_ext(ctx.get(), legacy.data(), legacy.size(), 0,
+                flags | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) == legacy.size(), "legacy snapshot failed");
+        CTX_REQUIRE(llama_state_seq_set_data_ext(ctx.get(), initial.data(), initial.size(), 0, flags) == initial.size(), "host restore failed");
+        CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 20, -1), "host tail removal failed");
+        CTX_REQUIRE(decode_gen(ctx.get(), n_vocab, 0, 20, 24) &&
+                decode_one(ctx.get(), gen_token(n_vocab, 0, 24), 24), "host continuation failed");
+        std::vector<float> expected;
+        CTX_REQUIRE(get_current_logits(ctx.get(), expected), "missing reference logits");
+        CTX_REQUIRE(llama_state_seq_snapshot_restore(ctx.get(), shared, 0, flags), "owned restore failed");
+        CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 20, -1), "owned tail removal failed");
+        CTX_REQUIRE(decode_gen(ctx.get(), n_vocab, 0, 20, 24) &&
+                decode_one(ctx.get(), gen_token(n_vocab, 0, 24), 24), "owned continuation failed");
+        std::vector<float> actual;
+        CTX_REQUIRE(get_current_logits(ctx.get(), actual) && actual == expected, "owned restore changed logits");
+        CTX_REQUIRE(export_equal(second, pending), "restoring a different checkpoint changed saved rollback history");
+        const auto current = host_state();
+        second = llama_state_seq_snapshot_save(ctx.get(), 0, flags, std::move(second));
+        CTX_REQUIRE(second && export_equal(second, current), "exclusive storage reuse changed state");
+        CTX_REQUIRE(export_equal(shared, initial), "exclusive reuse changed a shared checkpoint");
+        if (initial.size() > 32*1024*1024) {
+            std::vector<llama_state_seq_snapshot_ptr> held;
+            bool exhausted = false;
+            for (int i = 0; i < 32; ++i) {
+                auto snapshot = llama_state_seq_snapshot_save(ctx.get(), 0, flags);
+                if (!snapshot) {
+                    exhausted = true;
+                    break;
+                }
+                held.push_back(std::move(snapshot));
+            }
+            CTX_REQUIRE(exhausted, "checkpoint budget was not enforced");
+            held.clear();
+            CTX_REQUIRE(llama_state_seq_snapshot_save(ctx.get(), 0, flags), "released checkpoint budget was not returned");
+        }
+        auto other = mr.ctx(opts);
+        CTX_REQUIRE(other && !llama_state_seq_snapshot_restore(other.get(), shared, 0, flags), "a different context accepted the checkpoint");
+        ctx.reset();
+        CTX_REQUIRE(export_equal(shared, initial), "context destruction invalidated an owned checkpoint");
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
+    cases.push_back(std::make_unique<case_owned_checkpoint>());
 
+    cases.push_back(std::make_unique<case_verify_prefix>());
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());

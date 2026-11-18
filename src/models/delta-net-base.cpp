@@ -69,19 +69,52 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
-    const bool separate = separate_history &&
+    const bool separate = separate_history && !inp->tree_parent &&
             qkv_mixed->ne[0] >= int64_t(cparams.n_rs_seq) + conv_kernel_size;
     if (separate_history) {
         *separate_history = separate ? ggml_dup(ctx0, conv_states) : nullptr;
         if (separate) {
-            // Cache writes below can overwrite the old history before the convolution executes.
+            // Cache writes can overwrite the old history before convolution executes.
             ggml_build_forward_expand(gf, *separate_history);
         }
     }
     ggml_tensor * conv_input = separate ? qkv_mixed : ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
-    build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0, separate ? qkv_mixed->ne[0] : -1);
+    if (inp->tree_parent) {
+        const auto * mctx_cur = inp->mctx;
+        const auto kv_head = mctx_cur->get_head();
+        const auto mem_size = mctx_cur->get_size();
+        if (!inp->tree_conv) {
+            inp->tree_conv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, conv_kernel_size * ubatch.n_tokens);
+            ggml_set_input(inp->tree_conv);
+            ggml_set_name(inp->tree_conv, "tree_conv_rows");
+        }
+        ggml_tensor * rows = ggml_cont_2d(ctx0, ggml_transpose(ctx0, conv_input),
+                conv_channels, conv_input->ne[0] * n_seqs);
+        rows = ggml_get_rows(ctx0, rows, inp->tree_conv);
+        rows = ggml_reshape_3d(ctx0, rows, conv_channels, conv_kernel_size, ubatch.n_tokens);
+        conv_input = ggml_cont(ctx0, ggml_permute(ctx0, rows, 1, 0, 2, 3));
+
+        const int64_t K = cparams.n_rs_seq + 1;
+        GGML_ASSERT(ubatch.n_seq_tokens <= K);
+        if (!inp->s_slot_rev) {
+            inp->s_slot_rev = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seq_tokens);
+            ggml_set_input(inp->s_slot_rev);
+        }
+        ggml_tensor * windows = ggml_view_4d(ctx0, conv_input,
+                conv_kernel_size - 1, ubatch.n_seq_tokens, conv_channels, n_seqs,
+                conv_input->nb[2], conv_input->nb[1], ubatch.n_seq_tokens * conv_input->nb[2], sizeof(float));
+        const size_t row_size = ggml_row_size(conv_states_all->type, (conv_kernel_size - 1) * conv_channels);
+        ggml_tensor * slots = ggml_view_4d(ctx0, conv_states_all,
+                conv_kernel_size - 1, K, conv_channels, n_seqs, (size_t) mem_size * row_size,
+                ggml_row_size(conv_states_all->type, conv_kernel_size - 1), conv_states_all->nb[1], kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots, windows, inp->s_slot_rev));
+        return conv_input;
+    }
+
+    build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0,
+            separate ? qkv_mixed->ne[0] : -1);
 
     return conv_input;
 }
@@ -105,12 +138,24 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    // Compact replay retains update operands instead of per-token recurrent states.
+    const bool replay = inp->gdn_ctl != nullptr;
+    const bool keep = cparams.n_rs_seq > 0 && !replay;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
+        if (replay) {
+            ggml_tensor * gdn = output->view_src;
+            GGML_ASSERT(gdn && gdn->op == GGML_OP_GATED_DELTA_NET);
+            ggml_gated_delta_net_set_replay(gdn, mctx_cur->get_st_l(il), inp->gdn_ctl);
+            if (inp->tree_parent) {
+                GGML_ASSERT(g->ne[0] == 1 && n_seq_tokens <= 32);
+                gdn->src[8] = inp->tree_parent;
+                gdn->op_params[1] = inp->tree_slots;
+            }
+        }
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
@@ -118,6 +163,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+
+        if (replay && n_seq_tokens <= mctx_cur->get_gdn_width()) {
+            ggml_tensor * stash = mctx_cur->get_st_l(il);
+            const int64_t bank = stash->ne[0] * stash->ne[1];
+            for (uint32_t seq = 0; seq < ubatch.n_seqs; ++seq) {
+                const uint32_t first = seq * ubatch.n_seq_tokens;
+                for (int32_t j = 1; j < ubatch.n_seq_id[first]; ++j) {
+                    ggml_tensor * src = ggml_view_1d(ctx0, stash, bank, ubatch.seq_id[first][0] * stash->nb[2]);
+                    ggml_tensor * dst = ggml_view_1d(ctx0, stash, bank, ubatch.seq_id[first][j] * stash->nb[2]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+                }
+            }
+        }
 
         return output;
     }

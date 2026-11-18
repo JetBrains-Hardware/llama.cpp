@@ -76,6 +76,13 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    struct tree_state {
+        std::vector<int32_t> parents;
+        llama_pos pos0 = 0;
+    };
+    std::map<llama_seq_id, tree_state> trees;
+    bool tree_decoding = false;
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
@@ -136,6 +143,7 @@ struct llama_context {
     // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
     bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
+    bool supports_async_embd_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
 
@@ -212,6 +220,11 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+
+    llama_state_seq_snapshot_ptr state_seq_snapshot_save(
+            llama_seq_id seq_id, llama_state_seq_flags flags, llama_state_seq_snapshot_ptr reusable);
+    bool state_seq_snapshot_restore(
+            const llama_state_seq_snapshot_ptr & snapshot, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     //
     // training
@@ -488,6 +501,7 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+    std::shared_ptr<const uint8_t> state_snapshot_owner = std::make_shared<const uint8_t>(0);
 
     bool has_evaluated_once = false;
 

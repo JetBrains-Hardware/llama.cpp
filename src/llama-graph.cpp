@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-tree-schedule.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -27,6 +28,15 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+
+static llama_tree_schedule make_tree_schedule(const llama_ubatch & ubatch) {
+    llama_tree_schedule result;
+    for (uint32_t seq = 0; seq < ubatch.n_seqs; ++seq) {
+        result.slots = std::max(result.slots, llama_tree_schedule_make(
+                ubatch.tree_parent + seq * ubatch.n_seq_tokens, ubatch.n_seq_tokens).slots);
+    }
+    return result;
+}
 
 // dedup helpers
 
@@ -269,6 +279,20 @@ bool llm_graph_input_batch_idxs::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
+
+        if (ubatch->tree_parent) {
+            std::vector<llama_pos> values(n_tokens * n_pos_per_embd, 0);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const int32_t parent = ubatch->tree_parent[i];
+                const int64_t first = i / ubatch->n_seq_tokens * ubatch->n_seq_tokens;
+                const llama_pos p = parent < 0 ? ubatch->pos[i] : values[first + parent] + 1;
+                for (int64_t s = 0; s < std::min<int64_t>(3, n_pos_per_embd); ++s) {
+                    values[s * n_tokens + i] = p;
+                }
+            }
+            ggml_backend_tensor_set(pos, values.data(), 0, values.size() * sizeof(llama_pos));
+            return;
+        }
 
         const bool has_embd = ubatch->is_mixed() || ubatch->token == nullptr;
         if (rope_section_order == LLAMA_ROPE_SECTION_ORDER_TYXZ || !has_embd) {
@@ -525,10 +549,68 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+static void set_input_s_slot_rev(ggml_tensor * s_slot_rev) {
+    if (s_slot_rev) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_slot_rev->buffer));
+        int32_t * data = (int32_t *) s_slot_rev->data;
+
+        for (int64_t i = 0; i < s_slot_rev->ne[0]; ++i) {
+            data[i] = (int32_t) (s_slot_rev->ne[0] - 1 - i);
+        }
+    }
+}
+
+static void set_input_tree(llm_graph_input_rs * inp, const llama_ubatch * ubatch) {
+    set_input_s_slot_rev(inp->s_slot_rev);
+    if (!inp->tree_parent) {
+        return;
+    }
+    GGML_ASSERT(ubatch->tree_parent);
+    std::vector<int32_t> data(4 * ubatch->n_tokens);
+    for (uint32_t seq = 0; seq < ubatch->n_seqs; ++seq) {
+        const uint32_t first = seq * ubatch->n_seq_tokens;
+        int32_t * dst = data.data() + 4 * first;
+        const int32_t * parents = ubatch->tree_parent + first;
+        std::copy(parents, parents + ubatch->n_seq_tokens, dst);
+        const auto schedule = llama_tree_schedule_make(parents, ubatch->n_seq_tokens);
+        GGML_ASSERT(schedule.slots <= inp->tree_slots);
+        std::copy_n(schedule.steps.data(), 3 * ubatch->n_seq_tokens, dst + ubatch->n_seq_tokens);
+    }
+    ggml_backend_tensor_set(inp->tree_parent, data.data(), 0, data.size() * sizeof(int32_t));
+    if (inp->tree_conv) {
+        const int64_t width = inp->tree_conv->ne[0] / ubatch->n_tokens;
+        std::vector<int32_t> idxs(inp->tree_conv->ne[0]);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const int32_t first = i / ubatch->n_seq_tokens * ubatch->n_seq_tokens;
+            const int32_t seq = i / ubatch->n_seq_tokens;
+            int32_t ancestor = i - first;
+            for (int64_t j = width - 1; j >= 0; --j) {
+                idxs[i * width + j] = seq * (width - 1 + ubatch->n_seq_tokens) + width - 1 + ancestor;
+                ancestor = ancestor >= 0 ? ubatch->tree_parent[first + ancestor] : ancestor - 1;
+            }
+        }
+        ggml_backend_tensor_set(inp->tree_conv, idxs.data(), 0, idxs.size() * sizeof(int32_t));
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+    set_input_tree(this, ubatch);
     GGML_UNUSED(ubatch);
 
     const int64_t n_rs = mctx->get_n_rs();
+
+    // before s_copy, which consumes the pending rollback
+    if (s_copy_s) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_s->buffer));
+        int32_t * data = (int32_t *) s_copy_s->data;
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx->s_copy_s(i);
+        }
+    }
+    if (gdn_ctl) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(gdn_ctl->buffer));
+        mctx->gdn_ctl_take((int32_t *) gdn_ctl->data);
+    }
 
     if (s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
@@ -541,6 +623,23 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+bool llm_graph_input_rs::can_reuse_replay(const llama_ubatch & ubatch) const {
+    size_t index = 0;
+    if (gdn_ctl && ubatch.n_seq_tokens <= gdn_ctl->ne[0] - 4) {
+        for (uint32_t seq = 0; seq < ubatch.n_seqs; ++seq) {
+            const uint32_t first = seq * ubatch.n_seq_tokens;
+            for (int32_t j = 1; j < ubatch.n_seq_id[first]; ++j) {
+                if (index + 2 > replay_copy_ids.size() ||
+                        replay_copy_ids[index++] != ubatch.seq_id[first][0] ||
+                        replay_copy_ids[index++] != ubatch.seq_id[first][j]) {
+                    return false;
+                }
+            }
+        }
+    }
+    return index == replay_copy_ids.size();
+}
+
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 
@@ -549,6 +648,12 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
+    res &= (gdn_ctl != nullptr) == mctx->get_gdn_replay();
+    res &= can_reuse_replay(params.ubatch);
+    res &= (tree_parent != nullptr) == (params.ubatch.tree_parent != nullptr);
+    if (tree_slots && params.ubatch.tree_parent) {
+        res &= tree_slots == make_tree_schedule(params.ubatch).slots;
+    }
 
     res &= s_copy_main->ne[0] == params.ubatch.n_seqs;
 
@@ -1236,6 +1341,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+    set_input_tree(inp_rs.get(), ubatch);
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
@@ -1243,6 +1349,18 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+
+    if (inp_rs->s_copy_s) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy_s->buffer));
+        int32_t * data = (int32_t *) inp_rs->s_copy_s->data;
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx->get_recr()->s_copy_s(i);
+        }
+    }
+    if (inp_rs->gdn_ctl) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->gdn_ctl->buffer));
+        mctx->get_recr()->gdn_ctl_take((int32_t *) inp_rs->gdn_ctl->data);
+    }
 
     if (inp_rs->s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
@@ -1268,6 +1386,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= (inp_rs->gdn_ctl != nullptr) == mctx->get_recr()->get_gdn_replay();
+    res &= inp_rs->can_reuse_replay(params.ubatch);
+    res &= (inp_rs->tree_parent != nullptr) == (params.ubatch.tree_parent != nullptr);
+    if (inp_rs->tree_slots && params.ubatch.tree_parent) {
+        res &= inp_rs->tree_slots == make_tree_schedule(params.ubatch).slots;
+    }
 
     res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
 
@@ -1313,6 +1437,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= (inp_rs->gdn_ctl != nullptr) == mctx->get_recr()->get_gdn_replay();
+    res &= inp_rs->can_reuse_replay(params.ubatch);
 
     res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
 
@@ -1384,6 +1510,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    res &= (inp_rs->gdn_ctl != nullptr) == mctx->get_recr()->get_gdn_replay();
+    res &= inp_rs->can_reuse_replay(params.ubatch);
 
     res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
 
@@ -4118,6 +4246,19 @@ ggml_tensor * llm_graph_context::build_rs(
             states_extra,
             ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
 
+    if (n_rs > (uint32_t) n_seqs && s->ne[1] > rs_size) {
+        ggml_tensor * extra_idxs = ggml_view_1d(ctx0, state_copy, n_rs - n_seqs,
+                (n_seqs - i0) * state_copy->nb[0]);
+        for (int64_t plane = 1; plane < s->ne[1] / rs_size; ++plane) {
+            ggml_tensor * source = ggml_view_2d(ctx0, s, state_size, rs_size,
+                    s->nb[1], plane * rs_size * s->nb[1]);
+            ggml_tensor * extra = ggml_get_rows(ctx0, source, extra_idxs);
+            ggml_tensor * target = ggml_view_2d(ctx0, s, state_size, n_rs - n_seqs, s->nb[1],
+                    (plane * rs_size + rs_head + n_seqs) * s->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, extra, target));
+        }
+    }
+
     return output_states;
 }
 
@@ -4137,6 +4278,33 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
+
+    if (mctx_cur->get_gdn_replay()) {
+        inp->s_copy_s = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_s);
+        ggml_set_name(inp->s_copy_s, "rs_s_copy_s");
+        inp->s_copy_s_main = ggml_view_1d(ctx0, inp->s_copy_s, n_seqs, 0);
+        inp->gdn_ctl = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4 + mctx_cur->get_gdn_width(), n_seqs);
+        ggml_set_input(inp->gdn_ctl);
+        ggml_set_name(inp->gdn_ctl, "gdn_ctl");
+        if (ubatch.n_seq_tokens <= mctx_cur->get_gdn_width()) {
+            for (uint32_t seq = 0; seq < ubatch.n_seqs; ++seq) {
+                const uint32_t first = seq * ubatch.n_seq_tokens;
+                for (int32_t j = 1; j < ubatch.n_seq_id[first]; ++j) {
+                    inp->replay_copy_ids.push_back(ubatch.seq_id[first][0]);
+                    inp->replay_copy_ids.push_back(ubatch.seq_id[first][j]);
+                }
+            }
+        }
+    }
+
+    if (ubatch.tree_parent) {
+        GGML_ASSERT(inp->gdn_ctl);
+        inp->tree_slots = make_tree_schedule(ubatch).slots;
+        inp->tree_parent = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens * 4);
+        ggml_set_input(inp->tree_parent);
+        ggml_set_name(inp->tree_parent, "tree_parent");
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();

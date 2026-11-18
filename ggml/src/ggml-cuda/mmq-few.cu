@@ -1,4 +1,6 @@
 #include "mmq-few.cuh"
+#include "graph.cuh"
+#include "ggml-cuda.h"
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "mmvq.cuh"
@@ -6,6 +8,9 @@
 #include "vecdotq.cuh"
 
 #include <type_traits>
+#include <cinttypes>
+#include <map>
+#include <mutex>
 
 // NVIDIA only: the kernel uses the NVIDIA int8 MMA fragment layout and cp.async.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -869,6 +874,29 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
 }
 
+using mmq_few_key = std::array<int64_t, 5>;
+
+struct ggml_cuda_mmq_few_state {
+    std::map<mmq_few_key, bool> dispatch;
+    bool graph_mode = false;
+};
+
+static std::mutex mmq_few_mutex;
+static std::unordered_map<ggml_backend_cuda_context *, std::unique_ptr<ggml_cuda_mmq_few_state>> mmq_few_states;
+static thread_local ggml_cuda_mmq_few_state * mmq_few_active = nullptr;
+
+static mmq_few_key mmq_few_shape(const ggml_tensor * x, const ggml_tensor * y) {
+    return { x->type, x->ne[0], x->ne[1], y->ne[1], mmq_few_active ? mmq_few_active->graph_mode : false };
+}
+
+static bool mmq_few_can_calibrate(const ggml_tensor * x, const ggml_tensor * y) {
+    return (x->type == GGML_TYPE_IQ4_XS || x->type == GGML_TYPE_IQ4_NL) &&
+        y->ne[1] > 1 && y->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+        ggml_is_matrix(x) && ggml_is_matrix(y) && ggml_is_contiguous(x) && ggml_is_contiguous(y) &&
+        !x->view_src && x->buffer &&
+        ggml_backend_buffer_get_type(x->buffer) == ggml_backend_cuda_buffer_type(ggml_cuda_get_device()) && mmq_few_is_constant(x);
+}
+
 // Min. number of src1 columns (MUL_MAT_ID: tokens) for the few-row MMQ, 0 if it is not used for this type, GPU and row length.
 static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const int64_t ne00, const bool has_ids) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
@@ -925,7 +953,200 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
     }
     // unaligned data needs the alignment of the decoder loads
     const int x_alignment = mmq_few_unaligned(src0->type, nunits_stage) ? (ggml_type_size(src0->type) % 4 == 0 ? 4 : 2) : 16;
-    return ggml_cuda_is_aligned(src0, x_alignment) && ggml_cuda_is_aligned(src1, 16);
+    if (!ggml_cuda_is_aligned(src0, x_alignment) || !ggml_cuda_is_aligned(src1, 16)) {
+        return false;
+    }
+    if (!ids && mmq_few_active && mmq_few_can_calibrate(src0, src1)) {
+        const auto it = mmq_few_active->dispatch.find(mmq_few_shape(src0, src1));
+        if (it != mmq_few_active->dispatch.end()) {
+            return it->second;
+        }
+    }
+    return true;
+}
+
+static void mmq_few_calibrate(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, ggml_cuda_mmq_few_state & state) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    std::vector<const ggml_tensor *> nodes;
+    size_t input_count = 0;
+    size_t output_count = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * node = graph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(node, 1) != GGML_HINT_NONE ||
+                node->type != GGML_TYPE_F32 || node->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(node) || !mmq_few_can_calibrate(node->src[0], node->src[1])) {
+            continue;
+        }
+        const auto * x = node->src[0];
+        const auto * y = node->src[1];
+        if (state.dispatch.count(mmq_few_shape(x, y)) || !ggml_cuda_should_use_mmq_few(x, y, nullptr, cc) ||
+                !ggml_cuda_should_use_mmvq(x->type, cc, y->ne[1]) ||
+                uint64_t(x->ne[0]) > SIZE_MAX / sizeof(float) / uint64_t(y->ne[1]) ||
+                uint64_t(x->ne[1]) > SIZE_MAX / sizeof(float) / uint64_t(y->ne[1])) {
+            continue;
+        }
+        nodes.push_back(node);
+        input_count  = std::max(input_count,  size_t(x->ne[0] * y->ne[1]));
+        output_count = std::max(output_count, size_t(x->ne[1] * y->ne[1]));
+    }
+    if (nodes.empty()) {
+        return;
+    }
+    cudaStreamCaptureStatus capture;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+
+    struct scratch_buffer {
+        float * data = nullptr;
+        ~scratch_buffer() { if (data) { CUDA_CHECK(cudaFree(data)); } }
+    } input, output;
+    const auto allocate = [](scratch_buffer & buffer, size_t count) {
+        const cudaError_t error = cudaMalloc(&buffer.data, count * sizeof(float));
+        if (error == cudaErrorMemoryAllocation) {
+            cudaGetLastError();
+            return false;
+        }
+        CUDA_CHECK(error);
+        return true;
+    };
+    if (!allocate(input, input_count) || !allocate(output, output_count)) {
+        for (const auto * node : nodes) {
+            state.dispatch[mmq_few_shape(node->src[0], node->src[1])] = false;
+        }
+        return;
+    }
+    CUDA_CHECK(cudaMemsetAsync(input.data, 0x3f, input_count * sizeof(float), ctx.stream()));
+
+    struct sample {
+        mmq_few_key key;
+        int mode;
+        cudaEvent_t begin;
+        cudaEvent_t end;
+    };
+    std::vector<sample> samples;
+    std::map<mmq_few_key, std::vector<const ggml_tensor *>> groups;
+    for (const auto * node : nodes) {
+        groups[mmq_few_shape(node->src[0], node->src[1])].push_back(node);
+    }
+    const auto launch = [&](const ggml_tensor * node, int mode) {
+        ggml_tensor y = *node->src[1];
+        ggml_tensor dst = *node;
+        y.data = input.data;
+        dst.data = output.data;
+        if (mode == 0) {
+            ggml_cuda_mul_mat_vec_q(ctx, node->src[0], &y, nullptr, &dst);
+        } else {
+            ggml_cuda_mul_mat_q_few(ctx, node->src[0], &y, nullptr, &dst);
+        }
+    };
+    // Warm both implementations before timing, then traverse all layers per pass so large models keep their normal weight working set.
+    for (int mode : { 0, 1 }) {
+        for (const auto * node : nodes) {
+            launch(node, mode);
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    for (int mode : { 0, 1, 1, 0 }) {
+        for (const auto & group : groups) {
+            sample s{ group.first, mode, nullptr, nullptr };
+            CUDA_CHECK(cudaEventCreate(&s.begin));
+            CUDA_CHECK(cudaEventCreate(&s.end));
+            samples.push_back(s);
+        }
+    }
+    const auto launch_group = [&](const sample & s) {
+        for (const auto * node : groups.at(s.key)) {
+            launch(node, s.mode);
+        }
+    };
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    cudaGraph_t timing_graph = nullptr;
+    cudaGraphExec_t timing_exec = nullptr;
+    if (state.graph_mode) {
+        ggml_cuda_graph_capture_begin();
+        CUDA_CHECK(cudaStreamBeginCapture(ctx.stream(), cudaStreamCaptureModeRelaxed));
+    }
+#endif
+    for (const auto & s : samples) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (state.graph_mode) {
+            CUDA_CHECK(cudaEventRecordWithFlags(s.begin, ctx.stream(), cudaEventRecordExternal));
+            launch_group(s);
+            CUDA_CHECK(cudaEventRecordWithFlags(s.end, ctx.stream(), cudaEventRecordExternal));
+            continue;
+        }
+#endif
+        CUDA_CHECK(cudaEventRecord(s.begin, ctx.stream()));
+        launch_group(s);
+        CUDA_CHECK(cudaEventRecord(s.end, ctx.stream()));
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (state.graph_mode) {
+        CUDA_CHECK(cudaStreamEndCapture(ctx.stream(), &timing_graph));
+        ggml_cuda_graph_capture_end();
+        CUDA_CHECK(cudaGraphInstantiate(&timing_exec, timing_graph, nullptr, nullptr, 0));
+        // Replay twice so CUDA launch delays do not decide the steady-state kernel choice.
+        CUDA_CHECK(cudaGraphLaunch(timing_exec, ctx.stream()));
+        CUDA_CHECK(cudaGraphLaunch(timing_exec, ctx.stream()));
+    }
+#endif
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (timing_exec) {
+        CUDA_CHECK(cudaGraphExecDestroy(timing_exec));
+        CUDA_CHECK(cudaGraphDestroy(timing_graph));
+    }
+#endif
+    std::map<mmq_few_key, std::array<double, 2>> times;
+    for (const auto & s : samples) {
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, s.begin, s.end));
+        times[s.key][s.mode] += ms;
+        CUDA_CHECK(cudaEventDestroy(s.begin));
+        CUDA_CHECK(cudaEventDestroy(s.end));
+    }
+    for (const auto & entry : times) {
+        // Keep the established vector path when the measured difference is small.
+        const bool few = entry.second[1] < 0.97 * entry.second[0];
+        state.dispatch[entry.first] = few;
+        GGML_LOG_DEBUG("%s: type=%s k=%" PRId64 " m=%" PRId64 " n=%" PRId64 " graph=%d vector=%.3f ms few=%.3f ms use_few=%d\n",
+            __func__, ggml_type_name(ggml_type(entry.first[0])), entry.first[1], entry.first[2], entry.first[3],
+            int(state.graph_mode), entry.second[0], entry.second[1], int(few));
+    }
+#ifdef USE_CUDA_GRAPH
+    // No graph captured before calibration may keep an earlier dispatch decision.
+    ctx.cuda_graphs.clear();
+#endif
+}
+
+ggml_cuda_mmq_few_scope::ggml_cuda_mmq_few_scope(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, bool graph_mode)
+    : previous(mmq_few_active) {
+    {
+        std::lock_guard<std::mutex> lock(mmq_few_mutex);
+        auto & state = mmq_few_states[&ctx];
+        if (!state) {
+            state = std::make_unique<ggml_cuda_mmq_few_state>();
+        }
+        mmq_few_active = state.get();
+    }
+    mmq_few_active->graph_mode = graph_mode;
+    try {
+        mmq_few_calibrate(ctx, graph, *mmq_few_active);
+    } catch (...) {
+        mmq_few_active = previous;
+        throw;
+    }
+}
+
+ggml_cuda_mmq_few_scope::~ggml_cuda_mmq_few_scope() {
+    mmq_few_active = previous;
+}
+
+void ggml_cuda_mmq_few_free(ggml_backend_cuda_context & ctx) {
+    std::lock_guard<std::mutex> lock(mmq_few_mutex);
+    mmq_few_states.erase(&ctx);
 }
 
 #else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -938,6 +1159,17 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
 bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const int cc) {
     GGML_UNUSED_VARS(src0, src1, ids, cc);
     return false;
+}
+
+ggml_cuda_mmq_few_scope::ggml_cuda_mmq_few_scope(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, bool graph_mode)
+    : previous(nullptr) {
+    GGML_UNUSED_VARS(ctx, graph, graph_mode);
+}
+
+ggml_cuda_mmq_few_scope::~ggml_cuda_mmq_few_scope() {}
+
+void ggml_cuda_mmq_few_free(ggml_backend_cuda_context & ctx) {
+    GGML_UNUSED(ctx);
 }
 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

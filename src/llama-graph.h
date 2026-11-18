@@ -316,6 +316,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
+    bool can_reuse_replay(const llama_ubatch & ubatch) const;
 
     ggml_tensor * s_copy;  // I32 [n_rs]
 
@@ -323,6 +324,18 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+
+    // I32 [n_slot] = {n_slot - 1, ..., 0}, rollback slot of each conv window, created by the graphs that write them
+    ggml_tensor * s_slot_rev = nullptr;
+
+    ggml_tensor * s_copy_s      = nullptr;
+    ggml_tensor * s_copy_s_main = nullptr;
+    ggml_tensor * gdn_ctl       = nullptr;
+    ggml_tensor * tree_parent   = nullptr;
+    ggml_tensor * tree_conv     = nullptr;
+    int32_t       tree_slots    = 0;
+    std::vector<llama_seq_id> replay_copy_ids;
+
 
     const llama_memory_recurrent_context * mctx;
 
@@ -1475,12 +1488,14 @@ struct llm_graph_context {
 
     // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels, n_seqs},
     // at byte offset offs of each row of s, and with n_rs_seq > 0 once per rollback slot of this ubatch
+    // n_tokens overrides the token count when conv_x omits the history prefix
     void build_conv_state_store(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
             ggml_tensor * conv_x,
                 int64_t   n_cols,
-                 size_t   offs, int64_t n_tokens = -1) const;
+                 size_t   offs,
+                int64_t   n_tokens = -1) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

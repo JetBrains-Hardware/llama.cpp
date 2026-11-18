@@ -2,6 +2,8 @@
 
 #include "llama-impl.h"
 
+#include <cstdlib>
+
 void llama_model_dflash::load_tensors_dflash2() {
     LLAMA_LOAD_LOCALS;
 
@@ -76,6 +78,8 @@ ggml_tensor * llama_model_dflash::build_dflash2_conv(
     if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
         dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     }
+    // Keep the hidden-state producer outside the dynamic-convolution fusion.
+    ggml_build_forward_expand(g.gf, hidden);
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
@@ -135,8 +139,11 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     }
 
     const int64_t tokens_per_block = n_tokens / n_blocks;
-    const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
-    const int64_t row_used   = top_k + top_k * top_k;
+    const int64_t block_size = tokens_per_block;
+    const char * tree_env = std::getenv("LLAMA_DFLASH_TREE");
+    const bool tree = tree_env && std::atoi(tree_env) != 0;
+    const int64_t row_used = (top_k + top_k * top_k) * (tree ? 2 : 1);
+    GGML_ASSERT(row_used <= n_embd);
 
     ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
@@ -175,12 +182,18 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         if (n_pred == 1) {
             score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
         }
+        ggml_tensor * edge = score;
         ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
         score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
                 ggml_reshape_3d(ctx0, score, top_k * top_k, n_pos, n_blocks), 0);
+        if (tree) {
+            row = ggml_concat(ctx0, row, unary_run, 0);
+            row = ggml_concat(ctx0, row,
+                    ggml_reshape_3d(ctx0, edge, top_k * top_k, n_pos, n_blocks), 0);
+        }
         return ggml_pad(ctx0, row, n_embd - row_used, 0, 0, 0);
     };
 

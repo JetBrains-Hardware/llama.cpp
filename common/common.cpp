@@ -15,6 +15,7 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -2413,12 +2414,153 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+static std::atomic<size_t> checkpoint_pinned_bytes{0};
+static constexpr size_t checkpoint_pinned_limit = 512 * 1024 * 1024;
+
+struct common_checkpoint_storage {
+    ggml_backend_buffer_ptr buffer;
+    size_t capacity = 0;
+    size_t size = 0;
+
+    ~common_checkpoint_storage() {
+        buffer.reset();
+        checkpoint_pinned_bytes.fetch_sub(capacity);
+    }
+};
+
+static std::unique_ptr<common_checkpoint_storage> common_allocate_checkpoint(size_t size) {
+    if (size == 0 || size > checkpoint_pinned_limit) {
+        return nullptr;
+    }
+    auto reg = ggml_backend_reg_by_name("CUDA");
+    if (!reg || ggml_backend_reg_dev_count(reg) == 0) {
+        return nullptr;
+    }
+    auto buft = ggml_backend_dev_host_buffer_type(ggml_backend_reg_dev_get(reg, 0));
+    if (!buft) {
+        return nullptr;
+    }
+    auto result = std::make_unique<common_checkpoint_storage>();
+    size_t used = checkpoint_pinned_bytes.load();
+    do {
+        if (used > checkpoint_pinned_limit - size) {
+            return nullptr;
+        }
+    } while (!checkpoint_pinned_bytes.compare_exchange_weak(used, used + size));
+    result->capacity = size;
+    result->buffer.reset(ggml_backend_buft_alloc_buffer(buft, size));
+    // A backend may fall back to ordinary host memory when pinned allocation fails.
+    if (!result->buffer || ggml_backend_buffer_get_type(result->buffer.get()) != buft) {
+        return nullptr;
+    }
+    return result;
+}
+
+common_checkpoint_buffer::common_checkpoint_buffer() = default;
+common_checkpoint_buffer::~common_checkpoint_buffer() = default;
+common_checkpoint_buffer::common_checkpoint_buffer(common_checkpoint_buffer && other) noexcept = default;
+common_checkpoint_buffer & common_checkpoint_buffer::operator=(common_checkpoint_buffer && other) noexcept = default;
+
+common_checkpoint_buffer::common_checkpoint_buffer(const common_checkpoint_buffer & other) : bytes(other.bytes) {
+    if (other.pinned && other.size() > 0) {
+        bytes.assign(other.data(), other.data() + other.size());
+    }
+}
+
+common_checkpoint_buffer & common_checkpoint_buffer::operator=(const common_checkpoint_buffer & other) {
+    if (this != &other) {
+        *this = common_checkpoint_buffer(other);
+    }
+    return *this;
+}
+
+size_t common_checkpoint_buffer::size() const {
+    return pinned ? pinned->size : bytes.size();
+}
+
+uint8_t * common_checkpoint_buffer::data() {
+    return pinned ? (uint8_t *) ggml_backend_buffer_get_base(pinned->buffer.get()) : bytes.data();
+}
+
+const uint8_t * common_checkpoint_buffer::data() const {
+    return pinned ? (const uint8_t *) ggml_backend_buffer_get_base(pinned->buffer.get()) : bytes.data();
+}
+
+void common_checkpoint_buffer::clear() {
+    bytes.clear();
+    if (pinned) {
+        pinned->size = 0;
+    }
+}
+
+void common_checkpoint_buffer::resize(size_t size) {
+    const size_t old_size = this->size();
+    if (pinned) {
+        if (size <= pinned->capacity) {
+            if (size > old_size) {
+                memset(data() + old_size, 0, size - old_size);
+            }
+            pinned->size = size;
+            return;
+        }
+        bytes.assign(data(), data() + old_size);
+        pinned.reset();
+    }
+    bytes.resize(size);
+    if (size > old_size) {
+        memset(bytes.data() + old_size, 0, size - old_size);
+    }
+}
+
+void common_checkpoint_buffer::reset(size_t size, bool pin_host) {
+    if (pin_host) {
+        if (!pinned || size > pinned->capacity) {
+            pinned.reset();
+            pinned = common_allocate_checkpoint(size);
+        }
+        if (pinned) {
+            pinned->size = size;
+            common_state_data().swap(bytes);
+            return;
+        }
+    }
+    pinned.reset();
+    bytes.resize(size);
+}
+
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    return (device_tgt ? llama_state_seq_snapshot_size(device_tgt) : data_tgt.size()) +
+           (device_dft ? llama_state_seq_snapshot_size(device_dft) : data_dft.size()) + data_spec.size();
 }
 
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return !device_tgt && data_tgt.empty();
+}
+
+const common_checkpoint_buffer & common_prompt_checkpoint::target_data() const {
+    if (device_tgt && data_tgt.empty()) {
+        const size_t size = llama_state_seq_snapshot_size(device_tgt);
+        data_tgt.reset(size, true);
+        if (llama_state_seq_snapshot_export(device_tgt, data_tgt.data(), size) != size) {
+            GGML_ABORT("failed to export checkpoint\n");
+        }
+    }
+    return data_tgt;
+}
+
+const common_state_data & common_prompt_checkpoint::draft_data() const {
+    if (device_dft && data_dft.empty()) {
+        const size_t size = llama_state_seq_snapshot_size(device_dft);
+        data_dft.resize(size);
+        if (llama_state_seq_snapshot_export(device_dft, data_dft.data(), size) != size) {
+            GGML_ABORT("failed to export draft checkpoint\n");
+        }
+    }
+    return data_dft;
+}
+
+bool common_prompt_checkpoint::has_draft_state() const {
+    return device_dft || !data_dft.empty();
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2428,7 +2570,9 @@ void common_prompt_checkpoint::clear() {
     pos_max = 0;
 
     data_tgt.clear();
+    device_tgt.reset();
     data_dft.clear();
+    device_dft.reset();
     data_spec.clear();
 }
 
@@ -2444,14 +2588,25 @@ void common_prompt_checkpoint::update_pos(
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        bool device_storage) {
     if (ctx == nullptr) {
         return;
     }
 
+    if (device_storage) {
+        device_tgt = llama_state_seq_snapshot_save(ctx, seq_id, flags, std::move(device_tgt));
+        if (device_tgt) {
+            data_tgt.clear();
+            COM_DBG("%s: device checkpoint %.3f MiB\n", __func__, llama_state_seq_snapshot_size(device_tgt)/1024.0/1024.0);
+            return;
+        }
+        COM_DBG("%s: using host checkpoint fallback\n", __func__);
+    }
+    device_tgt.reset();
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    data_tgt.reset(ckpt_size, device_storage);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -2462,11 +2617,22 @@ void common_prompt_checkpoint::update_tgt(
 void common_prompt_checkpoint::update_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        bool device_storage) {
     if (ctx == nullptr) {
         return;
     }
 
+    if (device_storage) {
+        device_dft = llama_state_seq_snapshot_save(ctx, seq_id, flags, std::move(device_dft));
+        if (device_dft) {
+            data_dft.clear();
+            COM_DBG("%s: device checkpoint %.3f MiB\n", __func__, llama_state_seq_snapshot_size(device_dft)/1024.0/1024.0);
+            return;
+        }
+        COM_DBG("%s: using host checkpoint fallback\n", __func__);
+    }
+    device_dft.reset();
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_dft.resize(ckpt_size);
@@ -2485,6 +2651,9 @@ bool common_prompt_checkpoint::load_tgt(
         return true;
     }
 
+    if (device_tgt) {
+        return llama_state_seq_snapshot_restore(ctx, device_tgt, seq_id, flags);
+    }
     if (data_tgt.empty()) {
         return true;
     }
@@ -2501,6 +2670,9 @@ bool common_prompt_checkpoint::load_dft(
         return true;
     }
 
+    if (device_dft) {
+        return llama_state_seq_snapshot_restore(ctx, device_dft, seq_id, flags);
+    }
     if (data_dft.empty()) {
         return true;
     }
@@ -2511,9 +2683,11 @@ bool common_prompt_checkpoint::load_dft(
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    device_tgt.reset();
 }
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
+    device_dft.reset();
     data_spec.clear();
 }

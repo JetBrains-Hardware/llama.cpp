@@ -113,9 +113,23 @@ public:
 
     std::vector<mem_cell> cells;
 
+    // Each request owns its pending update tape; cache-cell compaction does not move it.
+    struct replay_state {
+        uint32_t n = 0;
+        uint32_t half = 0;
+        std::vector<int32_t> rows;
+    };
+    bool gdn_replay = false;
+    uint32_t gdn_w = 0;
+    std::vector<replay_state> replay;
+
+    void gdn_ctl_take(int32_t * ctl, const llama_ubatch & ubatch);
+    void replay_copy(llama_seq_id src, llama_seq_id dst);
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> st_l; // the replay stash, F32 [row, 2*gdn_w, n_seq_max]
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
@@ -138,7 +152,7 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, const std::vector<llama_seq_id> & replay_seqs) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -184,6 +198,14 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+
+    // the deferred commit of the gated delta net states (llama_memory_recurrent::gdn_replay)
+    bool          get_gdn_replay() const;
+    uint32_t      get_gdn_width() const;
+    ggml_tensor * get_st_l(int32_t il) const;
+    // the S rows have no rollback planes then: the cell itself
+    int32_t       s_copy_s(int i) const;
+    void          gdn_ctl_take(int32_t * ctl) const;
 
     int32_t s_copy(int i) const;
 

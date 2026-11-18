@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "speculative-tree.h"
 
 #include "ggml.h"
 
@@ -726,6 +727,79 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         result.push_back(id);
     }
 
+    return result;
+}
+
+llama_token common_sampler_sample_tree(common_sampler * gsmpl, llama_context * ctx, int idx, uint32_t seed, llama_pos position) {
+    llama_synchronize(ctx);
+    const auto tm = gsmpl->tm();
+    gsmpl->set_logits(ctx, idx);
+    if (llama_get_sampled_token_ith(ctx, idx) == LLAMA_TOKEN_NULL) {
+        llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p);
+        llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p);
+    }
+    auto draw = [&](uint32_t key) {
+        auto * p = common_sampler_get_candidates(gsmpl, true);
+        double best = -INFINITY;
+        llama_token result = LLAMA_TOKEN_NULL;
+        for (size_t i = 0; i < p->size; ++i) {
+            if (p->data[i].p <= 0.0f) {
+                continue;
+            }
+            const auto id = p->data[i].id;
+            const double score = std::log(p->data[i].p) + common_tree_noise(key, position, id);
+            if (score > best || (score == best && id < result)) {
+                best = score;
+                result = id;
+                p->selected = i;
+            }
+        }
+        GGML_ASSERT(result != LLAMA_TOKEN_NULL);
+        return result;
+    };
+    llama_token result = draw(seed);
+    if (grammar_should_apply(gsmpl)) {
+        llama_token_data single = {result, 1.0f, 0.0f};
+        llama_token_data_array candidate = {&single, 1, -1, false};
+        llama_sampler_apply(gsmpl->grmr, &candidate);
+        if (single.logit == -INFINITY) {
+            gsmpl->set_logits(ctx, idx);
+            llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p);
+            llama_sampler_apply(gsmpl->grmr, &gsmpl->cur_p);
+            llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p);
+            result = draw(seed ^ 0x6a09e667u);
+        }
+    }
+    return result;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_tree(common_sampler * gsmpl, llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<int32_t> & parents, std::vector<int32_t> & kept,
+        uint32_t seed, llama_pos pos0) {
+    GGML_ASSERT(parents.size() == draft.size() + 1 && idxs.size() == parents.size());
+    const auto * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    std::vector<llama_token> result;
+    int32_t row = 0;
+    kept.clear();
+    for (;;) {
+        kept.push_back(row);
+        const llama_token id = common_sampler_sample_tree(gsmpl, ctx, idxs[row], seed, pos0 + kept.size());
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        int32_t child = -1;
+        if (!llama_vocab_is_eog(vocab, id)) {
+            for (size_t i = 1; i < parents.size(); ++i) {
+                if (parents[i] == row && draft[i - 1] == id) {
+                    child = i;
+                    break;
+                }
+            }
+        }
+        if (child < 0) {
+            break;
+        }
+        row = child;
+    }
     return result;
 }
 
