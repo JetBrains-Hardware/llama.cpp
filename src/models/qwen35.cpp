@@ -150,9 +150,10 @@ static bool kvq_use_packed(const llama_kvq_params & p, uint32_t n_tokens, int32_
 }
 
 // fit mode, the other ubatches with rows in the host store: flash attention over the scratch, see llama_kvq_store
+// host ring: every other ubatch (the cache cells are in host memory)
 static bool kvq_use_scratch(const llama_kvq_params & p, const llama_kvq_store * store, bool packed_small, int32_t n_host) {
     return p.enabled && p.packed && store != nullptr && store->fit_mode() && store->scratch_ok() && (p.scratch || store->tail_mode()) &&
-           !packed_small && n_host > 0;
+           !packed_small && (n_host > 0 || store->host_ring());
 }
 
 // tail mode: scratch row r is position r, the rows after the host store come from the ring in position order,
@@ -184,9 +185,12 @@ public:
                     mctx->get_attn()->set_input_attn_mask(mask_attn, ubatch, causal_attn);
                     mctx->set_input_kvq_early(mask_early.raw, mask_attn.raw, ubatch);
                 }
-                mctx->get_store()->begin_ubatch(ubatch->n_tokens);
-            } else if (scratch && tail) {
-                mctx->set_input_kvq_scr(mask_scr.raw, ubatch, n_host);
+                mctx->get_store()->begin_ubatch(*ubatch);
+            } else if (scratch) {
+                if (tail && !scr_cells) {
+                    mctx->set_input_kvq_scr(mask_scr.raw, ubatch, n_host);
+                }
+                mctx->get_store()->begin_scr(*ubatch);
             }
             return;
         }
@@ -219,7 +223,7 @@ public:
                 res &= mask_attn.raw->ne[0] == n_mask;
                 res &= mask_attn.raw->ne[1] == gparams.ubatch.n_tokens;
             }
-            if (res && scratch && tail) {
+            if (res && scratch && tail && !scr_cells) {
                 res &= mask_scr.raw->ne[0] == kvq_scr_rows(store, n_host, gparams.ubatch);
                 res &= mask_scr.raw->ne[1] == gparams.ubatch.n_tokens;
             }
@@ -253,6 +257,9 @@ public:
 
     // fit mode, large ubatch: the attention reads the scratch
     bool    scratch  = false;
+
+    // host ring, scratch without host rows: the scratch rows are the cells (positions before the size of the ring), the mask of the cache
+    bool    scr_cells = false;
 
     // tail mode: the cache is a ring without the coarse region
     bool          tail = false;
@@ -451,6 +458,7 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
         inp->tail         = inp->store->tail_mode();
         inp->packed_small = kvq_use_packed(inp->params, n_tokens, inp->n_coarse, inp->n_host, n_kv, inp->tail);
         inp->scratch      = kvq_use_scratch(inp->params, inp->store, inp->packed_small, inp->n_host);
+        inp->scr_cells    = inp->scratch && inp->store->host_ring() && inp->n_host == 0;
 
         const int64_t n_mask = (inp->tail ? inp->n_coarse : 0) + n_kv;
 
@@ -466,7 +474,7 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
             ggml_set_name(inp->mask_attn.raw,  "kvq_mask_attn");
             ggml_set_name(inp->mask_early.raw, "kvq_mask_early");
         }
-        if (inp->scratch && inp->tail) {
+        if (inp->scratch && inp->tail && !inp->scr_cells) {
             const int64_t n_rows = kvq_scr_rows(inp->store, inp->n_host, ubatch);
             inp->mask_scr.n_kv = n_rows;
             inp->mask_scr.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_rows, n_tokens);
@@ -703,7 +711,8 @@ void llama_model_qwen35::graph::build_kvq_prefetch(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    ggml_tensor * k = kvq_tail_view(ctx0, inp->mctx->get_k(ctx0, il), inp_kvq->tail ? 0 : inp_kvq->n_coarse);
+    ggml_tensor * k = store->host_ring() ? store->get_ring(ctx0, il, false, inp->mctx->get_n_kv()) :
+            kvq_tail_view(ctx0, inp->mctx->get_k(ctx0, il), inp_kvq->tail ? 0 : inp_kvq->n_coarse);
 
     ggml_tensor * score = ggml_kvq_attn(ctx0, q, store->get_kc(ctx0, il), nullptr, t.tinv, t.taux, k, nullptr, nullptr, nullptr,
             inp_kvq->mask_early.raw, kq_scale, store->n_chunk_rows(), GGML_KVQ_SCORE);
@@ -770,8 +779,15 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
-    ggml_build_forward_expand(gf, mctx_attn->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
-    ggml_build_forward_expand(gf, mctx_attn->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+    // host ring: the cells are in the tail buffer of the layer
+    const bool hring = store->host_ring();
+    if (hring) {
+        ggml_build_forward_expand(gf, store->build_ring_cpy(ctx0, il, false, k_cur, inp->get_k_idxs()));
+        ggml_build_forward_expand(gf, store->build_ring_cpy(ctx0, il, true,  v_cur, inp->get_v_idxs()));
+    } else {
+        ggml_build_forward_expand(gf, mctx_attn->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_attn->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+    }
 
     const int64_t n_coarse = inp_kvq->n_coarse;
     const int64_t n_crow   = store->n_chunk_rows();
@@ -781,8 +797,8 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
 
     // tail mode: the whole ring, its mask has the cells after the coarse rows
     const int64_t c0   = inp_kvq->tail ? 0 : n_coarse;
-    ggml_tensor * k    = kvq_tail_view(ctx0, mctx_attn->get_k(ctx0, il), c0);
-    ggml_tensor * v    = kvq_tail_view(ctx0, mctx_attn->get_v(ctx0, il), c0);
+    ggml_tensor * k    = hring ? store->get_ring(ctx0, il, false, mctx_attn->get_n_kv()) : kvq_tail_view(ctx0, mctx_attn->get_k(ctx0, il), c0);
+    ggml_tensor * v    = hring ? store->get_ring(ctx0, il, true,  mctx_attn->get_n_kv()) : kvq_tail_view(ctx0, mctx_attn->get_v(ctx0, il), c0);
     ggml_tensor * kc   = store->get_kc(ctx0, il);
     ggml_tensor * vc   = store->get_vc(ctx0, il);
     ggml_tensor * ridx = store->get_ridx(ctx0, il);
@@ -836,10 +852,12 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
         ggml_tensor *             q_cur,
         ggml_tensor *             k_cur,
         ggml_tensor *             v_cur,
+        ggml_tensor *             inp_pos,
         float                     kq_scale,
         int                       il) {
     const auto * mctx_attn = inp->mctx;
     const auto * store     = inp_kvq->store;
+    const bool   hring     = store->host_ring();
 
     GGML_ASSERT(!inp->self_k_rot[il] && !inp->self_v_rot[il]);
     GGML_ASSERT(!mctx_attn->get_k_scale(il) && !mctx_attn->get_v_scale(il));
@@ -849,31 +867,38 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
-    ggml_build_forward_expand(gf, mctx_attn->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
-    ggml_build_forward_expand(gf, mctx_attn->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
-
     // the scratch rows: the rows of the host store, then the cells after them (tail mode: the ring cells of the positions after them, in order)
+    // host ring: the host store has the rows before the ubatch; no host rows yet: the rows of the cells, in the order of the cells (no wrap)
     const int64_t n_host = inp_kvq->n_host;
-    const int64_t n_rows = inp_kvq->tail ? inp_kvq->mask_scr.raw->ne[0] : mctx_attn->get_n_kv();
+    const int64_t n_rows = inp_kvq->tail && !inp_kvq->scr_cells ? inp_kvq->mask_scr.raw->ne[0] : mctx_attn->get_n_kv();
     GGML_ASSERT((n_host == store->n_host() || !inp_kvq->params.enabled) && n_rows > n_host);
 
-    if (inp_kvq->tail) {
-        const int64_t size = store->n_ring();
-        const int64_t n    = n_rows - n_host;
-        const int64_t j0   = n_host % size;
-        const int64_t n0   = std::min(n, size - j0);
-        for (int kv = 0; kv < 2; ++kv) {
-            ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, kv == 1, j0, n0, n_host));
-            if (n0 < n) {
-                ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, kv == 1, 0, n - n0, n_host + n0));
-            }
-        }
+    if (hring) {
+        // after the readback of the rows of the layer before (the same scratch rows)
+        store->build_scr_join(ctx0, gf, sched, il);
+        ggml_tensor * pos = ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
+        ggml_build_forward_expand(gf, store->build_scr_set(ctx0, false, k_cur, pos));
+        ggml_build_forward_expand(gf, store->build_scr_set(ctx0, true,  v_cur, pos));
     } else {
-        ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, false, n_host, n_rows - n_host, n_host));
-        ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, true,  n_host, n_rows - n_host, n_host));
+        ggml_build_forward_expand(gf, mctx_attn->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_attn->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+        if (inp_kvq->tail) {
+            const int64_t size = store->n_ring();
+            const int64_t n    = n_rows - n_host;
+            const int64_t j0   = n_host % size;
+            const int64_t n0   = std::min(n, size - j0);
+            for (int kv = 0; kv < 2; ++kv) {
+                ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, kv == 1, j0, n0, n_host));
+                if (n0 < n) {
+                    ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, kv == 1, 0, n - n0, n_host + n0));
+                }
+            }
+        } else {
+            ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, false, n_host, n_rows - n_host, n_host));
+            ggml_build_forward_expand(gf, store->build_scr_copy(ctx0, il, true,  n_host, n_rows - n_host, n_host));
+        }
+        store->build_scr_join(ctx0, gf, sched, il);
     }
-
-    store->build_scr_join(ctx0, gf, sched, il);
 
     // the scratch is head-major, so its V view looks transposed to build_attn_mha: the flash attention part of it
     GGML_ASSERT(cparams.flash_attn);
@@ -881,7 +906,7 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
     ggml_tensor * k = ggml_permute(ctx0, store->get_scr(ctx0, false, n_rows), 0, 2, 1, 3);
     ggml_tensor * v = ggml_permute(ctx0, store->get_scr(ctx0, true,  n_rows), 0, 2, 1, 3);
 
-    ggml_tensor * mask = inp_kvq->tail ? inp_kvq->mask_scr.raw : inp->self_attn_mask.raw;
+    ggml_tensor * mask = inp_kvq->tail && !inp_kvq->scr_cells ? inp_kvq->mask_scr.raw : inp->self_attn_mask.raw;
 
     ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k, v, mask, kq_scale, hparams.f_max_alibi_bias,
             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
@@ -891,12 +916,15 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
     ggml_build_forward_expand(gf, cur);
     cb(cur, "kqv_out", il);
 
-    // the scratch is free for the next attention layer
-    for (int ila = il + 1; ila < n_layer; ++ila) {
-        if (!hparams.is_recr(ila)) {
-            store->build_scr_up(ctx0, gf, sched, ila);
-            break;
-        }
+    // the scratch is free for the next attention layer (host ring: after the readback of the rows of this one)
+    int ila = il + 1;
+    while (ila < n_layer && hparams.is_recr(ila)) {
+        ila++;
+    }
+    if (ila < n_layer) {
+        store->build_scr_up(ctx0, gf, sched, ila);
+    } else if (hring) {
+        store->build_scr_rb(ctx0, gf, sched, il);
     }
 
     return cur;
@@ -964,7 +992,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     if (inp_kvq && inp_kvq->packed_small) {
         cur = build_attn_kvq_packed(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
     } else if (inp_kvq && inp_kvq->scratch) {
-        cur = build_attn_kvq_scratch(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
+        cur = build_attn_kvq_scratch(inp, inp_kvq, Qcur, Kcur, Vcur, inp_pos, kq_scale, il);
     } else if (inp_kvq && inp_kvq->params.enabled && !inp_kvq->params.packed) {
         cur = build_attn_kvq(inp, inp_kvq, Qcur, Kcur, Vcur, kq_scale, il);
     } else {

@@ -1427,6 +1427,20 @@ void llama_kv_cache::ring_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 }
 
+void llama_kv_cache::move_bufs(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(!ctxs_bufs.no_alloc);
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+        buf.reset();
+        buf = llama_memory_bufs::alloc_buf(ctx.get(), buft, false, "kv cache");
+        ggml_backend_buffer_clear(buf.get(), 0);
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+    }
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 

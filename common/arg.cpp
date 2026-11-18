@@ -2469,7 +2469,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KVQ_PREFETCH_N").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kvq-resident-cap"}, "N",
-        string_format("two-tier KV cache: resident q8_0 rows per (attention layer, kv head), 0 = 8 x prefetch_n, the whole request of a verify batch of 8 (default: %d)", params.kvq.resident_cap),
+        string_format("two-tier KV cache: resident q8_0 rows per (attention layer, kv head), 0 = 8 x prefetch_n, the whole request of a verify batch of 8; a larger union is cut by the max score (default: %d)", params.kvq.resident_cap),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

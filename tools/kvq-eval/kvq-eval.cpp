@@ -31,7 +31,7 @@
 //   coarse region = the full chunks of C rows that end at or before s - --kvq-protect, coded from the q8_0 rows (sinks included)
 //   the q8_0 cache is not changed, its rows of the coarse region are copied to the host store
 //   ubatches of up to 8 tokens attend through the packed path, larger ones through flash attention over the q8_0 cache
-//   --kvq-pf-n 1024, --kvq-cap 0 (8 x pf-n), --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
+//   --kvq-pf-n 1024, --kvq-cap 0 (6 x pf-n), --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
 //   --kvq-all-resident (debug: every coarse row resident), --kvq-pk-stats (top-m counters with sync off)
 // --kvq-no-rot: attention rotation off (for references of the packed mode)
 // --kvq-perf: no logits processing, decode times per chunk only
@@ -387,7 +387,7 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
                 "       [--kvq-variant exact|q8_0|aff8|K<b>V<b>|K<b>|V<b>] [--kvq-sinks 4] [--kvq-recent 0] [--kvq-qwin 2048] [--kvq-fit-chunk 0 [--kvq-kmetric own|last]]\n"
                 "       [--kvq-save-tables tables.bin] [--kvq-load-tables tables.bin [--kvq-load-only k|v] [--kvq-own-mean-k]] [--kvq-stats]\n"
                 "       [--kvq-two-tier all-precise|all-coarse|none|<N> [--kvq-protect 512] [--kvq-precise aff8|exact] [--kvq-tt-stats]]\n"
-                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 0][--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
+                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 0] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
                 "                     [--kvq-all-resident] [--kvq-pk-stats]] [--kvq-no-rot] [--kvq-perf]\n"
                 "       [--kvq-lib [--kvq-lib-vtab vtab.bin] [--kvq-fit-threads 8] [--kvq-lib-nowait] [--kvq-lib-busy] [--kvq-rm-test]] [common args]\n", argv[0]);
         return false;
@@ -1359,7 +1359,7 @@ static void kvq_print_counters(const llama_kvq_counters_all & c, int64_t n_decod
                 l.bytes/1048576.0, 1e3*l.t_wait/n_cb, 1e3*l.t_read/n_cb, 1e3*l.t_plan/n_cb, 1e3*l.t_gather/n_cb, 1e3*l.t_join/n_cb, 1e3*l.t_upload/n_cb);
         t.n_pf += l.n_pf; t.pf_req += l.pf_req; t.pf_fetch += l.pf_fetch; t.n_tu += l.n_tu; t.n_pos += l.n_pos;
         t.tu_check += l.tu_check; t.tu_fire += l.tu_fire; t.tu_stall += l.tu_stall; t.tu_redo += l.tu_redo; t.tu_fetch += l.tu_fetch;
-        t.top_hit += l.top_hit; t.top_n += l.top_n; t.evict += l.evict; t.bytes += l.bytes;
+        t.top_hit += l.top_hit; t.top_n += l.top_n; t.evict += l.evict; t.bytes += l.bytes; t.base_bytes += l.base_bytes; t.ring_bytes += l.ring_bytes; t.rb_bytes += l.rb_bytes; t.t_mirror += l.t_mirror;
         t.pf_sel += l.pf_sel; t.pf_cut += l.pf_cut; t.pf_lost += l.pf_lost;
         t.n_join += l.n_join;
         t.t_idle += l.t_idle;
@@ -1373,11 +1373,11 @@ static void kvq_print_counters(const llama_kvq_counters_all & c, int64_t n_decod
             t.n_tu ? 100.0*t.tu_redo/t.n_tu : NAN, t.tu_fire ? (double) t.tu_fetch/t.tu_fire : NAN, t.top_n ? 100.0*t.top_hit/t.top_n : NAN);
     LOG("kvq: total   : selected rows of the positions resident after the prefetch %.4f%% (%lld of %lld lost in %lld cut requests)\n",
             t.pf_sel ? 100.0 - 100.0*t.pf_lost/t.pf_sel : 100.0, (long long) t.pf_lost, (long long) t.pf_sel, (long long) t.pf_cut);
-    LOG("kvq: per token: rows fetched %.1f (prefetch %.1f, top-up %.1f), %.3f MiB host->device, evictions %.1f\n",
-            (t.pf_fetch + t.tu_fetch)/nt, t.pf_fetch/nt, t.tu_fetch/nt, t.bytes/1048576.0/nt, t.evict/nt);
+    LOG("kvq: per token: rows fetched %.1f (prefetch %.1f, top-up %.1f), %.3f MiB host->device, evictions %.1f; base uploads %.3f MiB, tail uploads %.3f MiB host->device, readbacks %.3f MiB\n",
+            (t.pf_fetch + t.tu_fetch)/nt, t.pf_fetch/nt, t.tu_fetch/nt, t.bytes/1048576.0/nt, t.evict/nt, t.base_bytes/1048576.0/nt, t.ring_bytes/1048576.0/nt, t.rb_bytes/1048576.0/nt);
     // the prefetch plan and gather run on the worker, the top-up ones in the callback
-    LOG("kvq: per token: decode thread ms: since previous callback %.3f, readback %.3f, join wait %.3f, upload %.3f; plan %.3f + gather %.3f (worker for the prefetch)\n",
-            1e3*t.t_wait/nt, 1e3*t.t_read/nt, 1e3*t.t_join/nt, 1e3*t.t_upload/nt, 1e3*t.t_plan/nt, 1e3*t.t_gather/nt);
+    LOG("kvq: per token: decode thread ms: since previous callback %.3f, readback %.3f, join wait %.3f, upload %.3f; plan %.3f + gather %.3f + mirror %.3f (worker for the prefetch)\n",
+            1e3*t.t_wait/nt, 1e3*t.t_read/nt, 1e3*t.t_join/nt, 1e3*t.t_upload/nt, 1e3*t.t_plan/nt, 1e3*t.t_gather/nt, 1e3*t.t_mirror/nt);
     if (t.t_idle > 0.0) {
         LOG("kvq: per token: GPU idle at the joins (LLAMA_KVQ_IDLE_PROBE) %.3f ms\n", 1e3*t.t_idle/nt);
     }
@@ -2084,9 +2084,9 @@ int main(int argc, char ** argv) {
 
         llama_kvq_memory_info mi_pk;
         if (llama_memory_kvq_get_memory_info(llama_get_memory(ctx), mi_pk)) {
-            LOG_INF("%s: packed: device codes %.1f MiB, tables %.1f MiB, resident %.1f MiB, other %.1f MiB; host store %.1f MiB (%s)\n", __func__,
-                    mi_pk.codes/1048576.0, mi_pk.tables/1048576.0, mi_pk.resident/1048576.0, mi_pk.other_dev/1048576.0, mi_pk.host_store/1048576.0,
-                    mi_pk.pinned ? "pinned" : "pageable");
+            LOG_INF("%s: packed: device codes %.1f MiB, tables %.1f MiB, resident %.1f MiB, ring %.1f MiB, other %.1f MiB; host store %.1f MiB (%s), ring %.1f MiB\n", __func__,
+                    mi_pk.codes/1048576.0, mi_pk.tables/1048576.0, mi_pk.resident/1048576.0, mi_pk.ring/1048576.0, mi_pk.other_dev/1048576.0, mi_pk.host_store/1048576.0,
+                    mi_pk.pinned ? "pinned" : "pageable", mi_pk.host_ring/1048576.0);
         }
     }
     std::map<int32_t, kvq_tt_stat> tt_acc;

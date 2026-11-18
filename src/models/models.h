@@ -2592,12 +2592,14 @@ struct llama_model_qwen35 : public llama_model_base {
                             int   il);
 
         // fit mode, large ubatch: flash attention over the scratch rows (coarse region from the host store, the rest from the cache)
+        // host ring: the rows of the ubatch go to the scratch rows of their positions (inp_pos)
         ggml_tensor * build_attn_kvq_scratch(
         llm_graph_input_attn_kv * inp_attn,
             llm_graph_input_kvq * inp_kvq,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
+                    ggml_tensor * inp_pos,
                           float   kq_scale,
                             int   il);
 

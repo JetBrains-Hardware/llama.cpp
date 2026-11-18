@@ -114,6 +114,11 @@ bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
     auto room = [&]() { return last + 1 - (int64_t) n_released <= size; };
     const bool fold_now = small && fold_every > 0 && p0 - store->n_coarse() >= fold_every;
 
+    // host ring: a large batch reads the rows before it from the host store
+    if (!small) {
+        store->sync_store(n_pos());
+    }
+
     bool waited = false;
     if (!room() && !small) {
         // the complete chunks before the batch, then the rest of the ring rows to the host store
@@ -176,6 +181,13 @@ bool llama_memory_hybrid_kvq::tail_restore(llama_pos p_lo, llama_pos p_hi) {
         return false;
     }
     GGML_ASSERT(p_lo >= store->n_coarse() && p_hi == store->n_host() && n_released == p_hi);
+    // host ring: the host store keeps the rows, the next packed ubatch copies them into the host ring
+    if (store->host_ring()) {
+        kv->ring_add(0, p_lo, p_hi);
+        store->set_n_host(p_lo);
+        n_released = p_lo;
+        return true;
+    }
     const int64_t G    = store->n_head_kv();
     const size_t  ROW  = llama_kvq_store::ROW;
     const size_t  nb1  = G*ROW;
@@ -207,6 +219,7 @@ bool llama_memory_hybrid_kvq::tail_restore(llama_pos p_lo, llama_pos p_hi) {
 }
 
 bool llama_memory_hybrid_kvq::settle(llama_pos n) {
+    store->sync_store(n_pos());
     const llama_pos e = fitter->settle(*get_mem_attn(), n);
     if (tail) {
         tail_release();
@@ -377,6 +390,9 @@ void llama_memory_hybrid_kvq::state_write(llama_io_write_i & io, llama_seq_id se
     store->state_write_meta(io);
     fitter->state_write_meta(io);
 
+    // host ring: the ring cells hold the rows after the host store, the readbacks of the last reply are done
+    store->sync_ring(n_pos());
+    store->synchronize();
     get_mem_attn()->state_write(io, 0, flags);
     get_mem_recr()->state_write(io, seq_id, flags);
 
@@ -410,6 +426,8 @@ void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_
         store->state_read_meta(io, n, h);
         fitter->state_read_meta(io);
 
+        // host ring: no readback of an earlier reply may land in the ring cells after they are read
+        store->synchronize();
         get_mem_attn()->state_read(io, 0, flags);
         get_mem_recr()->state_read(io, seq_id, flags);
 
@@ -422,6 +440,7 @@ void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_
         store->state_read_data(io, n, h);
         fitter->state_read_data(io);
         n_released = h;
+        store->ring_loaded(p_max >= 0 ? p_max + 1 : h);
 
         // the resident slots start empty
         if (!store->enable(params)) {
@@ -540,6 +559,10 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
             throw std::runtime_error("the tail mode needs the scratch attention (pinned host memory, LLAMA_KVQ_SCRATCH not 0)");
         }
         fitter = std::make_unique<llama_kvq_fitter>(*store, fp, v_tabs, wo, n_head, min_first);
+        // the graph does not read the ring cells any more, see llama_kvq_store (host ring)
+        if (store->host_ring()) {
+            get_mem_attn()->move_bufs(store->host_buft());
+        }
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
         fitter.reset();

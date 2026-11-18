@@ -545,7 +545,7 @@ ggml_cgraph * llama_kvq_fitter::build_phase(const job & jb, int phase, int32_t l
 
     // the ring rows as f16 pairs, position p in cell p mod size -> stage row p - r0, in at most two runs per K or V
     // the graph runs its nodes in order, so the copies are done before the rows are read
-    if (phase <= 1) {
+    if (phase <= 1 && jb.h1 < jb.r1) {
         for (int kv = 0; kv < 2; ++kv) {
             ggml_tensor * src  = kv ? lt.v_h : lt.k_h;
             const int64_t size = src->ne[2];
@@ -627,6 +627,9 @@ void llama_kvq_fitter::queue_phase(job & jb, int phase) {
         store.synchronize();
         t0 = kvq_fit_now();
     }
+
+    // host ring: the rows of the last ubatches reach the host store on the copy stream
+    store.order_rows();
 
     for (size_t li = 0; li < layer_ids.size(); ++li) {
         const int32_t il = layer_ids[li];
@@ -766,7 +769,8 @@ bool llama_kvq_fitter::check_ring(const llama_kv_cache & kv, int32_t p0, int32_t
 bool llama_kvq_fitter::take(const llama_kv_cache & kv, const range & r) {
     const int32_t C  = store.n_chunk_rows();
     const int32_t G  = store.n_head_kv();
-    const int32_t h1 = std::clamp(store.n_host(), r.r0, r.r1);
+    // host ring: the host store has the rows of the ring too
+    const int32_t h1 = store.host_ring() ? r.r1 : std::clamp(store.n_host(), r.r0, r.r1);
     GGML_ASSERT(r.r0 % C == 0 && r.r1 > r.r0 && r.r1 - r.r0 <= n_stage);
     if (!check_ring(kv, h1, r.r1)) {
         return false;
@@ -868,7 +872,7 @@ void llama_kvq_fitter::spill(const llama_kv_cache & kv, llama_pos p) {
     if (!check_ring(kv, h0, p)) {
         return;
     }
-    for (int32_t a = h0; a < p; a += n_stage) {
+    for (int32_t a = h0; a < p && !store.host_ring(); a += n_stage) {
         job jb;
         jb.r0 = a;
         jb.h1 = a;

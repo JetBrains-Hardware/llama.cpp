@@ -7,6 +7,7 @@
 #include "llama.h"
 #include "llama-arch.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -166,7 +167,7 @@ struct llama_kvq_params {
     int32_t max_tail      = 0;    // more cells than this after the coarse region (fit mode: the fit lags): the normal attention, 0: no limit
     int32_t prefetch_n    = 1024; // rows per (kv head, position) requested by the early query
     int32_t resident_cap  = 0;    // evictable resident slots per (layer, kv head), the sinks have their own; 0: max_batch*prefetch_n (llama_kvq_resident_slots); more slots cost attention time
-    int32_t lead          = 2;    // the early query of layer il runs at the input of layer il - lead, 0: no prefetch
+    int32_t lead          = 2;    // the early query of layer il runs at the input of layer il - lead, 0: no prefetch (packed mode needs 1 - 3)
     int32_t sync_mode     = LLAMA_KVQ_SYNC_OFF;
     int32_t sync_m        = 64;
     int32_t sync_min_hits = 48;
@@ -175,7 +176,8 @@ struct llama_kvq_params {
 };
 
 // the evictable resident slots of the parameters; the default holds the whole prefetch request of every packed ubatch,
-// with fewer slots a request of more distinct rows is cut by the max score over the positions
+// with fewer slots a request of more distinct rows is cut by the max score over the positions (6 x prefetch_n is as good
+// at 8 per batch and saves 71 MB of pinned host memory, resident cap sweep 2026-11-18; 8192 kept: 0.4 ms faster at n_max 7)
 static inline int32_t llama_kvq_resident_slots(const llama_kvq_params & p) {
     return p.resident_cap > 0 ? p.resident_cap : p.max_batch*p.prefetch_n;
 }
@@ -229,10 +231,14 @@ struct llama_kvq_counters {
     int64_t evict      = 0;
     int64_t n_join     = 0; // prefetch joins
     int64_t bytes      = 0; // host -> device, rows and slot lists
+    int64_t base_bytes = 0; // host -> device, base uploads of the resident rows from the mirror (rotating layers)
+    int64_t ring_bytes = 0; // host -> device, tail uploads of the ring cells (host ring)
+    int64_t rb_bytes   = 0; // device -> host, the new rows into the host ring or the host store (host ring)
     double  t_wait     = 0.0; // since the previous callback of the ubatch: launches (and GPU work with LLAMA_KVQ_SCHED_SYNC)
     double  t_read     = 0.0; // readback of the selection, top-up: with the wait for the GPU
     double  t_plan     = 0.0; // slots and eviction, prefetch: worker thread
     double  t_gather   = 0.0; // rows to the staging buffer, prefetch: worker thread
+    double  t_mirror   = 0.0; // fetched rows into the mirror (rotating layers), prefetch: worker thread after the gather
     double  t_join     = 0.0; // decode thread blocked on the worker
     double  t_idle     = 0.0; // LLAMA_KVQ_IDLE_PROBE: GPU at the join before the decode thread queued the upload (estimate)
     double  t_upload   = 0.0;
@@ -257,6 +263,8 @@ struct llama_kvq_memory_info {
     size_t codes      = 0; // packed coarse rows
     size_t tables     = 0;
     size_t resident   = 0; // rkv and ridx
+    size_t ring       = 0; // host ring: the rotating tail buffers (device), the ring cells are pinned host memory of the attention cache
+    size_t host_ring  = 0;
     size_t other_dev  = 0; // bias, staging and slot lists
     size_t scratch    = 0; // fit mode: K/V rows of the large ubatches
     size_t host_store = 0;

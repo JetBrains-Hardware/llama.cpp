@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -12,16 +13,22 @@
 #include <vector>
 
 struct llama_kvq_table;
+struct llama_ubatch;
 class llama_kv_cache;
 class llama_io_write_i;
 class llama_io_read_i;
 
 // packed two-tier state of the attention layers of one sequence (see llama_kvq_params::packed)
-//   device: packed coarse rows and tables of the coarse region, resident precise rows (rkv, ridx) per layer, top-k bias
-//   host:   precise store (the q8_0 K/V rows of the coarse region), slot state and row bitmaps of the resident slots
+//   device: packed coarse rows and tables of the coarse region, resident precise rows (rkv, ridx) of the layers in rotating buffers, top-k bias
+//   host:   precise store (the q8_0 K/V rows of the coarse region), mirrors of the resident rows, slot state and row bitmaps of the resident slots
 // the tensors and host arrays are allocated for n_rows coarse rows, the coarse region is [0, n_coarse)
 //
 // resident slots of a (layer, kv head): [0, n_sink) hold the sinks, then cap evictable slots, then one unused slot (the trash slot of the scatter before the trash rows)
+// where the resident rows live: each attention layer keeps its rows in a pinned host mirror [2][G][cap_tot][ROW]
+// the layers share n_buf rotating device buffers rkv, buffer = layer index mod n_buf (all_resident: one per layer, no mirror)
+//   base:  the mirror of layer i into its buffer on a base stream, after the attention of the previous reader of the buffer (layer i - n_buf)
+//          the worker queues it after the prefetch job and the join uploads of layer i - n_buf + 1 (see base_next), event ev_base
+//   delta: the join uploads the fetched rows after ev_base and scatters them as before; the worker writes them into the mirror after the gather
 // the host fills the slots in the scheduler copy callbacks of host trigger tensors, each read by a get_rows:
 //   prefetch: top prefetch_n of the early query of layer il, built at the input of layer il - lead
 //             the callback reads the selection back and returns, a worker thread plans the slots and gathers the rows
@@ -33,9 +40,19 @@ class llama_io_read_i;
 // the callbacks run before the scheduler waits for the GPU (ggml_backend_sched_set_copy_callback_early)
 // the readback and the uploads of the prefetch run on a copy stream (a second backend of the device), ordered by events:
 //   main: ev_sel at the prefetch trigger -> copy: readback, ev_read (worker) ... join: uploads, ev_up -> main waits ev_up
+//   base: worker after the join uploads of layer j -> base stream waits ev_sel of j, mirror upload of layer j + n_buf - 1, ev_base -> its join waits
 // a memcpy between two graphs on the main stream costs a GPU stall of about 50 us (measured, Windows), events do not
 // the trigger tensors are not written: the trigger node is an add whose result is not used
 //
+// host ring (tail mode with rotating buffers): the ring cells of the attention cache are pinned host memory (llama_kv_cache::move_bufs),
+// the device has N_TBUF rotating tail buffers [K cells | V cells], buffer = layer index mod N_TBUF
+//   tail upload: the occupied cells [n_host, end) of layer i from the host ring, on the base stream by the worker after the join uploads
+//                of layer i - 3 (after ev_sel of it and the readback of layer i - N_TBUF); the main stream waits for it at the join of layer i - 1,
+//                as the early query of layer i reads the cells
+//   new rows:    the graph writes the K/V of the ubatch into the tail buffer, the join reads them back into the host ring (copy stream)
+//   prefill:     the scratch path writes the K/V of the ubatch into the scratch rows of their positions and reads them back into the host
+//                store, the scratch rows [0, p0) come from the host store; so the store holds every row after a large ubatch,
+//                the host ring after a packed one (st_ok, rg_ok), and the other side is copied on the host at the switch
 // fit mode, scratch attention of the large ubatches (prefill): one device scratch holds the q8_0 K/V rows that flash attention reads,
 // the rows [0, n_host) uploaded from the host store per layer, the rest copied on the device from the cache
 // (the cells after them, or in tail mode the ring cells of the positions after them)
@@ -53,7 +70,8 @@ public:
         KIND_JOIN     = 2,
         KIND_SCR_UP   = 3,
         KIND_SCR_JOIN = 4,
-        KIND_COUNT    = 5,
+        KIND_SCR_RB   = 5,
+        KIND_COUNT    = 6,
     };
 
     struct layer_tensors {
@@ -61,10 +79,10 @@ public:
         ggml_tensor * vc    = nullptr; // i32 [nwv + 1, n_rows, G]
         ggml_tensor * tinv  = nullptr; // i8 [D, D, 2*G, n_chunk]
         ggml_tensor * taux  = nullptr; // f32 [D, 3, 2*G, n_chunk]
-        ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2], alias of the start of rkv_h
+        ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2], alias of the start of rkv_h (of the device buffer of the layer)
         ggml_tensor * rkv_h = nullptr; // f32 [ROW/4, 2*G*cap_tot + N_TRASH], row (kv*G + g)*cap_tot + slot, then the trash rows
         ggml_tensor * ridx  = nullptr; // i32 [cap_tot, G + 1], column G holds the flag of ggml_kvq_attn_cond
-        ggml_tensor * stage = nullptr; // f32 [ROW/4, n_stage], rows to scatter (set by enable)
+        ggml_tensor * stage = nullptr; // f32 [ROW/4, n_stage], rows to scatter (set by enable, one for all layers)
         ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest trash rows (trash_row)
         ggml_tensor * trig[KIND_COUNT] = {}; // host f32 [1], per kind
         ggml_tensor * qacc  = nullptr; // f32 [D, D, G], sum of q q^T over the query heads of each kv head (fit mode)
@@ -132,7 +150,34 @@ public:
     void reset_resident();
 
     // called once per ubatch of the packed path
-    void begin_ubatch(int64_t n_tokens);
+    void begin_ubatch(const llama_ubatch & ubatch);
+
+    // host ring: called once per ubatch of the scratch path
+    void begin_scr(const llama_ubatch & ubatch);
+
+    // host ring: the rows of the positions [n_host, n) in the host store, or in the host ring (the copy on the host at a switch, see the class comment)
+    void sync_store(int32_t n);
+    void sync_ring(int32_t n);
+
+    // host ring: after a state read, the host ring holds the positions [n_host, n)
+    void ring_loaded(int32_t n);
+
+    // host ring: the main stream waits for the readbacks into the host store (before it uploads host rows)
+    void order_rows();
+
+    bool host_ring() const { return hring; }
+
+    // host ring: K or V of the tail cells [0, n_kv) of layer il, like a view of the cache: [D, n_kv, G]
+    ggml_tensor * get_ring(ggml_context * ctx, int32_t il, bool is_v, int64_t n_kv) const;
+
+    // host ring: the K or V of the ubatch [D, G, n_tokens] into the tail buffer of layer il (cells idxs), like llama_kv_cache::cpy_k
+    ggml_tensor * build_ring_cpy(ggml_context * ctx, int32_t il, bool is_v, ggml_tensor * cur, ggml_tensor * idxs) const;
+
+    // host ring: the K or V of the ubatch [D, G, n_tokens] into the scratch rows of their positions pos (i32 [n_tokens])
+    ggml_tensor * build_scr_set(ggml_context * ctx, bool is_v, ggml_tensor * cur, ggml_tensor * pos) const;
+
+    // host ring: after the attention of the last attention layer of a scratch graph, the readback of its rows
+    void build_scr_rb(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
 
     // ggml_backend_sched copy callback, false if src is not a trigger
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
@@ -208,6 +253,10 @@ private:
     int64_t n_bmw     = 0; // 64-bit words of a row bitmap
     bool    all_res   = false;
     bool    cut_warn  = false;
+    int32_t n_rot     = 0; // attention layers through the rotating buffers, 0: each layer has its own buffer
+    int32_t n_buf     = 0; // rotating device buffers (LLAMA_KVQ_NBUF, default 2)
+    int32_t up_rep    = 1; // LLAMA_KVQ_UP_REPEAT: every base upload k times, emulates a slower bus
+    size_t  up_chunk  = 0; // bytes per piece of a base upload (LLAMA_KVQ_UP_CHUNK in KiB, default one piece)
 
     llama_kvq_params params;
 
@@ -225,15 +274,50 @@ private:
     ggml_context_ptr        ctx_host;
     ggml_backend_buffer_ptr buf_dev;
     ggml_backend_buffer_ptr buf_host; // triggers
-    ggml_backend_buffer_ptr buf_pin;  // pinned host buffers of the layers (staging rows, readback, ridx, slot list)
+    ggml_backend_buffer_ptr buf_pin;  // pinned host buffers (staging rows, ridx, slot list; readback per layer)
+    ggml_backend_buffer_ptr buf_mir;  // pinned host mirrors of the resident rows of the rotating layers
     ggml_context_ptr        ctx_stage;
-    ggml_backend_buffer_ptr buf_stage; // device staging rows and slot lists of the layers
+    ggml_backend_buffer_ptr buf_stage; // device staging rows and slot list
     ggml_backend_ptr        backend_cp; // copy stream
+    ggml_backend_ptr        backend_bu; // base upload stream
     ggml_backend_t          backend_main = nullptr;
     std::vector<ggml_backend_buffer_ptr> buf_store; // precise store, one per layer
 
+    // device buffers of the resident rows, the n_buf rotating ones first (their ridx is the one in jblk), then one per layer with its own
+    struct res_buf {
+        ggml_tensor * rkv_h = nullptr;
+        ggml_tensor * rkv   = nullptr;
+        ggml_tensor * ridx  = nullptr;
+    };
+    std::vector<res_buf> bufs;
+
+    // host ring: the rotating tail buffers, q8_0 [D*G, n_cell] K and V each, like the cache tensors
+    static constexpr int32_t N_TBUF = 4;
+    struct tail_buf {
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+    };
+    std::vector<tail_buf> tbufs;
+    bool    hring  = false;
+    int64_t n_cell = 0; // cells of the ring
+    int32_t st_ok  = 0; // decode thread: the host store holds the rows of the positions [n_host, st_ok)
+    int32_t rg_ok  = 0; // decode thread: the host ring holds the rows of the positions [n_host, rg_ok)
+    int32_t ub_p0  = 0; // decode thread: positions [ub_p0, ub_p1) of the current ubatch (packed or scratch)
+    int32_t ub_p1  = 0;
+    std::atomic<int32_t> tb_lo{0}; // the worker uploads the cells of the positions [tb_lo, tb_hi)
+    std::atomic<int32_t> tb_hi{0};
+    ggml_backend_event_ptr ev_ord; // copy stream, for order_rows
+
     ggml_tensor * bias    = nullptr; // f32 [n_coarse], -inf for the sinks
     int64_t       n_stage = 0;       // rows of the staging tensors
+    ggml_tensor * jblk    = nullptr; // i8, the device block [ridx | slot list | staging rows] of the rotating layers, one copy per join
+    size_t      off_stage = 0;       // byte offset of the staging rows in jblk and in the pinned block at h_ridx
+
+    // pinned staging [h_ridx | h_slots | h_stage] with the layout of jblk, shared by the layers (see gather)
+    uint8_t * h_stage  = nullptr; // [n_stage][ROW], K and V row of each fetch
+    int32_t * h_ridx   = nullptr; // [G + 1][cap_tot]
+    int32_t * h_slots  = nullptr; // [n_stage]
+    int64_t   slots_hi = 0;       // entries of the device slot list that are not trash
 
     ggml_tensor * scr    = nullptr; // q8_0 [D, 2, n_scr, G], K and V row of each scratch row (fit mode)
     ggml_tensor * scr_h  = nullptr; // f16 [ROW/2, 2, n_scr, G], alias of scr
@@ -281,4 +365,12 @@ private:
     void drop(layer & l);
     void drop_pending();
     void upload_pinned(layer & l, int32_t n_pin);
+    void write_mirror(layer & l);
+    void issue_base(layer & l, ggml_backend_event_t ev, ggml_backend_t stream);
+    void issue_tail(layer & l, ggml_backend_event_t ev, ggml_backend_t stream);
+    void read_ring(layer & l);
+    void read_scr(layer & l);
+    void ring_copy(bool to_store, int32_t p0, int32_t p1);
+    void wait_mirrors();
+    void reset_base();
 };
