@@ -31,6 +31,7 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                     bool   rs_replay,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -43,7 +44,7 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
         no_alloc,
         type_k, type_v, v_trans, n_tail > 0 ? std::min(n_tail, kv_size) : kv_size, n_swa, swa_type,
         type_r, type_s, rs_size,
-        n_seq_max, n_rs_seq, offload, unified,
+        n_seq_max, n_rs_seq, rs_replay, offload, unified,
         filter_attn, filter_recr),
     model(model),
     packed(packed),

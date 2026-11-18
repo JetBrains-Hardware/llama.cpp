@@ -183,6 +183,15 @@ static bool server_kvq_prepare_params(common_params & params) {
     if (params.fit_params) {
         SRV_WRN("%s", "--kvq: --fit does not count the memory of the two-tier cache (coarse rows, tables and scratch, about 1/4 of a full q8_0 K/V on the device)\n");
     }
+    // recurrent rollback by replay instead of n_rs_seq snapshots (read by llama_context); LLAMA_RS_REPLAY=0 keeps the snapshots
+    if (getenv("LLAMA_RS_REPLAY") == nullptr) {
+        SRV_WRN("%s", "--kvq: recurrent rollback by replay, setting LLAMA_RS_REPLAY=1\n");
+#ifdef _WIN32
+        _putenv_s("LLAMA_RS_REPLAY", "1");
+#else
+        setenv("LLAMA_RS_REPLAY", "1", 0);
+#endif
+    }
     return true;
 }
 
