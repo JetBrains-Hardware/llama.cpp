@@ -1726,9 +1726,9 @@ void llama_kvq_store::build_scr_rb(ggml_context * ctx, ggml_cgraph * gf, ggml_ba
     kvq_build_trigger(ctx, gf, sched, dev, bias, get_layer(il).trig[KIND_SCR_RB], KIND_SCR_RB, il);
 }
 
-ggml_tensor * llama_kvq_store::get_scr(ggml_context * ctx, bool is_v, int64_t n) const {
-    GGML_ASSERT(scr && n <= n_scr);
-    return ggml_view_4d(ctx, scr, D, G, n, 1, scr->nb[3], scr->nb[2], scr->nb[3]*G, is_v ? scr->nb[1] : 0);
+ggml_tensor * llama_kvq_store::get_scr(ggml_context * ctx, bool is_v, int64_t n, int64_t r0) const {
+    GGML_ASSERT(scr && r0 >= 0 && r0 + n <= n_scr);
+    return ggml_view_4d(ctx, scr, D, G, n, 1, scr->nb[3], scr->nb[2], scr->nb[3]*G, r0*scr->nb[2] + (is_v ? scr->nb[1] : 0));
 }
 
 ggml_tensor * llama_kvq_store::build_scr_copy(ggml_context * ctx, int32_t il, bool is_v, int64_t c0, int64_t n, int64_t r0) const {

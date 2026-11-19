@@ -2488,6 +2488,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVQ_LEAD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kvq-scr-block"}, "N",
+        string_format("two-tier KV cache: a prompt ubatch attends over the host rows in key blocks of N rows (multiple of 256) without a mask, 0 = one attention with a mask over all rows (default: %d)", params.kvq.scr_block),
+        [](common_params & params, int value) {
+            if (value < 0 || (value > 0 && value % 256 != 0)) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.scr_block = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_SCR_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--kvq-tail"}, "N",
         "two-tier KV cache: cells of the q8_0 cache on the device (a ring of the positions that are not coded yet), 0 = one cell per position (default: batch size + 256, at least 4352)",
         [](common_params & params, int value) {

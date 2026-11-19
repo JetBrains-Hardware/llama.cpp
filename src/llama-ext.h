@@ -173,6 +173,8 @@ struct llama_kvq_params {
     int32_t sync_min_hits = 48;
     bool    all_resident  = false; // debug: every coarse row resident, no prefetch and no top-up
     bool    scratch       = true;  // fit mode: the other ubatches attend over the scratch (coarse region from the host store), false: over the cache
+    int32_t scr_block     = 16384; // fit mode, tail: the scratch attention reads the host rows in key blocks of this many rows (rounded down to 256) without a mask,
+                                   // the rest with a mask, merged by the log-sum-exp; 0: one attention with a mask over all rows
 };
 
 // the evictable resident slots of the parameters; the default holds the whole prefetch request of every packed ubatch,

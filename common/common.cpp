@@ -1420,6 +1420,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         kp.prefetch_n   = params.kvq.prefetch_n;
         kp.resident_cap = params.kvq.resident_cap;
         kp.lead         = params.kvq.lead;
+        kp.scr_block    = params.kvq.scr_block;
         // while the fit lags by a chunk, the normal attention is faster than the packed one over the precise rows
         kp.max_tail     = fp.chunk;
 

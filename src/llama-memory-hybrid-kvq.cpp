@@ -750,6 +750,13 @@ bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_memory_info 
 // llama_memory_hybrid_kvq_context
 //
 
+// the reserve graph is not in two-tier mode, but sizes the scratch attention of the mode
+static llama_kvq_params kvq_params_reserve(const llama_kvq_params & p) {
+    llama_kvq_params res;
+    res.scr_block = p.scr_block;
+    return res;
+}
+
 llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(llama_memory_status status) :
     llama_memory_hybrid_context(status), status(status) {}
 
@@ -757,7 +764,7 @@ llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(llama_memory_hy
     llama_memory_hybrid_context(mem),
     kv_attn(mem->get_mem_attn()),
     ctx_coarse(mem->get_mem_coarse() ? mem->get_mem_coarse()->init_full() : nullptr),
-    params(),
+    params(kvq_params_reserve(mem->get_params())),
     store(mem->fit_graph_kind() > 0 ? mem->get_store() : nullptr),
     status(llama_memory_status_combine(llama_memory_hybrid_context::get_status(), ctx_coarse ? ctx_coarse->get_status() : LLAMA_MEMORY_STATUS_SUCCESS)) {
 }
@@ -921,16 +928,18 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggm
     }
 }
 
-void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_host) const {
+void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_host, int64_t r0) const {
     if (mask == nullptr || mask->buffer == nullptr) {
         return;
     }
     GGML_ASSERT(kv_attn->get_n_stream() == 1 && ggml_backend_buffer_is_host(mask->buffer));
-    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_host && mask->ne[1] == ubatch->n_tokens);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && r0 >= 0 && r0 <= n_host && r0 + mask->ne[0] > n_host && mask->ne[1] == ubatch->n_tokens);
 
     const auto & cells = kv_attn->get_cells(0);
 
-    const int64_t n_rows = mask->ne[0];
+    // mask column c is scratch row r0 + c
+    const int64_t n_cols = mask->ne[0];
+    const int64_t n_rows = r0 + n_cols;
     const int64_t size   = cells.size();
     GGML_ASSERT(n_rows - n_host <= size);
 
@@ -948,11 +957,11 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, cons
     };
 
     // the rows of the positions before the ubatch, then per token the positions of the ubatch up to its own
-    std::vector<ggml_fp16_t> row(n_rows, ninf);
-    std::fill(row.begin(), row.begin() + n_host, zero);
+    std::vector<ggml_fp16_t> row(n_cols, ninf);
+    std::fill(row.begin(), row.begin() + (n_host - r0), zero);
     for (int64_t r = n_host; r < std::min<int64_t>(p_min, n_rows); ++r) {
         if (has(r)) {
-            row[r] = zero;
+            row[r - r0] = zero;
         }
     }
     std::vector<int64_t> late;
@@ -964,13 +973,13 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, cons
 
     ggml_fp16_t * dst = (ggml_fp16_t *) mask->data;
     for (int64_t i = 0; i < mask->ne[1]; ++i) {
-        ggml_fp16_t * d = dst + i*n_rows;
-        memcpy(d, row.data(), n_rows*sizeof(ggml_fp16_t));
+        ggml_fp16_t * d = dst + i*n_cols;
+        memcpy(d, row.data(), n_cols*sizeof(ggml_fp16_t));
         for (const int64_t r : late) {
             if (r > ubatch->pos[i]) {
                 break;
             }
-            d[r] = zero;
+            d[r - r0] = zero;
         }
     }
 }

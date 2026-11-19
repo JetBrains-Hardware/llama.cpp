@@ -621,6 +621,7 @@ struct common_params {
         int32_t     chunk        = 8192; // rows per chunk (one table set)
         int32_t     rem          = 0;    // llama_kvq_rem: the rows after the last complete chunk, 0 own chunk, 1 merged into the last complete chunk
         int32_t     min_rows     = 256;  // own: the smallest chunk of these rows, fewer stay precise
+        int32_t     scr_block    = 16384; // rows per key block of the scratch attention of a prompt, 0: one attention with a mask
     } kvq;
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers

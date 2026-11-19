@@ -28,6 +28,7 @@ typedef void (* fattn_kernel_t)(
         const int  * __restrict__ KV_rows,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
+        float      * __restrict__ dst_lse,
         const float scale,
         const float max_bias,
         const float m0,
@@ -782,6 +783,7 @@ __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
         float * dst_ptr,
         const float2 * dst_fixup_ptr,
+        float * dst_lse,
         const int ne01, const int ne02,
         const int ne12, const int nblocks_stream_k,
         const int gqa_ratio,
@@ -857,6 +859,10 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
     // Write back final result:
     *dst = dst_val / rowsum;
+
+    if (dst_lse && tid == 0) {
+        dst_lse[sequence*ne02*ne01 + (jt*ncols1 + j)*ne02 + zt_Q + c] = max_val + logf(rowsum);
+    }
 }
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
@@ -866,6 +872,7 @@ __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_general(
         float * dst_ptr,
         const float2 * dst_fixup_ptr,
+        float * dst_lse,
         const int ne01, const int ne02,
         const int gqa_ratio,
         const int total_work,
@@ -968,6 +975,10 @@ static __global__ void flash_attn_stream_k_fixup_general(
 
     // Write back final result:
     *dst = dst_val / rowsum;
+
+    if (dst_lse && tid == 0) {
+        dst_lse[sequence*ne02*ne01 + (jt*ncols1 + j)*ne02 + zt_Q + c] = max_val + logf(rowsum);
+    }
 }
 
 template<int D> // D == head size
@@ -1054,6 +1065,10 @@ void launch_fattn(
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
+
+    // the log-sum-exp after the rows of the result, written by the kernel for whole tiles and by the stream-k fixup
+    float * dst_lse = ggml_flash_attn_ext_get_lse(KQV) ? (float *) ((char *) KQV->data + Q->ne[1]*KQV->nb[2]) : nullptr;
+    GGML_ASSERT(!dst_lse || (stream_k && Q->ne[3] == 1));
 
     GGML_ASSERT(Q->nb[0] == ggml_element_size(Q));
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
@@ -1318,7 +1333,7 @@ void launch_fattn(
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         kv_rows ? (const int *) kv_rows->data : nullptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr, dst_lse,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
@@ -1343,7 +1358,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr,
+                (float *) KQV->data, dst_tmp_meta.ptr, dst_lse,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
         } else if (ntiles_dst % blocks_num.x != 0) {
@@ -1360,7 +1375,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr,
+                (float *) KQV->data, dst_tmp_meta.ptr, dst_lse,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }

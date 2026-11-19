@@ -159,6 +159,12 @@ static int64_t kvq_scr_rows(const llama_kvq_store * store, int32_t n_host, const
     return std::min<int64_t>((int64_t) n_host + store->n_ring(), GGML_PAD((int64_t) p_max + 1, 256));
 }
 
+// tail mode: the scratch attention reads the host rows [0, r0) in key blocks without a mask, the rows [r0, n_rows) with the mask
+// (every query of a large ubatch sees all host rows); 0: one attention with the mask over all rows
+static int64_t kvq_scr_r0(const llama_kvq_params & p, int32_t n_host) {
+    return p.scr_block >= 256 ? n_host/256*256 : 0;
+}
+
 class llama_model_qwen35::llm_graph_input_kvq : public llm_graph_input_i {
 public:
     llm_graph_input_kvq(const llama_memory_hybrid_kvq_context * mctx, bool causal_attn) :
@@ -181,7 +187,7 @@ public:
                 mctx->get_store()->begin_ubatch(*ubatch);
             } else if (scratch) {
                 if (tail && !scr_cells) {
-                    mctx->set_input_kvq_scr(mask_scr.raw, ubatch, n_host);
+                    mctx->set_input_kvq_scr(mask_scr.raw, ubatch, n_host, scr_r0);
                 }
                 mctx->get_store()->begin_scr(*ubatch);
             }
@@ -204,7 +210,7 @@ public:
         bool res = p.enabled == params.enabled && p.n_top == params.n_top && p.stats == params.stats;
 
         res &= p.packed == params.packed && p.max_batch == params.max_batch && p.prefetch_n == params.prefetch_n && p.lead == params.lead &&
-               p.sync_mode == params.sync_mode && p.sync_m == params.sync_m && p.all_resident == params.all_resident;
+               p.sync_mode == params.sync_mode && p.sync_m == params.sync_m && p.all_resident == params.all_resident && p.scr_block == params.scr_block;
 
         if (res && params.enabled && params.packed) {
             res &= store == mctx->get_store();
@@ -217,7 +223,7 @@ public:
                 res &= mask_attn.raw->ne[1] == gparams.ubatch.n_tokens;
             }
             if (res && scratch && tail && !scr_cells) {
-                res &= mask_scr.raw->ne[0] == kvq_scr_rows(store, n_host, gparams.ubatch);
+                res &= scr_rows == kvq_scr_rows(store, n_host, gparams.ubatch) && scr_r0 == kvq_scr_r0(p, n_host);
                 res &= mask_scr.raw->ne[1] == gparams.ubatch.n_tokens;
             }
         } else if (res && params.enabled) {
@@ -257,7 +263,9 @@ public:
 
     // tail mode: the cache is a ring without the coarse region
     bool          tail = false;
-    llm_attn_mask mask_scr; // F16 [n_rows, n_tokens], scratch attention in tail mode, row r = position r (see kvq_scr_rows)
+    llm_attn_mask mask_scr; // F16 [scr_rows - scr_r0, n_tokens], scratch attention in tail mode, row r = position r (see kvq_scr_rows)
+    int64_t       scr_rows = 0;
+    int64_t       scr_r0   = 0; // see kvq_scr_r0
 
     const llama_memory_hybrid_kvq_context * mctx;
 
@@ -470,9 +478,10 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
             ggml_set_name(inp->mask_early.raw, "kvq_mask_early");
         }
         if (inp->scratch && inp->tail && !inp->scr_cells) {
-            const int64_t n_rows = kvq_scr_rows(inp->store, inp->n_host, ubatch);
-            inp->mask_scr.n_kv = n_rows;
-            inp->mask_scr.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_rows, n_tokens);
+            inp->scr_rows      = kvq_scr_rows(inp->store, inp->n_host, ubatch);
+            inp->scr_r0        = kvq_scr_r0(inp->params, inp->n_host);
+            inp->mask_scr.n_kv = inp->scr_rows - inp->scr_r0;
+            inp->mask_scr.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->mask_scr.n_kv, n_tokens);
             ggml_set_input(inp->mask_scr.raw);
             ggml_set_name(inp->mask_scr.raw, "kvq_mask_scr");
         }
@@ -503,13 +512,14 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
 
         // tail mode: and the scratch attention over the largest coarse region (flash attention keeps f16 copies of K/V in the compute buffer)
         if (inp->store->tail_mode() && inp->store->scratch_ok()) {
-            const int64_t n_mask = inp->store->n_rows() + inp->store->n_ring();
             inp->tail          = true;
             inp->scratch       = true;
             inp->n_coarse      = inp->store->n_rows();
             inp->n_host        = inp->store->n_rows();
-            inp->mask_scr.n_kv = n_mask;
-            inp->mask_scr.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_mask, n_tokens);
+            inp->scr_rows      = inp->store->n_rows() + inp->store->n_ring();
+            inp->scr_r0        = kvq_scr_r0(inp->params, inp->n_host);
+            inp->mask_scr.n_kv = inp->scr_rows - inp->scr_r0;
+            inp->mask_scr.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->mask_scr.n_kv, n_tokens);
             ggml_set_input(inp->mask_scr.raw);
             ggml_set_name(inp->mask_scr.raw, "kvq_mask_scr");
         }
@@ -865,7 +875,7 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
     // the scratch rows: the rows of the host store, then the cells after them (tail mode: the ring cells of the positions after them, in order)
     // host ring: the host store has the rows before the ubatch; no host rows yet: the rows of the cells, in the order of the cells (no wrap)
     const int64_t n_host = inp_kvq->n_host;
-    const int64_t n_rows = inp_kvq->tail && !inp_kvq->scr_cells ? inp_kvq->mask_scr.raw->ne[0] : mctx_attn->get_n_kv();
+    const int64_t n_rows = inp_kvq->tail && !inp_kvq->scr_cells ? inp_kvq->scr_rows : mctx_attn->get_n_kv();
     GGML_ASSERT((n_host == store->n_host() || !inp_kvq->params.enabled) && n_rows > n_host);
 
     if (hring) {
@@ -898,15 +908,49 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
     // the scratch is head-major, so its V view looks transposed to build_attn_mha: the flash attention part of it
     GGML_ASSERT(cparams.flash_attn);
     ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
-    ggml_tensor * k = ggml_permute(ctx0, store->get_scr(ctx0, false, n_rows), 0, 2, 1, 3);
-    ggml_tensor * v = ggml_permute(ctx0, store->get_scr(ctx0, true,  n_rows), 0, 2, 1, 3);
 
     ggml_tensor * mask = inp_kvq->tail && !inp_kvq->scr_cells ? inp_kvq->mask_scr.raw : inp->self_attn_mask.raw;
 
-    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k, v, mask, kq_scale, hparams.f_max_alibi_bias,
-            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
-    ggml_prec_set_acc(cur, GGML_PREC_F32);
+    const float softcap = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
+
+    // tail mode: the host rows [0, r0) in key blocks without a mask, then the rows [r0, n_rows) with the mask, so the f16 copies of K/V
+    // are made per block; the partial results are merged by their log-sum-exp l: w = sigmoid(l_b - l), o += (o_b - o)*w, l += softplus(l_b - l)
+    const int64_t r0 = inp_kvq->tail && !inp_kvq->scr_cells ? inp_kvq->scr_r0 : 0;
+    const int64_t nb = inp_kvq->params.scr_block/256*256;
+
+    ggml_tensor * cur = nullptr;
+    ggml_tensor * lse = nullptr;
+    for (int64_t b0 = 0; b0 < n_rows; ) {
+        const bool    last = b0 >= r0;
+        const int64_t n    = last ? n_rows - b0 : std::min(nb, r0 - b0);
+
+        ggml_tensor * k = ggml_permute(ctx0, store->get_scr(ctx0, false, n, b0), 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx0, store->get_scr(ctx0, true,  n, b0), 0, 2, 1, 3);
+
+        if (r0 == 0) {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, mask, kq_scale, hparams.f_max_alibi_bias, softcap);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
+            break;
+        }
+
+        ggml_tensor * fa = ggml_flash_attn_ext_lse(ctx0, q, k, v, last ? mask : nullptr, kq_scale, hparams.f_max_alibi_bias, softcap);
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
+
+        ggml_tensor * o_b = ggml_view_3d(ctx0, fa, fa->ne[0], fa->ne[1], n_tokens, fa->nb[1], fa->nb[2], 0);
+        ggml_tensor * l_b = ggml_view_3d(ctx0, fa, 1, fa->ne[1], n_tokens, sizeof(float), fa->ne[1]*sizeof(float), n_tokens*fa->nb[2]);
+        if (cur == nullptr) {
+            cur = o_b;
+            lse = l_b;
+        } else {
+            ggml_tensor * d = ggml_sub(ctx0, l_b, lse);
+            cur = ggml_add(ctx0, cur, ggml_mul(ctx0, ggml_sub(ctx0, o_b, cur), ggml_sigmoid(ctx0, d)));
+            if (!last) {
+                lse = ggml_add(ctx0, lse, ggml_softplus(ctx0, d));
+            }
+        }
+        b0 += n;
+    }
     cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     ggml_build_forward_expand(gf, cur);
     cb(cur, "kqv_out", il);

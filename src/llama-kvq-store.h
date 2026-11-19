@@ -218,8 +218,8 @@ public:
     void build_scr_up  (ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
     void build_scr_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
 
-    // K or V of scratch rows [0, n): [D, G, n, 1], like a cache view
-    ggml_tensor * get_scr(ggml_context * ctx, bool is_v, int64_t n) const;
+    // K or V of scratch rows [r0, r0 + n): [D, G, n, 1], like a cache view
+    ggml_tensor * get_scr(ggml_context * ctx, bool is_v, int64_t n, int64_t r0 = 0) const;
 
     // copies cache rows [c0, c0 + n) of layer il to scratch rows [r0, r0 + n), K or V
     ggml_tensor * build_scr_copy(ggml_context * ctx, int32_t il, bool is_v, int64_t c0, int64_t n, int64_t r0) const;

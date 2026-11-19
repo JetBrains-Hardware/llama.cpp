@@ -33,6 +33,7 @@
 //   ubatches of up to 8 tokens attend through the packed path, larger ones through flash attention over the q8_0 cache
 //   --kvq-pf-n 1024, --kvq-cap 0 (6 x pf-n), --kvq-lead 2, --kvq-sync off|count|always, --kvq-sync-m 64, --kvq-sync-hits 48,
 //   --kvq-all-resident (debug: every coarse row resident), --kvq-pk-stats (top-m counters with sync off)
+//   --kvq-scr-block N: the scratch attention of a large ubatch in key blocks of N rows, 0: one attention with a mask (llama_kvq_params::scr_block)
 // --kvq-no-rot: attention rotation off (for references of the packed mode)
 // --kvq-perf: no logits processing, decode times per chunk only
 //
@@ -125,6 +126,7 @@ struct kvq_args {
     int32_t pk_pf_n         = 1024;
     int32_t pk_cap          = 0;
     int32_t pk_lead         = 2;
+    int32_t pk_scr_block    = 16384;
     int32_t pk_sync         = LLAMA_KVQ_SYNC_OFF;
     int32_t pk_sync_m       = 64;
     int32_t pk_sync_hits    = 48;
@@ -303,6 +305,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.pk_cap = std::stoi(argv[++i]);
         } else if (a == "--kvq-lead" && has_val) {
             args.pk_lead = std::stoi(argv[++i]);
+        } else if (a == "--kvq-scr-block" && has_val) {
+            args.pk_scr_block = std::stoi(argv[++i]);
         } else if (a == "--kvq-sync" && has_val) {
             const std::string v = argv[++i];
             if (v == "off") {
@@ -387,7 +391,7 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
                 "       [--kvq-variant exact|q8_0|aff8|K<b>V<b>|K<b>|V<b>] [--kvq-sinks 4] [--kvq-recent 0] [--kvq-qwin 2048] [--kvq-fit-chunk 0 [--kvq-kmetric own|last]]\n"
                 "       [--kvq-save-tables tables.bin] [--kvq-load-tables tables.bin [--kvq-load-only k|v] [--kvq-own-mean-k]] [--kvq-stats]\n"
                 "       [--kvq-two-tier all-precise|all-coarse|none|<N> [--kvq-protect 512] [--kvq-precise aff8|exact] [--kvq-tt-stats]]\n"
-                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 0] [--kvq-lead 2] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
+                "       [--kvq-packed [--kvq-pf-n 1024] [--kvq-cap 0] [--kvq-lead 2] [--kvq-scr-block 16384] [--kvq-sync off|count|always] [--kvq-sync-m 64] [--kvq-sync-hits 48]\n"
                 "                     [--kvq-all-resident] [--kvq-pk-stats]] [--kvq-no-rot] [--kvq-perf]\n"
                 "       [--kvq-lib [--kvq-lib-vtab vtab.bin] [--kvq-fit-threads 8] [--kvq-lib-nowait] [--kvq-lib-busy] [--kvq-rm-test]] [common args]\n", argv[0]);
         return false;
@@ -1883,6 +1887,7 @@ int main(int argc, char ** argv) {
     tp_packed.prefetch_n    = args.pk_pf_n;
     tp_packed.resident_cap  = args.pk_cap;
     tp_packed.lead          = args.pk_lead;
+    tp_packed.scr_block     = args.pk_scr_block;
     tp_packed.sync_mode     = args.pk_sync;
     tp_packed.sync_m        = args.pk_sync_m;
     tp_packed.sync_min_hits = args.pk_sync_hits;
