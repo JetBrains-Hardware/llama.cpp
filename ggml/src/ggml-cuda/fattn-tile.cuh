@@ -800,6 +800,7 @@ static __global__ void flash_attn_tile(
         const int  * KV_rows_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
+        float      * dst_lse_ptr,
         const float scale,
         const float max_bias,
         const float m0,
@@ -823,6 +824,7 @@ static __global__ void flash_attn_tile(
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
     GGML_UNUSED(KV_rows_ptr);
+    GGML_UNUSED(dst_lse_ptr);
 
     // Skip unused kernel variants for faster compilation:
 
@@ -1134,7 +1136,7 @@ static __global__ void flash_attn_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, dst_lse_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

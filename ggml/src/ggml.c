@@ -5414,7 +5414,8 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
         struct ggml_tensor  * kv_rows,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        bool                  lse) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
 
@@ -5443,12 +5444,17 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
         GGML_ASSERT(mask);
     }
 
+    // the log-sum-exp goes after the rows of the result
+    GGML_ASSERT(!lse || (q->ne[3] == 1 && !kv_rows));
+    const int64_t n_lse = lse ? (q->ne[1] + v->ne[0] - 1)/v->ne[0] : 0;
+
     // permute(0, 2, 1, 3)
-    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1] + n_lse, q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 5, lse ? 1 : 0);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5469,7 +5475,19 @@ struct ggml_tensor * ggml_flash_attn_ext(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, false);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_lse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, true);
 }
 
 struct ggml_tensor * ggml_flash_attn_ext_rows(
@@ -5482,9 +5500,15 @@ struct ggml_tensor * ggml_flash_attn_ext_rows(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap, false);
 }
 
+bool ggml_flash_attn_ext_get_lse(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 5) != 0;
+}
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {

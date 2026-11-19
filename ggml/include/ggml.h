@@ -2270,6 +2270,23 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // same as ggml_flash_attn_ext (ne3 == 1), plus the log-sum-exp of the logits (scaled, with mask and sinks) of each query and head
+    // res: [n_embd_v, n_head, n_batch + ceil(n_batch/n_embd_v), 1]
+    //      rows [0, n_batch) of dim 2 are the result of ggml_flash_attn_ext, after them F32 [n_head, n_batch] the log-sum-exp
+    // use: merge attentions over disjoint K/V sets (a fully masked query gets -inf)
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_lse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    GGML_API bool ggml_flash_attn_ext_get_lse(
+            const struct ggml_tensor * a);
+
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
