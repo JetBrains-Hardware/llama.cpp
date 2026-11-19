@@ -319,6 +319,12 @@ private:
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // the ubatch is a token generation ubatch (tg phase): at most n_tokens_tg tokens
+    bool ubatch_tg(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) const;
+
+    // switches the device compute buffers to the sizes of the tg or the pp phase
+    void phase_set(bool tg);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -406,6 +412,16 @@ private:
     sched_params sched_params_cur;
 
     bool sched_need_reserve = true;
+
+    // compute buffers per phase: the prompt ubatches (pp) and the ubatches of at most n_tokens_tg tokens (tg), see phase_set
+    // the device buffers hold the sizes of the current phase only; host buffers are kept (SIZE_MAX)
+    bool     phase_on    = false; // cparams.phase_bufs and the context can use it
+    bool     phase_tg    = false;
+    uint32_t n_tokens_tg = 0;
+    std::vector<size_t> phase_size_pp; // the reserve of the pp graph
+    std::vector<size_t> phase_size_tg; // the reserve of a tg graph, at least the largest size used in a tg phase
+    int32_t  n_phase_switch = 0;
+    double   t_phase_switch = 0.0; // ms
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

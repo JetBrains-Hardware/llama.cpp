@@ -432,6 +432,8 @@ llama_context::llama_context(
         }
     }
 
+    cparams.phase_bufs = params.phase_bufs;
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -662,8 +664,13 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (n_phase_switch > 0) {
+        LLAMA_LOG_INFO("%s: %d switches of the compute buffers between the pp and the tg phase, %.2f ms in all\n", __func__, n_phase_switch, t_phase_switch);
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.no_alloc() && !opt_ctx) {
+    // the phases change the sizes
+    if (!model.no_alloc() && !opt_ctx && !phase_on) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -848,6 +855,25 @@ void llama_context::sched_reserve() {
         /*.op_offload =*/ cparams.op_offload,
     });
 
+    // per-phase compute buffers, see phase_set
+    {
+        const bool has_dev = std::any_of(backend_buft.begin(), backend_buft.end(), [](ggml_backend_buffer_type_t b) { return !ggml_backend_buft_is_host(b); });
+
+        // one sequence: prompt and generation ubatches do not alternate (several sequences can mix them in every batch)
+        n_tokens_tg = std::min(cparams.n_outputs_max, n_tokens);
+        phase_on    = cparams.phase_bufs && has_dev && !model.no_alloc() && !cparams.pipeline_parallel && !cparams.training && n_tokens_tg < n_tokens &&
+                      cparams.n_seq_max == 1;
+        phase_tg    = false;
+
+        phase_size_pp.assign(backend_ptrs.size(), SIZE_MAX);
+        phase_size_tg.assign(backend_ptrs.size(), SIZE_MAX);
+        if (phase_on) {
+            // the reserve below allocates the pp sizes exactly
+            const std::vector<size_t> sizes(backend_ptrs.size(), 0);
+            ggml_backend_sched_resize_buffers(sched.get(), sizes.data());
+        }
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -922,6 +948,19 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    // the tg phase: the sizes of a tg graph
+    if (phase_on) {
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        if (!graph_reserve(n_tokens_tg, n_seqs, n_tokens_tg, mctx.get(), true, sizes.data())) {
+            throw std::runtime_error("failed to reserve the tg graph");
+        }
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (!ggml_backend_buft_is_host(backend_buft[i])) {
+                phase_size_tg[i] = sizes[i];
+            }
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -950,10 +989,18 @@ void llama_context::sched_reserve() {
         if (!model.no_alloc()) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
+        if (phase_on && !ggml_backend_buft_is_host(buft)) {
+            phase_size_pp[i] = backend_buf_exp_size[i];
+        }
         if (backend_buf_exp_size[i] > 1) {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
+        }
+        if (phase_on && phase_size_tg[i] != SIZE_MAX) {
+            LLAMA_LOG_INFO("%s: %10s compute buffer size of the tg phase (ubatches of up to %u tokens) = %8.2f MiB%s\n", __func__,
+                    ggml_backend_buft_name(buft), n_tokens_tg, phase_size_tg[i] / 1024.0 / 1024.0,
+                    phase_size_tg[i] == 0 ? " (grows to the largest tg graph)" : "");
         }
     }
 
@@ -1842,11 +1889,58 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::ubatch_tg(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) const {
+    GGML_UNUSED(mctx);
+    return ubatch.n_tokens <= n_tokens_tg;
+}
+
+void llama_context::phase_set(bool tg) {
+    if (tg == phase_tg) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+
+    size_t size0 = 0;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        const size_t s = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        size0 += phase_size_pp[i] != SIZE_MAX ? s : 0;
+        // the next tg phase starts with the sizes this one reached
+        if (!tg && phase_size_tg[i] != SIZE_MAX) {
+            phase_size_tg[i] = std::max(phase_size_tg[i], s);
+        }
+    }
+
+    for (auto * backend : backend_ptrs) {
+        ggml_backend_synchronize(backend);
+    }
+    const int64_t t1 = ggml_time_us();
+    if (!ggml_backend_sched_resize_buffers(sched.get(), tg ? phase_size_tg.data() : phase_size_pp.data())) {
+        LLAMA_LOG_WARN("%s: a compute buffer of the %s phase was not allocated, the next graph reserves it\n", __func__, tg ? "tg" : "pp");
+    }
+    gf_res_prev_active = nullptr;
+    phase_tg = tg;
+
+    size_t size1 = 0;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        size1 += phase_size_pp[i] != SIZE_MAX ? ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) : 0;
+    }
+    const double ms = (ggml_time_us() - t0)/1000.0;
+    n_phase_switch++;
+    t_phase_switch += ms;
+    LLAMA_LOG_INFO("%s: %s phase, device compute buffers %.2f -> %.2f MiB in %.2f ms (%.2f ms of it the wait for the queued work)\n", __func__,
+            tg ? "tg" : "pp", size0/1048576.0, size1/1048576.0, ms, (t1 - t0)/1000.0);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // the compute buffers of the phase of the ubatch
+    if (phase_on) {
+        phase_set(ubatch_tg(ubatch, mctx));
     }
 
     auto * res = get_gf_res_prev();
@@ -3098,10 +3192,14 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-        GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
+    } else {
+        // the buffers can grow to the reserve: the next tg ubatch switches again
+        phase_tg = false;
+        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            GGML_ASSERT(!sizes);
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return nullptr;
+        }
     }
 
     return gf;
@@ -4480,6 +4578,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.phase_bufs                  =*/ true,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
