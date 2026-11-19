@@ -1391,9 +1391,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // two-tier KV cache: the memory of the context is created in packed mode, without the attention rotation
     // the flags are per model, so a later context (e.g. MTP) loses the rotation too
     if (params.kvq.enabled) {
-        char arch[64] = {};
-        if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) <= 0 || std::string(arch) != "qwen35") {
-            COM_ERR("%s: --kvq needs a qwen35 model (this one is '%s')\n", __func__, arch);
+        std::string why;
+        if (!llama_model_supports_kvq(model, &why)) {
+            COM_ERR("%s: --kvq is not supported by this model: %s\n", __func__, why.c_str());
             return;
         }
         llama_model_set_kvq_packed(model, true);

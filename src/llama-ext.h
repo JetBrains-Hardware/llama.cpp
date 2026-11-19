@@ -155,6 +155,11 @@ static inline int32_t llama_kvq_resident_slots(const llama_kvq_params & p) {
     return p.resident_cap > 0 ? p.resident_cap : p.max_batch*p.prefetch_n;
 }
 
+// whether the two-tier KV cache can serve the model: arch qwen35 and the shape its code assumes (K and V head size 256 in every
+// attention layer, the same number of query and kv heads in all of them, a whole number of query heads per kv head);
+// reason (optional) says what fails; the kv type (q8_0) is a context setting and is checked when the memory is created
+LLAMA_API bool llama_model_supports_kvq(const struct llama_model * model, std::string * reason = nullptr);
+
 // packed mode: the contexts created from this model attend through ggml_kvq_attn (qwen35 only)
 LLAMA_API void llama_model_set_kvq_packed(struct llama_model * model, bool value);
 

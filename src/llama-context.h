@@ -22,6 +22,7 @@ class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
+class llama_memory_hybrid_kvq;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -352,6 +353,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    llama_memory_hybrid_kvq * mem_kvq = nullptr; // memory.get() when it is the two-tier KV cache, set once where the memory is created
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

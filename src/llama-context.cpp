@@ -572,9 +572,10 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        mem_kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get());
 
         // the packed two-tier graphs build their attention masks over the cells, not over kv_rows
-        if (dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()) != nullptr) {
+        if (mem_kvq != nullptr) {
             cparams.auto_fkvr     = false;
             cparams.fused_kv_rows = false;
         }
@@ -825,8 +826,8 @@ void llama_context::sched_new(const sched_params & params) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
     // the triggers of the packed two-tier attention do not wait for the GPU
-    sched_copy_early = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()) != nullptr;
-    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get())) {
+    sched_copy_early = mem_kvq != nullptr;
+    if (auto * kvq = mem_kvq) {
         kvq->set_backends(backend_ptrs);
         // the end of a prompt: the device codes of the two-tier cache are allocated after the prompt buffers are freed
         kvq->set_tg_cb([this]() {
@@ -843,7 +844,7 @@ void llama_context::sched_new(const sched_params & params) {
 
 void llama_context::sched_reserve() {
     // the fit mode of the packed two-tier attention adds statistics nodes to every graph
-    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()); kvq && kvq->fit_graph_kind() != kvq_fit_graph) {
+    if (auto * kvq = mem_kvq; kvq && kvq->fit_graph_kind() != kvq_fit_graph) {
         kvq_fit_graph      = kvq->fit_graph_kind();
         sched_need_reserve = true;
     }
@@ -882,7 +883,7 @@ void llama_context::sched_reserve() {
         /*.op_offload =*/ cparams.op_offload,
     });
 
-    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get());
+    auto * kvq = mem_kvq;
 
     // per-phase compute buffers, see phase_set
     {
@@ -1974,7 +1975,7 @@ void llama_context::phase_set(bool tg) {
     }
 
     // the copy streams of the two-tier cache read graph tensors
-    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()); kvq && kvq->get_store()) {
+    if (auto * kvq = mem_kvq; kvq && kvq->get_store()) {
         kvq->get_store()->synchronize();
     }
     for (auto * backend : backend_ptrs) {
@@ -3386,7 +3387,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // the triggers of the packed two-tier attention
-    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(lctx->memory.get()); kvq && kvq->sched_copy(backend, src, dst, graph)) {
+    if (auto * kvq = lctx->mem_kvq; kvq && kvq->sched_copy(backend, src, dst, graph)) {
         return true;
     }
 
