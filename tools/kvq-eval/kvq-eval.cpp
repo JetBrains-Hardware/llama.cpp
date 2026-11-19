@@ -751,9 +751,8 @@ int main(int argc, char ** argv) {
         params.kvq.scr_block    = args.pk_scr_block;
     }
     if (args.rm_test || args.rb_test) {
-        // recurrent snapshots for a seq_rm into the last ubatch (n_rs_seq follows the speculative settings)
-        params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
-        params.speculative.draft.n_max = 4;
+        // recurrent snapshots for a seq_rm into the last ubatch
+        params.n_rs_seq = 4;
     }
     // no warmup decode in the measured context
     if (args.lib() || args.no_rot) {
