@@ -280,8 +280,10 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // embd: an embd ubatch (rows of ctx_other's layer input device buffer if the context reads them), the injection batches of a DFlash draft
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool embd = false);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -422,6 +424,9 @@ private:
     std::vector<size_t> phase_size_tg; // the reserve of a tg graph, at least the largest size used in a tg phase
     int32_t  n_phase_switch = 0;
     double   t_phase_switch = 0.0; // ms
+
+    // rows of the layer input device buffer: n_batch, or n_tokens_tg while the batches are that small (phases on)
+    int64_t layer_inp_rows = 0;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
