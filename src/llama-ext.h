@@ -155,6 +155,14 @@ static inline int32_t llama_kvq_resident_slots(const llama_kvq_params & p) {
     return p.resident_cap > 0 ? p.resident_cap : p.max_batch*p.prefetch_n;
 }
 
+// packed mode: the contexts created from this model attend through ggml_kvq_attn (qwen35 only)
+LLAMA_API void llama_model_set_kvq_packed(struct llama_model * model, bool value);
+
+// packed mode: the attention cache of the contexts created from this model holds n_cells > 0 cells as a ring (position p in cell p mod n_cells,
+// at most one cell per position of the context), in pinned host memory; the fit mode (llama_memory_kvq_fit_enable) removes the positions
+// of the coarse region from it; the context size still limits the positions; the large ubatches attend over the scratch
+LLAMA_API void llama_model_set_kvq_tail(struct llama_model * model, uint32_t n_cells);
+
 // packed mode counters, per attention layer; times in seconds
 struct llama_kvq_counters {
     int32_t il = -1;
@@ -187,6 +195,9 @@ struct llama_kvq_counters_all {
     int64_t n_ubatch   = 0; // ubatches through the packed path
     int64_t n_tokens   = 0;
 };
+
+LLAMA_API bool llama_memory_kvq_get_counters(llama_memory_t mem, llama_kvq_counters_all & out);
+LLAMA_API void llama_memory_kvq_reset_counters(llama_memory_t mem);
 
 // device and host memory of the packed state, bytes
 struct llama_kvq_memory_info {
@@ -243,6 +254,10 @@ struct llama_kvq_fit_params {
     int32_t     min_rows  = 256; // own: the smallest chunk of the rows after the last complete chunk (a covariance of fewer than D + 1 rows is rank deficient)
 };
 
+// the memory must be empty and created in packed mode (llama_model_set_kvq_packed)
+// the coarse region can grow to the full chunks of the cache; enabled until the memory is freed, clear() keeps it
+LLAMA_API bool llama_memory_kvq_fit_enable(llama_memory_t mem, const llama_kvq_fit_params & fparams, const llama_kvq_params & params);
+
 struct llama_kvq_fit_progress {
     int32_t n_coarse  = 0; // rows of the coarse region
     int32_t n_chunk   = 0; // chunks in the coarse region
@@ -265,6 +280,18 @@ struct llama_kvq_fit_progress {
     int32_t n_settle    = 0;    // llama_memory_kvq_fit_wait calls that fitted something
     double  t_settle    = 0.0;  // decode thread seconds of these calls
 };
+
+LLAMA_API bool llama_memory_kvq_fit_get_progress(llama_memory_t mem, llama_kvq_fit_progress & out);
+
+// the end of a prompt: fits every chunk that is not fitted yet and the rows after the last complete chunk (see llama_kvq_rem),
+// waits for all of it; afterwards no fit work runs. Call it between decodes, from the decode thread
+LLAMA_API bool llama_memory_kvq_fit_wait(llama_memory_t mem);
+
+// debug: hold = true: finished chunks join the coarse region only in llama_memory_kvq_fit_wait
+LLAMA_API bool llama_memory_kvq_fit_set_hold(llama_memory_t mem, bool hold);
+
+// scheduler splits of the last graph
+LLAMA_API int32_t llama_context_n_splits(const struct llama_context * ctx);
 
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details

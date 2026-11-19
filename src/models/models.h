@@ -2833,13 +2833,62 @@ struct llama_model_qwen35 : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
+    // two-tier attention inputs on top of the hybrid input, see llama_memory_hybrid_kvq
+    class llm_graph_input_kvq;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
     private:
+        // nullptr unless the memory keeps a coarse copy of the K/V
+        llm_graph_input_kvq * build_inp_kvq() const;
+
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
+                            int   il);
+
+        // packed two-tier attention of a small ubatch through ggml_kvq_attn
+        ggml_tensor * build_attn_kvq_packed(
+        llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                          float   kq_scale,
+                            int   il);
+
+        // fit mode, large ubatch: flash attention over the scratch rows (coarse region from the host store, the rest from the cache)
+        // host ring: the rows of the ubatch go to the scratch rows of their positions (inp_pos)
+        ggml_tensor * build_attn_kvq_scratch(
+        llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                    ggml_tensor * inp_pos,
+                          float   kq_scale,
+                            int   il);
+
+        // the early query of attention layer il from the hidden state x, and the prefetch of its top rows
+        void build_kvq_prefetch(
+        llm_graph_input_attn_kv * inp_attn,
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * x,
+                    ggml_tensor * inp_pos,
+                            int   il);
+
+        // fit mode: adds the query statistics of the ubatch to the store
+        void build_kvq_qstat(
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * q,
+                            int   il);
+
+        // fit mode with per-chunk V: adds the sum of sigmoid(gate) of the ubatch to the store
+        void build_kvq_gstat(
+            llm_graph_input_kvq * inp_kvq,
+                    ggml_tensor * gate_sigmoid,
                             int   il);
 
         ggml_tensor * build_layer_attn_linear(

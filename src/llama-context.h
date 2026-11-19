@@ -321,7 +321,7 @@ private:
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
-    // the ubatch is a token generation ubatch (tg phase): at most n_tokens_tg tokens
+    // the ubatch is a token generation ubatch (tg phase): at most n_tokens_tg tokens, and not a prompt ubatch of the two-tier cache
     bool ubatch_tg(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) const;
 
     // switches the device compute buffers to the sizes of the tg or the pp phase
@@ -421,12 +421,14 @@ private:
     bool     phase_tg    = false;
     uint32_t n_tokens_tg = 0;
     std::vector<size_t> phase_size_pp; // the reserve of the pp graph
-    std::vector<size_t> phase_size_tg; // the reserve of a tg graph, at least the largest size used in a tg phase
+    std::vector<size_t> phase_size_tg; // the reserve of a tg graph (0 with the two-tier cache), at least the largest size used in a tg phase
     int32_t  n_phase_switch = 0;
     double   t_phase_switch = 0.0; // ms
 
     // rows of the layer input device buffer: n_batch, or n_tokens_tg while the batches are that small (phases on)
     int64_t layer_inp_rows = 0;
+
+    int32_t kvq_fit_graph = 0; // llama_memory_hybrid_kvq::fit_graph_kind of the last reserve
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
@@ -446,6 +448,9 @@ private:
     };
 
     copy_experts_info copy_experts;
+
+    // the copy callback is called before the scheduler waits for the GPU, see sched_new
+    bool sched_copy_early = false;
 
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
