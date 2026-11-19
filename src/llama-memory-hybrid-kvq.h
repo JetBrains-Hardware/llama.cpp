@@ -134,7 +134,12 @@ public:
     bool prompt_bufs_alloc();
     void prompt_bufs_release();
 
+    // the context: switch to the buffers of the generation phase, called by fit_wait before the device codes are allocated
+    void set_tg_cb(std::function<void()> cb) { tg_cb = std::move(cb); }
+
 private:
+    std::function<void()> tg_cb;
+
     const llama_model & model;
 
     const bool packed;
@@ -163,7 +168,8 @@ private:
     bool tail_restore(llama_pos p_lo, llama_pos p_hi);
 
     // the layout of the positions [0, n) (llama_kvq_fitter::settle), the rows after its coarse region in the ring
-    bool settle(llama_pos n);
+    // end: the end of a prompt, the decode phase starts during the fit (see tg_cb)
+    bool settle(llama_pos n, bool end = false);
 
     // tail: before the batch is placed: the room in the ring for its positions (large batches: the jobs of the complete chunks, then
     // a spill of the ring rows to the host store; small batches: the jobs in flight are added first, a fold at a position set by p0)
@@ -232,6 +238,9 @@ public:
 
     // packed mode: the ubatch does not take the packed path (prompt ubatches; small ones after a rollback into the coarse region)
     bool prompt_path(const llama_ubatch & ubatch) const;
+
+    // fit mode, a packed ubatch: the device codes (llama_kvq_store::codes_alloc), after the context switched its compute buffers
+    bool codes_alloc(const llama_ubatch & ubatch) const;
 
 private:
     const llama_kv_cache * kv_attn = nullptr;

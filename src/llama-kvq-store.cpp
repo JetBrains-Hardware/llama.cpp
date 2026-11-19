@@ -53,6 +53,8 @@ struct llama_kvq_store::layer {
 
     uint8_t * store = nullptr; // [G][n_rows][2*ROW], K row then V row
 
+    uint8_t * hc[4] = {}; // fit mode: host copy of kc, vc, tinv, taux (the bytes of the device tensors)
+
     std::vector<int32_t>  ridx;       // [G + 1][cap_tot], mirror of t.ridx
     std::vector<uint64_t> res;        // [G][n_bmw], bitmap of the resident rows of the evictable slots
     std::vector<uint64_t> req;        // [G][n_bmw], bitmap of the rows of the request being planned, 0 between plans
@@ -567,6 +569,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
 
     ctx_dev   = init_ctx(layers.size()*8 + 4 + 2*N_TBUF);
+    ctx_codes = init_ctx(layers.size()*4);
     ctx_alias = init_ctx(layers.size()*3 + 1);
     ctx_host  = init_ctx(layers.size()*KIND_COUNT);
 
@@ -601,10 +604,10 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
 
     for (auto & l : layers) {
         layer_tensors & t = l.t;
-        t.kc   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, nwk, n_rows, G);
-        t.vc   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, nwv + 1, n_rows, G);
-        t.tinv = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_I8, D, D, 2*G, n_chunk);
-        t.taux = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_F32, D, 3, 2*G, n_chunk);
+        t.kc   = ggml_new_tensor_3d(ctx_codes.get(), GGML_TYPE_I32, nwk, n_rows, G);
+        t.vc   = ggml_new_tensor_3d(ctx_codes.get(), GGML_TYPE_I32, nwv + 1, n_rows, G);
+        t.tinv = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I8, D, D, 2*G, n_chunk);
+        t.taux = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_F32, D, 3, 2*G, n_chunk);
         t.rkv_h = bufs[l.buf].rkv_h;
         t.ridx  = bufs[l.buf].ridx;
         ggml_format_name(t.kc,    "kvq_kc-%d",    l.il);
@@ -648,6 +651,37 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     ggml_backend_buffer_clear(buf_dev.get(), 0);
     // as weights: the ops that read these tensors run on their device
     ggml_backend_buffer_set_usage(buf_dev.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // fit mode: every write of the codes and tables goes to a pinned host copy; with the shared memory the device copy exists
+    // only in the decode phase (codes_alloc, codes_free), else always
+    codes_dyn = !fill && dec_sep;
+    if (!fill) {
+        for (auto & l : layers) {
+            const ggml_tensor * ts[4] = { l.t.kc, l.t.vc, l.t.tinv, l.t.taux };
+            size_t sz = 0;
+            for (const ggml_tensor * t : ts) {
+                sz += ggml_nbytes(t);
+            }
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft_host, sz);
+            if (b == nullptr) {
+                b = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), sz);
+            }
+            if (b == nullptr) {
+                throw std::runtime_error("failed to allocate the host copy of the codes");
+            }
+            buf_hcodes.emplace_back(b);
+            uint8_t * p = (uint8_t *) ggml_backend_buffer_get_base(b);
+            for (int k = 0; k < 4; ++k) {
+                l.hc[k] = p;
+                p += ggml_nbytes(ts[k]);
+            }
+        }
+    }
+    if (!codes_dyn) {
+        if (!codes_alloc()) {
+            throw std::runtime_error("failed to allocate the packed two-tier codes");
+        }
+    }
 
     // set_rows has no q8_0 to q8_0 copy, so the scatter writes the rows of rkv as groups of 4 bytes (f32, half the threads of f16)
     for (size_t b = 0; b < bufs.size(); ++b) {
@@ -848,9 +882,9 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
 
     LLAMA_LOG_INFO("%s: n_coarse = %d of %d rows, %d chunks of %d rows, K %d / V %d bits (%d / %d words), resident slots %d + %d sinks%s\n", __func__,
             n_coarse_, n_rows, n_chunk, n_crow, bits_k, bits_v, nwk, nwv, cap, n_sink, all_res ? " (all resident)" : "");
-    LLAMA_LOG_INFO("%s: device: codes %.1f MiB, tables %.1f MiB, resident %.1f MiB, ring %.1f MiB, scratch %.1f MiB (%s), other %.1f MiB; host: store %.1f MiB (%s), ring %.1f MiB, other %.1f MiB\n", __func__,
-            mi.codes/1048576.0, mi.tables/1048576.0, mi.resident/1048576.0, mi.ring/1048576.0, mi.scratch/1048576.0, scr_ok ? "used" : "not used", mi.other_dev/1048576.0,
-            mi.host_store/1048576.0, mi.pinned ? "pinned" : "pageable", mi.host_ring/1048576.0, mi.host_other/1048576.0);
+    LLAMA_LOG_INFO("%s: device: codes %.1f MiB, tables %.1f MiB (%s), resident %.1f MiB, ring %.1f MiB, scratch %.1f MiB (%s), other %.1f MiB; host: store %.1f MiB (%s), codes and tables %.1f MiB, ring %.1f MiB, other %.1f MiB\n", __func__,
+            mi.codes/1048576.0, mi.tables/1048576.0, codes_dyn ? "decode phase only" : "always", mi.resident/1048576.0, mi.ring/1048576.0, mi.scratch/1048576.0, scr_ok ? "used" : "not used", mi.other_dev/1048576.0,
+            mi.host_store/1048576.0, mi.pinned ? "pinned" : "pageable", mi.host_codes/1048576.0, mi.host_ring/1048576.0, mi.host_other/1048576.0);
 }
 
 llama_kvq_store::~llama_kvq_store() {
@@ -925,8 +959,15 @@ void llama_kvq_store::synchronize() {
 void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async) {
     GGML_ASSERT(!filled && c >= 0 && c < n_chunk && g >= 0 && g < G);
     GGML_ASSERT(!async || backend_main);
-    const layer_tensors & t = get_layer(il);
+    const layer & l = layers.at(layer_of_il.at(il));
+    const layer_tensors & t = l.t;
     const int64_t m = (int64_t) c*2*G + 2*g + (is_v ? 1 : 0);
+    memcpy(l.hc[2] + m*t.tinv->nb[2], inv, t.tinv->nb[2]);
+    memcpy(l.hc[3] + m*t.taux->nb[2], aux, t.taux->nb[2]);
+    if (!codes_on_dev()) {
+        return;
+    }
+    // a queued upload of codes_alloc may read the host copy now: this write comes after it on the main stream
     if (async) {
         ggml_backend_tensor_set_async(backend_main, t.tinv, inv, m*t.tinv->nb[2], t.tinv->nb[2]);
         ggml_backend_tensor_set_async(backend_main, t.taux, aux, m*t.taux->nb[2], t.taux->nb[2]);
@@ -946,6 +987,8 @@ void llama_kvq_store::set_n_host(int32_t n) {
             rg_ok = std::min(rg_ok, n);
         }
     }
+    // the codes of a job are rows of the host store; the rows after n need no upload
+    hc_hi = std::min(hc_hi, n);
     n_host_ = n;
 }
 
@@ -957,6 +1000,7 @@ void llama_kvq_store::set_n_coarse(int32_t n) {
     drop_pending();
     reset_base();
     synchronize();
+    hc_hi = std::max(hc_hi, n);
     if (n < n_coarse_) {
         // the slots of the removed rows become empty, the sinks keep their slots
         // a rotating layer gets its device ridx at every join
@@ -1040,13 +1084,16 @@ void llama_kvq_store::state_write_data(llama_io_write_i & io) {
         if (n == 0) {
             continue;
         }
-        for (ggml_tensor * rows : { l.t.kc, l.t.vc }) {
+        // from the host copy, the device may not have the codes
+        for (int k = 0; k < 2; ++k) {
+            const ggml_tensor * rows = k ? l.t.vc : l.t.kc;
             for (int32_t g = 0; g < G; ++g) {
-                io.write_tensor(rows, g*rows->nb[2], (size_t) n*rows->nb[1]);
+                io.write(l.hc[k] + g*rows->nb[2], (size_t) n*rows->nb[1]);
             }
         }
-        for (ggml_tensor * tab : { l.t.tinv, l.t.taux }) {
-            io.write_tensor(tab, 0, (size_t) ((n + n_crow - 1)/n_crow)*tab->nb[3]);
+        for (int k = 2; k < 4; ++k) {
+            const ggml_tensor * tab = k == 3 ? l.t.taux : l.t.tinv;
+            io.write(l.hc[k], (size_t) ((n + n_crow - 1)/n_crow)*tab->nb[3]);
         }
     }
 }
@@ -1063,14 +1110,19 @@ void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n, int32_t h
         if (n == 0) {
             continue;
         }
-        for (ggml_tensor * rows : { l.t.kc, l.t.vc }) {
+        for (int k = 0; k < 2; ++k) {
+            const ggml_tensor * rows = k ? l.t.vc : l.t.kc;
             for (int32_t g = 0; g < G; ++g) {
-                io.read_tensor(rows, g*rows->nb[2], (size_t) n*rows->nb[1]);
+                io.read(l.hc[k] + g*rows->nb[2], (size_t) n*rows->nb[1]);
             }
         }
-        for (ggml_tensor * tab : { l.t.tinv, l.t.taux }) {
-            io.read_tensor(tab, 0, (size_t) ((n + n_crow - 1)/n_crow)*tab->nb[3]);
+        for (int k = 2; k < 4; ++k) {
+            const ggml_tensor * tab = k == 3 ? l.t.taux : l.t.tinv;
+            io.read(l.hc[k], (size_t) ((n + n_crow - 1)/n_crow)*tab->nb[3]);
         }
+    }
+    if (codes_on_dev()) {
+        codes_up(n, false);
     }
     // the sink rows are read from the host store now
     n_host_ = h;
@@ -2233,6 +2285,8 @@ bool llama_kvq_store::scr_alloc() {
     }
     const int64_t t0 = ggml_time_us();
     if (dec_sep) {
+        // the scratch attention does not read the codes, the fitter writes them to the host copy
+        codes_free();
         if (scr_mode == 1) {
             return true;
         }
@@ -2308,6 +2362,87 @@ bool llama_kvq_store::dec_alloc() {
     return true;
 }
 
+uint8_t * llama_kvq_store::host_codes(int32_t il, bool is_v) const {
+    return layers.at(layer_of_il.at(il)).hc[is_v ? 1 : 0];
+}
+
+void llama_kvq_store::codes_written(int32_t r1) {
+    hc_hi = std::max(hc_hi, r1);
+}
+
+// host copy -> device: the codes of the rows [0, n), the tables of their chunk slots; async: on the main stream (pinned host copy)
+void llama_kvq_store::codes_up(int32_t n, bool async) {
+    const int32_t n_tab = (n + n_crow - 1)/n_crow;
+    for (auto & l : layers) {
+        ggml_tensor * ts[4] = { l.t.kc, l.t.vc, l.t.tinv, l.t.taux };
+        for (int k = 0; k < 4; ++k) {
+            ggml_tensor * t = ts[k];
+            const int64_t n_part = k < 2 ? G : 1;
+            const size_t  sz     = k < 2 ? (size_t) n*t->nb[1] : (size_t) n_tab*t->nb[3];
+            for (int64_t g = 0; g < n_part && sz > 0; ++g) {
+                const size_t off = k < 2 ? g*t->nb[2] : 0;
+                if (async) {
+                    ggml_backend_tensor_set_async(backend_main, t, l.hc[k] + off, off, sz);
+                } else {
+                    ggml_backend_tensor_set(t, l.hc[k] + off, off, sz);
+                }
+            }
+        }
+    }
+}
+
+bool llama_kvq_store::codes_alloc() {
+    if (buf_codes) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    buf_codes.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_codes.get(), buft));
+    if (!buf_codes) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the codes and tables on the device\n", __func__);
+        return false;
+    }
+    // the ops read only the rows of the coarse region and the tables of its chunks; zero is still the safe value elsewhere
+    ggml_backend_buffer_clear(buf_codes.get(), 0);
+    ggml_backend_buffer_set_usage(buf_codes.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    codes_gen_++;
+    // also the rows of the jobs whose codes are in the host copy and that have not joined the coarse region yet
+    const int32_t n = filled ? 0 : std::min(n_rows_, std::max(n_coarse_, hc_hi));
+    const bool async = backend_main != nullptr;
+    const int64_t t1 = ggml_time_us();
+    codes_up(n, async);
+    double t_up = -1.0;
+    if (async && getenv("LLAMA_KVQ_FIT_SYNC") != nullptr && atoi(getenv("LLAMA_KVQ_FIT_SYNC")) != 0) {
+        ggml_backend_synchronize(backend_main);
+        t_up = (ggml_time_us() - t1)/1000.0;
+    }
+    if (!filled) {
+        const size_t sz_rows = (size_t) n*(ggml_nbytes(layers[0].t.kc) + ggml_nbytes(layers[0].t.vc))/n_rows_*layers.size();
+        const size_t sz_tabs = (size_t) ((n + n_crow - 1)/n_crow)*(ggml_nbytes(layers[0].t.tinv) + ggml_nbytes(layers[0].t.taux))/n_chunk*layers.size();
+        LLAMA_LOG_INFO("%s: codes and tables (%.1f MiB) on the device in %.2f ms, upload of the host copy of the rows [0, %d) and %d chunk slots (%.1f MiB) %s%s\n", __func__,
+                ggml_backend_buffer_get_size(buf_codes.get())/1048576.0, (t1 - t0)/1000.0, n, (n + n_crow - 1)/n_crow, (sz_rows + sz_tabs)/1048576.0,
+                async ? "queued" : "done", t_up >= 0.0 ? format(", %.2f ms", t_up).c_str() : "");
+    }
+    return true;
+}
+
+void llama_kvq_store::codes_free() {
+    if (!buf_codes || !codes_dyn) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    // the queued graphs and fitter phases read and write them
+    synchronize();
+    buf_codes.reset();
+    for (auto & l : layers) {
+        for (ggml_tensor * t : { l.t.kc, l.t.vc, l.t.tinv, l.t.taux }) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+    }
+    codes_gen_++;
+    LLAMA_LOG_INFO("%s: codes and tables freed on the device in %.2f ms, the host copy holds them\n", __func__, (ggml_time_us() - t0)/1000.0);
+}
+
 llama_kvq_memory_info llama_kvq_store::memory_info() const {
     llama_kvq_memory_info mi;
     for (const auto & l : layers) {
@@ -2327,6 +2462,10 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     mi.other_dev += ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
     mi.scratch    = scr ? ggml_nbytes(scr) : 0;
     mi.host_other += (buf_pin ? ggml_backend_buffer_get_size(buf_pin.get()) : 0) + (buf_mir ? ggml_backend_buffer_get_size(buf_mir.get()) : 0);
+    for (const auto & b : buf_hcodes) {
+        mi.host_codes += ggml_backend_buffer_get_size(b.get());
+    }
+    mi.codes_dyn = codes_dyn;
     mi.pinned = !buf_store.empty() && ggml_backend_buffer_get_type(buf_store[0].get()) != ggml_backend_cpu_buffer_type();
     return mi;
 }
@@ -2338,6 +2477,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kvq_store::memory_breakdown()
     }
     if (buf_scr) {
         res[ggml_backend_buffer_get_type(buf_scr.get())] += ggml_backend_buffer_get_size(buf_scr.get());
+    }
+    if (buf_codes) {
+        res[ggml_backend_buffer_get_type(buf_codes.get())] += ggml_backend_buffer_get_size(buf_codes.get());
+    }
+    for (const auto & b : buf_hcodes) {
+        res[ggml_backend_buffer_get_type(b.get())] += ggml_backend_buffer_get_size(b.get());
     }
     for (const auto & b : buf_store) {
         res[ggml_backend_buffer_get_type(b.get())] += ggml_backend_buffer_get_size(b.get());

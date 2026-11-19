@@ -208,7 +208,7 @@ public:
 
         if (res && params.enabled && params.packed) {
             res &= store == mctx->get_store();
-            res &= store != nullptr && n_coarse == store->n_coarse() && n_host == store->n_host();
+            res &= store != nullptr && n_coarse == store->n_coarse() && n_host == store->n_host() && codes_gen == store->codes_gen();
             res &= packed_small == llama_kvq_use_packed(p, gparams.ubatch.n_tokens, n_coarse, n_host, mctx->get_attn()->get_n_kv(), tail);
             res &= scratch == kvq_use_scratch(p, store, packed_small, n_host);
             const int64_t n_mask = (tail ? n_coarse : 0) + mctx->get_attn()->get_n_kv();
@@ -247,6 +247,7 @@ public:
     int32_t n_coarse = 0;
     int32_t n_host   = 0; // fit mode: the rows of the host store, the scratch attention reads them from there
     bool    fit      = false;
+    uint32_t codes_gen = 0; // the views of the codes hold their device address
 
     // fit mode, large ubatch: the attention reads the scratch
     bool    scratch  = false;
@@ -448,6 +449,7 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
         inp->n_coarse     = inp->store->n_coarse();
         inp->n_host       = inp->store->n_host();
         inp->fit          = inp->store->fit_mode();
+        inp->codes_gen    = inp->store->codes_gen();
         inp->tail         = inp->store->tail_mode();
         inp->packed_small = llama_kvq_use_packed(inp->params, n_tokens, inp->n_coarse, inp->n_host, n_kv, inp->tail);
         inp->scratch      = kvq_use_scratch(inp->params, inp->store, inp->packed_small, inp->n_host);

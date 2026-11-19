@@ -262,6 +262,8 @@ LLAMA_API void llama_memory_kvq_reset_counters(llama_memory_t mem);
 struct llama_kvq_memory_info {
     size_t codes      = 0; // packed coarse rows
     size_t tables     = 0;
+    size_t host_codes = 0;     // fit mode: the pinned host copy of the codes and tables
+    bool   codes_dyn  = false; // the device holds the codes and tables in the decode phase only
     size_t resident   = 0; // rkv and ridx
     size_t ring       = 0; // host ring: the rotating tail buffers (device), the ring cells are pinned host memory of the attention cache
     size_t host_ring  = 0;

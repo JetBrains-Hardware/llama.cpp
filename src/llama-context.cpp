@@ -822,6 +822,12 @@ void llama_context::sched_new(const sched_params & params) {
     sched_copy_early = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()) != nullptr && getenv("LLAMA_KVQ_SCHED_SYNC") == nullptr;
     if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get())) {
         kvq->set_backends(backend_ptrs);
+        // the end of a prompt: the device codes of the two-tier cache are allocated after the prompt buffers are freed
+        kvq->set_tg_cb([this]() {
+            if (phase_on) {
+                phase_set(true);
+            }
+        });
     }
     ggml_backend_sched_set_copy_callback_early(sched.get(), sched_copy_early);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
@@ -1996,6 +2002,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // after apply: the two-tier cache can move the coarse region there
     if (phase_on) {
         phase_set(ubatch_tg(ubatch, mctx));
+    }
+
+    // the device codes of the two-tier cache after the prompt buffers are freed (or the end of the prompt allocated them)
+    if (const auto * kctx = dynamic_cast<const llama_memory_hybrid_kvq_context *>(mctx); kctx && !kctx->codes_alloc(ubatch)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the codes of the two-tier cache\n", __func__);
+        ret = GGML_STATUS_ALLOC_FAILED;
+        return nullptr;
     }
 
     auto * res = get_gf_res_prev();

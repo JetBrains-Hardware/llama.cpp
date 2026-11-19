@@ -197,7 +197,7 @@ void llama_kvq_fitter::dev_alloc() {
     const int64_t t0 = ggml_time_us();
     const int32_t G  = store.n_head_kv();
 
-    ggml_init_params ip = { 3*ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params ip = { 5*ggml_tensor_overhead(), nullptr, true };
     ctx_dev.reset(ggml_init(ip));
     ggml_init_params ia = { ggml_tensor_overhead(), nullptr, true };
     ctx_alias.reset(ggml_init(ia));
@@ -207,9 +207,13 @@ void llama_kvq_fitter::dev_alloc() {
     idx   = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_stage, G);
     par   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, KVQ_D, KVQ_NP, 2*G);
     stage = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, KVQ_D, 2, n_stage, G);
-    ggml_set_name(idx,   "kvq_fit_idx");
-    ggml_set_name(par,   "kvq_fit_par");
-    ggml_set_name(stage, "kvq_fit_stage");
+    cst[0] = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, store.n_words(false), n_stage, G);
+    cst[1] = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, store.n_words(true) + 1, n_stage, G);
+    ggml_set_name(idx,    "kvq_fit_idx");
+    ggml_set_name(par,    "kvq_fit_par");
+    ggml_set_name(stage,  "kvq_fit_stage");
+    ggml_set_name(cst[0], "kvq_fit_kc");
+    ggml_set_name(cst[1], "kvq_fit_vc");
     buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), store.dev_buft()));
     if (!buf_dev) {
         throw std::runtime_error("failed to allocate the fitter device buffer");
@@ -271,6 +275,8 @@ void llama_kvq_fitter::dev_free() {
     par     = nullptr;
     stage   = nullptr;
     stage_h = nullptr;
+    cst[0]  = nullptr;
+    cst[1]  = nullptr;
     LLAMA_LOG_INFO("%s: the device stage and the graph allocator are freed in %.2f ms\n", __func__, (ggml_time_us() - t0)/1000.0);
 }
 
@@ -621,8 +627,10 @@ ggml_cgraph * llama_kvq_fitter::build_phase(const job & jb, int phase, int32_t l
             ggml_set_name(sig, "kvq_fit_sig");
             ggml_build_forward_expand(gf, sig);
         } else {
-            ggml_tensor * rows = kv ? lt.vc : lt.kc;
-            ggml_tensor * rv   = ggml_view_3d(ctx, rows, rows->ne[0], n, G, rows->nb[1], rows->nb[2], (size_t) jb.r0*rows->nb[1]);
+            // the codes go to the host copy (queue_phase); without the device codes through the code stage
+            const bool    dev  = store.codes_on_dev();
+            ggml_tensor * rows = dev ? (kv ? lt.vc : lt.kc) : cst[kv];
+            ggml_tensor * rv   = ggml_view_3d(ctx, rows, rows->ne[0], n, G, rows->nb[1], rows->nb[2], dev ? (size_t) jb.r0*rows->nb[1] : 0);
             ggml_build_forward_expand(gf, ggml_kvq_fit(ctx, GGML_KVQ_FIT_CODE, y, pq, rv));
         }
     }
@@ -686,6 +694,18 @@ void llama_kvq_fitter::queue_phase(job & jb, int phase) {
             }
         } else if (phase == 2) {
             ggml_backend_tensor_get_async(backend, ggml_graph_get_tensor(gf, "kvq_fit_sig"), jb.hsig + li*G*KVQ_D, 0, G*KVQ_D*sizeof(float));
+        } else if (phase == 3) {
+            // the codes to the host copy, in the layout of kc / vc; done at the synchronize of the install
+            const bool dev = store.codes_on_dev();
+            for (int kv = 0; kv < 2; ++kv) {
+                const ggml_tensor * rows = kv ? store.get_layer(il).vc : store.get_layer(il).kc;
+                ggml_tensor       * src  = dev ? const_cast<ggml_tensor *>(rows) : cst[kv];
+                uint8_t           * dst  = store.host_codes(il, kv == 1);
+                for (int64_t g = 0; g < G; ++g) {
+                    ggml_backend_tensor_get_async(backend, src, dst + g*rows->nb[2] + (size_t) jb.r0*rows->nb[1],
+                            g*src->nb[2] + (dev ? (size_t) jb.r0*rows->nb[1] : 0), (size_t) jb.n()*rows->nb[1]);
+                }
+            }
         }
         // the ring rows to the host store [head][row][K, V]
         if (phase <= 1 && jb.r1 > jb.h1) {
@@ -694,6 +714,9 @@ void llama_kvq_fitter::queue_phase(job & jb, int phase) {
                 ggml_backend_tensor_get_async(backend, stage, dst, g*stage->nb[3] + (size_t) (jb.h1 - jb.r0)*2*KVQ_ROW, (size_t) (jb.r1 - jb.h1)*2*KVQ_ROW);
             }
         }
+    }
+    if (phase == 3) {
+        store.codes_written(jb.r1);
     }
     if (phase > 0 && jb.ev[phase == 2 ? 1 : 0]) {
         ggml_backend_event_record(jb.ev[phase == 2 ? 1 : 0].get(), backend);
@@ -1068,7 +1091,7 @@ void llama_kvq_fitter::wait_jobs() {
     }
 }
 
-llama_pos llama_kvq_fitter::settle(const llama_kv_cache & kv, llama_pos n) {
+llama_pos llama_kvq_fitter::settle(const llama_kv_cache & kv, llama_pos n, const std::function<void(llama_pos)> & queued) {
     snapshots(n);
     const std::vector<range> lay = layout(n);
     const llama_pos e = lay.empty() ? 0 : lay.back().r1;
@@ -1084,6 +1107,9 @@ llama_pos llama_kvq_fitter::settle(const llama_kv_cache & kv, llama_pos n) {
         if (!fitted(r) && !in_flight(r) && !take(kv, r)) {
             break;
         }
+    }
+    if (queued && !failed) {
+        queued(e);
     }
     wait_jobs();
     return failed ? store.n_coarse() : e;

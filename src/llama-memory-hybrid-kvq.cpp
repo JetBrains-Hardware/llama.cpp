@@ -220,9 +220,18 @@ bool llama_memory_hybrid_kvq::tail_restore(llama_pos p_lo, llama_pos p_hi) {
     return true;
 }
 
-bool llama_memory_hybrid_kvq::settle(llama_pos n) {
+bool llama_memory_hybrid_kvq::settle(llama_pos n, bool end) {
     store->sync_store(n_pos());
-    const llama_pos e = fitter->settle(*get_mem_attn(), n);
+    // the end of a prompt: the context frees its prompt buffers, then the device codes are allocated and the host copy uploaded
+    // while the CPU fits the last rows
+    const llama_pos e = fitter->settle(*get_mem_attn(), n, [&](llama_pos e_lay) {
+        if (end && e_lay > 0) {
+            if (tg_cb) {
+                tg_cb();
+            }
+            store->codes_alloc();
+        }
+    });
     if (tail) {
         tail_release();
         if (store->n_host() > e && !tail_restore(e, store->n_host())) {
@@ -610,7 +619,7 @@ bool llama_memory_hybrid_kvq::fit_wait() {
     }
     const int64_t t0 = ggml_time_us();
     const int32_t c0 = store->n_coarse();
-    const bool ok = settle(n_pos());
+    const bool ok = settle(n_pos(), true);
     if (store->n_coarse() != c0) {
         n_settle++;
         t_settle += (ggml_time_us() - t0)*1e-6;
@@ -798,6 +807,13 @@ bool llama_memory_hybrid_kvq_context::apply() {
     }
 
     return res;
+}
+
+bool llama_memory_hybrid_kvq_context::codes_alloc(const llama_ubatch & ubatch) const {
+    if (!mem_kvq || !store || !store->fit_mode() || prompt_path(ubatch)) {
+        return true;
+    }
+    return store->codes_alloc();
 }
 
 bool llama_memory_hybrid_kvq_context::prompt_path(const llama_ubatch & ubatch) const {

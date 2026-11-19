@@ -74,6 +74,7 @@ public:
         KIND_COUNT    = 6,
     };
 
+    // kc, vc, tinv, taux: in their own device buffer, with a pinned host copy in fit mode (see codes_alloc)
     struct layer_tensors {
         ggml_tensor * kc    = nullptr; // i32 [nwk, n_rows, G]
         ggml_tensor * vc    = nullptr; // i32 [nwv + 1, n_rows, G]
@@ -203,6 +204,16 @@ public:
     void scr_free();
     bool dec_alloc();
 
+    // fit mode: every write of the codes and tables goes to a pinned host copy first (same bytes as kc, vc, tinv, taux)
+    // with the shared memory the device copy exists only for the packed path: scr_alloc frees it, codes_alloc (end of a prompt,
+    // or dec_alloc) allocates it and queues the upload of the host copy on the main stream; else it exists always
+    uint8_t * host_codes(int32_t il, bool is_v) const;
+    void      codes_written(int32_t r1); // the fitter queued the codes of rows before r1 into the host copy
+    bool      codes_alloc();
+    void      codes_free();
+    bool      codes_on_dev() const { return buf_codes != nullptr; }
+    uint32_t  codes_gen()    const { return codes_gen_; } // changes when the device addresses of the codes change
+
     // the scratch triggers of layer il, see the class comment
     void build_scr_up  (ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
     void build_scr_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
@@ -279,6 +290,12 @@ private:
     std::unordered_map<const ggml_tensor *, std::pair<size_t, int>> trig_of; // trigger -> layer index, kind
 
     ggml_context_ptr        ctx_dev;
+    ggml_context_ptr        ctx_codes; // kc, vc, tinv, taux
+    ggml_backend_buffer_ptr buf_codes;
+    std::vector<ggml_backend_buffer_ptr> buf_hcodes; // host copy, one per layer
+    bool                    codes_dyn  = false; // the device copy only for the packed path
+    int32_t                 hc_hi      = 0;     // the host copy holds the codes of the rows that a later upload needs before this
+    uint32_t                codes_gen_ = 0;
     ggml_context_ptr        ctx_alias;
     ggml_context_ptr        ctx_host;
     ggml_backend_buffer_ptr buf_dev;
@@ -389,4 +406,5 @@ private:
     void ring_copy(bool to_store, int32_t p0, int32_t p1);
     void wait_mirrors();
     void reset_base();
+    void codes_up(int32_t n, bool async);
 };

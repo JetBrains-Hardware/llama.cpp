@@ -52,7 +52,8 @@ public:
 
     // the layout of the positions [0, n) (see llama_kvq_rem): starts the jobs that are missing, cancels the ones that the
     // layout does not have, waits for all and adds them. Returns the end of the coarse region of the layout
-    llama_pos settle(const llama_kv_cache & kv, llama_pos n);
+    // queued (optional): called with that end after the jobs are started, before the wait (the GPU is idle during the CPU tasks)
+    llama_pos settle(const llama_kv_cache & kv, llama_pos n, const std::function<void(llama_pos)> & queued = nullptr);
 
     // the ring rows of the positions [n_host, p) to the host store, no fit
     void spill(const llama_kv_cache & kv, llama_pos p);
@@ -134,6 +135,7 @@ private:
     ggml_tensor *           par     = nullptr; // f32 [D, D + 5, 2*G], per (K or V, kv head): fwd, mu, step, bits, offsets, den
     ggml_tensor *           stage   = nullptr; // q8_0 [D, 2, n_stage, G], K and V rows in the layout of the host store
     ggml_tensor *           stage_h = nullptr; // f16 [ROW/2, 2, n_stage, G], alias of stage
+    ggml_tensor *           cst[2]  = {};      // i32 [nwk or nwv + 1, n_stage, G], phase 3 codes when the device has no kc / vc
     ggml_gallocr_ptr        galloc;
     std::vector<uint8_t>    graph_meta;
     bool                    prof = false; // LLAMA_KVQ_FIT_SYNC: synchronize around the device phases, device time per job
