@@ -231,7 +231,10 @@ struct llama_kvq_memory_info {
 //   an error if that cannot free the room
 // memory operations: clear and seq_rm of the end of the sequence; a seq_rm into the coarse region or into a chunk that
 // is fitting drops the coarse rows from the chunk of the removal on, the rows before the removal stay in the host store and are
-// fitted again by the next llama_memory_kvq_fit_wait; the other ones abort
+// fitted again by the next llama_memory_kvq_fit_wait
+// not supported, each aborts with "not supported by the two-tier KV cache (--kvq)" and the reason: seq_cp, seq_add, seq_div,
+// seq_keep and seq_rm of a sequence > 0 (one sequence only), seq_rm of a middle range [p0, p1) with p1 >= 0
+// the same list is in the "Not supported" section of docs/development/kvq-two-tier-cache-guide.md
 //
 // the rows after the last complete chunk (rem): llama_memory_kvq_fit_wait (the end of a prompt) fits them as well, so the
 // coarse region ends with the prompt; the next fit_wait fits them again from the host store with all rows they have then
