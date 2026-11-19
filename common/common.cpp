@@ -1814,7 +1814,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.rs_replay         = params.rs_replay;
-    cparams.phase_bufs        = params.phase_bufs;
+    cparams.phase_bufs        = params.phase_bufs < 0 ? params.kvq.enabled : params.phase_bufs != 0;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

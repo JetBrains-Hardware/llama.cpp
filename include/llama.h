@@ -426,7 +426,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
-        bool phase_bufs;  // compute buffers per phase: a single-sequence context holds only the buffers of small ubatches while it generates [EXPERIMENTAL]
+        bool phase_bufs;  // compute buffers per phase: a single-sequence context holds only the buffers of small ubatches while it generates, default: false (the two-tier KV cache and the DFlash drafter of common turn it on) [EXPERIMENTAL]
         bool rs_replay;   // recurrent rollback by replay of the kept inputs instead of n_rs_seq snapshots, env LLAMA_RS_REPLAY overrides [EXPERIMENTAL]
 
         // [EXPERIMENTAL]

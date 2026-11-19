@@ -88,7 +88,7 @@ Memory layout and test knobs:
 
 | setting | default | effect |
 |---|---|---|
-| `--no-phase-buffers` (context param `phase_bufs`) | on | one compute buffer for all ubatches, no switch between the prompt and the decode phase (also for the plain server). Then decode holds the prompt buffers again (about +1.7 GB at 250k) |
+| `--[no-]phase-buffers` (context param `phase_bufs`) | on with `--kvq` and for the DFlash drafter, off otherwise | `--no-phase-buffers`: one compute buffer for all ubatches, no switch between the prompt and the decode phase; then decode holds the prompt buffers again (about +1.7 GB at 250k). `--phase-buffers` turns the switch on for a plain context |
 | `LLAMA_RS_REPLAY` | unset | overrides the context param `rs_replay`, which `--kvq` turns on: 0 keeps the GDN snapshot rows (+1,020 MiB at n_max 7) instead of the replay (+27 MiB of host memory per checkpoint or slot file) |
 | `LLAMA_KVQ_FOLD_EVERY=N` | off | test knob: a fold whenever N reply rows follow the coarse region (the only way to exercise folds in kvq-eval) |
 | `LLAMA_KVQ_UP_REPEAT=k` | 1 | test knob: every base upload of the resident rows (rotating buffers: every round; own buffers: the mirror after a prompt) and every tail upload k times, emulates a slower bus; k = 2 is about PCIe 4.0, k = 3 about PCIe 3.0 on the RTX 5090 (the join uploads of the fetched rows are not repeated) |

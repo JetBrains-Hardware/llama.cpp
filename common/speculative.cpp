@@ -3118,6 +3118,14 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // a DFlash drafter uses the compute buffers per phase unless --[no-]phase-buffers says otherwise
+    if (params.phase_bufs < 0) {
+        const uint32_t dflash_configs = common_get_enabled_speculative_configs(params.speculative.types) & (
+                (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)  | (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) |
+                (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2) | (1u << COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR));
+        cparams.phase_bufs = cparams.phase_bufs || dflash_configs != 0;
+    }
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
