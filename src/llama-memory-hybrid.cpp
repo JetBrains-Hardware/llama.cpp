@@ -1,6 +1,5 @@
 #include "llama-memory-hybrid.h"
 
-#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-context.h"

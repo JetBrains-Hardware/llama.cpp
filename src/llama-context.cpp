@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-kvq.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -570,6 +571,12 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // the packed two-tier graphs build their attention masks over the cells, not over kv_rows
+        if (dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()) != nullptr) {
+            cparams.auto_fkvr     = false;
+            cparams.fused_kv_rows = false;
+        }
     }
 
     // init backends
@@ -815,12 +822,31 @@ void llama_context::sched_new(const sched_params & params) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+
+    // the triggers of the packed two-tier attention do not wait for the GPU
+    sched_copy_early = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()) != nullptr;
+    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get())) {
+        kvq->set_backends(backend_ptrs);
+        // the end of a prompt: the device codes of the two-tier cache are allocated after the prompt buffers are freed
+        kvq->set_tg_cb([this]() {
+            if (phase_on) {
+                phase_set(true);
+            }
+        });
+    }
+    ggml_backend_sched_set_copy_callback_early(sched.get(), sched_copy_early);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     sched_params_cur = params;
 }
 
 void llama_context::sched_reserve() {
+    // the fit mode of the packed two-tier attention adds statistics nodes to every graph
+    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()); kvq && kvq->fit_graph_kind() != kvq_fit_graph) {
+        kvq_fit_graph      = kvq->fit_graph_kind();
+        sched_need_reserve = true;
+    }
+
     if (!sched_need_reserve) {
         return;
     }
@@ -855,6 +881,8 @@ void llama_context::sched_reserve() {
         /*.op_offload =*/ cparams.op_offload,
     });
 
+    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get());
+
     // per-phase compute buffers, see phase_set
     {
         const bool has_dev = std::any_of(backend_buft.begin(), backend_buft.end(), [](ggml_backend_buffer_type_t b) { return !ggml_backend_buft_is_host(b); });
@@ -876,6 +904,11 @@ void llama_context::sched_reserve() {
             const std::vector<size_t> sizes(backend_ptrs.size(), 0);
             ggml_backend_sched_resize_buffers(sched.get(), sizes.data());
         }
+    }
+
+    // the reserve graph of the two-tier cache reads the scratch
+    if (kvq && !kvq->prompt_bufs_alloc()) {
+        throw std::runtime_error("failed to allocate the scratch of the two-tier cache");
     }
 
     // a DFlash draft: the large ubatches are the injection batches, the token batches are tg ubatches
@@ -958,15 +991,17 @@ void llama_context::sched_reserve() {
         graph_has_logits = graph_has_logits || get_gf_res_reserve()->get_logits() != nullptr;
     }
 
-    // the tg phase: the sizes of a tg graph
+    // the tg phase: the sizes of a tg graph; the two-tier cache reserves the scratch attention (the prompt path), so its tg sizes
+    // are the largest ones used (they grow in the first tg phase)
     if (phase_on) {
         std::vector<size_t> sizes(backend_ptrs.size(), 0);
         if (!graph_reserve(n_tokens_tg, n_seqs, n_tokens_tg, mctx.get(), true, sizes.data())) {
             throw std::runtime_error("failed to reserve the tg graph");
         }
+        const bool tg_grow = kvq && kvq->fit_graph_kind() > 0;
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             if (!ggml_backend_buft_is_host(backend_buft[i])) {
-                phase_size_tg[i] = sizes[i];
+                phase_size_tg[i] = tg_grow ? 0 : sizes[i];
             }
         }
     }
@@ -1914,8 +1949,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 bool llama_context::ubatch_tg(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) const {
-    GGML_UNUSED(mctx);
-    return ubatch.n_tokens <= n_tokens_tg;
+    if (ubatch.n_tokens > n_tokens_tg) {
+        return false;
+    }
+    const auto * kctx = dynamic_cast<const llama_memory_hybrid_kvq_context *>(mctx);
+    return kctx == nullptr || !kctx->prompt_path(ubatch);
 }
 
 void llama_context::phase_set(bool tg) {
@@ -1934,6 +1972,10 @@ void llama_context::phase_set(bool tg) {
         }
     }
 
+    // the copy streams of the two-tier cache read graph tensors
+    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(memory.get()); kvq && kvq->get_store()) {
+        kvq->get_store()->synchronize();
+    }
     for (auto * backend : backend_ptrs) {
         ggml_backend_synchronize(backend);
     }
@@ -1962,9 +2004,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    // the compute buffers of the phase of the ubatch
+    // after apply: the two-tier cache can move the coarse region there
     if (phase_on) {
         phase_set(ubatch_tg(ubatch, mctx));
+    }
+
+    // the device codes of the two-tier cache after the prompt buffers are freed (or the end of the prompt allocated them)
+    if (const auto * kctx = dynamic_cast<const llama_memory_hybrid_kvq_context *>(mctx); kctx && !kctx->codes_alloc(ubatch)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the codes of the two-tier cache\n", __func__);
+        ret = GGML_STATUS_ALLOC_FAILED;
+        return nullptr;
     }
 
     auto * res = get_gf_res_prev();
@@ -3333,6 +3382,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
         return true;
+    }
+
+    // the triggers of the packed two-tier attention
+    if (auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(lctx->memory.get()); kvq && kvq->sched_copy(backend, src, dst, graph)) {
+        return true;
+    }
+
+    // the wait that the scheduler skips for an early callback
+    if (lctx->sched_copy_early) {
+        ggml_backend_synchronize(backend);
     }
 
     auto & st = lctx->copy_experts;
@@ -5352,6 +5411,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+int32_t llama_context_n_splits(const struct llama_context * ctx) {
+    return ggml_backend_sched_get_n_splits(ctx->get_sched());
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
