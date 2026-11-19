@@ -1035,6 +1035,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (ring) {
+            GGML_ASSERT(n_stream == 1);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const llama_pos pos = ubatch.pos[i];
+                const uint32_t  idx = pos >= 0 ? (uint32_t) (pos % (llama_pos) cells.size()) : 0;
+                if (pos < 0 || !cells.is_empty(idx)) {
+                    return { };
+                }
+                res.idxs[s].push_back(idx);
+            }
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -1282,6 +1295,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -1292,6 +1311,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return seq_to_stream[seq_id];
+}
+
+void llama_kv_cache::ring_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    GGML_ASSERT(ring && n_stream == 1 && p0 >= 0 && seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (llama_pos p = p0; p < p1; ++p) {
+        const uint32_t idx = (uint32_t) (p % (llama_pos) cells.size());
+        GGML_ASSERT(cells.is_empty(idx));
+        cells.pos_set(idx, p);
+        cells.seq_add(idx, seq_id);
+    }
+}
+
+void llama_kv_cache::move_bufs(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(!ctxs_bufs.no_alloc);
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+        buf.reset();
+        buf = llama_memory_bufs::alloc_buf(ctx.get(), buft, false, "kv cache");
+        ggml_backend_buffer_clear(buf.get(), 0);
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+    }
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
