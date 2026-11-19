@@ -235,7 +235,7 @@ Each of these is a documented limit (release blockers R1, R2 and R6 in `kvq-scra
 
 - `seq_cp`, `seq_keep` of a sequence > 0, `seq_rm` of a sequence > 0, and more than one sequence: the store and the fitter hold sequence 0 only. Use `n_seq_max = 1` (server: `-np 1`).
 - `seq_add` and `seq_div`: the coarse codes hold rotated keys, so positions cannot be shifted or divided. Disable the context shift and `--cache-reuse`.
-- `seq_rm` of a middle range: only the end of the sequence can be removed, `[p0, -1)` with `p0 <= last position` (a removal into the coarse region refits it, see section 6).
+- `seq_rm` of a middle range: only the end of the sequence can be removed, `[p0, -1)` with `p0 <= last position`.
 - Multimodal input and embeddings: the memory serves text generation of the qwen35 target only.
 - `--fit`: it measures a plain q8_0 K/V cache and does not know the kvq memory (device codes, tables, scratch, resident sets, host store). Use `--fit off`, with `--ctx-size` and `-ngl` set (release blocker R2).
 - More than one kvq context per GPU per process: the CUDA attention uses one side stream and function-static fork / join events per device (release blocker R6).

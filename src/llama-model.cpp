@@ -3566,7 +3566,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
-                    } else if (kvq_packed && arch == LLM_ARCH_QWEN35) {
+                    } else if (kvq_packed && llama_model_supports_kvq(this)) {
                         // the two-tier KV cache
                         res = new llama_memory_hybrid_kvq(
                             /* model             */ *this,
@@ -4242,6 +4242,47 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
 
 void llama_model_set_attn_rot(struct llama_model * model, bool value) {
     model->attn_rot = value;
+}
+
+bool llama_model_supports_kvq(const struct llama_model * model, std::string * reason) {
+    auto fail = [&](const std::string & why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+
+    if (model->arch != LLM_ARCH_QWEN35) {
+        return fail(std::string("the architecture is '") + llm_arch_name(model->arch) + "', only qwen35 is supported");
+    }
+
+    const auto & hp = model->hparams;
+
+    uint32_t n_head    = 0;
+    uint32_t n_head_kv = 0;
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        if (hp.is_recr(il)) {
+            continue;
+        }
+        if (hp.n_embd_head_k(il) != 256 || hp.n_embd_head_v(il) != 256) {
+            return fail("the attention head size must be 256 for K and V (layer " + std::to_string(il) + " has " +
+                    std::to_string(hp.n_embd_head_k(il)) + " and " + std::to_string(hp.n_embd_head_v(il)) + ")");
+        }
+        if (hp.n_head_kv(il) == 0 || hp.n_head(il) % hp.n_head_kv(il) != 0) {
+            return fail("layer " + std::to_string(il) + " needs a whole number of query heads per kv head");
+        }
+        if (n_head == 0) {
+            n_head    = hp.n_head(il);
+            n_head_kv = hp.n_head_kv(il);
+        } else if (hp.n_head(il) != n_head || hp.n_head_kv(il) != n_head_kv) {
+            return fail("all attention layers must have the same number of heads and kv heads");
+        }
+    }
+    if (n_head == 0) {
+        return fail("the model has no attention layer");
+    }
+
+    return true;
 }
 
 void llama_model_set_kvq_packed(struct llama_model * model, bool value) {
