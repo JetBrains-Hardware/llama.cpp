@@ -415,6 +415,8 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_KVQ_ATTN,
+        GGML_OP_KVQ_FIT,
 
         GGML_OP_UNARY,
 
@@ -2557,6 +2559,97 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // two-tier attention: packed low-bit ("coarse") K/V rows, attended in the code domain, plus precise rows
+    //
+    // the cache rows (tokens) of a layer are [0, n_coarse) coarse and [n_coarse, n_kv) tail, n_kv = n_coarse + n_tail
+    // the coarse rows are split in chunks of n_chunk_rows, chunk t = rows [t*n_chunk_rows, (t+1)*n_chunk_rows)
+    // each (chunk, kv head) has its own codec tables for K and for V
+    //
+    // q:       [D, n_head, L]                  f32, n_head % G == 0, head h reads kv head h/(n_head/G), rows contiguous
+    // kc:      [nwk, n_coarse, G]              i32, packed K row of each (row, kv head), any nb1/nb2; NULL: n_coarse = 0
+    // vc:      [nwv + 1, n_coarse, G]          i32, packed V row in words [0, nwv), V gain in the low 16 bits (f16) of word nwv
+    // tab_inv: [D, D, 2*G, >= n_chunk]         i8, inverse transforms, (K, V) of kv head g at i2 = 2*g + (0, 1), chunk t at i3 = t
+    //            K: element [c, i] = inv[c][i] (i0 = component), V: element [i, c] = inv[c][i] (i0 = dim)
+    //            the scale of inv[c][:] is part of step[c] (src/llama-kvq-pack.h: one scale per component, max |inv[c][:]| -> 127)
+    // tab_aux: [D, 3, 2*G, >= n_chunk]         f32, i1 = 0: step[c], 1: mu[i], 2: bits[c] (0..8, as float), same i2/i3
+    // k, v:    [D, n_tail, G]                  q8_0, tail K/V (any nb1/nb2, e.g. a permuted cache view),
+    //                                          v not transposed; n_tail >= 1, tail row r is cache row n_coarse + r
+    // rkv:     [D, cap, G, 2]                  q8_0, resident precise K (i3 = 0) and V (i3 = 1); NULL: no resident rows
+    // ridx:    [cap, G]                        i32, coarse row held by each resident slot, -1 (or any row outside [0, n_coarse)) = empty
+    // mask:    [>= n_kv, >= L]                 f16, added to the scaled logits, element [row, l] for cache row row and position l,
+    //                                          a resident slot uses the mask of its row; NULL: no mask
+    //
+    // packed rows: component c of a table holds bits[c] bits, sum(bits) <= 32*nwk (K) or 32*nwv (V)
+    //   the field u of component c is bits [o_c, o_c + bits[c]) of the row, o_c = sum of bits[c'] for c' < c,
+    //   row bit b = bit (b % 32) of word b/32; the code is u - 2^(bits[c]-1), components with 0 bits are not stored
+    //   decoded K row: x[i] = sum_c (code_c + 0.5)*step[c]*inv[c][i] + mu[i] over the components with bits[c] > 0;
+    //   decoded V row: the same with step[c]*gain; the components may be in any order (src/llama-kvq-pack.h sorts by bits)
+    //
+    // logits: s = scale*(q . k) + mask[row, l], for a coarse row with the decoded K row
+    // a resident slot overrides its coarse row for the attention of its kv head; slots of a kv head must hold distinct rows
+    //
+    // CUDA (Ampere or newer): D == 256, L <= 8, (n_head/G)*L <= 48, nwk <= 32, nwv <= 32, k/v/rkv row strides multiple of 16 bytes
+    //
+    // mode GGML_KVQ_ATTN:  res [D, n_head, L] f32 = sum_j w_j v_j, w = softmax over the non-resident coarse rows (coarse K/V),
+    //                      the resident slots (precise K/V) and the tail rows (precise K/V)
+    // mode GGML_KVQ_SCORE: res [n_coarse, G, L] f32, sum over the query heads of kv head g of softmax over all coarse rows
+    //                      (coarse K, resident or not) and the tail rows (precise K), at the coarse rows; needs kc,
+    //                      vc, v, rkv, ridx are unused
+    //
+    // an all -inf row of weights gives 0
+    //
+    enum ggml_kvq_mode {
+        GGML_KVQ_ATTN  = 1,
+        GGML_KVQ_SCORE = 2,
+    };
+
+    GGML_API struct ggml_tensor * ggml_kvq_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kc,
+            struct ggml_tensor  * vc,
+            struct ggml_tensor  * tab_inv,
+            struct ggml_tensor  * tab_aux,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * rkv,
+            struct ggml_tensor  * ridx,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            int                   n_chunk_rows,
+            int                   mode);
+
+    // device steps of the kvq codec fit (src/llama-kvq-codec.cpp): B tasks of n rows of D values, f32, rows contiguous
+    //
+    // x:    [D, n, B]      the rows of each task, nb1 == D*sizeof(float), any nb2
+    // par:  [D, >= k, B]   f32, rows contiguous, any nb2; ROT: k = D, the forward transform, element [c, i] = fwd[i][c]
+    //                      GAIN and CODE: k = 4, i1 = 0: step[c] (0 for 0 bits), 1: bits[c] (0..8), 2: bit offset of component c
+    //                      in a packed row, 3: element 0 = den, the V gain denominator (0: K, no gain)
+    // rows: [nw, n, B]     i32, CODE only, any nb1/nb2
+    //
+    // GGML_KVQ_FIT_MEAN: res [D, 1, B], mean of the rows, summed in double
+    // GGML_KVQ_FIT_COV:  res [D, D, B], sum over the rows of x x^T, f32 products (no TF32 or lower precision)
+    // GGML_KVQ_FIT_ROT:  res [D, n, B], y[c] = sum_i x[i]*fwd[i][c], f32 products as COV
+    // GGML_KVQ_FIT_GAIN: x = y; res [D, 1, B], sigma[c] = sqrt(mean over the rows of (y[c]/g)^2), g = sqrt(sum_c y[c]^2/den) + 1e-8 per row
+    //                    (sums in double, the operations of the CPU codec)
+    // GGML_KVQ_FIT_CODE: x = y; writes rows in place: code_c = clamp(floor(y[c]/g/step[c]), -2^(b-1), 2^(b-1) - 1) for bits b > 0,
+    //                    field code_c + 2^(b-1) at the bit offset of c (layout of ggml_kvq_attn), the unused bits 0;
+    //                    den > 0: g as GAIN, the low 16 bits of word nw - 1 hold g as f16; den == 0: g = 1
+    enum ggml_kvq_fit_mode {
+        GGML_KVQ_FIT_MEAN = 0,
+        GGML_KVQ_FIT_COV  = 1,
+        GGML_KVQ_FIT_ROT  = 2,
+        GGML_KVQ_FIT_GAIN = 3,
+        GGML_KVQ_FIT_CODE = 4,
+    };
+
+    GGML_API struct ggml_tensor * ggml_kvq_fit(
+            struct ggml_context * ctx,
+            int                   mode,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * par,   // ROT, GAIN, CODE
+            struct ggml_tensor  * rows); // CODE
 
     // custom operators
 
