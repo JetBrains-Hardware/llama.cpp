@@ -21,6 +21,8 @@
 // --kvq-rb-test: ring rollbacks with and without an earlier rollback (also without --kvq-lib), no scoring
 // --kvq-state-save / --kvq-state-load FNAME: the sequence state after the prefill (and the wait), or instead of the prefill;
 //   --kvq-state-ckpt P: a recurrent checkpoint at P, rollback to it after the save or load and prefill again (FNAME.ckpt)
+// --kvq-state-refuse F1,F2,...: each state file must be refused by the load (another version, a wrong section size), the memory must
+//   stay empty, then a prefill of 2048 positions must work; exit 0 if all of that holds, no scoring
 
 #include "arg.h"
 #include "common.h"
@@ -77,6 +79,7 @@ struct kvq_args {
 
     std::string state_save;     // sequence state file after the prefill (and the wait)
     std::string state_load;     // sequence state file instead of the prefill
+    std::vector<std::string> state_refuse; // state files that the load must refuse
     int32_t     state_ckpt = 0; // recurrent checkpoint at this position, rollback to it after the save or load and prefill again
 
     bool lib() const { return lib_on; }
@@ -158,6 +161,13 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.state_save = argv[++i];
         } else if (a == "--kvq-state-load" && has_val) {
             args.state_load = argv[++i];
+        } else if (a == "--kvq-state-refuse" && has_val) {
+            const std::string v = argv[++i];
+            for (size_t p = 0; p < v.size();) {
+                const size_t q = v.find(',', p);
+                args.state_refuse.push_back(v.substr(p, q == std::string::npos ? std::string::npos : q - p));
+                p = q == std::string::npos ? v.size() : q + 1;
+            }
         } else if (a == "--kvq-state-ckpt" && has_val) {
             args.state_ckpt = std::stoi(argv[++i]);
         } else if (a.rfind("--kvq-", 0) == 0) {
@@ -822,6 +832,27 @@ int main(int argc, char ** argv) {
 
     if (args.rb_test) {
         return kvq_rb_test(ctx, ids, args.fit_chunk, n_vocab, args.lib()) ? 0 : 1;
+    }
+
+    if (!args.state_refuse.empty()) {
+        std::vector<llama_token> toks(ids.size());
+        for (const auto & f : args.state_refuse) {
+            size_t n_tok = 0;
+            const size_t n_read = llama_state_seq_load_file(ctx, f.c_str(), 0, toks.data(), toks.size(), &n_tok);
+            const llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+            if (n_read != 0 || pos >= 0) {
+                LOG_ERR("%s: state %s: expected a refusal and an empty memory, got %zu bytes read, last position %d\n", __func__, f.c_str(), n_read, (int) pos);
+                return 1;
+            }
+            LOG("kvq: state: refused %s, the memory is empty\n", f.c_str());
+        }
+        const int32_t n_chk = std::min<int32_t>(2048, s);
+        if (!kvq_prefill(ctx, ids, n_chk, params.n_batch) || (args.lib() && !llama_memory_kvq_fit_wait(llama_get_memory(ctx)))) {
+            LOG_ERR("%s: the prefill after the refused loads failed\n", __func__);
+            return 1;
+        }
+        LOG("kvq: state: prefill of %d positions after the refused loads ok, last position %d\n", n_chk, (int) llama_memory_seq_pos_max(llama_get_memory(ctx), 0));
+        return 0;
     }
 
     const int32_t ckpt = args.state_ckpt;
