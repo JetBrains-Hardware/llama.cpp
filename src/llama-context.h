@@ -45,9 +45,11 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
+    // kvq_tail > 0: the memory is the two-tier KV cache with a ring of that many cells (llama_init_from_model_kvq)
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+                  uint32_t kvq_tail = 0);
 
     ~llama_context();
 

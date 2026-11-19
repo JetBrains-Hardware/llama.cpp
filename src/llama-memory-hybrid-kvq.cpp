@@ -16,7 +16,7 @@
 
 // the cells of the ring of the attention cache
 static uint32_t kvq_ring_cells(uint32_t n_tail, uint32_t kv_size) {
-    GGML_ASSERT(n_tail > 0 && "the two-tier cache needs the attention cache as a ring (llama_model_set_kvq_tail)");
+    GGML_ASSERT(n_tail > 0 && "the two-tier cache needs the attention cache as a ring (llama_kvq_config::tail)");
     return std::min(n_tail, kv_size);
 }
 
@@ -50,7 +50,8 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
         type_k, type_v, v_trans, kvq_ring_cells(n_tail, kv_size), n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, rs_replay, offload, unified,
-        filter_attn, filter_recr),
+        filter_attn, filter_recr,
+        /* attn_rot */ false),
     model(model),
     n_ctx_max(kv_size) {
     get_mem_attn()->set_ring(true);
@@ -132,7 +133,7 @@ bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
         llama_kvq_fit_progress pr;
         fitter->get_progress(pr);
         LLAMA_LOG_ERROR("%s: the ring of %lld cells cannot hold the positions [%d, %d] of the batch: %s\n", __func__,
-                (long long) size, n_released, last, pr.failed ? "the fit failed" : "the batch is too large for the ring (see llama_model_set_kvq_tail)");
+                (long long) size, n_released, last, pr.failed ? "the fit failed" : "the batch is too large for the ring (see llama_kvq_config::tail)");
         return false;
     }
     if (waited) {

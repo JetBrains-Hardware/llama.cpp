@@ -116,7 +116,9 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // lightning indexer keys are rotated with the indexer RoPE parameters
-                       bool   is_indexer = false);
+                       bool   is_indexer = false,
+        // false: this cache holds unrotated K / V whatever the model setting (the two-tier KV cache, see llama_memory_hybrid_kvq)
+                       bool   attn_rot   = true);
 
     ~llama_kv_cache() = default;
 

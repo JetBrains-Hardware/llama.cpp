@@ -3566,7 +3566,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
-                    } else if (kvq_packed && llama_model_supports_kvq(this)) {
+                    } else if (params.kvq_tail > 0 && llama_model_supports_kvq(this)) {
                         // the two-tier KV cache
                         res = new llama_memory_hybrid_kvq(
                             /* model             */ *this,
@@ -3587,7 +3587,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* tail              */ kvq_tail);
+                            /* tail              */ params.kvq_tail);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -4283,14 +4283,6 @@ bool llama_model_supports_kvq(const struct llama_model * model, std::string * re
     }
 
     return true;
-}
-
-void llama_model_set_kvq_packed(struct llama_model * model, bool value) {
-    model->kvq_packed = value;
-}
-
-void llama_model_set_kvq_tail(struct llama_model * model, uint32_t n_cells) {
-    model->kvq_tail = n_cells;
 }
 
 //
