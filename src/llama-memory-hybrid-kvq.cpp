@@ -301,15 +301,57 @@ llama_pos llama_memory_hybrid_kvq::seq_pos_max(llama_seq_id seq_id) const {
 }
 
 // state of the fit mode, sequence 0 (seq_id -1 is the same):
-//   magic, version, meta of the store and of the fitter (checked before the data is read)
-//   ring: the plain state of the attention cache, the positions after the rows of the host store
-//   recurrent: the plain state
-//   store: host rows [0, n_host), codes and tables of the coarse region [0, n_coarse) (it can end inside a chunk);
-//   fitter: the fitted range of each chunk slot, statistics of the complete chunks, sums of the open chunk
+//   magic, version, then six sections, each as (u64 byte size, data):
+//     store meta, fitter meta (layout, bits, rem policy, min rows; checked before any data is read)
+//     ring: the plain state of the attention cache, the positions after the rows of the host store
+//     recurrent: the plain state
+//     store data: host rows [0, n_host), codes and tables of the coarse region [0, n_coarse) (it can end inside a chunk)
+//     fitter data: the fitted range of each chunk slot, statistics of the complete chunks, sums of the open chunk
+//   a reader checks that each section consumed exactly its size and names the section otherwise
 // a plain state starts with the stream count of the attention cache, so neither reader takes the state of the other
 // version 2: the coarse region ends at any row, the host store can hold rows after it
+// version 3: a size per section; rem policy and min rows in the fitter meta
 static constexpr uint32_t KVQ_STATE_MAGIC   = 0x5351564b; // "KVQS"
-static constexpr uint32_t KVQ_STATE_VERSION = 2;
+static constexpr uint32_t KVQ_STATE_VERSION = 3;
+
+// counts the bytes a section will write; the sizes are written before the data, the writers cannot seek back
+namespace {
+class kvq_io_count : public llama_io_write_i {
+public:
+    void write(const void *, size_t size) override { n += size; }
+    void write_tensor(ggml_tensor *, size_t, size_t size) override { n += size; }
+    size_t n_bytes() override { return n; }
+private:
+    size_t n = 0;
+};
+
+// the section is written twice: counted first (no copies), then for real, and the real size is checked against the count
+template <typename F>
+void kvq_section_write(llama_io_write_i & io, const char * name, F && f) {
+    kvq_io_count c;
+    f(c);
+    const uint64_t size = c.n_bytes();
+    io.write(&size, sizeof(size));
+    const size_t b0 = io.n_bytes();
+    f(io);
+    if (io.n_bytes() - b0 != size) {
+        throw std::runtime_error(format("kvq state section '%s' wrote %zu bytes, counted %zu", name, io.n_bytes() - b0, (size_t) size));
+    }
+}
+
+template <typename F>
+void kvq_section_read(llama_io_read_i & io, const char * name, F && f) {
+    uint64_t size = 0;
+    io.read(&size, sizeof(size));
+    const size_t b0 = io.n_bytes();
+    f();
+    const size_t got = io.n_bytes() - b0;
+    if (got != size) {
+        throw std::runtime_error(format("kvq state section '%s' holds %zu bytes, this build read %zu (saved by another build of the two-tier cache; process the prompt again)",
+                name, (size_t) size, got));
+    }
+}
+} // namespace
 
 void llama_memory_hybrid_kvq::state_check(llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if (!fitter) {
@@ -341,17 +383,17 @@ void llama_memory_hybrid_kvq::state_write(llama_io_write_i & io, llama_seq_id se
 
     io.write(&KVQ_STATE_MAGIC,   sizeof(KVQ_STATE_MAGIC));
     io.write(&KVQ_STATE_VERSION, sizeof(KVQ_STATE_VERSION));
-    store->state_write_meta(io);
-    fitter->state_write_meta(io);
+    kvq_section_write(io, "store meta",  [&](llama_io_write_i & w) { store->state_write_meta(w); });
+    kvq_section_write(io, "fitter meta", [&](llama_io_write_i & w) { fitter->state_write_meta(w); });
 
     // host ring: the ring cells hold the rows after the host store, the readbacks of the last reply are done
     store->sync_ring(n_pos());
     store->synchronize();
-    get_mem_attn()->state_write(io, 0, flags);
-    get_mem_recr()->state_write(io, seq_id, flags);
+    kvq_section_write(io, "ring",      [&](llama_io_write_i & w) { get_mem_attn()->state_write(w, 0, flags); });
+    kvq_section_write(io, "recurrent", [&](llama_io_write_i & w) { get_mem_recr()->state_write(w, seq_id, flags); });
 
-    store->state_write_data(io);
-    fitter->state_write_data(io);
+    kvq_section_write(io, "store data",  [&](llama_io_write_i & w) { store->state_write_data(w); });
+    kvq_section_write(io, "fitter data", [&](llama_io_write_i & w) { fitter->state_write_data(w); });
 }
 
 void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -373,17 +415,18 @@ void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_
         }
         io.read(&version, sizeof(version));
         if (version != KVQ_STATE_VERSION) {
-            throw std::runtime_error(format("version %u of the two-tier cache state, expected %u", version, KVQ_STATE_VERSION));
+            throw std::runtime_error(format("version %u of the two-tier cache state, this build reads version %u "
+                    "(saved by another build of the two-tier cache; process the prompt again)", version, KVQ_STATE_VERSION));
         }
         int32_t n = 0;
         int32_t h = 0;
-        store->state_read_meta(io, n, h);
-        fitter->state_read_meta(io);
+        kvq_section_read(io, "store meta",  [&]() { store->state_read_meta(io, n, h); });
+        kvq_section_read(io, "fitter meta", [&]() { fitter->state_read_meta(io); });
 
         // host ring: no readback of an earlier reply may land in the ring cells after they are read
         store->synchronize();
-        get_mem_attn()->state_read(io, 0, flags);
-        get_mem_recr()->state_read(io, seq_id, flags);
+        kvq_section_read(io, "ring",      [&]() { get_mem_attn()->state_read(io, 0, flags); });
+        kvq_section_read(io, "recurrent", [&]() { get_mem_recr()->state_read(io, seq_id, flags); });
 
         const llama_pos p_min = get_mem_attn()->seq_pos_min(0);
         const llama_pos p_max = get_mem_attn()->seq_pos_max(0);
@@ -391,8 +434,8 @@ void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_
             throw std::runtime_error(format("the ring holds positions [%d, %d], expected the positions after the %d rows of the host store, below %u", p_min, p_max, h, n_ctx_max));
         }
 
-        store->state_read_data(io, n, h);
-        fitter->state_read_data(io);
+        kvq_section_read(io, "store data",  [&]() { store->state_read_data(io, n, h); });
+        kvq_section_read(io, "fitter data", [&]() { fitter->state_read_data(io); });
         n_released = h;
         store->ring_loaded(p_max >= 0 ? p_max + 1 : h);
 

@@ -1093,17 +1093,23 @@ void llama_kvq_fitter::state_write_meta(llama_io_write_i & io) const {
             throw std::runtime_error(format("the kvq fitter is not idle (failed = %d, %zu jobs), the state is not saved", failed ? 1 : 0, jobs.size()));
         }
     }
-    // element 2: V fitted per chunk (1; 0 was an offline V table file), element 3: the query heads of the gate statistics
-    const int32_t v[4] = { fparams.bits_k, fparams.bits_v, 1, n_head };
+    // element 2: V fitted per chunk (1; 0 was an offline V table file), element 3: the query heads of the gate statistics,
+    // elements 4, 5: the policy for the rows after the last complete chunk and its smallest chunk (they change what the next round does)
+    const int32_t v[6] = { fparams.bits_k, fparams.bits_v, 1, n_head, fparams.rem, fparams.min_rows };
     io.write(v, sizeof(v));
 }
 
 void llama_kvq_fitter::state_read_meta(llama_io_read_i & io) const {
-    int32_t v[4];
+    int32_t v[6];
     io.read(v, sizeof(v));
     if (v[0] != fparams.bits_k || v[1] != fparams.bits_v || v[2] != 1 || v[3] != n_head) {
         throw std::runtime_error(format("kvq state with K %d / V %d bits, V %s (%d heads), this context: K %d / V %d bits, V fitted per chunk (%d heads)",
                 v[0], v[1], v[2] ? "fitted per chunk" : "from a table file", v[3], fparams.bits_k, fparams.bits_v, n_head));
+    }
+    if (v[4] != fparams.rem || v[5] != fparams.min_rows) {
+        throw std::runtime_error(format("kvq state fitted with rem policy %d and min rows %d, this context: rem policy %d, min rows %d "
+                "(the rows after the last complete chunk would be fitted differently); use the same --kvq-rem / --kvq-min-rows or process the prompt again",
+                v[4], v[5], fparams.rem, fparams.min_rows));
     }
 }
 
