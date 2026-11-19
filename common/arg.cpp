@@ -1713,6 +1713,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--phase-buffers"},
+        {"--no-phase-buffers"},
+        string_format("compute buffers per phase: a single-sequence GPU context frees the prompt compute buffers while it generates (default: %s)", params.phase_bufs ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.phase_bufs = value;
+        }
+    ).set_env("LLAMA_ARG_PHASE_BUFFERS"));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
