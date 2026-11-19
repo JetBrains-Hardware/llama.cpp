@@ -117,6 +117,29 @@ Environment variables of the memory layout: `LLAMA_PHASE_BUFFERS=0` (one compute
 
 Machine: RTX 5090 32 GB, Ryzen 9950X3D, Windows 11, CUDA 12.9. One trace of 100k tokens unless noted; treat single runs as such.
 
+### Combined build at 250k: codes out, attention split, drafter ubatch (2026-11-19, branch kvq-mem, affa1fa81 + 6d2ecbfab)
+
+Both changes below in one build. The default block (`--kvq-scr-block 16384`) is under quality review: a wider check found its KL to the teacher at 100k about 1.8x the old path, so the numbers are given for block 16k and for block 0 (the old attention, the fallback if the default has to become 0). Consistency: with block 16k the ids equal the attention split alone in every session (100k, 250k with the follow-up prompt, 24k slot save + restore with byte-identical slot files, a 5000-token reply with a fold), with block 0 they equal the build before (15b59d61d) at ub 1024 and ub 4096; kvq-eval 9 / 9 checks bit-identical in both pairings; FLASH_ATTN_EXT_LSE, FLASH_ATTN_EXT, KVQ_ATTN, KVQ_FIT, GATED_DELTA_NET, test-kvq-codec, test-kvq-attn pass.
+
+VRAM at 250k (n_ctx 256000, n_max 7, MiB, budget 15,872; "d1024" = `--spec-draft-n-ubatch 1024`, the drafter's pp compute buffer sized by its own ubatch, 480 -> 120 MiB at ub 4096):
+
+| cell | load | prompt | decode median | follow-up prompt peak | largest vs budget |
+|---|---|---|---|---|---|
+| build before, ub 1024 | 17,187 | 17,369 | 15,163 | 17,299 - 17,411 | +1,539 |
+| ub 1024, block 16k | 14,039 | 14,205 (15,105 - 15,187 at the switch to decode) | 15,159 | 15,247 - 15,271 | -601 |
+| ub 1024, block 0 | 15,364 | 15,546 | 15,168 | 15,472 - 15,584 | -288 |
+| build before, ub 4096 | 19,628 | 20,300 | 15,310 | 19,824 - 20,297 | +4,428 |
+| ub 4096, block 16k, d1024 | 15,126 | 15,372 | 15,176 | 15,354 | -500 |
+| ub 4096, block 16k | 15,186 | 15,876 | 15,320 | 15,408 | +4 |
+| ub 4096, block 8k, d1024 | 15,126 | 15,394 | 15,194 | 15,372 | -478 |
+| ub 4096, block 0, d1024 | 17,746 | 17,974 | 15,172 | 17,854 | +2,102 |
+
+Fit the budget in every phase: ub 1024 with block 16k or block 0, ub 4096 with block 16k or 8k and d1024. ub 4096 needs both the attention split and d1024 (block 0 is 2.1 GB over); 8k gives nothing over 16k at ub 4096 (1,570 MiB of pp compute is the floor of the other activations). With block 16k at ub 1024 the decode phase (the codes back on the device) is larger than the prompt, so decode and the switch into it set the headroom.
+
+Speed at 250k (interleaved pairs): ub 1024 block 16k prompt 139.1 s against 199.3 s of the build before (-30%), decode 37.2 against 37.5 ms per verify batch, follow-up prompt 1.50 s against 1.71 s (-12%: the split saves more than the codes upload costs). ub 1024 block 0: prompt 201.9 s (+1.3%, the pair was not adjacent), decode -0.1%, follow-up 1.73 s (+1.5%, the accepted cost of the codes upload). ub 4096 block 16k d1024: prompt 136.1 s against 164.0 s of the build before at ub 4096 (-17%), follow-up 1.49 against 1.76 s; ub 4096 block 0 d1024 165.4 s. 100k: ub 1024 block 16k 37.3 against 42.9 s (-13%), ub 4096 d1024 37.2 against 39.5 s (-6%), decode within 0.3% where the ids are equal.
+
+`--spec-draft-n-ubatch 1024` changes the generated ids at 250k ub 4096 with block 0 and 8k (not with 16k, where the drafts happened to be the same): the drafter prefills in other ubatches, proposes other drafts, and the target's output depends on the verify batch boundaries. Numbers, logs and notes: `kvq-scratch\mem\final` (`RESULTS.md`, `NOTES.md`).
+
 ### Scratch attention of the prompt in key blocks (2026-11-19, branch kvq-mem, not bit-identical)
 
 Measured alone on 15b59d61d (without the codes change below). The target's pp compute buffer was mostly the F16 copies of K/V and the F16 mask that flash attention makes over all n_ctx + ring scratch rows (1,809.5 MiB at 250k, ub 1024). Now the host rows go through `ggml_flash_attn_ext_lse` in mask-free key blocks (`--kvq-scr-block`, default 16384) and only the rest has a mask (see How it works, prefill). The new op is FLASH_ATTN_EXT with op param 5 = 1: the result has ceil(n_batch / DV) more rows in dim 2 that hold the F32 [n_head, n_batch] log-sum-exp (scale, softcap, mask, sinks included). CPU: the one-chunk and tiled paths. CUDA: the MMA kernel only (Turing+); a whole tile writes KQ_max + log(KQ_rowsum) from its shared memory meta, a tile split by stream-k gets it from the fixup kernels; no new combine kernel. The GQA kernel variants (ncols2 > 1) loaded the mask unconditionally, so a mask-less attention ran the ncols2 = 1 variant, 1.7x slower; they now load the mask only if present, and the dispatch uses them without a mask for the LSE op only (other users keep their kernel). The reserve graph uses the same blocks (`kvq_params_reserve` passes `scr_block`).
@@ -640,7 +663,7 @@ Sizes are for ctx 230000 as allocated today.
 - With the ring of one batch (the default) a long reply folds every ring size of tokens (about 4.3k at -b 4096, 0.57 s each in line with 4 threads, measured in two server sessions with identical ids); with `--kvq-tail 12544` every 12k.
 - The slots of a batch are placed for the whole batch at once, so the ring cannot be smaller than one batch (per-ubatch placement would allow n_ubatch + 256, not built).
 - Host memory: 7.6 GB of pinned RAM at ctx 230000, 8.5 GB at 256000, per sequence; plus 27 MiB per context checkpoint, slot file or RAM cache entry for the replay's pending inputs.
-- VRAM at 250k: since the codes live in host memory during the prompt, every phase fits 15.5 GiB at ub 1024 (prompt peak 15,546 MiB with the codes change alone, generation 15,168), and the follow-up prompt pays about 55 ms for the upload of the codes; the attention split lowers the prompt phase further (see Results, combined build).
+- VRAM at 250k: every phase fits 15.5 GiB at ub 1024 (largest sample 15,271 MiB with block 16k, 15,584 with block 0) and at ub 4096 with block 16k and `--spec-draft-n-ubatch 1024` (15,372); ub 4096 with block 0 does not (17,974). The follow-up prompt pays about 55 ms for the upload of the codes (see Results, combined build).
 - The attention split changes the rounding of the prompt (other ids than the single attention); its quality is checked on few traces only (see Results, attention split).
 - Deferred tuning: top-up rules and thresholds, prefetch size. Lead 3 was measured with the whole union (no gain, worse KL); the resident capacity follows the largest verify batch.
 - No automated tests for the store, the fitter, the ring cache or the server flows; only the codec and the kernel have tests. The session flows were checked by hand once.
@@ -667,4 +690,4 @@ State save and load of the K/V outside the fit mode with a tail ring (`--kvq-tai
 
 ## Working material outside the repository
 
-`../kvq-scratch`: build scripts (`build.bat`, `reconfigure.bat`, build dir `build-cuda`), token files of four traces (`tok/`, prefix lengths 11705, 24183, 49737, 99395; `tok/cat281k.bin` = four traces one after the other, 281,551 tokens, for 250k prompts), reference logits (`ref/`), server session scripts (`srv/`), logs; `mem/` holds the memory work of 2026-11-17 and 2026-11-18 (`inventory`, `vram`, `phase`, `replay`, `m250`, `comb250`, each with a `RESULTS.md`). The token files come from private data: never print or log prompt text, generated text or decoded tokens.
+`../kvq-scratch`: build scripts (`build.bat`, `reconfigure.bat`, build dir `build-cuda`), token files of four traces (`tok/`, prefix lengths 11705, 24183, 49737, 99395; `tok/cat281k.bin` = four traces one after the other, 281,551 tokens, for 250k prompts), reference logits (`ref/`), server session scripts (`srv/`), logs; `mem/` holds the memory work of 2026-11-17 to 2026-11-19 (`inventory`, `vram`, `phase`, `replay`, `m250`, `comb250`, `codes`, `attnsplit`, `final`, each with a `RESULTS.md`). The token files come from private data: never print or log prompt text, generated text or decoded tokens.
