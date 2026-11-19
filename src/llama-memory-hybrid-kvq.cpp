@@ -182,6 +182,7 @@ bool llama_memory_hybrid_kvq::settle(llama_pos n, bool end) {
             if (tg_cb) {
                 tg_cb();
             }
+            // the result is ignored on purpose: a failure is retried before the first decode graph (llama-context.cpp, process_ubatch, kctx->codes_alloc) and returns ALLOC_FAILED
             store->codes_alloc();
         }
     });
@@ -218,7 +219,7 @@ void llama_memory_hybrid_kvq::clear(bool data) {
 bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (fitter) {
         if (seq_id > 0) {
-            GGML_ABORT("seq_rm of sequence %d: the fit mode supports sequence 0 only", seq_id);
+            GGML_ABORT("seq_rm of sequence %d is not supported by the two-tier KV cache (--kvq): the cache holds one sequence only (seq 0). Use n_seq_max = 1 (server: -np 1), or run without --kvq.", seq_id);
         }
         // the attention positions: a restored recurrent checkpoint can end before them; the ring is empty when they end with the host store
         const llama_pos pos_max = n_pos() - 1;
@@ -228,7 +229,7 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
             return llama_memory_hybrid::seq_rm(seq_id, p0, p1);
         }
         if (q1 <= pos_max) {
-            GGML_ABORT("seq_rm of positions [%d, %d): the fit mode can remove the end of the sequence only (last position %d)", p0, p1, pos_max);
+            GGML_ABORT("seq_rm of positions [%d, %d) is not supported by the two-tier KV cache (--kvq): it can only remove the end of the sequence (here [p0, -1) with p0 <= %d). Removing a middle range is not supported. Disable the context shift and --cache-reuse, or run without --kvq.", p0, p1, pos_max);
         }
         if (!llama_memory_hybrid::seq_rm(seq_id, p0, p1)) {
             return false;
@@ -240,7 +241,7 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     if (store && (p1 < 0 || p1 > 0) && (p0 < 0 || p0 < store->n_coarse())) {
-        GGML_ABORT("seq_rm of positions [%d, %d) would remove the packed coarse region [0, %d)", p0, p1, store->n_coarse());
+        GGML_ABORT("seq_rm of positions [%d, %d) is not supported by the two-tier KV cache (--kvq): it would remove the packed coarse region [0, %d), only the end of the sequence after it can be removed. Disable the context shift and --cache-reuse, or run without --kvq.", p0, p1, store->n_coarse());
     }
 
     return llama_memory_hybrid::seq_rm(seq_id, p0, p1);
@@ -248,7 +249,7 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 
 void llama_memory_hybrid_kvq::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (params.enabled || store) {
-        GGML_ABORT("seq_cp is not supported in two-tier mode");
+        GGML_ABORT("seq_cp is not supported by the two-tier KV cache (--kvq): the cache holds one sequence only (seq 0). Use n_seq_max = 1 (server: -np 1), or run without --kvq.");
     }
 
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -256,7 +257,7 @@ void llama_memory_hybrid_kvq::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
 void llama_memory_hybrid_kvq::seq_keep(llama_seq_id seq_id) {
     if ((params.enabled || store) && seq_id != 0) {
-        GGML_ABORT("seq_keep of sequence %d: two-tier mode supports sequence 0 only", seq_id);
+        GGML_ABORT("seq_keep of sequence %d is not supported by the two-tier KV cache (--kvq): the cache holds one sequence only (seq 0). Use n_seq_max = 1 (server: -np 1), or run without --kvq.", seq_id);
     }
 
     llama_memory_hybrid::seq_keep(seq_id);
@@ -264,7 +265,7 @@ void llama_memory_hybrid_kvq::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid_kvq::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     if (params.enabled) {
-        GGML_ABORT("seq_add is not supported in two-tier mode");
+        GGML_ABORT("seq_add is not supported by the two-tier KV cache (--kvq): the coarse codes hold rotated keys, so positions cannot be shifted. Disable the context shift and --cache-reuse, or run without --kvq.");
     }
 
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
@@ -272,7 +273,7 @@ void llama_memory_hybrid_kvq::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 
 void llama_memory_hybrid_kvq::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     if (params.enabled) {
-        GGML_ABORT("seq_div is not supported in two-tier mode");
+        GGML_ABORT("seq_div is not supported by the two-tier KV cache (--kvq): the coarse codes hold rotated keys, so positions cannot be divided. Disable the context shift (self-extend), or run without --kvq.");
     }
 
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);

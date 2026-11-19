@@ -222,14 +222,24 @@ Consequences: block 16k is the default; a KL against a single-attention referenc
 
 ## 8. Known costs, limits and gaps
 
-- One sequence only (`--parallel 1`); no context shift, no cache reuse, no `seq_cp`; the phases are only used with one sequence.
-- CUDA only; other ggml backends would compute the LSE flash attention without the LSE (a `supports_op` check is needed before this goes anywhere else).
+- Not supported: see the next section (one sequence only, no context shift, no cache reuse, CUDA only, ...).
 - The graph is re-planned at almost every prompt ubatch because the number of key blocks follows the number of stored rows (the buffer does not grow; the cost is inside the prompt times above).
 - The follow-up prompt pays the codes upload (section 6). A per-layer overlapped upload was built and hid nothing (the batch it would hide behind is shorter than the upload), so the simple version is in the tree.
 - Host memory: 8.5 GB of pinned RAM for the store at 256k plus 1.8 GB for the codes copy, per sequence.
 - Quality measured on one 100k trace and four shorter ones; nothing at 150k or above; no long session (hours, many rollbacks and refits); no automated tests of the store, the fitter, the ring or the server flows beyond the codec and kernel tests.
 - The branch changes ggml (two new ops, the scheduler callback order, `ggml_gallocr_resize`, the CUDA flash-attention kernels) and carries the merge of the open PR 31669; rebases will conflict there and the final upstream version of the PR will have to replace the merged one.
-- `--fit` and the memory estimate do not know about the kvq memory.
+
+### 8.1 Not supported
+
+Each of these is a documented limit (release blockers R1, R2 and R6 in `kvq-scratch/RELEASE-BLOCKERS.md` list what supporting them takes). The memory operations abort with a message that starts with `not supported by the two-tier KV cache (--kvq)`, then the reason and what to do; the server never calls them with its `--kvq` settings (one slot, no context shift, no cache reuse).
+
+- `seq_cp`, `seq_keep` of a sequence > 0, `seq_rm` of a sequence > 0, and more than one sequence: the store and the fitter hold sequence 0 only. Use `n_seq_max = 1` (server: `-np 1`).
+- `seq_add` and `seq_div`: the coarse codes hold rotated keys, so positions cannot be shifted or divided. Disable the context shift and `--cache-reuse`.
+- `seq_rm` of a middle range: only the end of the sequence can be removed, `[p0, -1)` with `p0 <= last position` (a removal into the coarse region refits it, see section 6).
+- Multimodal input and embeddings: the memory serves text generation of the qwen35 target only.
+- `--fit`: it measures a plain q8_0 K/V cache and does not know the kvq memory (device codes, tables, scratch, resident sets, host store). Use `--fit off`, with `--ctx-size` and `-ngl` set (release blocker R2).
+- More than one kvq context per GPU per process: the CUDA attention uses one side stream and function-static fork / join events per device (release blocker R6).
+- CUDA only: the other ggml backends refuse the kvq ops and the flash attention with the LSE output, and `--kvq` refuses to start on a model or device that cannot run them.
 
 ## 9. Ideas kept for later (owner's order)
 
