@@ -24,6 +24,8 @@
 #include "mtmd-helper.h"
 #include "base64.hpp"
 
+#include "../../src/llama-ext.h" // staging API: two-tier KV cache progress and counters
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -818,6 +820,32 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        print_timings_kvq();
+    }
+
+    // --kvq: one line with the fitted chunks and the packed attention counters since the previous print
+    void print_timings_kvq() const {
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+        llama_kvq_fit_progress fp;
+        llama_kvq_counters_all ca;
+        if (!llama_memory_kvq_fit_get_progress(mem, fp) || !llama_memory_kvq_get_counters(mem, ca)) {
+            return;
+        }
+        llama_kvq_counters s;
+        for (const auto & l : ca.layers) {
+            s.pf_fetch += l.pf_fetch;
+            s.bytes    += l.bytes;
+            s.t_join   += l.t_join;
+            s.t_upload += l.t_upload;
+        }
+        const double n_ub = (double) std::max<int64_t>(1, ca.n_ubatch);
+        SLT_INF(*this, "kvq: coarse rows = %d (%d chunks), host rows = %d, drops = %d, failed = %d, folds = %d (%.2f s), end-of-prompt fits = %d (%.2f s); "
+                "packed ubatches = %" PRId64 " (%" PRId64 " tokens), rows fetched = %" PRId64 ", %.1f MiB uploaded, join %.2f ms and upload %.2f ms per ubatch\n",
+                fp.n_coarse, fp.n_chunk, fp.n_host, fp.n_drop, fp.failed, fp.n_fold, fp.t_fold, fp.n_settle, fp.t_settle,
+                ca.n_ubatch, ca.n_tokens, s.pf_fetch, s.bytes/1048576.0, 1e3*s.t_join/n_ub, 1e3*s.t_upload/n_ub);
+        llama_memory_kvq_reset_counters(mem);
     }
 
     json to_json(bool only_metrics = false) const {
@@ -1101,6 +1129,31 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+
+    // --kvq: progress of the fitter at the previous log
+    int32_t kvq_n_coarse_last = 0;
+    int32_t kvq_n_drop_last   = 0;
+    bool    kvq_failed_last   = false;
+
+    // --kvq: a log line when the coarse region changes (cheap, no sync)
+    void kvq_log_progress() {
+        llama_kvq_fit_progress fp;
+        if (!llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), fp)) {
+            return;
+        }
+        if (fp.n_drop != kvq_n_drop_last) {
+            SRV_INF("kvq: the coarse region dropped back to %d rows (%d drops so far)\n", fp.n_coarse, fp.n_drop);
+        } else if (fp.n_coarse != kvq_n_coarse_last && !fp.t_job.empty()) {
+            SRV_INF("kvq: coarse region = %d rows (%d chunks), last job %.2f s (%.2f s since its statistics), %d jobs running\n",
+                    fp.n_coarse, fp.n_chunk, fp.t_job.back(), fp.t_wall.back(), fp.n_running);
+        }
+        if (fp.failed && !kvq_failed_last) {
+            SRV_WRN("%s", "kvq: the fit failed, the coarse region does not grow\n");
+        }
+        kvq_n_coarse_last = fp.n_coarse;
+        kvq_n_drop_last   = fp.n_drop;
+        kvq_failed_last   = fp.failed;
+    }
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -4648,6 +4701,8 @@ private:
             }
         });
 
+        kvq_log_progress();
+
         if (ret != 0) {
             {
                 std::string err;
@@ -4807,6 +4862,15 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // --kvq: the prompt is done when it is fitted up to its end (the rows after the last complete chunk too) and no fit work runs
+                if (params_base.kvq.enabled) {
+                    const int64_t t_wait_start = ggml_time_us();
+                    llama_memory_kvq_fit_wait(llama_get_memory(ctx_tgt));
+                    llama_kvq_fit_progress fp;
+                    llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), fp);
+                    SLT_INF(slot, "kvq: waited %.3f s for the fitter at the end of the prompt, coarse region %d rows\n", (ggml_time_us() - t_wait_start)*1e-6, fp.n_coarse);
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

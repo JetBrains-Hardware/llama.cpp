@@ -12,6 +12,9 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "speculative.h"
+
+#include "../../src/llama-ext.h" // staging API: llama_kvq_params
 
 #include <algorithm>
 #include <atomic>
@@ -114,6 +117,70 @@ static server_role_type server_role_detect(const common_params & params, server_
     return has_model ? SERVER_ROLE_INSTANCE : SERVER_ROLE_ROUTER;
 }
 
+// --kvq: the two-tier KV cache holds one sequence and cannot copy or shift the K/V,
+// the settings it needs are forced with a warning, the others are an error
+static bool server_kvq_prepare_params(common_params & params) {
+    // ubatches of up to this many tokens use the packed attention (llama_kvq_params::max_batch)
+    const int32_t kvq_max_batch = llama_kvq_params().max_batch;
+
+    if (!params.mmproj.path.empty() || !params.mmproj.hf_repo.empty() || !params.mmproj.url.empty()) {
+        SRV_ERR("%s", "--kvq: multimodal projectors are not supported\n");
+        return false;
+    }
+    if (params.embedding) {
+        SRV_ERR("%s", "--kvq: embeddings are not supported\n");
+        return false;
+    }
+    if (params.n_parallel != 1) {
+        SRV_WRN("--kvq: one slot only, setting n_parallel = 1 (was %d)\n", params.n_parallel);
+        params.n_parallel = 1;
+    }
+    if (params.kv_unified) {
+        params.kv_unified = false;
+    }
+    params.cache_idle_slots = false;
+    if (params.ctx_shift) {
+        SRV_WRN("%s", "--kvq: the K/V cannot be shifted, disabling the context shift\n");
+        params.ctx_shift = false;
+    }
+    if (params.n_cache_reuse > 0) {
+        SRV_WRN("%s", "--kvq: the K/V cannot be shifted, disabling the cache reuse (--cache-reuse 0)\n");
+        params.n_cache_reuse = 0;
+    }
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        SRV_WRN("%s", "--kvq: enabling flash attention\n");
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+    if (params.cache_type_k != GGML_TYPE_Q8_0 || params.cache_type_v != GGML_TYPE_Q8_0) {
+        SRV_WRN("--kvq: the K/V cache must be q8_0, setting it (was %s/%s)\n", ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v));
+        params.cache_type_k = GGML_TYPE_Q8_0;
+        params.cache_type_v = GGML_TYPE_Q8_0;
+    }
+    if (params.speculative.draft.n_max > kvq_max_batch - 1) {
+        SRV_WRN("--kvq: the verify batch must fit the packed attention, setting --spec-draft-n-max %d (was %d)\n", kvq_max_batch - 1, params.speculative.draft.n_max);
+        params.speculative.draft.n_max = kvq_max_batch - 1;
+    }
+    if (common_speculative_n_max(&params.speculative) > kvq_max_batch - 1) {
+        SRV_WRN("--kvq: drafts of more than %d tokens are verified with the flash attention over the scratch\n", kvq_max_batch - 1);
+    }
+    if (params.kvq.resident_cap > 0 && params.kvq.prefetch_n > params.kvq.resident_cap) {
+        SRV_WRN("--kvq: the prefetch must fit the resident rows, setting --kvq-resident-cap %d (was %d)\n", params.kvq.prefetch_n, params.kvq.resident_cap);
+        params.kvq.resident_cap = params.kvq.prefetch_n;
+    }
+    if (params.n_ctx_checkpoints <= 0) {
+        SRV_WRN("%s", "--kvq: without context checkpoints a changed conversation is processed again from the start\n");
+    }
+    if (params.fit_params) {
+        SRV_WRN("%s", "--kvq: --fit does not count the memory of the two-tier cache (coarse rows, tables and scratch, about 1/4 of a full q8_0 K/V on the device)\n");
+    }
+    // recurrent rollback by replay instead of n_rs_seq snapshots; LLAMA_RS_REPLAY=0 keeps the snapshots
+    if (!params.rs_replay) {
+        SRV_WRN("%s", "--kvq: recurrent rollback by replay\n");
+        params.rs_replay = true;
+    }
+    return true;
+}
+
 // adjust the params for the role; returns false on a configuration error
 static bool server_prepare_params(common_params & params, server_role_type role_type) {
     if (role_type != SERVER_ROLE_ROUTER) {
@@ -131,6 +198,10 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 
             params.n_parallel = 4;
             params.kv_unified = true;
+        }
+
+        if (params.kvq.enabled && !server_kvq_prepare_params(params)) {
+            return false;
         }
     }
 

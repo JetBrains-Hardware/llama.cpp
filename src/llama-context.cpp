@@ -198,16 +198,17 @@ llama_context::llama_context(
     }
 
     // [EXPERIMENTAL] deferred commit for delta-net: keep one state and the inputs of the last ubatch
-    // LLAMA_RS_REPLAY=1: the gdn op replays the kept pending tokens before the new ones
+    // rs_replay: the gdn op replays the kept pending tokens before the new ones; LLAMA_RS_REPLAY=0/1 overrides it
     cparams.rs_replay = false;
     if (cparams.n_rs_seq > 0) {
         const char * env = getenv("LLAMA_RS_REPLAY");
+        const bool replay = env ? atoi(env) != 0 : params.rs_replay;
         const bool supported = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN3NEXT ||
                                model.arch == LLM_ARCH_QWEN4EXP || model.arch == LLM_ARCH_CLOVER_MOE ||
                                // KDA
                                model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
                                model.arch == LLM_ARCH_BAILINGMOE3;
-        cparams.rs_replay = env && atoi(env) != 0 && supported;
+        cparams.rs_replay = replay && supported;
         if (cparams.rs_replay && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.arch == LLM_ARCH_QWEN3NEXT) {
             // its conv channels split in two segments, which the channels-first replay conv history cannot keep
             LLAMA_LOG_WARN("%s: LLAMA_RS_REPLAY is not supported for qwen3next with SPLIT_MODE_TENSOR, using snapshots\n", __func__);
@@ -4682,6 +4683,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.phase_bufs                  =*/ true,
+        /*.rs_replay                   =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
