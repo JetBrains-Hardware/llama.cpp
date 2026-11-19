@@ -599,6 +599,7 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool rs_replay         = false; // recurrent rollback by replay instead of snapshots (llama_context_params::rs_replay)
     bool phase_bufs        = true;  // compute buffers per phase (llama_context_params::phase_bufs)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
@@ -616,6 +617,21 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+
+    // two-tier KV cache of the main context (qwen35): packed attention, K and V tables fitted in the background, see llama_kvq_fit_params
+    struct {
+        bool        enabled      = false;
+        int32_t     n_threads    = -1;   // CPU threads of the fitter, -1: 4, at most the physical cores
+        int32_t     prefetch_n   = 1024; // rows per (kv head, position) of the early query
+        int32_t     resident_cap = 0;    // resident rows per (layer, kv head), 0: max_batch x prefetch_n
+        int32_t     lead         = 2;    // layers between the early query and its attention
+        int32_t     layer_bufs   = -1;   // device buffers of the resident rows: -1 one per attention layer, N >= 2 rotating
+        int32_t     tail         = -1;   // cells of the ring of the rows that are not coded yet (pinned host memory), -1: max(n_batch, 4096) + 256
+        int32_t     chunk        = 8192; // rows per chunk (one table set)
+        int32_t     rem          = 0;    // llama_kvq_rem: the rows after the last complete chunk, 0 own chunk, 1 merged into the last complete chunk
+        int32_t     min_rows     = 256;  // own: the smallest chunk of these rows, fewer stay precise
+        int32_t     scr_block    = 16384; // rows per key block of the scratch attention of a prompt, 0: one attention with a mask
+    } kvq;
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded

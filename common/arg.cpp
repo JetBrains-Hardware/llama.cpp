@@ -2452,6 +2452,124 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--kvq"},
+        "two-tier KV cache (qwen35 only): small batches attend through packed K/V codes and a resident set of q8_0 rows\n"
+        "from pinned host memory, the K and V tables are fitted per 8k chunk in the background; forces 1 slot, q8_0 K/V,\n"
+        "flash attention, no context shift, no cache reuse; slot save / restore and the RAM prompt cache work (default: disabled)",
+        [](common_params & params) {
+            params.kvq.enabled = true;
+        }
+    ).set_env("LLAMA_ARG_KVQ").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-threads"}, "N",
+        "two-tier KV cache: CPU threads that fit the tables of the chunks (the rows are coded on the GPU), at a low priority (default: 4, at most the physical cores)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.n_threads = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_THREADS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-prefetch-n"}, "N",
+        string_format("two-tier KV cache: rows per (kv head, position) prefetched to the resident set (default: %d)", params.kvq.prefetch_n),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.prefetch_n = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_PREFETCH_N").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-resident-cap"}, "N",
+        string_format("two-tier KV cache: resident q8_0 rows per (attention layer, kv head), 0 = 8 x prefetch_n, the whole request of a verify batch of 8; a larger union is cut by the max score (default: %d)", params.kvq.resident_cap),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.resident_cap = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_RESIDENT_CAP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-lead"}, "N",
+        string_format("two-tier KV cache: the prefetch of an attention layer starts N layers earlier, 0 = no prefetch (default: %d)", params.kvq.lead),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.lead = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_LEAD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-layer-bufs"}, "N|all",
+        "two-tier KV cache: device buffers of the resident rows; 'all' = one buffer per attention layer, the rows stay on the device; N >= 2 = the layers rotate through N buffers and each verify batch uploads every layer's resident rows (slower on a slow bus, about 100 MiB less VRAM below 250k) (default: all)",
+        [](common_params & params, const std::string & value) {
+            if (value == "all") {
+                params.kvq.layer_bufs = -1;
+                return;
+            }
+            const int n = std::stoi(value);
+            if (n < 2) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.layer_bufs = n;
+        }
+    ).set_env("LLAMA_ARG_KVQ_LAYER_BUFS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-scr-block"}, "N",
+        string_format("two-tier KV cache: a prompt ubatch attends over the host rows in key blocks of N rows (multiple of 256) without a mask, 0 = one attention with a mask over all rows (default: %d)", params.kvq.scr_block),
+        [](common_params & params, int value) {
+            if (value < 0 || (value > 0 && value % 256 != 0)) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.scr_block = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_SCR_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-tail"}, "N",
+        "two-tier KV cache: cells of the ring of q8_0 rows that are not coded yet, in pinned host memory (default: max(batch size, 4096) + 256)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.tail = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_TAIL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-chunk"}, "N",
+        string_format("two-tier KV cache: rows per chunk, each chunk gets its own K and V tables (default: %d)", params.kvq.chunk),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.chunk = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-rem"}, "{own,merge}",
+        "two-tier KV cache: the rows after the last complete chunk at the end of a prompt, fitted as a chunk of their own\n"
+        "or merged with the last complete chunk into one group (default: own)",
+        [](common_params & params, const std::string & value) {
+            if (value == "own") {
+                params.kvq.rem = 0;
+            } else if (value == "merge") {
+                params.kvq.rem = 1;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_KVQ_REM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-min-rows"}, "N",
+        string_format("two-tier KV cache, --kvq-rem own: the fewest rows after the last complete chunk that get a chunk of their own, fewer stay precise (default: %d)", params.kvq.min_rows),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.min_rows = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_MIN_ROWS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
