@@ -73,6 +73,11 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// frees buffer i and allocates it again with sizes[i] bytes (0: freed only, SIZE_MAX: buffer i is kept)
+// the node assignments stay: ggml_gallocr_alloc_graph reserves again only if a buffer is missing or too small for them
+// returns false if an allocation failed (that buffer is then missing)
+GGML_API bool ggml_gallocr_resize(ggml_gallocr_t galloc, const size_t * sizes);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 
