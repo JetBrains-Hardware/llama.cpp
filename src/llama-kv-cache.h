@@ -168,11 +168,22 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // The stream holding seq_id's cells.
     uint32_t get_stream(llama_seq_id seq_id) const;
+
+    // ring mode (single stream): position p goes to cell p mod size, a slot fails if that cell is not empty
+    void set_ring(bool value) { ring = value; }
+    bool get_ring() const { return ring; }
+
+    // ring mode: positions [p0, p1) of seq_id into their cells, which must be empty; the caller writes their K/V
+    void ring_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
+    // the K/V tensors move to new buffers of buft, zeroed (the data is not copied); the graphs must be built again
+    void move_bufs(ggml_backend_buffer_type_t buft);
 
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
@@ -293,6 +304,9 @@ private:
     const uint32_t n_swa = 0;
 
     const bool is_indexer = false;
+
+    // see set_ring
+    bool ring = false;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;
