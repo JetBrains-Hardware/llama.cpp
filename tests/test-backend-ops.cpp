@@ -9587,6 +9587,101 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with the log-sum-exp, K/V as a view of rows [r0, r0 + kv) of a head-major cache [hs, 2 (K, V), n_rows, nh]
+struct test_flash_attn_ext_lse : public test_case {
+    const int64_t hs;
+    const int64_t nh;  // K/V heads
+    const int64_t gqa;
+    const int64_t n_rows;
+    const int64_t r0;
+    const int64_t kv;
+    const int64_t nb;
+    const bool mask;
+    const ggml_type type_KV;
+    const bool lse; // false: ggml_flash_attn_ext (for the perf mode)
+    const bool lse_only; // compare only the log-sum-exp, by the max abs error
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_LSE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR10(hs, nh, gqa, n_rows, r0, kv, nb, mask, type_KV, lse) + ",lse_only=" + std::to_string(lse_only);
+    }
+
+    double max_nmse_err() override {
+        return lse_only ? 2e-3 : 5e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!lse_only) {
+            return nmse(a, b, n);
+        }
+        double e = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            e = std::max(e, (double) std::fabs(a[i] - b[i]));
+        }
+        return e;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_flash_attn_ext_lse(int64_t hs = 256, int64_t nh = 4, int64_t gqa = 6, int64_t n_rows = 1024, int64_t r0 = 256, int64_t kv = 512,
+                            int64_t nb = 8, bool mask = false, ggml_type type_KV = GGML_TYPE_Q8_0, bool lse = true, bool lse_only = false)
+        : hs(hs), nh(nh), gqa(gqa), n_rows(n_rows), r0(r0), kv(kv), nb(nb), mask(mask), type_KV(type_KV), lse(lse), lse_only(lse_only) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * cache = ggml_new_tensor_4d(ctx, type_KV, hs, 2, n_rows, nh);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * k = ggml_view_4d(ctx, cache, hs, nh, kv, 1, cache->nb[3], cache->nb[2], cache->nb[3]*nh, r0*cache->nb[2]);
+        ggml_tensor * v = ggml_view_4d(ctx, cache, hs, nh, kv, 1, cache->nb[3], cache->nb[2], cache->nb[3]*nh, r0*cache->nb[2] + cache->nb[1]);
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx, v, 0, 2, 1, 3);
+
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, nb);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * fa = lse ? ggml_flash_attn_ext_lse(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f) : ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
+        ggml_set_name(fa, "fa");
+
+        if (mode == MODE_PERF) {
+            return fa;
+        }
+
+        // the result rows and the log-sum-exp, without the padding of the last row
+        ggml_tensor * out = lse_only ? ggml_cont(ctx, ggml_view_1d(ctx, fa, nh*gqa*nb, nb*fa->nb[2])) :
+                                       ggml_cont(ctx, ggml_view_1d(ctx, fa, hs*nh*gqa*nb + (lse ? nh*gqa*nb : 0), 0));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "m") == 0 && mode == MODE_PERF) {
+                std::vector<ggml_fp16_t> z(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                ggml_backend_tensor_set(t, z.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -13563,6 +13658,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // with the log-sum-exp: key blocks of a cache without a mask, the last rows with a mask
+    for (int64_t nb : {1, 3, 8, 33, 64, 512, 1024}) {
+        for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_lse(256, 4, 6, 8192, 2048, 4096, nb, false, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_lse(256, 4, 6, 8192,    0,  256, nb, false, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_lse(256, 4, 6, 8192, 6912, 1280, nb, true,  type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_lse(256, 4, 6, 8192, 7680,  300, nb, true,  type_KV));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_lse(128, 8, 4, 2048,  512, 1024, nb, false, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext_lse(256, 4, 6, 8192, 2048, 4096, nb, false, GGML_TYPE_Q8_0, true, true));
+        test_cases.emplace_back(new test_flash_attn_ext_lse(256, 4, 6, 8192, 6912, 1280, nb, true,  GGML_TYPE_Q8_0, true, true));
+        test_cases.emplace_back(new test_flash_attn_ext_lse(128, 2, 1, 2048,  256,  768, nb, true,  GGML_TYPE_F16));
+    }
+
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -14399,6 +14508,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // the scratch attention of a prompt ubatch (qwen35 two-tier cache): key blocks with the log-sum-exp against one masked attention
+    for (int64_t nb : {1024, 2048}) {
+        for (bool mask : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_ext_lse(256, 4, 6, 32768, 0, 32768, nb, mask, GGML_TYPE_Q8_0, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_lse(256, 4, 6, 32768, 0, 32768, nb, true, GGML_TYPE_Q8_0, false));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));

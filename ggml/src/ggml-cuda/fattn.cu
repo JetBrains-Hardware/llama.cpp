@@ -682,9 +682,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
-    // only the MMA kernel reads K/V through kv_rows
-    if (kv_rows) {
-        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
+    // only the MMA kernel reads K/V through kv_rows and writes the log-sum-exp
+    if (kv_rows || ggml_flash_attn_ext_get_lse(KQV)) {
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && (mask || !kv_rows) && Q->ne[0] != 40 && Q->ne[0] != 72 ?
             BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 

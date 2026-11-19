@@ -8995,8 +8995,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
+    // the log-sum-exp of each (query, head) after the N rows of the result
+    float * lse = ggml_flash_attn_ext_get_lse(dst) ? (float *) ((char *) dst->data + N*nb2) : nullptr;
+
     GGML_ASSERT(ne0 == DV);
-    GGML_ASSERT(ne2 == N);
+    GGML_ASSERT(ne2 == N + (lse ? (N + DV - 1)/DV : 0));
 
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
@@ -9183,6 +9186,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+
+            if (lse) {
+                lse[i1*ne1 + i2] = S == 0.0f ? -INFINITY : M + logf(S);
+            }
         }
     }
 }
@@ -9210,8 +9217,11 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
+    // the log-sum-exp of each (query, head) after the N rows of the result
+    float * lse = ggml_flash_attn_ext_get_lse(dst) ? (float *) ((char *) dst->data + N*nb2) : nullptr;
+
     GGML_ASSERT(ne0 == DV);
-    GGML_ASSERT(ne2 == N);
+    GGML_ASSERT(ne2 == N + (lse ? (N + DV - 1)/DV : 0));
 
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
@@ -9477,6 +9487,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32 + tq * DV, nb1);
+
+            if (lse) {
+                lse[i1*ne1 + i2] = S[tq] == 0.0f ? -INFINITY : M[tq] + logf(S[tq]);
+            }
         }
 
         ir += tile_rows;
@@ -9576,9 +9590,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
+    const bool lse = ggml_flash_attn_ext_get_lse(dst);
 
     GGML_ASSERT(ne0 == DV);
-    GGML_ASSERT(ne2 == N);
+    GGML_ASSERT(ne2 == N + (lse ? (N + DV - 1)/DV : 0));
 
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
@@ -9608,7 +9623,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && !kv_rows && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !use_ref && !kv_rows && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512 && !lse;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
