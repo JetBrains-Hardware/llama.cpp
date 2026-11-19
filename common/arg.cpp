@@ -1715,9 +1715,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--phase-buffers"},
         {"--no-phase-buffers"},
-        string_format("compute buffers per phase: a single-sequence GPU context frees the prompt compute buffers while it generates (default: %s)", params.phase_bufs ? "enabled" : "disabled"),
+        "compute buffers per phase: a single-sequence GPU context frees the prompt compute buffers while it generates (default: enabled with --kvq and for the DFlash drafter, disabled otherwise)",
         [](common_params & params, bool value) {
-            params.phase_bufs = value;
+            params.phase_bufs = value ? 1 : 0;
         }
     ).set_env("LLAMA_ARG_PHASE_BUFFERS"));
     add_opt(common_arg(

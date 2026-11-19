@@ -4682,7 +4682,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.phase_bufs                  =*/ true,
+        /*.phase_bufs                  =*/ false,
         /*.rs_replay                   =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,

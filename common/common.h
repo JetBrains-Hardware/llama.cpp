@@ -600,7 +600,7 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
     bool rs_replay         = false; // recurrent rollback by replay instead of snapshots (llama_context_params::rs_replay)
-    bool phase_bufs        = true;  // compute buffers per phase (llama_context_params::phase_bufs)
+    int32_t phase_bufs      = -1;    // compute buffers per phase (llama_context_params::phase_bufs), -1 = auto: on with --kvq and for a DFlash drafter, off otherwise
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
