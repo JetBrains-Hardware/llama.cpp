@@ -241,6 +241,10 @@ Each of these is a documented limit (release blockers R1, R2 and R6 in `kvq-scra
 - More than one kvq context per GPU per process: the CUDA attention uses one side stream and function-static fork / join events per device (release blocker R6).
 - CUDA only: the other ggml backends refuse the kvq ops and the flash attention with the LSE output, and `--kvq` refuses to start on a model or device that cannot run them.
 
+### 8.2 Using it from a program
+
+One entry point, `llama_init_from_model_kvq(model, cparams, llama_kvq_config)` in `src/llama-ext.h` (the server and kvq-eval go through `common_init_from_params`, which calls it). The setting belongs to the context, not to the model: the context gets the packed memory, the ring of `llama_kvq_config::tail` cells and the fit, and the attention rotation is off in its own attention cache only. A second context of the same model (an MTP drafter, a plain context) keeps the rotation and a normal memory. `llama_model_set_attn_rot` (the ggml-org setter, for tests) is not used by `--kvq`.
+
 ## 9. Ideas kept for later (owner's order)
 
 1. Scratch as a ring of 16k-row blocks fed on the copy stream: 540 -> about 105 MiB in both phases (the one item that moves the decode phase, which sets the headroom in configuration A); 10 - 20 ms of alloc / free per phase switch is acceptable.
