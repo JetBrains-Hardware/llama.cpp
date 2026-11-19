@@ -313,6 +313,7 @@ llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp  LABEL behavior)
 llama_build_and_test(test-kvq-codec.cpp  LABEL behavior  LINK llama)
+llama_build_and_test(test-kvq-attn.cpp   LABEL behavior  LINK llama)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
