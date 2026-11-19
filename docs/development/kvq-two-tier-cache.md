@@ -2,6 +2,8 @@
 
 State of branch `kvq-two-tier-cache` (2026-11-19): the GPU fitter, the ring redesign (the rows after the last complete chunk are fitted at the end of every prompt, the ring holds only rows that are not coded yet), the whole union of the verify batch, the resident rows and the ring in pinned host memory, since fba885494 the compute buffers per phase and the GDN replay of ggml-org PR 31669 (merged at 4218b5b9f, see Results, memory per phase), since affa1fa81 the codes and tables in host memory during the prompt, and since 6d2ecbfab the prompt's scratch attention in mask-free key blocks merged by the log-sum-exp (see Results, combined build; its quality is settled in Results, quality of the blocked attention). With these the server fits 250k context into 15.5 GiB of VRAM in every phase, at ub 1024 and, with `--spec-draft-n-ubatch 1024`, at ub 4096. The CPU fitter is kept on branch `kvq-fit-cpu`. The branch starts from ggml-org/master 951d465f5 and is pushed to the JetBrains-Hardware fork. This file is the starting point for the next work session.
 
+A self-contained user guide with the final numbers of 2026-11-19 (build, run, every knob, memory per phase, speed, quality, limits) is `kvq-two-tier-cache-guide.md` next to this file.
+
 Research background, codec definition and the original plan are in the `qwen3.8-exp` repository: `notes/kvq_implementation_plan.md`, `notes/kv_prefetch_results.md`, `src/qexp/kvcodec.py`, `experiments/14_kv_prefetch.py`.
 
 ## What it is
