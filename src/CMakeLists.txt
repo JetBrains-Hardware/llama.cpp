@@ -28,6 +28,7 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-msa.cpp
     llama-kv-cache-dsv4.cpp
     llama-kvq-codec.cpp
+    llama-kvq-fit.cpp
     llama-kvq-pack.cpp
     llama-kvq-store.cpp
     llama-memory.cpp
