@@ -169,7 +169,8 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+              uint32_t kvq_tail) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -435,6 +436,7 @@ llama_context::llama_context(
     }
 
     cparams.phase_bufs = params.phase_bufs;
+    cparams.kvq_tail   = kvq_tail;
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
@@ -569,6 +571,7 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
             /*.no_alloc  =*/ model.no_alloc(),
+            /*.kvq_tail  =*/ cparams.kvq_tail,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -4693,9 +4696,11 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
-llama_context * llama_init_from_model(
+// kvq_tail > 0: the memory of the context is the two-tier KV cache (llama_init_from_model_kvq), a ring of kvq_tail cells
+static llama_context * llama_init_from_model_impl(
                  llama_model * model,
-        llama_context_params   params) {
+        llama_context_params   params,
+                    uint32_t   kvq_tail) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -4822,7 +4827,7 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, kvq_tail);
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -4837,6 +4842,51 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model(
+                 llama_model * model,
+        llama_context_params   params) {
+    return llama_init_from_model_impl(model, params, 0);
+}
+
+llama_context * llama_init_from_model_kvq(
+                 llama_model * model,
+        llama_context_params   params,
+    const llama_kvq_config   & cfg) {
+    if (!model) {
+        LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
+        return nullptr;
+    }
+
+    std::string why;
+    if (!llama_model_supports_kvq(model, &why)) {
+        LLAMA_LOG_ERROR("%s: the two-tier KV cache is not supported by this model: %s\n", __func__, why.c_str());
+        return nullptr;
+    }
+    if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        LLAMA_LOG_ERROR("%s: the two-tier KV cache needs a default context (not MTP or a draft context)\n", __func__);
+        return nullptr;
+    }
+    // the q8_0 cache types are checked by the store when the memory is created
+
+    // the device cache holds one batch: the rows of a prompt go to the host store when the ring is full or their job starts
+    // at least 4096 positions, a long reply is fitted in line once per ring size of tokens
+    const uint32_t tail = cfg.tail > 0 ? (uint32_t) cfg.tail : (uint32_t) GGML_PAD(std::max<int64_t>(params.n_batch, 4096) + 256, 256);
+
+    llama_context * ctx = llama_init_from_model_impl(model, params, tail);
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+
+    llama_kvq_params kp = cfg.params;
+    kp.enabled = true;
+    if (!llama_memory_kvq_fit_enable(llama_get_memory(ctx), cfg.fit, kp)) {
+        LLAMA_LOG_ERROR("%s: cannot enable the two-tier KV cache on the context\n", __func__);
+        delete ctx;
+        return nullptr;
+    }
+    return ctx;
 }
 
 void llama_free(llama_context * ctx) {

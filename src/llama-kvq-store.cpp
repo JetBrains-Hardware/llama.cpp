@@ -350,7 +350,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         throw std::runtime_error("packed two-tier mode needs a single KV stream");
     }
     if (!kv.get_ring()) {
-        throw std::runtime_error("packed two-tier mode needs the attention cache as a ring (llama_model_set_kvq_tail)");
+        throw std::runtime_error("packed two-tier mode needs the attention cache as a ring (llama_kvq_config::tail)");
     }
     if (n_rows <= 0 || n_chunk_rows <= 0 || n_sink < 0 || n_sink >= n_chunk_rows) {
         throw std::runtime_error("packed two-tier mode: bad coarse region");

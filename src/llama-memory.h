@@ -29,6 +29,9 @@ struct llama_memory_params {
 
     // only simulate the memory allocations
     bool no_alloc;
+
+    // two-tier KV cache (llama_init_from_model_kvq): the ring cells of the attention cache, 0: a normal memory
+    uint32_t kvq_tail = 0;
 };
 
 // the tensor contexts and backend buffers of a memory instance

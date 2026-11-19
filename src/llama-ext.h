@@ -123,14 +123,15 @@ LLAMA_API std::vector<ggml_tensor *> llama_memory_get_tensors(const llama_memory
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
 // Turn the KV cache attention rotation on or off for the contexts created from this model.
-// Useful for testing purposes.
+// Useful for testing purposes. (The two-tier KV cache does not use it: llama_init_from_model_kvq turns the rotation off in the
+// attention cache of its own context only.)
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
 //
 // two-tier KV cache (kvq)
 //
 
-// packed mode (llama_model_set_kvq_packed, ggml_kvq_attn): the coarse region grows with the fit (llama_memory_kvq_fit_enable),
+// packed mode (llama_init_from_model_kvq, ggml_kvq_attn): the coarse region grows with the fit (llama_memory_kvq_fit_enable),
 // the precise rows of the coarse region come from a host store into a resident cache per (layer, kv head)
 // ubatches of up to max_batch tokens attend through ggml_kvq_attn, larger ones through the normal attention
 // the first n_sink rows are always resident; the other resident rows are the ones the prefetch fetched
@@ -159,14 +160,6 @@ static inline int32_t llama_kvq_resident_slots(const llama_kvq_params & p) {
 // attention layer, the same number of query and kv heads in all of them, a whole number of query heads per kv head);
 // reason (optional) says what fails; the kv type (q8_0) is a context setting and is checked when the memory is created
 LLAMA_API bool llama_model_supports_kvq(const struct llama_model * model, std::string * reason = nullptr);
-
-// packed mode: the contexts created from this model attend through ggml_kvq_attn (qwen35 only)
-LLAMA_API void llama_model_set_kvq_packed(struct llama_model * model, bool value);
-
-// packed mode: the attention cache of the contexts created from this model holds n_cells > 0 cells as a ring (position p in cell p mod n_cells,
-// at most one cell per position of the context), in pinned host memory; the fit mode (llama_memory_kvq_fit_enable) removes the positions
-// of the coarse region from it; the context size still limits the positions; the large ubatches attend over the scratch
-LLAMA_API void llama_model_set_kvq_tail(struct llama_model * model, uint32_t n_cells);
 
 // packed mode counters, per attention layer; times in seconds
 struct llama_kvq_counters {
@@ -231,7 +224,7 @@ struct llama_kvq_memory_info {
 //   a finished job joins the coarse region on the decode thread before a later ubatch (in order); a small batch (packed
 //   attention) waits for the jobs in flight first, so its result does not depend on their timing
 //   the positions after the coarse region attend precisely (the q8_0 cache)
-//   tail (llama_model_set_kvq_tail): the cache is a ring of the positions whose rows are not in the host store; a large batch
+//   tail (llama_kvq_config::tail): the cache is a ring of the positions whose rows are not in the host store; a large batch
 //   that does not fit it starts the jobs of the complete chunks, then copies the ring rows to the host store (spill);
 //   an error if that cannot free the room
 // memory operations: clear and seq_rm of the end of the sequence; a seq_rm into the coarse region or into a chunk that
@@ -262,9 +255,30 @@ struct llama_kvq_fit_params {
     int32_t     min_rows  = 256; // own: the smallest chunk of the rows after the last complete chunk (a covariance of fewer than D + 1 rows is rank deficient)
 };
 
-// the memory must be empty and created in packed mode (llama_model_set_kvq_packed)
+// the memory must be empty and created in packed mode (llama_init_from_model_kvq calls this, use it instead)
 // the coarse region can grow to the full chunks of the cache; enabled until the memory is freed, clear() keeps it
 LLAMA_API bool llama_memory_kvq_fit_enable(llama_memory_t mem, const llama_kvq_fit_params & fparams, const llama_kvq_params & params);
+
+// everything that makes a context a two-tier KV cache context; the setting belongs to the context, not to the model
+// (a second context of the same model, e.g. an MTP drafter, keeps the attention rotation and a normal memory)
+struct llama_kvq_config {
+    // cells of the ring of the attention cache, in pinned host memory: position p in cell p mod tail, at most one cell per position of
+    // the context; the fit removes the positions of the coarse region from it; the context size still limits the positions;
+    // the large ubatches attend over the scratch; 0: the larger of n_batch and 4096, plus 256, padded to 256
+    int32_t              tail = 0;
+    llama_kvq_fit_params fit;    // the fit of the tables (chunk, bits, threads, the rows after the last chunk)
+    llama_kvq_params     params; // `enabled` is set by llama_init_from_model_kvq
+};
+
+// the one way to create a two-tier KV cache context (qwen35, see llama_model_supports_kvq): the context gets the packed memory
+// with the given tail, the attention rotation is off in its attention cache only (the model setting and the other contexts of the
+// model are untouched), and the fit is enabled; cparams.n_rs_seq, rs_replay and phase_bufs are taken as they are (common turns
+// phase_bufs on for --kvq, it is a policy with a user override); cparams.type_k and type_v must be q8_0, ctx_type the default
+// returns nullptr and logs the reason when the model or the settings do not fit, or the memory cannot be created
+LLAMA_API struct llama_context * llama_init_from_model_kvq(
+                 struct llama_model * model,
+        struct llama_context_params   cparams,
+              const llama_kvq_config & cfg);
 
 struct llama_kvq_fit_progress {
     int32_t n_coarse  = 0; // rows of the coarse region

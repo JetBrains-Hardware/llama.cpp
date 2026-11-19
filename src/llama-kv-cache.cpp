@@ -80,7 +80,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
                const char * name_tag,
-                     bool   is_indexer) :
+                     bool   is_indexer,
+                     bool   attn_rot) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
@@ -298,14 +299,14 @@ llama_kv_cache::llama_kv_cache(
         n_rot_k = other->n_rot_k;
         n_rot_v = other->n_rot_v;
     } else {
-        // two knobs turn the same thing off: the environment variable, for the whole process, and
-        //   the model setting, for the contexts of one model - see llama_model_set_attn_rot
+        // three knobs turn the same thing off: the environment variable, for the whole process, the model
+        //   setting, for the contexts of one model (llama_model_set_attn_rot), and the argument of this cache
         const char * env_rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
 
-        const bool attn_rot_disable = !model.attn_rot || (env_rot_disable != nullptr && atoi(env_rot_disable) != 0);
+        const bool attn_rot_disable = !attn_rot || !model.attn_rot || (env_rot_disable != nullptr && atoi(env_rot_disable) != 0);
         if (attn_rot_disable) {
             LLAMA_LOG_INFO("%s: attention rotation force disabled (%s)\n", __func__,
-                    model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
+                    !attn_rot ? "this cache" : model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
         }
 
         bool attn_rot_k =

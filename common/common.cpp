@@ -1388,49 +1388,33 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    // two-tier KV cache: the memory of the context is created in packed mode, without the attention rotation
-    // the flags are per model, so a later context (e.g. MTP) loses the rotation too
+    // two-tier KV cache: one entry point creates the context with the packed memory and enables the fit
+    // (the rotation is off in the attention cache of this context only, a later context of the model is a normal one)
+    llama_kvq_config kvq_cfg;
     if (params.kvq.enabled) {
-        std::string why;
-        if (!llama_model_supports_kvq(model, &why)) {
-            COM_ERR("%s: --kvq is not supported by this model: %s\n", __func__, why.c_str());
-            return;
-        }
-        llama_model_set_kvq_packed(model, true);
-        llama_model_set_attn_rot(model, false);
+        kvq_cfg.tail = params.kvq.tail;
 
-        // the device cache holds one batch: the rows of a prompt go to the host store when the ring is full or their job starts
-        // at least 4096 positions, a long reply is fitted in line once per ring size of tokens
-        const int32_t tail = params.kvq.tail > 0 ? params.kvq.tail : GGML_PAD(std::max(params.n_batch, 4096) + 256, 256);
-        llama_model_set_kvq_tail(model, (uint32_t) tail);
+        kvq_cfg.fit.n_threads = params.kvq.n_threads > 0 ? params.kvq.n_threads : std::min(4, common_cpu_get_num_math());
+        kvq_cfg.fit.chunk     = params.kvq.chunk;
+        kvq_cfg.fit.rem       = params.kvq.rem;
+        kvq_cfg.fit.min_rows  = params.kvq.min_rows;
+
+        kvq_cfg.params.prefetch_n   = params.kvq.prefetch_n;
+        kvq_cfg.params.resident_cap = params.kvq.resident_cap;
+        kvq_cfg.params.lead         = params.kvq.lead;
+        kvq_cfg.params.layer_bufs   = params.kvq.layer_bufs;
+        kvq_cfg.params.scr_block    = params.kvq.scr_block;
     }
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context * lctx = params.kvq.enabled ? llama_init_from_model_kvq(model, cparams, kvq_cfg) : llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
     }
 
     if (params.kvq.enabled) {
-        llama_kvq_fit_params fp;
-        fp.n_threads = params.kvq.n_threads > 0 ? params.kvq.n_threads : std::min(4, common_cpu_get_num_math());
-        fp.chunk     = params.kvq.chunk;
-        fp.rem       = params.kvq.rem;
-        fp.min_rows  = params.kvq.min_rows;
-
-        llama_kvq_params kp;
-        kp.enabled      = true;
-        kp.prefetch_n   = params.kvq.prefetch_n;
-        kp.resident_cap = params.kvq.resident_cap;
-        kp.lead         = params.kvq.lead;
-        kp.layer_bufs   = params.kvq.layer_bufs;
-        kp.scr_block    = params.kvq.scr_block;
-
-        if (!llama_memory_kvq_fit_enable(llama_get_memory(lctx), fp, kp)) {
-            COM_ERR("%s: cannot enable the two-tier KV cache\n", __func__);
-            llama_free(lctx);
-            return;
-        }
+        const llama_kvq_fit_params & fp = kvq_cfg.fit;
+        const llama_kvq_params     & kp = kvq_cfg.params;
         COM_INF("%s: two-tier KV cache: chunks of %d rows, K%dV%d, %d fit threads, prefetch_n = %d, resident_cap = %d, lead = %d, rows after the last chunk: %s\n", __func__,
                 fp.chunk, fp.bits_k, fp.bits_v, fp.n_threads, kp.prefetch_n, llama_kvq_resident_slots(kp), kp.lead, fp.rem == LLAMA_KVQ_REM_MERGE ? "merge" : "own");
     }

@@ -40,7 +40,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                     bool   attn_rot    = true); // false: the attention cache holds unrotated K / V (llama_kv_cache)
 
     ~llama_memory_hybrid() = default;
 

@@ -16,6 +16,7 @@ struct llama_cparams {
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     bool     rs_replay;       // roll back by replaying kept tokens instead of keeping n_rs_seq snapshots
     bool     phase_bufs;      // compute buffers per phase, see llama_context::phase_set
+    uint32_t kvq_tail = 0;    // two-tier KV cache (llama_init_from_model_kvq): ring cells of the attention cache, 0: a normal memory
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
