@@ -33,10 +33,23 @@
 #define KVQ_LOG2E    1.4426950408889634f
 #define KVQ_FB       32          // precise partials per batch of loads in kvq_final
 
+#define KVQ_MAX_STREAM GGML_KVQ_MAX_STREAM
+
+// Streams (the sequences of a ubatch). The host fields below are the LAYOUT: the largest numbers over the streams, they size the
+// grids and the scratch buffers (one slice of each buffer per stream). Each kernel block works on one stream s = a grid index
+// and first builds its view (kvq_sview): the pointers of the stream, and the LOGICAL numbers of the stream (ncs ... cblk), the
+// values a single-stream call with the n_coarse of this stream would have. The arithmetic of a stream only depends on its own
+// logical numbers, so its output is the same bits as that of a call without the other streams.
 struct kvq_args {
     int G, n_rep, L, cols, N, n_head;
-    int n_coarse, n_crow, n_chunk, n_cbpc, rows_blk, n_tiles_blk, n_cblk;
+    int n_coarse, n_crow, n_chunk, n_cbpc, rows_blk, n_tiles_blk, n_cblk; // layout: n_coarse, n_chunk, ... are the largest of the streams
     int n_tail, cap, n_rblk, n_tblk, n_part;
+    int S;
+    int nc_s[KVQ_MAX_STREAM];       // coarse rows of each stream
+    int rows_s[KVQ_MAX_STREAM];     // rows per coarse block of each stream (kvq_rows_per_block of its n_coarse)
+    int64_t q_nb3, mask_nb3, pt_nb1, ridx_nb2; // stream strides, in elements
+    // logical numbers of the stream of a block (kvq_sview)
+    int s, ncs, nck, cbpc, rows, tiles, cblk;
     int nwk, nwv, nrk, nrv; // words per packed K/V row, word rows of the K/V staging
     float scale2;           // scale*log2(e)
 
@@ -70,11 +83,66 @@ struct kvq_args {
 
 // precise row source: resident slots (row index from ridx) or tail rows
 struct kvq_src {
-    const char * k; int64_t k_nb1, k_nb2;
-    const char * v; int64_t v_nb1, v_nb2;
+    const char * k; int64_t k_nb1, k_nb2, k_nb3; // k_nb3, v_nb3: bytes from stream to stream
+    const char * v; int64_t v_nb1, v_nb2, v_nb3;
     int  n_rows;
     bool res;
 };
+
+// the view of stream s: pointers moved to the stream, logical numbers set (see kvq_args)
+static __device__ __forceinline__ kvq_args kvq_sview(const kvq_args & a0, const int s) {
+    kvq_args a = a0;
+    const int64_t G = a0.G, N = a0.N;
+    const int64_t tabs = (int64_t) a0.n_chunk*G;
+
+    a.s    = s;
+    a.ncs  = a0.nc_s[s];
+    a.nck  = (a.ncs + a0.n_crow - 1)/a0.n_crow;
+    a.rows = a0.rows_s[s];
+    a.tiles = a.rows/KVQ_T;
+    a.cbpc = a.nck > 0 ? (min(a0.n_crow, a.ncs) + a.rows - 1)/a.rows : 0;
+    a.cblk = a.nck*a.cbpc;
+
+    a.q    = a0.q + s*a0.q_nb3;
+    a.mask = a0.mask ? a0.mask + s*a0.mask_nb3 : nullptr;
+    a.pt   = a0.pt ? a0.pt + s*a0.pt_nb1 : nullptr;
+    a.ridx = a0.ridx ? a0.ridx + s*a0.ridx_nb2 : nullptr;
+
+    a.qtf   = a0.qtf   + s*tabs*N*KVQ_D;
+    a.kmax  = a0.kmax  + s*tabs*(KVQ_D/WARP_SIZE)*N;
+    a.kmu   = a0.kmu   + s*tabs*N;
+    a.kpair = a0.kpair + s*tabs*(KVQ_D/2);
+    a.vfld  = a0.vfld  + s*tabs*KVQ_D;
+    a.nst   = a0.nst   + s*tabs*2;
+    a.resmap = a0.resmap + s*G*a0.nres_words;
+    a.po  = a0.po  + s*G*a0.n_part*N*KVQ_D;
+    a.pm  = a0.pm  + s*G*a0.n_part*N;
+    a.pz  = a0.pz  + s*G*a0.n_part*N;
+    a.pmc = a0.pmc + s*G*a0.n_cblk*N;
+    a.pzc = a0.pzc + s*G*a0.n_cblk*N;
+    a.cy  = a0.cy  + s*G*a0.n_chunk*N*KVQ_D;
+    a.co  = a0.co  + s*G*a0.n_chunk*N*KVQ_D;
+    a.cm  = a0.cm  + s*G*a0.n_chunk*N;
+    a.cz  = a0.cz  + s*G*a0.n_chunk*N;
+    a.scp = a0.scp + s*G*a0.n_coarse*N;
+    a.scm = a0.scm + s*G*a0.n_cblk*a0.n_tiles_blk*a0.cols;
+    a.scs = a0.scs + s*G*2*N;
+    a.dst_attn  = a0.dst_attn  ? a0.dst_attn  + s*(int64_t) KVQ_D*a0.n_head*a0.L : nullptr;
+    a.dst_score = a0.dst_score ? a0.dst_score + s*(int64_t) a0.n_coarse*G*a0.L : nullptr;
+    return a;
+}
+
+// MS: the call has several streams, every block builds its view; one stream: the host fields are the logical numbers (kvq_args::s ... cblk
+// are set by the host), the arguments are used as they are, the code of the single-stream call
+template <bool MS>
+static __device__ __forceinline__ const kvq_args & kvq_view(const kvq_args & a0, const int s, kvq_args & tmp) {
+    if constexpr (MS) {
+        tmp = kvq_sview(a0, s);
+        return tmp;
+    } else {
+        return a0;
+    }
+}
 
 // f16 scale of the qt of one column: max |qt| to [2^14, 2^15)
 static __device__ __forceinline__ float kvq_qscale(const float * kmax, const int N) {
@@ -230,11 +298,16 @@ static __device__ __forceinline__ void kvq_write_mz(const float (&m)[NT][2], con
 
 // per (chunk, kv head) and slice of 32 components: qt = (inv q)*step in f32, max |qt| per column;
 // slice 0 also q . mu, slice 1 the unpack fields; grid (n_chunk*G, D/32), D threads, warp w sums dims [32w, 32w + 32)
-template <int N>
-static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const bool attn) {
+template <int N, bool MS>
+static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a0, const bool attn) {
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z, a_v);
     const int tab   = blockIdx.x;
     const int t     = tab / a.G;
     const int g     = tab % a.G;
+    if (MS && t >= a.nck) {
+        return;
+    }
     const int slice = blockIdx.y;
     const int tid   = threadIdx.x;
     const int lane  = tid % WARP_SIZE;
@@ -326,7 +399,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
         __syncthreads();
         for (int sl = tid; sl < a.cap; sl += KVQ_D) {
             const int32_t idx = a.ridx[sl + g*a.ridx_nb1];
-            if (idx >= 0 && idx < a.n_coarse) {
+            if (idx >= 0 && idx < a.ncs) {
                 atomicOr(&rm[idx/32], 1u << (idx % 32));
             }
         }
@@ -384,11 +457,16 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
 // prep with one thread per component c: qt of NG columns per block, summed over the dims in the order of kvq_prep
 // (each 32 dims from 0, then the 8 partial sums in order), so the bits are the same;
 // grid (n_chunk*G, groups + 1), the last block of a table does q . mu, the unpack fields and the resident bitmap
-template <int NG>
-static __global__ void __launch_bounds__(KVQ_D) kvq_prep_c(const kvq_args a, const bool attn) {
+template <int NG, bool MS>
+static __global__ void __launch_bounds__(KVQ_D) kvq_prep_c(const kvq_args a0, const bool attn) {
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z, a_v);
     const int tab   = blockIdx.x;
     const int t     = tab / a.G;
     const int g     = tab % a.G;
+    if (MS && t >= a.nck) {
+        return;
+    }
     const int grp   = blockIdx.y;
     const int tid   = threadIdx.x;
     const int lane  = tid % WARP_SIZE;
@@ -476,7 +554,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep_c(const kvq_args a, con
         __syncthreads();
         for (int sl = tid; sl < a.cap; sl += KVQ_D) {
             const int32_t idx = a.ridx[sl + g*a.ridx_nb1];
-            if (idx >= 0 && idx < a.n_coarse) {
+            if (idx >= 0 && idx < a.ncs) {
                 atomicOr(&rm[idx/32], 1u << (idx % 32));
             }
         }
@@ -533,26 +611,32 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep_c(const kvq_args a, con
 // coarse rows, N of the NA = a.N columns from n0; grid (n_cbpc*n_grp, n_chunk, G), block x takes rows x / n_grp and the columns from
 // n0 + (x % n_grp)*N (NA > N: column groups, fewer registers per thread)
 // staging of a tile: packed rows word-major, word i of row r at [i*LDR + r], so that rows r and r + 8 share the address computation
-template <int N, int NA, bool ATTN, bool SCORE>
-static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args a, const int n0_launch, const int n_grp) {
+template <int N, int NA, bool ATTN, bool SCORE, bool MS>
+static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args a0, const int n0_launch, const int n_grp) {
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int NT = N/8;
 
     const int bx   = NA == N ? blockIdx.x : blockIdx.x / n_grp;
     const int n0   = NA == N ? 0 : n0_launch + (blockIdx.x % n_grp)*N;
     const int t    = blockIdx.y;
-    const int g    = blockIdx.z;
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z / a0.G, a_v);
+    const int g    = MS ? blockIdx.z % a0.G : blockIdx.z;
+    // chunks and blocks that the stream does not have (its n_coarse is smaller than the largest one)
+    if (MS && (t >= a.nck || bx >= a.cbpc)) {
+        return;
+    }
     const int tid  = threadIdx.x;
     const int lane = tid % WARP_SIZE;
     const int w    = tid / WARP_SIZE;
     const int gid  = lane / 4;
     const int t4   = lane % 4;
     const int tab  = t*a.G + g;
-    const int blk  = t*a.n_cbpc + bx;
+    const int blk  = t*a.cbpc + bx;
 
-    const int64_t c1 = min((int64_t) a.n_coarse, (int64_t) (t + 1)*a.n_crow);
-    const int64_t r0 = (int64_t) t*a.n_crow + (int64_t) bx*a.rows_blk;
-    const int64_t r1 = min(c1, r0 + a.rows_blk);
+    const int64_t c1 = min((int64_t) a.ncs, (int64_t) (t + 1)*a.n_crow);
+    const int64_t r0 = (int64_t) t*a.n_crow + (int64_t) bx*a.rows;
+    const int64_t r1 = min(c1, r0 + a.rows);
 
     const int ld_st = (a.nrk + (ATTN ? a.nrv : 0))*KVQ_LDR; // words per staging buffer
 
@@ -797,7 +881,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
 
         if (SCORE) {
             kvq_tile_update<NT>(sc, m_c, z_c, alpha, s_red + KVQ_WARPS*N, lane);
-            const int tile = blk*a.n_tiles_blk + it;
+            const int tile = blk*a.tiles + it;
 #pragma unroll
             for (int j = 0; j < NT; ++j) {
 #pragma unroll
@@ -908,7 +992,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
         }
     }
 #else
-    GGML_UNUSED_VARS(a, n0_launch, n_grp);
+    GGML_UNUSED_VARS(a0, n0_launch, n_grp);
     NO_DEVICE_CODE;
 #endif // AMPERE_MMA_AVAILABLE
 }
@@ -916,8 +1000,8 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
 // precise rows: resident slots or tail rows, one tile of KVQ_PROWS rows per block; grid (n_blocks, G)
 // the N columns in N/NG groups of 4 warps, each group computes its NG columns as a block of NG columns would (the same sums);
 // the groups share the K and V tiles (q8_0): K is fetched while q is staged, V while K . q is computed
-template <int N, int NG, bool ATTN>
-static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const kvq_args a, const kvq_src src, const int part0) {
+template <int N, int NG, bool ATTN, bool MS>
+static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const kvq_args a0, const kvq_src src, const int part0) {
 #ifdef AMPERE_MMA_AVAILABLE
     static_assert(N % NG == 0 && NG % 8 == 0 && KVQ_PROWS == KVQ_T, "bad column groups");
     constexpr int NT  = NG/8;
@@ -925,6 +1009,8 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const 
 
     const int bx   = blockIdx.x;
     const int g    = blockIdx.y;
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z, a_v);
     const int tid  = threadIdx.x;
     const int lane = tid % WARP_SIZE;
     const int w    = (tid / WARP_SIZE) % KVQ_WARPS;
@@ -939,7 +1025,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const 
     if (!src.res && a.mask) {
         bool live = false;
         for (int e = tid; e < (r1 - r0)*a.L; e += NTH) {
-            const int64_t row = a.n_coarse + r0 + e / a.L;
+            const int64_t row = a.ncs + r0 + e / a.L;
             live = live || __half2float(a.mask[row + (int64_t) (e % a.L)*a.mask_nb1]) != -INFINITY;
         }
         if (!__syncthreads_or(live)) {
@@ -960,8 +1046,8 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const 
     int   * s_row  = (int *) (s_red + KVQ_WARPS*N); // [T]
     char  * s_st   = (char *) (s_row + KVQ_T);      // [T][KVQ_Q8_ROW]
 
-    const char * kbase = src.k + g*src.k_nb2;
-    const char * vbase = ATTN ? src.v + g*src.v_nb2 : nullptr;
+    const char * kbase = src.k + g*src.k_nb2 + a.s*src.k_nb3;
+    const char * vbase = ATTN ? src.v + g*src.v_nb2 + a.s*src.v_nb3 : nullptr;
 
     // q8_0: the raw rows into s_st (async), after a wait and a barrier dequant_q8 writes them to s_tile as f16
     auto fetch_q8 = [&](const char * base, const int64_t nb1) {
@@ -1005,9 +1091,9 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const 
         if (sr < r1) {
             if (src.res) {
                 const int32_t idx = a.ridx[sr + g*a.ridx_nb1];
-                row = idx >= 0 && idx < a.n_coarse ? idx : -1;
+                row = idx >= 0 && idx < a.ncs ? idx : -1;
             } else {
-                row = a.n_coarse + sr;
+                row = a.ncs + sr;
             }
         }
         s_row[tid] = row;
@@ -1172,7 +1258,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const 
         }
     }
 #else
-    GGML_UNUSED_VARS(a, src, part0);
+    GGML_UNUSED_VARS(a0, src, part0);
     NO_DEVICE_CODE;
 #endif // AMPERE_MMA_AVAILABLE
 }
@@ -1180,8 +1266,8 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const 
 // q8_0 resident slots, several tiles of KVQ_T rows per block (rows_blk rows), online softmax over the tiles of the block
 // (another summation order than one partial per tile); q8_0 only. The columns in N/NG groups of 4 warps as in kvq_precise.
 // Pipeline with one staging buffer: V of tile t is fetched during K . q of tile t, K of tile t + 1 during P V of tile t
-template <int N, int NG, bool ATTN>
-static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise_m(const kvq_args a, const kvq_src src, const int part0, const int rows_blk) {
+template <int N, int NG, bool ATTN, bool MS>
+static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise_m(const kvq_args a0, const kvq_src src, const int part0, const int rows_blk) {
 #ifdef AMPERE_MMA_AVAILABLE
     static_assert(N % NG == 0 && NG % 8 == 0, "bad column groups");
     constexpr int NT  = NG/8;
@@ -1189,6 +1275,8 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise_m(cons
 
     const int bx   = blockIdx.x;
     const int g    = blockIdx.y;
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z, a_v);
     const int tid  = threadIdx.x;
     const int lane = tid % WARP_SIZE;
     const int w    = (tid / WARP_SIZE) % KVQ_WARPS;
@@ -1207,8 +1295,8 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise_m(cons
     int   * s_row  = (int *) (s_red + KVQ_WARPS*N); // [T]
     char  * s_st   = (char *) (s_row + KVQ_T);      // [T][KVQ_Q8_ROW]
 
-    const char * kbase = src.k + g*src.k_nb2;
-    const char * vbase = ATTN ? src.v + g*src.v_nb2 : nullptr;
+    const char * kbase = src.k + g*src.k_nb2 + a.s*src.k_nb3;
+    const char * vbase = ATTN ? src.v + g*src.v_nb2 + a.s*src.v_nb3 : nullptr;
 
     auto fetch_q8 = [&](const char * base, const int64_t nb1, const int tr) {
         constexpr int nseg = KVQ_Q8_ROW/16;
@@ -1280,7 +1368,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise_m(cons
             int row = -1;
             if (sr < r1) {
                 const int32_t idx = a.ridx[sr + g*a.ridx_nb1];
-                row = idx >= 0 && idx < a.n_coarse ? idx : -1;
+                row = idx >= 0 && idx < a.ncs ? idx : -1;
             }
             s_row[tid] = row;
         }
@@ -1423,14 +1511,17 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise_m(cons
         }
     }
 #else
-    GGML_UNUSED_VARS(a, src, part0, rows_blk);
+    GGML_UNUSED_VARS(a0, src, part0, rows_blk);
     NO_DEVICE_CODE;
 #endif // AMPERE_MMA_AVAILABLE
 }
 
 // merge the coarse partials of a chunk: y = O*step, per column the max and the sum of weights
 // grid (n_chunk*G, N), D threads (component)
-static __global__ void __launch_bounds__(KVQ_D) kvq_merge(const kvq_args a) {
+template <bool MS>
+static __global__ void __launch_bounds__(KVQ_D) kvq_merge(const kvq_args a0) {
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z, a_v);
     const int tab = blockIdx.x;
     const int t   = tab / a.G;
     const int g   = tab % a.G;
@@ -1438,18 +1529,28 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_merge(const kvq_args a) {
     const int c   = threadIdx.x;
     const int N   = a.N;
 
+    // a chunk the stream does not have: no weight (kvq_final skips its output)
+    if (MS && t >= a.nck) {
+        if (c == 0) {
+            const int64_t ic = (int64_t) g*a.n_chunk + t;
+            a.cm[ic*N + n] = -INFINITY;
+            a.cz[ic*N + n] = 0.0f;
+        }
+        return;
+    }
+
     const float * aux = a.taux + (int64_t) a.pt[t]*a.taux_nb3 + (2*g + 1)*a.taux_nb2;
 
-    const int64_t ip0 = (int64_t) g*a.n_part + (int64_t) t*a.n_cbpc;
+    const int64_t ip0 = (int64_t) g*a.n_part + (int64_t) t*a.cbpc;
     const int64_t ic  = (int64_t) g*a.n_chunk + t;
 
     float mx = -INFINITY;
-    for (int b = 0; b < a.n_cbpc; ++b) {
+    for (int b = 0; b < a.cbpc; ++b) {
         mx = fmaxf(mx, a.pm[(ip0 + b)*N + n]);
     }
     float oc = 0.0f;
     float zs = 0.0f;
-    for (int b = 0; b < a.n_cbpc && mx > -INFINITY; ++b) {
+    for (int b = 0; b < a.cbpc && mx > -INFINITY; ++b) {
         const float wb = kvq_exp2(a.pm[(ip0 + b)*N + n] - mx);
         oc += wb*a.po[((ip0 + b)*N + n)*KVQ_D + c];
         zs += wb*a.pz[(ip0 + b)*N + n];
@@ -1462,8 +1563,10 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_merge(const kvq_args a) {
 }
 
 // out = y inv + z mu per chunk; grid (n_chunk*G, D/32), D threads: lane = dim of the slice, warp w sums components [32w, 32w + 32)
-template <int N>
-static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
+template <int N, bool MS>
+static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a0) {
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z, a_v);
     const int tab   = blockIdx.x;
     const int t     = tab / a.G;
     const int g     = tab % a.G;
@@ -1471,6 +1574,9 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
     const int tid   = threadIdx.x;
     const int lane  = tid % WARP_SIZE;
     const int w     = tid / WARP_SIZE;
+    if (MS && t >= a.nck) {
+        return;
+    }
 
     __shared__ float s_y[8][KVQ_D];
     __shared__ float s_out[KVQ_D/WARP_SIZE][8][WARP_SIZE]; // per warp, summed in a fixed order
@@ -1551,8 +1657,10 @@ static __device__ __forceinline__ float kvq_block_sum(float x, float * s_r) {
 
 // grid (cols, G), D threads
 // sources of the output: the chunks (m, z, out in cm, cz, co) and the precise partials (pm, pz, po from n_cblk on)
-template <bool ATTN, bool SCORE>
-static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a) {
+template <bool ATTN, bool SCORE, bool MS>
+static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a0) {
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z, a_v);
     const int n   = blockIdx.x;
     const int g   = blockIdx.y;
     const int tid = threadIdx.x;
@@ -1563,11 +1671,11 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a) {
     const int64_t ip0 = (int64_t) g*a.n_part;
     const int64_t ic0 = (int64_t) g*a.n_chunk;
     const int     n_p = a.n_part - a.n_cblk;   // precise partials
-    const int     n_s = a.n_chunk + n_p;       // all sources
+    const int     n_s = a.nck + n_p;           // all sources (the chunks of this stream)
 
-    // source s: chunk s < n_chunk, else precise partial
-    auto src_m = [&](const int s) { return s < a.n_chunk ? a.cm[(ic0 + s)*N + n] : a.pm[(ip0 + a.n_cblk + s - a.n_chunk)*N + n]; };
-    auto src_z = [&](const int s) { return s < a.n_chunk ? a.cz[(ic0 + s)*N + n] : a.pz[(ip0 + a.n_cblk + s - a.n_chunk)*N + n]; };
+    // source s: chunk s < nck, else precise partial (the precise partials start at n_cblk of the layout)
+    auto src_m = [&](const int s) { return s < a.nck ? a.cm[(ic0 + s)*N + n] : a.pm[(ip0 + a.n_cblk + s - a.nck)*N + n]; };
+    auto src_z = [&](const int s) { return s < a.nck ? a.cz[(ic0 + s)*N + n] : a.pz[(ip0 + a.n_cblk + s - a.nck)*N + n]; };
 
     if (ATTN) {
         float mx = -INFINITY;
@@ -1585,7 +1693,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a) {
         float acc = 0.0f;
         if (mx > -INFINITY) {
 #pragma unroll 4
-            for (int t = 0; t < a.n_chunk; ++t) {
+            for (int t = 0; t < a.nck; ++t) {
                 acc += kvq_exp2(a.cm[(ic0 + t)*N + n] - mx)*a.co[((ic0 + t)*N + n)*KVQ_D + tid];
             }
             // the loads of KVQ_FB partials first (more loads in flight), then the sum in the same order
@@ -1615,9 +1723,9 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a) {
     if (SCORE) {
         // all coarse rows (coarse normalizers of the coarse blocks) and the tail partials
         const int nt0 = a.n_cblk + a.n_rblk;
-        const int n_c = a.n_cblk + (a.n_part - nt0);
-        auto sc_m = [&](const int s) { return s < a.n_cblk ? a.pmc[((int64_t) g*a.n_cblk + s)*N + n] : a.pm[(ip0 + nt0 + s - a.n_cblk)*N + n]; };
-        auto sc_z = [&](const int s) { return s < a.n_cblk ? a.pzc[((int64_t) g*a.n_cblk + s)*N + n] : a.pz[(ip0 + nt0 + s - a.n_cblk)*N + n]; };
+        const int n_c = a.cblk + (a.n_part - nt0);
+        auto sc_m = [&](const int s) { return s < a.cblk ? a.pmc[((int64_t) g*a.n_cblk + s)*N + n] : a.pm[(ip0 + nt0 + s - a.cblk)*N + n]; };
+        auto sc_z = [&](const int s) { return s < a.cblk ? a.pzc[((int64_t) g*a.n_cblk + s)*N + n] : a.pz[(ip0 + nt0 + s - a.cblk)*N + n]; };
 
         float mx = -INFINITY;
         for (int s = tid; s < n_c; s += KVQ_D) {
@@ -1638,16 +1746,26 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a) {
 
 // grid (ceil(n_coarse/256), G), 256 threads; a thread reads the weights of its row (stride N) in 16-byte loads,
 // so no thread depends on L1 keeping its row between loads (2-byte loads of rows 96 bytes apart thrash L1 at 48 columns)
-static __global__ void kvq_score(const kvq_args a) {
+template <bool MS>
+static __global__ void kvq_score(const kvq_args a0) {
+    kvq_args a_v;
+    const kvq_args & a = kvq_view<MS>(a0, blockIdx.z, a_v);
     const int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     const int     g = blockIdx.y;
     if (j >= a.n_coarse) {
         return;
     }
+    if (MS && j >= a.ncs) {
+        // a row the stream does not have
+        for (int l = 0; l < a.L; ++l) {
+            a.dst_score[j + (int64_t) a.n_coarse*(g + (int64_t) a.G*l)] = 0.0f;
+        }
+        return;
+    }
     const int t    = (int) (j / a.n_crow);
     const int jj   = (int) (j - (int64_t) t*a.n_crow);
-    const int b    = jj / a.rows_blk;
-    const int tile = (t*a.n_cbpc + b)*a.n_tiles_blk + (jj - b*a.rows_blk)/KVQ_T;
+    const int b    = jj / a.rows;
+    const int tile = (t*a.cbpc + b)*a.tiles + (jj - b*a.rows)/KVQ_T;
 
     const uint4 * p  = (const uint4 *) (a.scp + ((int64_t) g*a.n_coarse + j)*a.N);
     const float * mt = a.scm + ((int64_t) g*a.n_cblk*a.n_tiles_blk + tile)*a.cols;
@@ -1712,58 +1830,58 @@ static size_t kvq_precise_smem(const int N) {
 
 // the columns in groups of 8, 4 warps each (RTX 5090, 8192 slots, test-kvq-attn): 52 us per call at 48 columns, 38 / 30 / 36 us
 // at 24 / 12 / 6 columns, against 76 us at 24 and 48 us at 12 columns with one group
-template <int N, bool ATTN>
+template <int N, bool ATTN, bool MS>
 static void kvq_launch_precise(const kvq_args & a, const kvq_src & src, const int part0, const int n_blk, cudaStream_t stream) {
     if (n_blk == 0) {
         return;
     }
-    kvq_set_smem<kvq_precise<N, 8, ATTN>>();
-    kvq_precise<N, 8, ATTN><<<dim3(n_blk, a.G), KVQ_NTHREADS*(N/8), kvq_precise_smem(N), stream>>>(a, src, part0);
+    kvq_set_smem<kvq_precise<N, 8, ATTN, MS>>();
+    kvq_precise<N, 8, ATTN, MS><<<dim3(n_blk, a.G, a.S), KVQ_NTHREADS*(N/8), kvq_precise_smem(N), stream>>>(a, src, part0);
 }
 
-template <int NG, int NA, bool ATTN, bool SCORE>
+template <int NG, int NA, bool ATTN, bool SCORE, bool MS>
 static void kvq_launch_coarse_n(const kvq_args & a, const int n0, const int n_grp, cudaStream_t stream) {
     const int ld_st = (a.nrk + (ATTN ? a.nrv : 0))*KVQ_LDR;
-    kvq_set_smem<kvq_coarse<NG, NA, ATTN, SCORE>>();
-    kvq_coarse<NG, NA, ATTN, SCORE><<<dim3(a.n_cbpc*n_grp, a.n_chunk, a.G), KVQ_NTHREADS, kvq_coarse_smem(NG, ld_st, a.L), stream>>>(a, n0, n_grp);
+    kvq_set_smem<kvq_coarse<NG, NA, ATTN, SCORE, MS>>();
+    kvq_coarse<NG, NA, ATTN, SCORE, MS><<<dim3(a.n_cbpc*n_grp, a.n_chunk, a.G*a.S), KVQ_NTHREADS, kvq_coarse_smem(NG, ld_st, a.L), stream>>>(a, n0, n_grp);
 }
 
 // column groups by measurement (RTX 5090, 100k rows, test-kvq-attn): at 48 columns the ATTN kernel spills (255 registers),
 // 3 groups of 16 take half the time of one launch, the SCORE kernel is fastest with 2 groups of 24; at 32 columns SCORE with 2 of 16
-template <int N, bool ATTN, bool SCORE>
+template <int N, bool ATTN, bool SCORE, bool MS>
 static void kvq_launch_coarse(const kvq_args & a, cudaStream_t stream) {
     if constexpr (N == 48 && ATTN) {
-        kvq_launch_coarse_n<16, 48, ATTN, SCORE>(a, 0, 3, stream);
+        kvq_launch_coarse_n<16, 48, ATTN, SCORE, MS>(a, 0, 3, stream);
     } else if constexpr (N == 48) {
-        kvq_launch_coarse_n<24, 48, ATTN, SCORE>(a, 0, 2, stream);
+        kvq_launch_coarse_n<24, 48, ATTN, SCORE, MS>(a, 0, 2, stream);
     } else if constexpr (N == 32 && !ATTN) {
-        kvq_launch_coarse_n<16, 32, ATTN, SCORE>(a, 0, 2, stream);
+        kvq_launch_coarse_n<16, 32, ATTN, SCORE, MS>(a, 0, 2, stream);
     } else {
-        kvq_launch_coarse_n<N, N, ATTN, SCORE>(a, 0, 1, stream);
+        kvq_launch_coarse_n<N, N, ATTN, SCORE, MS>(a, 0, 1, stream);
     }
 }
 
-template <int NG>
+template <int NG, bool MS>
 static void kvq_launch_prep_c(const kvq_args & a, const bool attn, cudaStream_t stream) {
-    kvq_prep_c<NG><<<dim3(a.n_chunk*a.G, (a.N + NG - 1)/NG + 1), KVQ_D, std::max(NG*KVQ_D*sizeof(float), (4*KVQ_D + 2)*sizeof(int)), stream>>>(a, attn);
+    kvq_prep_c<NG, MS><<<dim3(a.n_chunk*a.G, (a.N + NG - 1)/NG + 1, a.S), KVQ_D, std::max(NG*KVQ_D*sizeof(float), (4*KVQ_D + 2)*sizeof(int)), stream>>>(a, attn);
 }
 
 // prep by measurement (RTX 5090, 100k rows): kvq_prep for 8 columns, else kvq_prep_c with 8 columns per block, 4 from 40 columns on
 // (48 columns: 22 us against 59 us)
-template <int N>
+template <int N, bool MS>
 static void kvq_launch_prep(const kvq_args & a, const bool attn, cudaStream_t stream) {
     if constexpr (N == 8) {
-        kvq_set_smem<kvq_prep<N>>();
-        kvq_prep<N><<<dim3(a.n_chunk*a.G, KVQ_D/WARP_SIZE), KVQ_D, (N*KVQ_D + KVQ_D/WARP_SIZE*N*WARP_SIZE)*sizeof(float), stream>>>(a, attn);
+        kvq_set_smem<kvq_prep<N, MS>>();
+        kvq_prep<N, MS><<<dim3(a.n_chunk*a.G, KVQ_D/WARP_SIZE, a.S), KVQ_D, (N*KVQ_D + KVQ_D/WARP_SIZE*N*WARP_SIZE)*sizeof(float), stream>>>(a, attn);
     } else if constexpr (N <= 32) {
-        kvq_launch_prep_c<8>(a, attn, stream);
+        kvq_launch_prep_c<8, MS>(a, attn, stream);
     } else {
-        kvq_launch_prep_c<4>(a, attn, stream);
+        kvq_launch_prep_c<4, MS>(a, attn, stream);
     }
 }
 
 // the precise rows run on a side stream, concurrently with the coarse rows
-template <int N>
+template <int N, bool MS>
 static void kvq_launch(const kvq_args & a, const bool attn, const bool score,
         const kvq_src & src_res, const kvq_src & src_tail, cudaStream_t stream, cudaStream_t side) {
     static cudaEvent_t ev_fork[GGML_CUDA_MAX_DEVICES] = { nullptr };
@@ -1779,39 +1897,39 @@ static void kvq_launch(const kvq_args & a, const bool attn, const bool score,
         // q8_0 resident rows: 256 rows per block (RTX 5090, 8192 slots: 31 + 7 us of kvq_precise_m + kvq_final per call at 48 columns
         // against 51 + 17 us with one partial per 64 rows), another summation order than kvq_precise
         if (a.n_rblk > 0) {
-            kvq_set_smem<kvq_precise_m<N, 8, true>>();
-            kvq_precise_m<N, 8, true><<<dim3(a.n_rblk, a.G), KVQ_NTHREADS*(N/8), kvq_precise_smem(N), side>>>(a, src_res, a.n_cblk, KVQ_RROWS);
+            kvq_set_smem<kvq_precise_m<N, 8, true, MS>>();
+            kvq_precise_m<N, 8, true, MS><<<dim3(a.n_rblk, a.G, a.S), KVQ_NTHREADS*(N/8), kvq_precise_smem(N), side>>>(a, src_res, a.n_cblk, KVQ_RROWS);
         }
-        kvq_launch_precise<N, true>(a, src_tail, a.n_cblk + a.n_rblk, a.n_tblk, side);
+        kvq_launch_precise<N, true, MS>(a, src_tail, a.n_cblk + a.n_rblk, a.n_tblk, side);
     } else {
-        kvq_launch_precise<N, false>(a, src_tail, a.n_cblk + a.n_rblk, a.n_tblk, side);
+        kvq_launch_precise<N, false, MS>(a, src_tail, a.n_cblk + a.n_rblk, a.n_tblk, side);
     }
     CUDA_CHECK(cudaEventRecord(ev_join[id], side));
 
     if (a.n_chunk > 0) {
-        kvq_launch_prep<N>(a, attn, stream);
+        kvq_launch_prep<N, MS>(a, attn, stream);
         if (attn) {
-            kvq_launch_coarse<N, true, false>(a, stream);
+            kvq_launch_coarse<N, true, false, MS>(a, stream);
         } else {
-            kvq_launch_coarse<N, false, true>(a, stream);
+            kvq_launch_coarse<N, false, true, MS>(a, stream);
         }
     }
 
     if (attn && a.n_chunk > 0) {
-        kvq_merge<<<dim3(a.n_chunk*a.G, N), KVQ_D, 0, stream>>>(a);
-        kvq_combine<N><<<dim3(a.n_chunk*a.G, KVQ_D/WARP_SIZE), KVQ_D, 0, stream>>>(a);
+        kvq_merge<MS><<<dim3(a.n_chunk*a.G, N, a.S), KVQ_D, 0, stream>>>(a);
+        kvq_combine<N, MS><<<dim3(a.n_chunk*a.G, KVQ_D/WARP_SIZE, a.S), KVQ_D, 0, stream>>>(a);
     }
     CUDA_CHECK(cudaStreamWaitEvent(stream, ev_join[id], 0));
 
-    const dim3 grid_f(a.cols, a.G);
+    const dim3 grid_f(a.cols, a.G, a.S);
     if (attn) {
-        kvq_final<true, false><<<grid_f, KVQ_D, 0, stream>>>(a);
+        kvq_final<true, false, MS><<<grid_f, KVQ_D, 0, stream>>>(a);
     } else {
-        kvq_final<false, true><<<grid_f, KVQ_D, 0, stream>>>(a);
+        kvq_final<false, true, MS><<<grid_f, KVQ_D, 0, stream>>>(a);
     }
 
     if (score) {
-        kvq_score<<<dim3((a.n_coarse + 255)/256, a.G), 256, 0, stream>>>(a);
+        kvq_score<MS><<<dim3((a.n_coarse + 255)/256, a.G, a.S), 256, 0, stream>>>(a);
     }
 }
 
@@ -1846,8 +1964,16 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     a.n_coarse = kc ? ggml_get_op_params_i32(dst, 3) : 0;
     a.n_crow   = ggml_get_op_params_i32(dst, 1);
     a.n_chunk  = kc ? (a.n_coarse + a.n_crow - 1)/a.n_crow : 0;
-    a.rows_blk = kvq_rows_per_block(a.n_coarse, a.G, ggml_cuda_info().devices[ctx.device].nsm);
-    a.n_cbpc   = a.n_chunk > 0 ? (std::min(a.n_crow, a.n_coarse) + a.rows_blk - 1)/a.rows_blk : 0;
+    a.S        = (int) q->ne[3];
+    GGML_ASSERT(a.S >= 1 && a.S <= KVQ_MAX_STREAM);
+    // layout: the largest numbers of the streams; each stream has its own coarse rows, rows per block, blocks per chunk
+    for (int s = 0; s < a.S; ++s) {
+        a.nc_s[s]   = kc ? ggml_get_op_params_i32(dst, 5 + s) : 0;
+        a.rows_s[s] = kvq_rows_per_block(a.nc_s[s], a.G, ggml_cuda_info().devices[ctx.device].nsm);
+        const int nck = (a.nc_s[s] + a.n_crow - 1)/a.n_crow;
+        a.rows_blk    = std::max(a.rows_blk, a.rows_s[s]);
+        a.n_cbpc      = std::max(a.n_cbpc, nck > 0 ? (std::min(a.n_crow, a.nc_s[s]) + a.rows_s[s] - 1)/a.rows_s[s] : 0);
+    }
     a.n_tiles_blk = a.rows_blk/KVQ_T;
     a.n_cblk   = a.n_chunk*a.n_cbpc;
     a.n_tail   = (int) k->ne[1];
@@ -1864,9 +1990,11 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     a.q     = (const float *) q->data;
     a.q_nb1 = q->nb[1]/sizeof(float);
     a.q_nb2 = q->nb[2]/sizeof(float);
+    a.q_nb3 = q->nb[3]/sizeof(float);
     if (kc) {
         a.kc = (const char *) kc->data; a.kc_nb1 = kc->nb[1]; a.kc_nb2 = kc->nb[2]; a.kc_nb3 = kc->nb[3];
         a.pt = (const int32_t *) pt->data;
+        a.pt_nb1 = pt->nb[1]/sizeof(int32_t);
         // a slot of the table tensor: the inverse table (D*D bytes) then the aux floats
         a.tinv = (const int8_t *) tab->data; a.tinv_nb2 = tab->nb[1]; a.tinv_nb3 = tab->nb[2];
         a.taux = (const float *) ((const char *) tab->data + KVQ_D*KVQ_D); a.taux_nb2 = tab->nb[1]/sizeof(float); a.taux_nb3 = tab->nb[2]/sizeof(float);
@@ -1877,36 +2005,39 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (a.cap > 0) {
         a.ridx = (const int32_t *) ridx->data;
         a.ridx_nb1 = ridx->nb[1]/sizeof(int32_t);
+        a.ridx_nb2 = ridx->nb[2]/sizeof(int32_t);
     }
     if (mask) {
         a.mask = (const half *) mask->data;
         a.mask_nb1 = mask->nb[1]/sizeof(half);
+        a.mask_nb3 = mask->nb[3]/sizeof(half);
     }
 
     const int N  = a.N;
     const int G  = a.G;
     const int nc = std::max(1, a.n_chunk);
+    const size_t S = a.S; // one slice of every scratch buffer per stream (kvq_sview)
 
-    ggml_cuda_pool_alloc<float>    qtf_a(pool, (size_t) nc*G*N*KVQ_D);
-    ggml_cuda_pool_alloc<float>    kmax_a(pool, (size_t) nc*G*(KVQ_D/WARP_SIZE)*N);
-    ggml_cuda_pool_alloc<float>    kmu_a(pool, (size_t) nc*G*N);
-    ggml_cuda_pool_alloc<uint4>    kpair_a(pool, (size_t) nc*G*KVQ_D/2);
-    ggml_cuda_pool_alloc<uint2>    vfld_a(pool, (size_t) nc*G*KVQ_D);
-    ggml_cuda_pool_alloc<int>      nst_a(pool, (size_t) nc*G*2);
+    ggml_cuda_pool_alloc<float>    qtf_a(pool, (size_t) S*nc*G*N*KVQ_D);
+    ggml_cuda_pool_alloc<float>    kmax_a(pool, (size_t) S*nc*G*(KVQ_D/WARP_SIZE)*N);
+    ggml_cuda_pool_alloc<float>    kmu_a(pool, (size_t) S*nc*G*N);
+    ggml_cuda_pool_alloc<uint4>    kpair_a(pool, (size_t) S*nc*G*KVQ_D/2);
+    ggml_cuda_pool_alloc<uint2>    vfld_a(pool, (size_t) S*nc*G*KVQ_D);
+    ggml_cuda_pool_alloc<int>      nst_a(pool, (size_t) S*nc*G*2);
     a.nres_words = (a.n_coarse + 31)/32;
-    ggml_cuda_pool_alloc<uint32_t> resmap_a(pool, (size_t) std::max(1, G*a.nres_words));
-    ggml_cuda_pool_alloc<float>    po_a(pool, attn ? (size_t) G*a.n_part*N*KVQ_D : 1);
-    ggml_cuda_pool_alloc<float>    pm_a(pool, (size_t) G*a.n_part*N);
-    ggml_cuda_pool_alloc<float>    pz_a(pool, (size_t) G*a.n_part*N);
-    ggml_cuda_pool_alloc<float>    pmc_a(pool, (size_t) std::max(1, G*a.n_cblk*N));
-    ggml_cuda_pool_alloc<float>    pzc_a(pool, (size_t) std::max(1, G*a.n_cblk*N));
-    ggml_cuda_pool_alloc<float>    cy_a(pool, attn ? (size_t) G*nc*N*KVQ_D : 1);
-    ggml_cuda_pool_alloc<float>    co_a(pool, attn ? (size_t) G*nc*N*KVQ_D : 1);
-    ggml_cuda_pool_alloc<float>    cm_a(pool, (size_t) G*nc*N);
-    ggml_cuda_pool_alloc<float>    cz_a(pool, (size_t) G*nc*N);
-    ggml_cuda_pool_alloc<half>     scp_a(pool, score ? (size_t) G*a.n_coarse*N : 1);
-    ggml_cuda_pool_alloc<float>    scm_a(pool, score ? (size_t) G*a.n_cblk*a.n_tiles_blk*a.cols : 1);
-    ggml_cuda_pool_alloc<float>    scs_a(pool, (size_t) G*2*N);
+    ggml_cuda_pool_alloc<uint32_t> resmap_a(pool, std::max((size_t) 1, S*G*a.nres_words));
+    ggml_cuda_pool_alloc<float>    po_a(pool, attn ? (size_t) S*G*a.n_part*N*KVQ_D : 1);
+    ggml_cuda_pool_alloc<float>    pm_a(pool, (size_t) S*G*a.n_part*N);
+    ggml_cuda_pool_alloc<float>    pz_a(pool, (size_t) S*G*a.n_part*N);
+    ggml_cuda_pool_alloc<float>    pmc_a(pool, std::max((size_t) 1, S*G*a.n_cblk*N));
+    ggml_cuda_pool_alloc<float>    pzc_a(pool, std::max((size_t) 1, S*G*a.n_cblk*N));
+    ggml_cuda_pool_alloc<float>    cy_a(pool, attn ? (size_t) S*G*nc*N*KVQ_D : 1);
+    ggml_cuda_pool_alloc<float>    co_a(pool, attn ? (size_t) S*G*nc*N*KVQ_D : 1);
+    ggml_cuda_pool_alloc<float>    cm_a(pool, (size_t) S*G*nc*N);
+    ggml_cuda_pool_alloc<float>    cz_a(pool, (size_t) S*G*nc*N);
+    ggml_cuda_pool_alloc<half>     scp_a(pool, score ? (size_t) S*G*a.n_coarse*N : 1);
+    ggml_cuda_pool_alloc<float>    scm_a(pool, score ? (size_t) S*G*a.n_cblk*a.n_tiles_blk*a.cols : 1);
+    ggml_cuda_pool_alloc<float>    scs_a(pool, (size_t) S*G*2*N);
 
     a.qtf = qtf_a.get(); a.kmax = kmax_a.get(); a.kmu = kmu_a.get();
     a.kpair = kpair_a.get(); a.vfld = vfld_a.get(); a.nst = nst_a.get();
@@ -1921,28 +2052,34 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     kvq_src src_res = {};
     if (a.cap > 0) {
-        src_res.k = (const char *) rkv->data; src_res.k_nb1 = rkv->nb[1]; src_res.k_nb2 = rkv->nb[2];
-        src_res.v = (const char *) rkv->data + rkv->nb[3]; src_res.v_nb1 = rkv->nb[1]; src_res.v_nb2 = rkv->nb[2];
+        src_res.k = (const char *) rkv->data; src_res.k_nb1 = rkv->nb[1]; src_res.k_nb2 = rkv->nb[2]; src_res.k_nb3 = 2*rkv->nb[3];
+        src_res.v = (const char *) rkv->data + rkv->nb[3]; src_res.v_nb1 = rkv->nb[1]; src_res.v_nb2 = rkv->nb[2]; src_res.v_nb3 = 2*rkv->nb[3];
         src_res.n_rows = a.cap;
         src_res.res = true;
     }
     kvq_src src_tail = {};
-    src_tail.k = (const char *) k->data; src_tail.k_nb1 = k->nb[1]; src_tail.k_nb2 = k->nb[2];
+    src_tail.k = (const char *) k->data; src_tail.k_nb1 = k->nb[1]; src_tail.k_nb2 = k->nb[2]; src_tail.k_nb3 = k->nb[3];
     if (attn) {
-        src_tail.v = (const char *) v->data; src_tail.v_nb1 = v->nb[1]; src_tail.v_nb2 = v->nb[2];
+        src_tail.v = (const char *) v->data; src_tail.v_nb1 = v->nb[1]; src_tail.v_nb2 = v->nb[2]; src_tail.v_nb3 = v->nb[3];
     }
     src_tail.n_rows = a.n_tail;
     src_tail.res = false;
 
+    // one stream: the numbers of the host are the logical numbers of the stream, the kernels use the arguments as they are
+    if (a.S == 1) {
+        a.s = 0; a.ncs = a.n_coarse; a.nck = a.n_chunk; a.cbpc = a.n_cbpc; a.rows = a.rows_blk; a.tiles = a.n_tiles_blk; a.cblk = a.n_cblk;
+    }
+#define KVQ_CASE(n) case n: if (a.S > 1) { kvq_launch<n, true>(a, attn, score, src_res, src_tail, stream, side); } else { kvq_launch<n, false>(a, attn, score, src_res, src_tail, stream, side); } break;
     switch (N) {
-        case  8: kvq_launch< 8>(a, attn, score, src_res, src_tail, stream, side); break;
-        case 16: kvq_launch<16>(a, attn, score, src_res, src_tail, stream, side); break;
-        case 24: kvq_launch<24>(a, attn, score, src_res, src_tail, stream, side); break;
-        case 32: kvq_launch<32>(a, attn, score, src_res, src_tail, stream, side); break;
-        case 40: kvq_launch<40>(a, attn, score, src_res, src_tail, stream, side); break;
-        case 48: kvq_launch<48>(a, attn, score, src_res, src_tail, stream, side); break;
+        KVQ_CASE( 8)
+        KVQ_CASE(16)
+        KVQ_CASE(24)
+        KVQ_CASE(32)
+        KVQ_CASE(40)
+        KVQ_CASE(48)
         default: GGML_ABORT("unsupported number of queries per kv head");
     }
+#undef KVQ_CASE
 }
 
 bool ggml_cuda_kvq_attn_supported(int device, const ggml_tensor * op) {

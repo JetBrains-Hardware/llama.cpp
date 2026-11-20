@@ -10161,6 +10161,7 @@ struct test_kvq_attn : public test_case {
     const int64_t   cut;      // rows missing from the last chunk (a partial page)
     const int64_t   n_pages;  // pages of the pool, 0: n_chunk
     const bool      shuffled; // the page table is a random choice of pages (a pool with more pages than the chunks), else the identity
+    const int64_t   n_stream; // streams (sequences) of the call; stream s has fewer coarse rows, ring rows and resident rows than stream s - 1
     const int64_t   G     = 4;
     const int64_t   n_rep = 6;
     const int64_t   D     = 256;
@@ -10168,10 +10169,17 @@ struct test_kvq_attn : public test_case {
     const int64_t   nwv   = 8;  // 1 bit per V value
 
     std::string vars() override {
-        return VARS_TO_STR13(n_chunk, n_crow, n_tail, L, cap, n_res, type_tail, type_res, masked, mode, cut, n_pages, shuffled);
+        return VARS_TO_STR14(n_chunk, n_crow, n_tail, L, cap, n_res, type_tail, type_res, masked, mode, cut, n_pages, shuffled, n_stream);
     }
 
-    int64_t pages() const { return n_pages > 0 ? n_pages : n_chunk; }
+    int64_t pages() const { return n_pages > 0 ? n_pages : n_stream*n_chunk; }
+
+    // stream 0 is the largest: n_coarse_max coarse rows, n_tail ring rows (the others masked), n_res resident rows
+    int64_t n_coarse_max() const { return n_chunk*n_crow - cut; }
+    int64_t nc_s(int64_t s) const { return n_stream > 1 && n_coarse_max() > 0 ? n_coarse_max() - s*(n_coarse_max()/n_stream - 1) : n_coarse_max(); }
+    int64_t nchunk_s(int64_t s) const { return (nc_s(s) + n_crow - 1)/n_crow; }
+    int64_t tail_s(int64_t s) const { return n_stream > 1 ? std::max<int64_t>(L, n_tail - s*(n_tail/(2*n_stream))) : n_tail; }
+    int64_t res_s(int64_t s) const { return n_stream > 1 ? n_res - s*(n_res/(2*n_stream)) : n_res; }
 
     // f16 qt and f16 weights in the mma of the CUDA kernels against the double reference of the CPU, observed <= 1e-7
     double max_nmse_err() override {
@@ -10180,15 +10188,15 @@ struct test_kvq_attn : public test_case {
 
     test_kvq_attn(int64_t n_chunk = 2, int64_t n_crow = 512, int64_t n_tail = 100, int64_t L = 1, int64_t cap = 256, int64_t n_res = 100,
             ggml_type type_tail = GGML_TYPE_Q8_0, ggml_type type_res = GGML_TYPE_Q8_0, bool masked = false, int mode = GGML_KVQ_ATTN,
-            int64_t cut = 0, int64_t n_pages = 0, bool shuffled = false)
+            int64_t cut = 0, int64_t n_pages = 0, bool shuffled = false, int64_t n_stream = 1)
         : n_chunk(n_chunk), n_crow(n_crow), n_tail(n_tail), L(L), cap(cap), n_res(n_res), type_tail(type_tail), type_res(type_res),
-          masked(masked), mode(mode), cut(cut), n_pages(n_pages), shuffled(shuffled) {}
+          masked(masked), mode(mode), cut(cut), n_pages(n_pages), shuffled(shuffled), n_stream(n_stream) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_coarse = n_chunk*n_crow - cut;
         const bool    attn     = mode == GGML_KVQ_ATTN;
 
-        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, G*n_rep, L);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, G*n_rep, L, n_stream);
         ggml_set_name(q, "q");
 
         ggml_tensor * kc = nullptr, * vc = nullptr, * tab = nullptr, * pt = nullptr;
@@ -10200,34 +10208,38 @@ struct test_kvq_attn : public test_case {
                 ggml_set_name(vc, "vc");
             }
             tab  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, D*D + 3*D*sizeof(float), 2*G, pages());
-            pt   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_chunk);
+            pt   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_chunk, n_stream);
             ggml_set_name(tab, "tab");
             ggml_set_name(pt, "pt");
         }
 
-        // tail K/V in the cache layout [D, G, n_tail], viewed as [D, n_tail, G]
-        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_tail, D, G, n_tail);
+        // tail K/V in the cache layout [D, G, n_tail, n_stream], viewed as [D, n_tail, G, n_stream]
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_tail, D, G, n_tail, n_stream);
         ggml_set_name(k, "k");
         k = ggml_permute(ctx, k, 0, 2, 1, 3);
         ggml_tensor * v = nullptr;
         if (attn) {
-            v = ggml_new_tensor_3d(ctx, type_tail, D, G, n_tail);
+            v = ggml_new_tensor_4d(ctx, type_tail, D, G, n_tail, n_stream);
             ggml_set_name(v, "v");
             v = ggml_permute(ctx, v, 0, 2, 1, 3);
         }
 
         ggml_tensor * rkv = nullptr, * ridx = nullptr;
         if (attn && cap > 0) {
-            rkv  = ggml_new_tensor_4d(ctx, type_res, D, cap, G, 2);
-            ridx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cap, G);
+            rkv  = ggml_new_tensor_4d(ctx, type_res, D, cap, G, 2*n_stream);
+            ridx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, cap, G, n_stream);
             ggml_set_name(rkv, "rkv");
             ggml_set_name(ridx, "ridx");
         }
 
-        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_coarse + n_tail, L);
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_coarse + n_tail, L, 1, n_stream);
         ggml_set_name(mask, "mask");
 
-        ggml_tensor * out = ggml_kvq_attn(ctx, q, kc, vc, tab, pt, k, v, rkv, ridx, mask, 1.0f/16.0f, (int) n_coarse, (int) n_crow, mode);
+        int nc[GGML_KVQ_MAX_STREAM] = { 0 };
+        for (int64_t s = 0; s < n_stream; ++s) {
+            nc[s] = (int) nc_s(s);
+        }
+        ggml_tensor * out = ggml_kvq_attn_streams(ctx, q, kc, vc, tab, pt, k, v, rkv, ridx, mask, 1.0f/16.0f, nc, (int) n_crow, mode);
         ggml_set_name(out, "out");
 
         return out;
@@ -10238,7 +10250,7 @@ struct test_kvq_attn : public test_case {
         std::uniform_int_distribution<uint32_t> ud;
         std::uniform_real_distribution<float>   uf(-1.0f, 1.0f);
 
-        const int64_t n_coarse = n_chunk*n_crow - cut;
+        const int64_t n_coarse = n_coarse_max();
         const int64_t n_kv     = n_coarse + n_tail;
 
         // bits of each table: random in 0..8 with 0 and 8 present, summing to 32*nw, in random order
@@ -10292,7 +10304,8 @@ struct test_kvq_attn : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "pt") == 0) {
-                // the identity, or n_chunk distinct pages of the pool in random order
+                // the identity, or distinct pages of the pool in random order; stream s takes the chunks from s*n_chunk of the pool,
+                // the entries after its own chunks are not valid pages (they must not be read)
                 std::vector<int32_t> pool(pages());
                 for (int64_t i = 0; i < pages(); ++i) {
                     pool[i] = (int32_t) i;
@@ -10300,13 +10313,21 @@ struct test_kvq_attn : public test_case {
                 if (shuffled) {
                     std::shuffle(pool.begin(), pool.end(), gen);
                 }
-                ggml_backend_tensor_set(t, pool.data(), 0, ggml_nbytes(t));
+                std::vector<int32_t> data(n_chunk*n_stream, 0x3fffffff);
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t c = 0; c < nchunk_s(s); ++c) {
+                        data[s*n_chunk + c] = pool[s*n_chunk + c];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "ridx") == 0) {
                 // n_res distinct coarse rows per kv head at random slots, rows at the chunk boundaries first
                 std::vector<int32_t> data(ggml_nelements(t), -1);
+                for (int64_t s = 0; s < n_stream; ++s)
                 for (int64_t g = 0; g < G; ++g) {
+                    const int64_t n_coarse = nc_s(s);
                     std::vector<int32_t> rows;
-                    for (int64_t c = 0; c < n_chunk; ++c) {
+                    for (int64_t c = 0; c < nchunk_s(s); ++c) {
                         if (c > 0) {
                             rows.push_back((int32_t) (c*n_crow - 1));
                         }
@@ -10329,23 +10350,28 @@ struct test_kvq_attn : public test_case {
                         slots[i] = i;
                     }
                     std::shuffle(slots.begin(), slots.end(), gen);
-                    for (int64_t i = 0; i < std::min<int64_t>(n_res, (int64_t) rows.size()); ++i) {
-                        data[g*cap + slots[i]] = rows[i];
+                    for (int64_t i = 0; i < std::min<int64_t>(res_s(s), (int64_t) rows.size()); ++i) {
+                        data[(s*G + g)*cap + slots[i]] = rows[i];
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "mask") == 0) {
                 // causal over the tail, every 7th coarse row masked when masked
                 std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                // stream s: its own coarse rows, a ring of tail_s(s) valid rows (the others masked, as the free cells of a ring)
+                for (int64_t s = 0; s < n_stream; ++s)
                 for (int64_t l = 0; l < L; ++l) {
+                    const int64_t n_coarse = nc_s(s);
+                    const int64_t n_ring   = tail_s(s);
+                    ggml_fp16_t * m = data.data() + (s*L + l)*n_kv;
                     for (int64_t r = 0; r < n_tail; ++r) {
-                        if (r > n_tail - L + l) {
-                            data[l*n_kv + n_coarse + r] = ggml_fp32_to_fp16(-INFINITY);
+                        if (r > n_ring - L + l) {
+                            m[n_coarse + r] = ggml_fp32_to_fp16(-INFINITY);
                         }
                     }
                     for (int64_t j = 0; j < n_coarse && masked; ++j) {
                         if (j % 7 == 3 || j == n_crow) {
-                            data[l*n_kv + j] = ggml_fp32_to_fp16(-INFINITY);
+                            m[j] = ggml_fp32_to_fp16(-INFINITY);
                         }
                     }
                 }
@@ -11532,6 +11558,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_kvq_attn(3, 700, 65, 4, 1024, 900, tp, tp, true, mode, 333, 0, false));    // partial last page, identity
         test_cases.emplace_back(new test_kvq_attn(2, 8192, 600, 1, 1024, 1000, tp, tp, false, mode, 1000, 5, true)); // default chunk size
+    }
+
+    // several streams (sequences of one packed ubatch): n_stream 2 and 4, each stream with its own coarse rows (stream s has fewer than
+    // stream s - 1, also fewer chunks), page table (pages of the pool, random), ring rows (the rest masked) and resident rows
+    for (int mode : {(int) GGML_KVQ_ATTN, (int) GGML_KVQ_SCORE}) {
+        const ggml_type tp = GGML_TYPE_Q8_0;
+        for (int64_t L : {1, 4, 8}) {
+            test_cases.emplace_back(new test_kvq_attn(3, 384, 70, L, 1024, 600, tp, tp, true, mode, 100, 8, true, 2));
+            test_cases.emplace_back(new test_kvq_attn(5, 512, 60, L, 4096, 900, tp, tp, false, mode, 0, 24, true, 4));
+            test_cases.emplace_back(new test_kvq_attn(2, 700, 65, L, 1024, 300, tp, tp, true, mode, 333, 0, false, 4));
+        }
+        test_cases.emplace_back(new test_kvq_attn(1, 700, 65, 4, 256, 100, tp, tp, true, mode, 0, 0, false, 4));  // one chunk each
+        test_cases.emplace_back(new test_kvq_attn(2, 8192, 600, 4, 1024, 1000, tp, tp, false, mode, 1000, 5, true, 2)); // default chunk size
     }
 
     // fit steps of the two-tier cache: mode, rows, tasks, words, V; K2 (16 words) and V1 (8 + 1 words) as the fitter

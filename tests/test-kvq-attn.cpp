@@ -199,6 +199,7 @@ struct eq_case {
     bool masked;   // masked coarse rows
     bool boundary; // resident rows at chunk boundaries
     bool no_mask;
+    int  salt = 0; // other data for the streams of test_streams
 };
 
 // coarse rows from fitted codec tables, reference from kvq_ref_decode
@@ -217,7 +218,7 @@ static void build_equivalence(const eq_case & ec, kvq_problem & P, kvq_reference
     P.nwk = 16;
     P.nwv = 8;
 
-    std::mt19937 rng(1234 + ec.n_chunk*7 + ec.L*13 + ec.cap);
+    std::mt19937 rng(1234 + ec.n_chunk*7 + ec.L*13 + ec.cap + 1000*ec.salt);
     std::normal_distribution<float> nd;
 
     const int H = P.n_head();
@@ -241,8 +242,8 @@ static void build_equivalence(const eq_case & ec, kvq_problem & P, kvq_reference
 
     std::vector<row_source> srcs;
     for (int g = 0; g < P.G; ++g) {
-        srcs.emplace_back(100 + 2*g);
-        srcs.emplace_back(101 + 2*g);
+        srcs.emplace_back(100 + 2*g + 50*ec.salt);
+        srcs.emplace_back(101 + 2*g + 50*ec.salt);
     }
 
     int n_bits0 = 0, n_bits8 = 0;
@@ -461,6 +462,115 @@ static void test_equivalence(ggml_backend_t cpu, ggml_backend_t gpu) {
     }
 }
 
+// one call with n_stream streams against n_stream single-stream calls on the same data: the same bits per stream
+// (a stream reads only its own rows and its arithmetic only depends on its own numbers), CPU and GPU
+static void test_streams(ggml_backend_t cpu, ggml_backend_t gpu) {
+    const ggml_type Q8 = GGML_TYPE_Q8_0;
+    struct sc {
+        const char * name;
+        int G, L, C, n_tail, cap;
+        std::vector<int> n_chunk, n_res; // per stream
+    };
+    const sc cases[] = {
+        { "S2 L1",    2, 1, 512, 100, 256,  { 3, 2 },       { 100, 40 } },
+        { "S2 L4",    4, 4, 512, 100, 256,  { 2, 3 },       { 256, 0 } },
+        { "S4 L1",    2, 1, 512, 70,  1024, { 3, 1, 2, 3 }, { 300, 0, 700, 50 } },
+        { "S4 L4",    4, 4, 384, 70,  1024, { 2, 3, 1, 2 }, { 100, 600, 384, 7 } },
+        { "S4 L8",    4, 8, 640, 150, 1024, { 1, 2, 2, 1 }, { 900, 5, 0, 640 } },
+        { "S3 L8 ring", 4, 8, 512, 33, 256, { 2, 2, 1 },    { 256, 100, 64 } },
+    };
+    for (const sc & c : cases) {
+        const int S = (int) c.n_chunk.size();
+        std::vector<kvq_problem> Ps(S);
+        for (int s = 0; s < S; ++s) {
+            kvq_reference R8, R32;
+            eq_case ec = { "", c.G, c.L, c.C, c.n_chunk[s], c.n_tail, c.cap, c.n_res[s], Q8, Q8, true, true, false, s + 1 };
+            build_equivalence(ec, Ps[s], R8, R32);
+            // a ring shorter than the others: the tail rows beyond ring_s are masked (the free cells), the others causal
+            {
+                kvq_problem & P = Ps[s];
+                const int ring = c.n_tail - s*(c.n_tail/6);
+                for (int l = 0; l < P.L; ++l) {
+                    for (int r = 0; r < P.n_tail; ++r) {
+                        if (r >= ring || r > ring - P.L + l) {
+                            P.mask[(size_t) l*P.n_kv() + P.n_coarse + r] = ggml_fp32_to_fp16(-INFINITY);
+                        }
+                    }
+                }
+            }
+        }
+        std::vector<const kvq_problem *> pp;
+        for (auto & P : Ps) {
+            pp.push_back(&P);
+        }
+        printf("  case %-12s streams %d n_chunk", c.name, S);
+        for (int s = 0; s < S; ++s) {
+            printf(" %d", c.n_chunk[s]);
+        }
+        printf("\n");
+
+        for (ggml_backend_t be : { cpu, gpu }) {
+            if (!be) {
+                continue;
+            }
+            for (int mode : { (int) GGML_KVQ_ATTN, (int) GGML_KVQ_SCORE }) {
+                const std::vector<float> r = run_kvq_streams(be, pp, mode);
+                if (r.empty()) {
+                    printf("    %-5s not supported\n", ggml_backend_name(be));
+                    continue;
+                }
+                int n_diff = 0;
+                double worst = 0.0;
+                int n_coarse_max = 0;
+                for (auto & P : Ps) {
+                    n_coarse_max = std::max(n_coarse_max, P.n_coarse);
+                }
+                for (int s = 0; s < S; ++s) {
+                    const kvq_problem & P = Ps[s];
+                    if (mode == GGML_KVQ_SCORE && P.n_coarse == 0) {
+                        continue;
+                    }
+                    const std::vector<float> one = run_kvq(be, P, mode);
+                    if (mode == GGML_KVQ_ATTN) {
+                        const size_t n = one.size();
+                        const float * x = r.data() + s*n;
+                        n_diff += memcmp(x, one.data(), n*sizeof(float)) != 0;
+                        worst = std::max(worst, nmse(x, one.data(), n));
+                    } else {
+                        // [n_coarse_max, G, L] per stream: the rows of the stream as in the single call, the rest 0
+                        for (int gl = 0; gl < P.G*P.L; ++gl) {
+                            const float * x = r.data() + ((size_t) s*P.G*P.L + gl)*n_coarse_max;
+                            const float * y = one.data() + (size_t) gl*P.n_coarse;
+                            n_diff += memcmp(x, y, (size_t) P.n_coarse*sizeof(float)) != 0;
+                            for (int j = P.n_coarse; j < n_coarse_max; ++j) {
+                                n_diff += x[j] != 0.0f;
+                            }
+                        }
+                    }
+                }
+                printf("    %-5s %-5s streams differ from single calls: %d (max nmse %.1e)\n", ggml_backend_name(be),
+                    mode == GGML_KVQ_ATTN ? "attn" : "score", n_diff, worst);
+                // CPU: the same double math per stream; GPU: the same kernels with the same arithmetic order
+                CHECK(n_diff == 0, "%s %s %s: %d streams differ from the single-stream calls", c.name, ggml_backend_name(be),
+                    mode == GGML_KVQ_ATTN ? "attn" : "score", n_diff);
+            }
+        }
+
+        // CPU against GPU, all streams in one call
+        if (gpu) {
+            for (int mode : { (int) GGML_KVQ_ATTN, (int) GGML_KVQ_SCORE }) {
+                const std::vector<float> a = run_kvq_streams(cpu, pp, mode);
+                const std::vector<float> b = run_kvq_streams(gpu, pp, mode);
+                if (a.size() == b.size() && !a.empty()) {
+                    const double e = nmse(b.data(), a.data(), a.size());
+                    printf("    gpu vs cpu %-5s nmse %.2e\n", mode == GGML_KVQ_ATTN ? "attn" : "score", e);
+                    CHECK(e < 2e-5, "%s gpu vs cpu nmse %e", c.name, e);
+                }
+            }
+        }
+    }
+}
+
 int main() {
     ggml_backend_load_all();
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -470,6 +580,9 @@ int main() {
 
     printf("equivalence with decode-then-attend (kvq_ref_decode with the int8 inverse of the op; f32 for information)\n");
     test_equivalence(cpu, gpu);
+
+    printf("several streams in one call against single-stream calls\n");
+    test_streams(cpu, gpu);
 
     if (gpu) {
         ggml_backend_free(gpu);

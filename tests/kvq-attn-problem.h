@@ -212,3 +212,138 @@ static std::vector<float> run_kvq(ggml_backend_t backend, const kvq_problem & P,
     delete g;
     return res;
 }
+
+// one call over several streams (ggml_kvq_attn_streams): stream s is the problem Ps[s]; all of them have the same G, n_rep, L,
+// n_crow, nwk, nwv, cap, n_tail and types, and their own coarse rows, pages, resident rows and mask. The pages of the streams are
+// concatenated in one pool (stream s after the pages of the streams before it), the resident slots, the tail rows and the mask
+// rows are the slices of the stream. The result has the layout of the op: attn [D, n_head, L, S], score [n_coarse_max, G, L, S]
+static std::vector<float> run_kvq_streams(ggml_backend_t backend, const std::vector<const kvq_problem *> & Ps, int mode) {
+    const int S = (int) Ps.size();
+    const kvq_problem & P0 = *Ps[0];
+    const bool attn = mode == GGML_KVQ_ATTN;
+
+    int n_coarse_max = 0, n_chunk_max = 0, n_pages = 0, n_kv_max = 0;
+    std::vector<int> page0(S), nc(GGML_KVQ_MAX_STREAM, 0);
+    for (int s = 0; s < S; ++s) {
+        const kvq_problem & P = *Ps[s];
+        GGML_ASSERT(P.G == P0.G && P.L == P0.L && P.n_crow == P0.n_crow && P.cap == P0.cap && P.n_tail == P0.n_tail);
+        page0[s]     = n_pages;
+        n_pages     += P.pages();
+        nc[s]        = P.n_coarse;
+        n_coarse_max = std::max(n_coarse_max, P.n_coarse);
+        n_chunk_max  = std::max(n_chunk_max, P.n_chunk);
+        n_kv_max     = std::max(n_kv_max, P.n_kv());
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead()*64 + ggml_graph_overhead_custom(64, false), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const int G = P0.G, L = P0.L, cap = P0.cap, n_crow = P0.n_crow, n_tail = P0.n_tail;
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, P0.n_head(), L, S);
+    ggml_tensor * kc = nullptr, * vc = nullptr, * tab = nullptr, * pt = nullptr;
+    if (n_coarse_max > 0) {
+        kc  = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, P0.nwk, n_crow, G, n_pages);
+        vc  = attn ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, P0.nwv + 1, n_crow, G, n_pages) : nullptr;
+        tab = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, D*D + 3*D*sizeof(float), 2*G, n_pages);
+        pt  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_chunk_max, S);
+    }
+    auto cache_view = [&](const kvq_problem & P) {
+        ggml_tensor * t = ggml_new_tensor_4d(ctx, P.type_tail, D, G, n_tail, S);
+        return ggml_permute(ctx, t, 0, 2, 1, 3);
+    };
+    ggml_tensor * k = cache_view(P0);
+    ggml_tensor * v = attn ? cache_view(P0) : nullptr;
+    ggml_tensor * rkv = nullptr, * ridx = nullptr;
+    if (attn && cap > 0) {
+        rkv  = ggml_new_tensor_4d(ctx, P0.type_res, D, cap, G, 2*S);
+        ridx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, cap, G, S);
+    }
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_max, L, 1, S);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+    ggml_tensor * out = ggml_kvq_attn_streams(ctx, q, kc, vc, tab, pt, k, v, rkv, ridx, mask, P0.scale, nc.data(), n_crow, mode);
+    ggml_build_forward_expand(gf, out);
+
+    std::vector<float> res;
+    if (!ggml_backend_supports_op(backend, out)) {
+        ggml_free(ctx);
+        return res;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buf);
+
+    auto set_cat = [&](ggml_tensor * t, auto && data_of) {
+        if (!t) {
+            return;
+        }
+        std::vector<uint8_t> all(ggml_nbytes(t), 0);
+        size_t off = 0;
+        for (int s = 0; s < S; ++s) {
+            const std::pair<const uint8_t *, size_t> d = data_of(*Ps[s]);
+            GGML_ASSERT(off + d.second <= all.size());
+            memcpy(all.data() + off, d.first, d.second);
+            off += d.second;
+        }
+        ggml_backend_tensor_set(t, all.data(), 0, all.size());
+    };
+    set_cat(q, [](const kvq_problem & P) { return std::make_pair((const uint8_t *) P.q.data(), P.q.size()*sizeof(float)); });
+    set_cat(k, [](const kvq_problem & P) { return std::make_pair(P.k.data(), P.k.size()); });
+    set_cat(v, [](const kvq_problem & P) { return std::make_pair(P.v.data(), P.v.size()); });
+    set_cat(rkv, [](const kvq_problem & P) { return std::make_pair(P.rkv.data(), P.rkv.size()); });
+    set_cat(ridx, [](const kvq_problem & P) { return std::make_pair((const uint8_t *) P.ridx.data(), P.ridx.size()*sizeof(int32_t)); });
+
+    // mask rows of stream s: [L][n_kv_s] into [L][n_kv_max]
+    {
+        std::vector<ggml_fp16_t> m((size_t) S*L*n_kv_max, ggml_fp32_to_fp16(0.0f));
+        for (int s = 0; s < S; ++s) {
+            const kvq_problem & P = *Ps[s];
+            for (int l = 0; l < L; ++l) {
+                for (int r = 0; r < P.n_kv(); ++r) {
+                    m[((size_t) s*L + l)*n_kv_max + r] = P.has_mask ? P.mask[(size_t) l*P.n_kv() + r] : ggml_fp32_to_fp16(0.0f);
+                }
+            }
+        }
+        ggml_backend_tensor_set(mask, m.data(), 0, m.size()*sizeof(ggml_fp16_t));
+    }
+
+    if (kc) {
+        const size_t slot = D*D + 3*D*sizeof(float);
+        std::vector<uint8_t> kc_d(ggml_nbytes(kc), 0), vc_d(vc ? ggml_nbytes(vc) : 0, 0), tab_d(ggml_nbytes(tab), 0);
+        std::vector<int32_t> pt_d((size_t) n_chunk_max*S, 0x3fffffff);
+        for (int s = 0; s < S; ++s) {
+            const kvq_problem & P = *Ps[s];
+            for (int c = 0; c < P.n_chunk; ++c) {
+                const int page = page0[s] + P.page(c);
+                pt_d[(size_t) s*n_chunk_max + c] = page;
+                const int rows = std::min(P.n_crow, P.n_coarse - c*P.n_crow);
+                for (int gi = 0; gi < G; ++gi) {
+                    const size_t rk = P.nwk*sizeof(int32_t), rv = (P.nwv + 1)*sizeof(int32_t);
+                    memcpy(kc_d.data() + (size_t) page*kc->nb[3] + (size_t) gi*kc->nb[2],
+                        (const uint8_t *) P.kc.data() + ((size_t) gi*P.n_coarse + (size_t) c*n_crow)*rk, (size_t) rows*rk);
+                    if (vc) {
+                        memcpy(vc_d.data() + (size_t) page*vc->nb[3] + (size_t) gi*vc->nb[2],
+                            (const uint8_t *) P.vc.data() + ((size_t) gi*P.n_coarse + (size_t) c*n_crow)*rv, (size_t) rows*rv);
+                    }
+                }
+                for (int m = 0; m < 2*G; ++m) {
+                    uint8_t * dst = tab_d.data() + (size_t) page*tab->nb[2] + (size_t) m*slot;
+                    memcpy(dst, P.tinv.data() + ((size_t) c*2*G + m)*D*D, (size_t) D*D);
+                    memcpy(dst + D*D, P.taux.data() + ((size_t) c*2*G + m)*3*D, 3*D*sizeof(float));
+                }
+            }
+        }
+        ggml_backend_tensor_set(kc, kc_d.data(), 0, kc_d.size());
+        if (vc) {
+            ggml_backend_tensor_set(vc, vc_d.data(), 0, vc_d.size());
+        }
+        ggml_backend_tensor_set(tab, tab_d.data(), 0, tab_d.size());
+        ggml_backend_tensor_set(pt, pt_d.data(), 0, pt_d.size()*sizeof(int32_t));
+    }
+
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+    res.resize(ggml_nelements(out));
+    ggml_backend_tensor_get(out, res.data(), 0, res.size()*sizeof(float));
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return res;
+}
