@@ -1316,6 +1316,8 @@ jobs:
 
   # note: builds only the ggml-sycl backend - llama-server is injected from the
   #       windows-cpu zip during the release "Merge artifacts" step
+  # note: fp16 build. The fp32 build reads prompts several times slower on Arc GPUs
+  #       (Arc Pro B65: about 210 tokens/s against about 1200).
   windows-sycl:
     needs: [check-release]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
@@ -1369,7 +1371,7 @@ jobs:
             -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_BACKEND_DL=ON -DBUILD_SHARED_LIBS=ON ^
-            -DGGML_CPU=OFF -DGGML_SYCL=ON ^
+            -DGGML_CPU=OFF -DGGML_SYCL=ON -DGGML_SYCL_F16=ON ^
             -DLLAMA_BUILD_BORINGSSL=ON
           cmake --build build --target ggml-sycl -j %NUMBER_OF_PROCESSORS%
 

@@ -13,7 +13,11 @@
 #ifndef GGML_SYCL_COMMON_HPP
 #define GGML_SYCL_COMMON_HPP
 
+#include <memory>
+#include <atomic>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -143,6 +147,9 @@ static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
+extern int g_ggml_sycl_enable_graph;
+// counts graph computes; ops use it to cache what they learn about a graph input for the rest of the graph
+extern std::atomic<uint64_t> g_ggml_sycl_graph_epoch;
 extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;
 extern int g_ggml_sycl_fa_dpas;
@@ -437,6 +444,8 @@ struct ggml_tensor_extra_gpu {
   dpct::event_ptr events[GGML_SYCL_MAX_DEVICES]
                         [GGML_SYCL_MAX_STREAMS]; // events for synchronizing multiple GPUs
   optimize_feature optimized_feature;
+  // state of the int8 prompt-batch GEMM for this weight (int8-gemm.hpp), created on first use
+  std::shared_ptr<struct ggml_sycl_int8_state> int8;
 };
 
 extern int g_ggml_sycl_use_level_zero_api;
@@ -493,7 +502,12 @@ struct sdpa_partition {
     dnnl::graph::logical_tensor              out;
     size_t id_q = 0, id_k = 0, id_v = 0, id_scale = 0, id_mask = 0;
     bool   has_mask = false;
-    bool   ok = false;
+    // causal mask made by the kernel: host scalars of the graph (they live here; a map entry never moves)
+    size_t  id_kv_len = SIZE_MAX, id_q_len = SIZE_MAX, id_neg_inf = SIZE_MAX;
+    int32_t kv_len    = 0;
+    int32_t q_len     = 0;
+    float   neg_inf   = -INFINITY;
+    bool    ok = false;
 };
 #endif
 
@@ -568,6 +582,46 @@ struct ggml_backend_sycl_context {
 
     std::unordered_map<std::string, sdpa_partition> sdpa_partitions;
 #endif
+
+    // f16 copy of the f32 activations (src1) of the last library GEMM. Matmuls of the same graph that read the
+    // same tensor (FFN gate and up, the q/k/v projections, ...) reuse it instead of converting src1 again.
+    // node_src1 is src[1] of the MUL_MAT node being computed: only real graph tensors are cached, their data
+    // cannot change while they still have a consumer in the graph.
+    struct src1_f16_cache_t {
+        const ggml_tensor * node_src1 = nullptr;
+        const ggml_tensor * tensor    = nullptr;
+        const void *        data      = nullptr;
+        size_t              ne        = 0;
+        void *              buf       = nullptr;
+        size_t              cap       = 0; // bytes
+        // tensor whose f32 data was not written, only this f16 copy (ggml_sycl_glu_f16_only), and whether the
+        // GEMM that reads it took the copy
+        const ggml_tensor * f16_only      = nullptr;
+        bool                f16_only_used = false;
+    } src1_f16_cache;
+
+    // per-dimension rms of the activations (src1) of the last int8 prompt-batch GEMM (int8-gemm.hpp), reused by
+    // the matmuls of the same graph that read the same tensor; same validity rule as src1_f16_cache
+    struct int8_xr_cache_t {
+        const ggml_tensor * tensor = nullptr;
+        const void *        data   = nullptr;
+        size_t              n      = 0;
+        size_t              k      = 0;
+        float *             buf    = nullptr;
+        size_t              cap    = 0; // floats
+    } int8_xr_cache;
+
+    ~ggml_backend_sycl_context() {
+        try {
+            if (src1_f16_cache.buf != nullptr) {
+                sycl::free(src1_f16_cache.buf, *stream());
+            }
+            if (int8_xr_cache.buf != nullptr) {
+                sycl::free(int8_xr_cache.buf, *stream());
+            }
+        } catch (...) {
+        }
+    }
 
     // pool
     std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES];

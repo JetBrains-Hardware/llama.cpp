@@ -368,8 +368,8 @@ static void unary_op_ceil_kernel(const T * x, T * dst, const int k, const sycl::
     }
 }
 
-template<typename T, typename F>
-static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, const uint64_t k, const sycl::nd_item<1> & item_ct1, F func) {
+template<typename T, typename D, typename F>
+static void unary_gated_op_flat_kernel(const T * x, const T * g, D * dst, const uint64_t k, const sycl::nd_item<1> & item_ct1, F func) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
         dst[i] = func(x[i]) * g[i];
     }
@@ -1452,6 +1452,22 @@ void ggml_sycl_reglu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 void ggml_sycl_swiglu(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_op_swiglu(ctx, dst);
+}
+
+// SwiGLU of contiguous f32 operands written as f16 into dst16 (ggml_nelements(dst) values) instead of dst->data:
+// for a prompt batch whose only reader is a library f16 GEMM, see ggml_sycl_glu_f16_only() in ggml-sycl.cpp.
+void ggml_sycl_swiglu_f16(ggml_backend_sycl_context & ctx, const ggml_tensor * dst, sycl::half * dst16) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
+    const float *  x = (const float *) dst->src[0]->data;
+    const float *  g = (const float *) dst->src[1]->data;
+    const uint64_t k = (uint64_t) ggml_nelements(dst);
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const uint32_t num_blocks = (uint32_t) ceil_div(k, SYCL_GLU_BLOCK_SIZE);
+    const sycl::nd_range<1> launch_range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+    stream->parallel_for(launch_range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+        unary_gated_op_flat_kernel(x, g, dst16, k, item_ct1, [](float v) { return op_silu(v); });
+    });
 }
 
 void ggml_sycl_swiglu_oai(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
