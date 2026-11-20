@@ -3318,12 +3318,23 @@ inline void ggml_sycl_op_mul_mat_sycl(
         src0_reordered = src0_extra->optimized_feature.reorder;
     }
 #if GGML_SYCL_DNNL
-    // prompt batches of q4_K / q6_K projections: int8 GEMM (int8-gemm.hpp)
+    // prompt batches of q4_K / q5_K / q6_K projections: int8 GEMM (int8-gemm.hpp)
     const bool int8_gemm_ok = src0_reordered && row_diff == src0->ne[1] && g_ggml_sycl_enable_dnn &&
                               ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) && ggml_sycl_src1_f16_ok(dst) &&
                               ggml_prec_get_acc(dst) == GGML_PREC_UNDEFINED && ggml_sycl_int8_gemm_shape_ok(src0, src1, src1_ncols);
-    if (int8_gemm_ok && !ggml_sycl_int8_audit_on() &&
-        ggml_sycl_int8_gemm(ctx, src0, dst, src0_dd_i, src1_ddf_i, dst_dd_i, row_diff, src1_ncols, ne10, stream)) {
+    if (int8_gemm_ok && !ggml_sycl_int8_audit_on()) {
+        // if the graph already has an f16 copy of the activations (a SwiGLU that wrote only f16), read it:
+        // it is half the size
+        auto & cache = ctx.src1_f16_cache;
+        if (g_ggml_sycl_src1_f16_cache && !g_ggml_sycl_enable_graph && id == ctx.device && src1 == cache.node_src1 && cache.tensor == src1 &&
+            cache.data == (const void *) src1_ddf_i && cache.ne == (size_t) (src1_ncols * ne10)) {
+            if (cache.f16_only == src1) {
+                cache.f16_only_used = true;
+            }
+            ggml_sycl_int8_gemm(ctx, src0, dst, src0_dd_i, (const sycl::half *) cache.buf, dst_dd_i, row_diff, src1_ncols, ne10, stream);
+        } else {
+            ggml_sycl_int8_gemm(ctx, src0, dst, src0_dd_i, src1_ddf_i, dst_dd_i, row_diff, src1_ncols, ne10, stream);
+        }
         return;
     }
 #endif
@@ -6931,12 +6942,6 @@ static bool ggml_sycl_glu_f16_only(ggml_backend_sycl_context & ctx, const ggml_c
     if (reader == nullptr) {
         return false;
     }
-#if GGML_SYCL_DNNL
-    // the int8 GEMM reads f32
-    if (ggml_sycl_int8_gemm_shape_ok(reader->src[0], node, node->ne[1])) {
-        return false;
-    }
-#endif
     queue_ptr stream = ctx.stream();
     auto & cache = ctx.src1_f16_cache;
     const size_t ne = (size_t) ggml_nelements(node);
