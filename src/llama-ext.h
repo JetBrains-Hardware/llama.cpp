@@ -250,13 +250,13 @@ LLAMA_API bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_me
 //   tail (llama_kvq_config::tail): the cache is a ring of the positions whose rows are not in the host store; a large batch
 //   that does not fit it starts the jobs of the complete chunks, then copies the ring rows to the host store (spill);
 //   an error if that cannot free the room
-// memory operations: clear and seq_rm of the end of the sequence; a seq_rm into the coarse region or into a chunk that
+// memory operations: clear, seq_keep and seq_rm of the end of a sequence (n_seq_max sequences, each with its own state); a seq_rm into the coarse region or into a chunk that
 // is fitting drops the coarse rows from the chunk of the removal on, the rows before the removal stay in the host store and are
 // fitted again by the next llama_memory_kvq_fit_wait
-// not supported, each aborts with "not supported by the two-tier KV cache (--kvq)" and the reason: seq_cp, seq_keep and seq_rm
-// of a sequence > 0 (one sequence only), seq_rm of a middle range [p0, p1) with p1 >= 0; seq_add, seq_div (qwen35 uses IMROPE,
+// not supported, each aborts with "not supported by the two-tier KV cache (--kvq)" and the reason: seq_cp (the sequences do not share rows)
+// seq_rm of a middle range [p0, p1) with p1 >= 0; seq_add, seq_div (qwen35 uses IMROPE,
 // no KV cache can shift its keys, llama_memory_can_shift is false)
-// the same list is in the "Not supported" section of docs/development/kvq-two-tier-cache-guide.md
+// the same list, with the status of each item, is in section 9 ("Not implemented, known gaps, ideas") of docs/development/kvq-two-tier-cache.md
 //
 // the rows after the last complete chunk (rem): llama_memory_kvq_fit_wait (the end of a prompt) fits them as well, so the
 // coarse region ends with the prompt; the next fit_wait fits them again from the host store with all rows they have then
