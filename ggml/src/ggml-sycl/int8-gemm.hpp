@@ -33,8 +33,10 @@
 //                                    device, and the scratch buffers of the queued matmuls use about 1.7 GiB more.
 //   GGML_SYCL_INT8_STAT_COLS=<n>     how many columns of a batch the scale statistics read, evenly spaced
 //                                    (default 256; 0: all columns)
-//   GGML_SYCL_INT8_WCACHE_MB=<n>     limit, in MiB, for kept s8 copies of the weights (0: keep none; default:
-//                                    no limit). The copies make prompts 3-4% faster and use up to 10 GiB.
+//   GGML_SYCL_INT8_WCACHE_MB=<n>     limit, in MiB, for kept s8 copies of the weights (default 0: keep none).
+//                                    The copies make prompts 3-4% faster and use up to 10 GiB. With a long
+//                                    context they left no memory for the vision projector
+//                                    (Arc Pro B65 32 GB, context 250000).
 //   GGML_SYCL_INT8_WCACHE_RESERVE_MB=<n>  free device memory that the copies must leave (default 2048)
 //   GGML_SYCL_INT8_GEMM_STATS=1      print call, calibration and cache counters at exit (2: also the time of
 //                                    each stage, with waits)
@@ -67,7 +69,7 @@ struct ggml_sycl_int8_gemm_cfg {
     float   drift    = 1.15f;     // calibrate again above this ratio of estimated noise power, kept / fresh factors
     int     drift_sync = 4;       // the host waits for the statistics of every n-th call (1: every call; 0: never)
     int     stat_cols = 256;      // columns of the batch the statistics read (evenly spaced; 0: all)
-    size_t  wcache_cap     = SIZE_MAX;            // bytes of s8 weight copies allowed
+    size_t  wcache_cap     = 0;                   // bytes of s8 weight copies allowed (0: none)
     size_t  wcache_reserve = (size_t) 2048 << 20; // free device memory the copies must leave
     // counters
     int64_t calls = 0, calibrations = 0, recalibrations = 0, cached_calls = 0, wcache_tensors = 0;
