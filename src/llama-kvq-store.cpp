@@ -344,7 +344,7 @@ static int kvq_popcount(uint64_t x) {
 }
 
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-        int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate) :
+        int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min) :
     n_rows_(n_rows), n_crow(n_chunk_rows) {
     if (kv.get_n_stream() != 1) {
         throw std::runtime_error("packed two-tier mode needs a single KV stream");
@@ -584,7 +584,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
             off += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
         }
         off_jblk = off;
-        buf_scr.reset(ggml_backend_buft_alloc_buffer(buft, std::max(ggml_backend_buft_get_alloc_size(buft, scr), off)));
+        buf_scr.reset(ggml_backend_buft_alloc_buffer(buft, std::max({ ggml_backend_buft_get_alloc_size(buft, scr), off, shared_min })));
         if (!buf_scr) {
             throw std::runtime_error("failed to allocate the scratch");
         }
@@ -1903,6 +1903,19 @@ bool llama_kvq_store::scr_alloc() {
     scr_mode = 1;
     LLAMA_LOG_INFO("%s: the scratch (%.1f MiB) in the shared memory in %.2f ms\n", __func__, ggml_nbytes(scr)/1048576.0, (ggml_time_us() - t0)/1000.0);
     return true;
+}
+
+void llama_kvq_store::fit_alloc() {
+    if (scr_mode == 3) {
+        return;
+    }
+    if (scr_mode == 2) {
+        drop_pending();
+        reset_base();
+    }
+    // the readbacks of the last graph read the same memory
+    synchronize();
+    scr_mode = 3;
 }
 
 bool llama_kvq_store::dec_alloc() {

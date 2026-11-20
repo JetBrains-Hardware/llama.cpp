@@ -3,85 +3,67 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
-#include "llama-kvq-pack.h"
 #include "llama-kvq-store.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
+#include <functional>
+#include <map>
+#include <unordered_map>
 #include <stdexcept>
-
-#if defined(_WIN32)
-    #define WIN32_LEAN_AND_MEAN
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #include <windows.h>
-#elif defined(__linux__)
-    #include <sys/resource.h>
-#endif
 
 static constexpr int64_t KVQ_D   = llama_kvq_store::D;
 static constexpr size_t  KVQ_ROW = llama_kvq_store::ROW;
-static constexpr int64_t KVQ_NP  = KVQ_D + 5; // rows of the parameters of a task: fwd [D], mu, step, bits, offsets, den
-
-// the pool runs behind the decode thread and the prefetch worker
-static void kvq_fit_lower_priority() {
-#if defined(_WIN32)
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-#elif defined(__linux__)
-    // per thread on Linux
-    setpriority(PRIO_PROCESS, 0, 10);
-#endif
-}
 
 static double kvq_fit_now() {
     return ggml_time_us()*1e-6;
 }
 
-enum kvq_fit_stage {
-    KVQ_STAGE_FIT,    // phase 1 queued, fit tasks
-    KVQ_STAGE_BITS,   // the V fit tasks are done: phase 2 and the V bits tasks queued (per-chunk V), the K fit tasks may still run
-    KVQ_STAGE_READY,  // all phases queued
-    KVQ_STAGE_FAILED,
-};
-
-// task i = kv*n_pair + layer index*G + kv head, kv = 0 for K, 1 for V; the host arrays are per (layer index, K or V, kv head)
+// task i = kv*n_pair + layer index*G + kv head, kv = 0 for K, 1 for V; the host arrays are per task
 struct llama_kvq_fitter::job {
-    int32_t r0    = 0; // rows [r0, r1), the table set of the chunk slots r0/C .. (r1 - 1)/C
-    int32_t r1    = 0;
-    int     stage = KVQ_STAGE_FIT; // decode thread
+    int32_t r0 = 0; // rows [r0, r1), the table set of the chunk slots r0/C .. (r1 - 1)/C
+    int32_t r1 = 0;
 
     int32_t n() const { return r1 - r0; }
 
     std::vector<float> gram; // [n_layer][G][D*D]
     std::vector<float> gsum; // [n_layer][n_gate], per-chunk V only
 
-    std::atomic<bool> cancel{false};
-    std::atomic<bool> failed{false};
-
     // pool mutex
-    int32_t n_left[2] = {}; // tasks not finished: K (fit), V (fit, then bits)
-    int32_t n_run  = 0; // tasks running
-    double  t_cpu  = 0.0;
+    bool done   = false; // the device work and its readbacks are done
+    bool cancel = false;
 
     double t_snap = 0.0;
     double t_take = 0.0;
 
-    // the end of phase 1 (and later of phase 3), of phase 2
-    ggml_backend_event_ptr ev[2];
+    // after the readbacks of the last layer
+    ggml_backend_event_ptr ev;
 
     // pinned host memory
     ggml_backend_buffer_ptr buf;
-    float       * hstat = nullptr; // per (layer index, K or V): cov [G][D*D], mu [G][D]
-    float       * hpar  = nullptr; // per (layer index, K or V, kv head): [KVQ_NP][D]
-    float       * hsig  = nullptr; // per (layer index, kv head): V scale of the shape [D]
-    int8_t      * htinv = nullptr; // per task [D*D]
-    float       * htaux = nullptr; // per task [3*D]
-
-    // per-chunk V: the tables between the fit and the bits tasks, per (layer index, kv head)
-    std::vector<llama_kvq_table> vt;
+    float  * hmet  = nullptr; // per layer index [2*G][D*D]: the metrics, K then V
+    float  * hres  = nullptr; // per layer index [2*G][D]: the result row of each table
+    int8_t * htinv = nullptr; // per task [D*D]
+    float  * htaux = nullptr; // per task [3*D]
 };
+
+int32_t llama_kvq_fitter::stage_rows(int32_t n_rows, const llama_kvq_fit_params & fparams) {
+    // merge: a group of the last complete chunk and up to C - 1 rows after it
+    return std::min<int32_t>(n_rows, fparams.rem == LLAMA_KVQ_REM_MERGE ? 2*fparams.chunk - 1 : fparams.chunk);
+}
+
+size_t llama_kvq_fitter::shared_min(int32_t n_head_kv, int32_t n_stage, int32_t bits_k, int32_t bits_v) {
+    const size_t G     = n_head_kv;
+    const size_t rows  = (size_t) n_stage*G;
+    const size_t words = (size_t) (bits_k*KVQ_D + 31)/32 + (bits_v*KVQ_D + 31)/32 + 1;
+    const size_t fixed = rows*2*KVQ_ROW + rows*words*sizeof(int32_t);
+    const size_t tab1  = 2*G*(2*KVQ_D + 3)*KVQ_D*sizeof(float);
+    // a graph of one layer holds at most three f32 copies of the rows of one of K and V
+    const size_t inter = 3*rows*KVQ_D*sizeof(float);
+    return fixed + tab1 + std::max(inter, ggml_kvq_fit_table_work_size(KVQ_D, 2*G)) + (8u << 20);
+}
 
 llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_params & fparams,
         const std::vector<const ggml_tensor *> & wo, int32_t n_head, int32_t min_first) :
@@ -90,14 +72,21 @@ llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_
     const int32_t C     = store.n_chunk_rows();
     const int32_t n_chk = store.n_chunks();
 
-    if (store.backend() == nullptr) {
-        throw std::runtime_error("the fitter needs the backend of the device");
+    if (store.backend() == nullptr || store.shared_buffer() == nullptr) {
+        throw std::runtime_error("the fitter needs the backend of the device and the shared memory of the store");
     }
     if (fparams.rem != LLAMA_KVQ_REM_OWN && fparams.rem != LLAMA_KVQ_REM_MERGE) {
         throw std::runtime_error(format("unknown policy %d for the rows after the last complete chunk", fparams.rem));
     }
-    // merge: a group of the last complete chunk and up to C - 1 rows after it
-    n_stage = std::min<int32_t>(store.n_rows(), fparams.rem == LLAMA_KVQ_REM_MERGE ? 2*C - 1 : C);
+    // the bits of a row: round(bits*D), ggml_kvq_fit_bits
+    for (int kv = 0; kv < 2; ++kv) {
+        const int64_t nb = (int64_t) std::nearbyint((double) (kv ? fparams.bits_v : fparams.bits_k)*KVQ_D);
+        if (nb < 0 || nb > 8*KVQ_D || (nb + 31)/32 > store.n_words(kv == 1)) {
+            throw std::runtime_error(format("%d bits per value of %s do not fit the %d words of a packed row", kv ? fparams.bits_v : fparams.bits_k,
+                    kv ? "V" : "K", store.n_words(kv == 1)));
+        }
+    }
+    n_stage = stage_rows(store.n_rows(), fparams);
     slot_fit.assign(n_chk, range());
 
     n_rep = n_head/G;
@@ -114,151 +103,286 @@ llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_
         }
     }
     wo_gram.resize(layer_ids.size()*G);
-    wo_once.reset(new std::once_flag[layer_ids.size()*G]);
 
     graph_meta.resize(ggml_tensor_overhead()*128 + ggml_graph_overhead());
-    dev_alloc();
-    compute_wo_gram_dev();
-
-    for (int i = 0; i < fparams.n_threads; ++i) {
-        threads.emplace_back([this]() { loop(); });
+    dev_init();
+    std::vector<char> on_dev;
+    compute_wo_gram_dev(on_dev);
+    int n_host = 0;
+    const double t0 = kvq_fit_now();
+    for (int32_t p = 0; p < (int32_t) on_dev.size(); ++p) {
+        if (!on_dev[p]) {
+            compute_wo_gram(p);
+            n_host++;
+        }
     }
-    const double mib_dev = (ggml_backend_buffer_get_size(buf_dev.get()) + ggml_gallocr_get_buffer_size(galloc.get(), 0))/1048576.0;
+    if (n_host > 0) {
+        LLAMA_LOG_INFO("%s: o_proj grams of %d (layer, kv head) on the CPU in %.2f s\n", __func__, n_host, kvq_fit_now() - t0);
+    }
+
+    waiter = std::thread([this]() { loop(); });
+
     const std::string rem = fparams.rem == LLAMA_KVQ_REM_MERGE ? "merged into the last complete chunk" : format("own chunk of at least %d rows", fparams.min_rows);
-    LLAMA_LOG_INFO("%s: chunks of %d rows, up to %d chunks, K %d bits and V %d bits fitted per chunk on the device, %.1f MiB, %d CPU threads, rows after the last complete chunk: %s\n", __func__,
-            C, n_chk, fparams.bits_k, fparams.bits_v, mib_dev, fparams.n_threads, rem.c_str());
+    LLAMA_LOG_INFO("%s: chunks of %d rows, up to %d chunks, K %d bits and V %d bits fitted per chunk on the device, rows after the last complete chunk: %s\n", __func__,
+            C, n_chk, fparams.bits_k, fparams.bits_v, rem.c_str());
 }
 
 llama_kvq_fitter::~llama_kvq_fitter() {
     {
         std::lock_guard<std::mutex> lk(m);
         stop = true;
-        for (auto & jb : jobs) {
-            jb->cancel = true;
-        }
     }
     cv_work.notify_all();
-    for (auto & t : threads) {
-        t.join();
-    }
-    // queued phases use the buffers; the backend may be freed already, the events are not
+    waiter.join();
+    // queued graphs use the buffers; the backend may be freed already, the events are not
     for (auto & jb : jobs) {
-        for (auto & ev : jb->ev) {
-            ggml_backend_event_synchronize(ev.get());
-        }
+        ggml_backend_event_synchronize(jb->ev.get());
     }
 }
 
-// device state, then the largest graphs once: the ops must run on the device, and the allocator does not grow later
-void llama_kvq_fitter::dev_alloc() {
-    if (buf_dev) {
-        return;
-    }
-    const int64_t t0 = ggml_time_us();
-    const int32_t G  = store.n_head_kv();
+// places the tensors of gf without memory (not views) in the shared memory from lo: first fit, a tensor is free after its
+// last reader (outputs stay to the end); place = false: only the size. Returns the end of the used memory, 0 if it does not fit
+size_t llama_kvq_fitter::plan(ggml_cgraph * gf, size_t lo, bool place) {
+    ggml_backend_buffer_t buf  = store.shared_buffer();
+    const size_t          size = place ? ggml_backend_buffer_get_size(buf) : SIZE_MAX/2;
+    const size_t          al   = 256;
 
-    ggml_init_params ip = { 5*ggml_tensor_overhead(), nullptr, true };
-    ctx_dev.reset(ggml_init(ip));
-    if (!ctx_dev) {
-        throw std::runtime_error("failed to create the fitter context");
+    auto owner = [](ggml_tensor * t) {
+        while (t->view_src) {
+            t = t->view_src;
+        }
+        return t;
+    };
+    const int n = ggml_graph_n_nodes(gf);
+    std::unordered_map<const ggml_tensor *, int> last;
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s]) {
+                last[owner(node->src[s])] = i;
+            }
+        }
     }
-    idx   = ggml_new_tensor_2d(ctx_dev.get(), GGML_TYPE_I32, n_stage, G);
-    par   = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, KVQ_D, KVQ_NP, 2*G);
-    stage = ggml_new_tensor_4d(ctx_dev.get(), GGML_TYPE_Q8_0, KVQ_D, 2, n_stage, G);
-    cst[0] = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, store.n_words(false), n_stage, G);
-    cst[1] = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_I32, store.n_words(true) + 1, n_stage, G);
-    ggml_set_name(idx,    "kvq_fit_idx");
-    ggml_set_name(par,    "kvq_fit_par");
-    ggml_set_name(stage,  "kvq_fit_stage");
-    ggml_set_name(cst[0], "kvq_fit_kc");
-    ggml_set_name(cst[1], "kvq_fit_vc");
-    buf_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_dev.get(), store.dev_buft()));
-    if (!buf_dev) {
+
+    std::map<size_t, size_t> free_mem = { { lo, size - lo } }; // offset -> bytes
+    std::vector<std::pair<ggml_tensor *, size_t>> at;
+    std::unordered_map<const ggml_tensor *, std::pair<size_t, size_t>> where;
+    size_t hi = lo;
+    bool ok = true;
+    auto take = [&](ggml_tensor * t) {
+        if (t->data || t->view_src || where.count(t)) {
+            return;
+        }
+        const size_t sz = GGML_PAD(ggml_nbytes(t), al);
+        for (auto it = free_mem.begin(); it != free_mem.end(); ++it) {
+            if (it->second >= sz) {
+                const size_t off = it->first;
+                const size_t len = it->second;
+                free_mem.erase(it);
+                if (len > sz) {
+                    free_mem[off + sz] = len - sz;
+                }
+                where[t] = { off, sz };
+                at.emplace_back(t, off);
+                hi = std::max(hi, off + sz);
+                return;
+            }
+        }
+        ok = false;
+    };
+    auto give = [&](const ggml_tensor * t) {
+        auto w = where.find(t);
+        if (w == where.end() || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return;
+        }
+        size_t off = w->second.first;
+        size_t sz  = w->second.second;
+        auto nx = free_mem.lower_bound(off);
+        if (nx != free_mem.end() && nx->first == off + sz) {
+            sz += nx->second;
+            free_mem.erase(nx);
+        }
+        auto pv = free_mem.lower_bound(off);
+        if (pv != free_mem.begin()) {
+            --pv;
+            if (pv->first + pv->second == off) {
+                off = pv->first;
+                sz += pv->second;
+                free_mem.erase(pv);
+            }
+        }
+        free_mem[off] = sz;
+    };
+    for (int i = 0; i < n && ok; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s]) {
+                take(owner(node->src[s]));
+            }
+        }
+        take(node);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] && last[owner(node->src[s])] == i) {
+                give(owner(node->src[s]));
+            }
+        }
+    }
+    if (!ok) {
+        return 0;
+    }
+    if (place) {
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+        for (const auto & [t, off] : at) {
+            if (ggml_backend_tensor_alloc(buf, t, base + off) != GGML_STATUS_SUCCESS) {
+                return 0;
+            }
+        }
+        // the views, their sources first
+        std::function<void(ggml_tensor *)> init_view = [&](ggml_tensor * t) {
+            if (t->view_src == nullptr || t->buffer != nullptr) {
+                return;
+            }
+            init_view(t->view_src);
+            ggml_backend_view_init(t);
+        };
+        for (int i = 0; i < n; ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            init_view(node);
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (node->src[s]) {
+                    init_view(node->src[s]);
+                }
+            }
+        }
+    }
+    return hi;
+}
+
+void llama_kvq_fitter::compute(ggml_cgraph * gf, const char * what) {
+    if (!plan(gf, plan_lo, true) || ggml_backend_graph_compute_async(store.backend(), gf) != GGML_STATUS_SUCCESS) {
+        GGML_ABORT("%s: %s failed\n", __func__, what);
+    }
+}
+
+// the own buffer and the layout in the shared memory: as many layers per group as fit next to the largest graph of one layer
+void llama_kvq_fitter::dev_init() {
+    const int64_t G      = store.n_head_kv();
+    const int32_t n_lay  = (int32_t) layer_ids.size();
+    const size_t  al     = 256;
+    const size_t  shared = ggml_backend_buffer_get_size(store.shared_buffer());
+
+    ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+    ctx_own.reset(ggml_init(ip));
+    idx  = ggml_new_tensor_2d(ctx_own.get(), GGML_TYPE_I32, n_stage, G);
+    tinv = ggml_new_tensor_3d(ctx_own.get(), GGML_TYPE_I8, KVQ_D, KVQ_D, 2*G);
+    ggml_set_name(idx,  "kvq_fit_idx");
+    ggml_set_name(tinv, "kvq_fit_tinv");
+    buf_own.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_own.get(), store.dev_buft()));
+    if (!buf_own) {
         throw std::runtime_error("failed to allocate the fitter device buffer");
     }
-    ggml_backend_buffer_clear(buf_dev.get(), 0);
-
     std::vector<int32_t> ids((size_t) n_stage*G);
     for (size_t j = 0; j < ids.size(); ++j) {
         ids[j] = (int32_t) (j % n_stage);
     }
     ggml_backend_tensor_set(idx, ids.data(), 0, ggml_nbytes(idx));
 
-    galloc.reset(ggml_gallocr_new(store.dev_buft()));
-
+    // the largest graphs, measured with tab for one layer, then the group
+    ggml_init_params sp = { 4*ggml_tensor_overhead(), nullptr, true };
+    auto make_shr = [&](int32_t ng) {
+        ctx_shr.reset(ggml_init(sp));
+        stage  = ggml_new_tensor_4d(ctx_shr.get(), GGML_TYPE_Q8_0, KVQ_D, 2, n_stage, G);
+        cst[0] = ggml_new_tensor_3d(ctx_shr.get(), GGML_TYPE_I32, store.n_words(false), n_stage, G);
+        cst[1] = ggml_new_tensor_3d(ctx_shr.get(), GGML_TYPE_I32, store.n_words(true) + 1, n_stage, G);
+        tab    = ggml_new_tensor_3d(ctx_shr.get(), GGML_TYPE_F32, KVQ_D, 2*KVQ_D + 3, 2*G*ng);
+        ggml_set_name(stage,  "kvq_fit_stage");
+        ggml_set_name(cst[0], "kvq_fit_kc");
+        ggml_set_name(cst[1], "kvq_fit_vc");
+        ggml_set_name(tab,    "kvq_fit_tab");
+    };
     job jb;
     jb.r0 = 0;
     jb.r1 = n_stage;
-    for (int phase = 1; phase <= 3; ++phase) {
+    auto measure = [&](int which, int32_t ng) {
         ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
         ggml_context_ptr ctx(ggml_init(gp));
-        ggml_cgraph * gf = build_phase(jb, phase, 0, ctx.get());
+        ggml_cgraph * gf = which == 0 ? build_moments(jb, 0, ng, ctx.get()) : which == 1 ? build_codes(jb, 0, 0, ng, ctx.get()) : build_tables(jb, ng, ctx.get());
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             ggml_tensor * node = ggml_graph_node(gf, i);
-            if (node->op != GGML_OP_NONE && !ggml_backend_supports_op(store.backend(), node)) {
+            if (node->op != GGML_OP_NONE && node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE &&
+                    !ggml_backend_supports_op(store.backend(), node)) {
                 throw std::runtime_error(format("the device does not run the fit op %s (%s)", ggml_op_desc(node), node->name));
             }
         }
-        if (!ggml_gallocr_reserve(galloc.get(), gf)) {
-            throw std::runtime_error("failed to allocate the fitter graphs");
+        return plan(gf, 0, false);
+    };
+    make_shr(1);
+    const size_t inter  = std::max(measure(0, 1), measure(1, 1));
+    const size_t fixed  = GGML_PAD(ggml_nbytes(stage), al) + GGML_PAD(ggml_nbytes(cst[0]), al) + GGML_PAD(ggml_nbytes(cst[1]), al);
+    const size_t tab1   = GGML_PAD(ggml_nbytes(tab), al);
+    n_grp = 0;
+    for (int32_t ng = n_lay; ng >= 1; --ng) {
+        make_shr(ng);
+        if (fixed + ng*tab1 + std::max(inter, measure(2, ng)) <= shared) {
+            n_grp = ng;
+            break;
         }
     }
-    LLAMA_LOG_INFO("%s: %.1f MiB in %.2f ms\n", __func__,
-            (ggml_backend_buffer_get_size(buf_dev.get()) + ggml_gallocr_get_buffer_size(galloc.get(), 0))/1048576.0, (ggml_time_us() - t0)/1000.0);
-}
-
-void llama_kvq_fitter::dev_free() {
-    if (!buf_dev) {
-        return;
+    if (n_grp == 0) {
+        throw std::runtime_error(format("the shared memory of the store (%.1f MiB) is too small for the fitter", shared/1048576.0));
     }
-    GGML_ASSERT(jobs_empty());
-    const int64_t t0 = ggml_time_us();
-    store.synchronize();
-    galloc.reset();
-    buf_dev.reset();
-    ctx_dev.reset();
-    idx     = nullptr;
-    par     = nullptr;
-    stage   = nullptr;
-    cst[0]  = nullptr;
-    cst[1]  = nullptr;
-    LLAMA_LOG_INFO("%s: the device stage and the graph allocator are freed in %.2f ms\n", __func__, (ggml_time_us() - t0)/1000.0);
+    make_shr(n_grp);
+    ggml_backend_buffer_t buf  = store.shared_buffer();
+    uint8_t *             base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    size_t off = 0;
+    for (ggml_tensor * t : { stage, cst[0], cst[1], tab }) {
+        if (ggml_backend_tensor_alloc(buf, t, base + off) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("failed to place the fitter tensors in the shared memory");
+        }
+        off += GGML_PAD(ggml_nbytes(t), al);
+    }
+    plan_lo = off;
+    const size_t tables = measure(2, n_grp);
+    LLAMA_LOG_INFO("%s: %d attention layers per group, %.1f MiB of the %.1f MiB shared memory (stage %.1f, tables %.1f, graphs %.1f / table graph %.1f), own %.1f MiB\n", __func__,
+            n_grp, (plan_lo + std::max(inter, tables))/1048576.0, shared/1048576.0, fixed/1048576.0, n_grp*tab1/1048576.0, inter/1048576.0, tables/1048576.0,
+            ggml_backend_buffer_get_size(buf_own.get())/1048576.0);
 }
 
 int32_t llama_kvq_fitter::n_pair() const {
     return (int32_t) layer_ids.size()*store.n_head_kv();
 }
 
+// waits for the events of the jobs in order, the decode thread installs the done ones
 void llama_kvq_fitter::loop() {
-    kvq_fit_lower_priority();
     std::unique_lock<std::mutex> lk(m);
     while (true) {
-        cv_work.wait(lk, [&]() { return stop || !tasks.empty(); });
+        job * jb = nullptr;
+        cv_work.wait(lk, [&]() {
+            if (stop) {
+                return true;
+            }
+            for (auto & j : jobs) {
+                if (!j->done) {
+                    jb = j.get();
+                    return true;
+                }
+            }
+            return false;
+        });
         if (stop) {
             return;
         }
-        job * jb = tasks.front().first;
-        const int32_t i = tasks.front().second;
-        tasks.pop_front();
-        jb->n_run++;
+        // a cancel waits for the job to be done, so it stays in the queue until then
         lk.unlock();
-        double t_task = 0.0;
-        if (!jb->cancel && !jb->failed) {
-            // the wait for the device phase does not count
-            ggml_backend_event_synchronize(jb->ev[i >= 2*n_pair() ? 1 : 0].get());
-            const double t0 = kvq_fit_now();
-            run(*jb, i);
-            t_task = kvq_fit_now() - t0;
-        }
+        ggml_backend_event_synchronize(jb->ev.get());
         lk.lock();
-        jb->t_cpu += t_task;
-        jb->n_run--;
-        jb->n_left[i >= n_pair() ? 1 : 0]--;
+        jb->done = true;
         cv_done.notify_all();
     }
 }
 
-// pool thread, once per (layer index, kv head) p: Wo_r^T Wo_r for the query heads r of kv head g, Wo = o_proj weight [n_out][n_in]
+// ctor, once per (layer index, kv head) p whose o_proj weight is not on the device: Wo_r^T Wo_r for the query heads r of
+// kv head g, Wo = o_proj weight [n_out][n_in]
 void llama_kvq_fitter::compute_wo_gram(int32_t p) {
     const int32_t       G = store.n_head_kv();
     const int32_t       g = p % G;
@@ -267,25 +391,27 @@ void llama_kvq_fitter::compute_wo_gram(int32_t p) {
     const int64_t n_out = w->ne[1];
     const int64_t nc    = (int64_t) n_rep*KVQ_D; // the columns of kv head g
     const size_t  off   = ggml_row_size(w->type, g*nc);
-    const int64_t blk   = 256;
 
     std::vector<uint8_t> raw(ggml_nbytes(w));
     ggml_backend_tensor_get(w, raw.data(), 0, raw.size());
 
     std::vector<double> gram((size_t) n_rep*KVQ_D*KVQ_D, 0.0);
-    std::vector<float>  x(blk*nc);
-    for (int64_t o0 = 0; o0 < n_out; o0 += blk) {
-        const int64_t nb = std::min(blk, n_out - o0);
-        for (int64_t o = 0; o < nb; ++o) {
-            const uint8_t * src = raw.data() + (o0 + o)*w->nb[1] + off;
-            if (w->type == GGML_TYPE_F32) {
-                memcpy(x.data() + o*nc, src, nc*sizeof(float));
-            } else {
-                ggml_get_type_traits(w->type)->to_float(src, x.data() + o*nc, nc);
-            }
+    std::vector<float>  x(nc);
+    for (int64_t o = 0; o < n_out; ++o) {
+        const uint8_t * src = raw.data() + o*w->nb[1] + off;
+        if (w->type == GGML_TYPE_F32) {
+            memcpy(x.data(), src, nc*sizeof(float));
+        } else {
+            ggml_get_type_traits(w->type)->to_float(src, x.data(), nc);
         }
         for (int32_t r = 0; r < n_rep; ++r) {
-            llama_kvq_gram(x.data() + r*KVQ_D, nb, KVQ_D, nc, gram.data() + (size_t) r*KVQ_D*KVQ_D, 1);
+            const float * xr = x.data() + r*KVQ_D;
+            double      * gr = gram.data() + (size_t) r*KVQ_D*KVQ_D;
+            for (int64_t i = 0; i < KVQ_D; ++i) {
+                for (int64_t j = 0; j < KVQ_D; ++j) {
+                    gr[i*KVQ_D + j] += (double) xr[i]*xr[j];
+                }
+            }
         }
     }
     wo_gram[p].resize(gram.size());
@@ -294,13 +420,13 @@ void llama_kvq_fitter::compute_wo_gram(int32_t p) {
     }
 }
 
-// constructor: Wo_r^T Wo_r of every (layer index, kv head) on the device, the covariance op without the mean on the dequantized
-// columns; a weight that is not on the device gets it on the CPU at the first chunk (compute_wo_gram)
-void llama_kvq_fitter::compute_wo_gram_dev() {
+// ctor: Wo_r^T Wo_r of every (layer index, kv head) on the device, the covariance op without the mean on the dequantized
+// columns, in the shared memory
+void llama_kvq_fitter::compute_wo_gram_dev(std::vector<char> & on_dev) {
     const int32_t  G       = store.n_head_kv();
     ggml_backend_t backend = store.backend();
 
-    wo_dev.assign(layer_ids.size()*G, 0);
+    on_dev.assign(layer_ids.size()*G, 0);
     int64_t n_out = 0;
     for (const ggml_tensor * w : wo) {
         n_out = std::max(n_out, w->ne[1]);
@@ -319,9 +445,10 @@ void llama_kvq_fitter::compute_wo_gram_dev() {
     }
     ggml_backend_tensor_set(ids, v.data(), 0, ggml_nbytes(ids));
 
+    store.fit_alloc();
     const double t0 = kvq_fit_now();
     int n_dev = 0;
-    for (int32_t p = 0; p < (int32_t) wo_dev.size(); ++p) {
+    for (int32_t p = 0; p < (int32_t) on_dev.size(); ++p) {
         ggml_tensor * w = const_cast<ggml_tensor *>(wo[p / G]);
         if (w->buffer == nullptr || ggml_backend_buffer_get_type(w->buffer) != store.dev_buft()) {
             continue;
@@ -338,222 +465,151 @@ void llama_kvq_fitter::compute_wo_gram_dev() {
         ggml_tensor * cov = ggml_kvq_fit(ctx.get(), GGML_KVQ_FIT_COV, x, nullptr, nullptr);
         ggml_set_output(cov);
         ggml_build_forward_expand(gf, cov);
-        if (!ggml_backend_supports_op(backend, x) || !ggml_backend_supports_op(backend, cov) || !ggml_gallocr_alloc_graph(galloc.get(), gf) ||
+        if (!ggml_backend_supports_op(backend, x) || !ggml_backend_supports_op(backend, cov) || !plan(gf, 0, true) ||
                 ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
             continue;
         }
         wo_gram[p].resize((size_t) n_rep*KVQ_D*KVQ_D);
         ggml_backend_tensor_get(cov, wo_gram[p].data(), 0, ggml_nbytes(cov));
-        wo_dev[p] = 1;
+        on_dev[p] = 1;
         n_dev++;
     }
-    LLAMA_LOG_INFO("%s: o_proj grams of %d of %zu (layer, kv head) on the device in %.2f s\n", __func__, n_dev, wo_dev.size(), kvq_fit_now() - t0);
+    LLAMA_LOG_INFO("%s: o_proj grams of %d of %zu (layer, kv head) on the device in %.2f s\n", __func__, n_dev, on_dev.size(), kvq_fit_now() - t0);
 }
 
-// V metric of a chunk: sum over r of D_r Wo_r^T Wo_r D_r, D_r = diag of the chunk's mean sigmoid(gate) of query head g*n_rep + r
-void llama_kvq_fitter::metric_v(const job & jb, int32_t p, std::vector<double> & m) {
+// V metric of a range: sum over r of D_r Wo_r^T Wo_r D_r, D_r = diag of the range's mean sigmoid(gate) of query head g*n_rep + r
+void llama_kvq_fitter::metric_v(const job & jb, int32_t p, float * m) {
     const int32_t G      = store.n_head_kv();
     const int32_t li     = p / G;
     const int32_t g      = p % G;
     const int64_t n_gate = (int64_t) n_head*KVQ_D;
 
-    if (!wo_dev[p]) {
-        std::call_once(wo_once[p], [&]() { compute_wo_gram(p); });
-    }
-
-    std::vector<double> gbar((size_t) n_rep*KVQ_D);
+    std::vector<float> gbar((size_t) n_rep*KVQ_D);
     const float * gs = jb.gsum.data() + li*n_gate + (int64_t) g*n_rep*KVQ_D;
     double tot = 0.0;
     for (size_t j = 0; j < gbar.size(); ++j) {
-        gbar[j] = (double) gs[j]/jb.n();
+        gbar[j] = (float) ((double) gs[j]/jb.n());
         tot += gbar[j];
     }
     if (!(tot > 0.0)) {
         // no gate statistics (e.g. after a removal), plain o_proj metric
         LLAMA_LOG_WARN("%s: rows [%d, %d), layer %d, kv head %d: no gate statistics, the V table is fitted without the gate\n", __func__, jb.r0, jb.r1, layer_ids[li], g);
-        std::fill(gbar.begin(), gbar.end(), 1.0);
+        std::fill(gbar.begin(), gbar.end(), 1.0f);
     }
 
-    m.assign(KVQ_D*KVQ_D, 0.0);
+    std::fill(m, m + KVQ_D*KVQ_D, 0.0f);
     for (int32_t r = 0; r < n_rep; ++r) {
-        const double * d  = gbar.data() + (size_t) r*KVQ_D;
-        const float  * wg = wo_gram[p].data() + (size_t) r*KVQ_D*KVQ_D;
+        const float * d  = gbar.data() + (size_t) r*KVQ_D;
+        const float * wg = wo_gram[p].data() + (size_t) r*KVQ_D*KVQ_D;
         for (int64_t i = 0; i < KVQ_D; ++i) {
+            float       * mi = m + i*KVQ_D;
+            const float * wi = wg + i*KVQ_D;
             for (int64_t j = 0; j < KVQ_D; ++j) {
-                m[i*KVQ_D + j] += d[i]*wg[i*KVQ_D + j]*d[j];
+                mi[j] += d[i]*wi[j]*d[j];
             }
         }
     }
 }
 
-// the parameters of a task for the device: fwd, mu, den; with bits also step, bits and the offsets of the packed row
-static void kvq_fit_set_par(float * par, const llama_kvq_table & t) {
-    const int64_t n = KVQ_D;
-    memcpy(par, t.fwd.data(), n*n*sizeof(float));
-    memcpy(par + n*n, t.mu.data(), n*sizeof(float));
-    float * step = par + (n + 1)*n;
-    float * bits = par + (n + 2)*n;
-    float * offs = par + (n + 3)*n;
-    std::fill(step, step + 3*n, 0.0f);
-    if (!t.bits.empty()) {
-        const std::vector<int32_t> perm = llama_kvq_pack_perm(t);
-        int32_t o = 0;
-        for (int64_t c = 0; c < n; ++c) {
-            const int32_t pc = perm[c];
-            step[pc] = t.bits[pc] ? t.step[pc] : 0.0f;
-            bits[pc] = (float) t.bits[pc];
-            offs[pc] = (float) o;
-            o += t.bits[pc];
-        }
-    }
-    std::fill(par + (n + 4)*n, par + (n + 5)*n, 0.0f);
-    par[(n + 4)*n] = t.is_v ? t.gain_den : 0.0f;
-}
-
-void llama_kvq_fitter::run(job & jb, int32_t t) {
-    const int32_t n_task = 2*(int32_t) layer_ids.size()*store.n_head_kv();
-    if (t < n_task) {
-        fit_task(jb, t);
-    } else {
-        bits_task(jb, n_task/2 + t - n_task);
-    }
-}
-
-// pool thread, after phase 1: the table of K or V of one (layer, kv head) from the moments of the rows; K: also bits and the packed table
-void llama_kvq_fitter::fit_task(job & jb, int32_t i) {
-    const int32_t G      = store.n_head_kv();
-    const int32_t n_pair = (int32_t) layer_ids.size()*G;
-    const bool    is_v   = i >= n_pair;
-    const int32_t p      = i % n_pair;
-    const int32_t li     = p / G;
-    const int32_t g      = p % G;
-    const int32_t il     = layer_ids[li];
-    const int64_t n_tok  = jb.n();
-    const int32_t blk    = 2*li + (is_v ? 1 : 0);
-    float * par = jb.hpar + ((size_t) blk*G + g)*KVQ_NP*KVQ_D;
-
-    std::vector<double> metric;
-    if (is_v) {
-        metric_v(jb, p, metric);
-    } else {
-        // K metric: second moment of the queries of the chunk, the fit does not depend on its scale
-        metric.resize(KVQ_D*KVQ_D);
-        const float * gr = jb.gram.data() + (size_t) p*KVQ_D*KVQ_D;
-        double tr = 0.0;
-        for (int64_t j = 0; j < KVQ_D*KVQ_D; ++j) {
-            metric[j] = gr[j];
-        }
-        for (int64_t j = 0; j < KVQ_D; ++j) {
-            tr += metric[j*KVQ_D + j];
-        }
-        if (!(tr > 0.0)) {
-            // no queries (e.g. after a removal), plain MSE
-            LLAMA_LOG_WARN("%s: rows [%d, %d), layer %d, kv head %d: no query statistics, the K table is fitted for the MSE\n", __func__, jb.r0, jb.r1, il, g);
-            std::fill(metric.begin(), metric.end(), 0.0);
+// decode thread: the metric of every task of the job into its pinned buffer
+void llama_kvq_fitter::host_metrics(job & jb) {
+    const int32_t G = store.n_head_kv();
+    for (size_t li = 0; li < layer_ids.size(); ++li) {
+        for (int32_t g = 0; g < G; ++g) {
+            const int32_t p = (int32_t) li*G + g;
+            // K: second moment of the queries of the range, the fit does not depend on its scale
+            float       * mk = jb.hmet + ((size_t) li*2*G + g)*KVQ_D*KVQ_D;
+            const float * gr = jb.gram.data() + (size_t) p*KVQ_D*KVQ_D;
+            double tr = 0.0;
             for (int64_t j = 0; j < KVQ_D; ++j) {
-                metric[j*KVQ_D + j] = 1.0;
+                tr += gr[j*KVQ_D + j];
             }
+            if (tr > 0.0) {
+                memcpy(mk, gr, KVQ_D*KVQ_D*sizeof(float));
+            } else {
+                // no queries (e.g. after a removal), plain MSE
+                LLAMA_LOG_WARN("%s: rows [%d, %d), layer %d, kv head %d: no query statistics, the K table is fitted for the MSE\n", __func__, jb.r0, jb.r1, layer_ids[li], g);
+                std::fill(mk, mk + KVQ_D*KVQ_D, 0.0f);
+                for (int64_t j = 0; j < KVQ_D; ++j) {
+                    mk[j*KVQ_D + j] = 1.0f;
+                }
+            }
+            metric_v(jb, p, jb.hmet + ((size_t) li*2*G + G + g)*KVQ_D*KVQ_D);
         }
     }
-    if (jb.cancel) {
-        return;
-    }
-
-    const float * st = jb.hstat + (size_t) blk*G*(KVQ_D*KVQ_D + KVQ_D);
-    const float * cf = st + (size_t) g*KVQ_D*KVQ_D;
-    const float * mu = st + (size_t) G*KVQ_D*KVQ_D + g*KVQ_D;
-    std::vector<double> cov(cf, cf + KVQ_D*KVQ_D);
-
-    llama_kvq_table tab;
-    bool ok = llama_kvq_fit_cov(tab, mu, cov.data(), n_tok, KVQ_D, metric.data(), is_v);
-    if (ok && !is_v) {
-        llama_kvq_fit_bits(tab, (float) fparams.bits_k);
-        ok = llama_kvq_pack_words(tab) <= store.n_words(false);
-    }
-    if (!ok) {
-        LLAMA_LOG_ERROR("%s: rows [%d, %d): the %s fit of layer %d, kv head %d failed\n", __func__, jb.r0, jb.r1, is_v ? "V" : "K", il, g);
-        jb.failed = true;
-        return;
-    }
-    kvq_fit_set_par(par, tab);
-    if (is_v) {
-        jb.vt[p] = std::move(tab);
-    } else {
-        llama_kvq_pack_table(tab, jb.htinv + (size_t) i*KVQ_D*KVQ_D, jb.htaux + (size_t) i*3*KVQ_D);
-    }
 }
 
-// pool thread, after phase 2: V bits and steps from the scale of the shape, the packed table
-void llama_kvq_fitter::bits_task(job & jb, int32_t i) {
-    const int32_t G      = store.n_head_kv();
-    const int32_t n_pair = (int32_t) layer_ids.size()*G;
-    const int32_t p      = i - n_pair;
-    const int32_t li     = p / G;
-    const int32_t g      = p % G;
-
-    llama_kvq_table & tab = jb.vt[p];
-    memcpy(tab.sigma.data(), jb.hsig + (size_t) p*KVQ_D, KVQ_D*sizeof(float));
-    llama_kvq_fit_bits(tab, (float) fparams.bits_v);
-    if (llama_kvq_pack_words(tab) > store.n_words(true)) {
-        LLAMA_LOG_ERROR("%s: rows [%d, %d): the V fit of layer %d, kv head %d failed\n", __func__, jb.r0, jb.r1, layer_ids[li], g);
-        jb.failed = true;
-        return;
-    }
-    kvq_fit_set_par(jb.hpar + ((size_t) (2*li + 1)*G + g)*KVQ_NP*KVQ_D, tab);
-    llama_kvq_pack_table(tab, jb.htinv + (size_t) i*KVQ_D*KVQ_D, jb.htaux + (size_t) i*3*KVQ_D);
-    tab = {};
+// rows [row0, row0 + n_rows) of the tables of layer j of a group of n_lay layers, K or V of its kv heads: [D, n_rows, G]
+ggml_tensor * llama_kvq_fitter::tab_view(int kv, int32_t j, int32_t n_lay, size_t row0, int64_t n_rows, ggml_context * ctx) const {
+    const int64_t G = store.n_head_kv();
+    return ggml_view_3d(ctx, tab, KVQ_D, n_rows, G, tab->nb[1], tab->nb[2], (size_t) (kv*n_lay*G + j*G)*tab->nb[2] + row0*tab->nb[1]);
 }
 
-// the graph of one phase of one attention layer, x = the rows of the job in the stage (from the host store):
-//   1: K and V rows -> mean, covariance (outputs)
-//   2: V (per-chunk V): rows -> centered -> rotated -> scale of the shape (output)
-//   3: K and V: rows -> centered -> rotated -> codes in kc and vc
-ggml_cgraph * llama_kvq_fitter::build_phase(const job & jb, int phase, int32_t li, ggml_context * ctx) {
-    const int32_t il   = layer_ids[li];
-    const int64_t G    = store.n_head_kv();
-    const int64_t n    = jb.n();
-    const auto &  lt   = store.get_layer(il);
+// the rows of the stage [D, n, G], K or V
+static ggml_tensor * kvq_fit_rows(ggml_context * ctx, ggml_tensor * stage, ggml_tensor * idx, int kv, int64_t n) {
+    ggml_tensor * sv = ggml_view_3d(ctx, stage, stage->ne[0], stage->ne[2], stage->ne[3], stage->nb[2], stage->nb[3], kv*stage->nb[1]);
+    ggml_tensor * iv = ggml_view_2d(ctx, idx, n, idx->ne[1], idx->nb[1], 0);
+    return ggml_get_rows(ctx, sv, iv);
+}
+
+// layer j of a group: mean and covariance of the rows of the job (from the stage) -> its tables (rows [0, D) and 2D)
+ggml_cgraph * llama_kvq_fitter::build_moments(const job & jb, int32_t j, int32_t n_lay, ggml_context * ctx) {
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+    for (int kv = 0; kv < 2; ++kv) {
+        ggml_tensor * x   = kvq_fit_rows(ctx, stage, idx, kv, jb.n());
+        ggml_tensor * mu  = ggml_kvq_fit(ctx, GGML_KVQ_FIT_MEAN, x, nullptr, nullptr);
+        ggml_tensor * cov = ggml_kvq_fit(ctx, GGML_KVQ_FIT_COV, ggml_sub(ctx, x, mu), nullptr, nullptr);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, cov, tab_view(kv, j, n_lay, 0, KVQ_D, ctx)));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, mu, tab_view(kv, j, n_lay, 2*KVQ_D, 1, ctx)));
+    }
+    return gf;
+}
+
+// the tables of a group of n_lay layers (the metrics are in rows [D, 2D)), the result rows to the output
+ggml_cgraph * llama_kvq_fitter::build_tables(const job & jb, int32_t n_lay, ggml_context * ctx) {
+    const int64_t G = store.n_head_kv();
+    const int64_t B = 2*n_lay*G;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16, false);
+    ggml_tensor * t    = ggml_view_3d(ctx, tab, KVQ_D, 2*KVQ_D + 3, B, tab->nb[1], tab->nb[2], 0);
+    ggml_tensor * work = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, ggml_kvq_fit_table_work_size(KVQ_D, B));
+    ggml_tensor * tb   = ggml_kvq_fit_table(ctx, t, work, (int) jb.n(), (int) (n_lay*G));
+    ggml_tensor * res  = ggml_cont(ctx, ggml_view_3d(ctx, tb, KVQ_D, 1, B, tb->nb[1], tb->nb[2], (2*KVQ_D + 2)*tb->nb[1]));
+    ggml_set_output(res);
+    ggml_set_name(res, "kvq_fit_res");
+    ggml_build_forward_expand(gf, res);
+    return gf;
+}
+
+// layer li (index j in a group of n_lay): rows of the job (from the stage) -> K: bits; V: rows rotated, scale of the shape, bits
+// -> packed tables (outputs); rows rotated -> codes in kc and vc
+ggml_cgraph * llama_kvq_fitter::build_codes(const job & jb, int32_t li, int32_t j, int32_t n_lay, ggml_context * ctx) {
+    const int64_t G  = store.n_head_kv();
+    const int64_t n  = jb.n();
+    const auto &  lt = store.get_layer(layer_ids[li]);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+    for (int kv = 0; kv < 2; ++kv) {
+        ggml_tensor * fwd = tab_view(kv, j, n_lay, 0, KVQ_D, ctx);
+        ggml_tensor * gp  = tab_view(kv, j, n_lay, 2*KVQ_D - 1, 4, ctx);
+        ggml_tensor * mu  = tab_view(kv, j, n_lay, 2*KVQ_D, 1, ctx);
+        ggml_tensor * y   = ggml_kvq_fit(ctx, GGML_KVQ_FIT_ROT, ggml_sub(ctx, kvq_fit_rows(ctx, stage, idx, kv, n), mu), fwd, nullptr);
+        ggml_tensor * sig = kv ? ggml_kvq_fit(ctx, GGML_KVQ_FIT_GAIN, y, gp, nullptr) : tab_view(kv, j, n_lay, 2*KVQ_D + 1, 1, ctx);
+        ggml_tensor * p4  = ggml_kvq_fit_bits(ctx, sig, gp, (float) (kv ? fparams.bits_v : fparams.bits_k));
 
-    for (int kv = phase == 2 ? 1 : 0; kv < 2; ++kv) {
-        // the rows of the stage [D, n_stage, G], K or V
-        ggml_tensor * sv = ggml_view_3d(ctx, stage, KVQ_D, n_stage, G, stage->nb[2], stage->nb[3], kv*stage->nb[1]);
-        ggml_tensor * iv = ggml_view_2d(ctx, idx, n, G, idx->nb[1], 0);
-        ggml_tensor * x  = ggml_get_rows(ctx, sv, iv);
+        ggml_tensor * xi  = tab_view(kv, j, n_lay, KVQ_D, KVQ_D + 1, ctx);
+        ggml_tensor * ti  = ggml_view_3d(ctx, tinv, KVQ_D, KVQ_D, G, tinv->nb[1], tinv->nb[2], kv*G*tinv->nb[2]);
+        ggml_build_forward_expand(gf, ggml_kvq_fit_pack(ctx, xi, p4, ti));
+        ggml_tensor * aux = ggml_kvq_fit_pack(ctx, xi, p4, nullptr);
+        ggml_set_output(aux);
+        ggml_format_name(aux, "kvq_fit_aux%d", kv);
+        ggml_build_forward_expand(gf, aux);
 
-        if (phase == 1) {
-            ggml_tensor * mu = ggml_kvq_fit(ctx, GGML_KVQ_FIT_MEAN, x, nullptr, nullptr);
-            ggml_set_output(mu);
-            ggml_tensor * cov = ggml_kvq_fit(ctx, GGML_KVQ_FIT_COV, ggml_sub(ctx, x, mu), nullptr, nullptr);
-            ggml_set_output(cov);
-            ggml_format_name(mu,  "kvq_fit_mu%d",  kv);
-            ggml_format_name(cov, "kvq_fit_cov%d", kv);
-            ggml_build_forward_expand(gf, mu);
-            ggml_build_forward_expand(gf, cov);
-            continue;
-        }
-
-        const size_t  o  = kv*G*par->nb[2];
-        ggml_tensor * mu = ggml_view_3d(ctx, par, KVQ_D, 1, G, par->nb[1], par->nb[2], o + KVQ_D*par->nb[1]);
-        ggml_tensor * fw = ggml_view_3d(ctx, par, KVQ_D, KVQ_D, G, par->nb[1], par->nb[2], o);
-        ggml_tensor * pq = ggml_view_3d(ctx, par, KVQ_D, 4, G, par->nb[1], par->nb[2], o + (KVQ_D + 1)*par->nb[1]);
-        ggml_tensor * y  = ggml_kvq_fit(ctx, GGML_KVQ_FIT_ROT, ggml_sub(ctx, x, mu), fw, nullptr);
-
-        if (phase == 2) {
-            ggml_tensor * sig = ggml_kvq_fit(ctx, GGML_KVQ_FIT_GAIN, y, pq, nullptr);
-            ggml_set_output(sig);
-            ggml_set_name(sig, "kvq_fit_sig");
-            ggml_build_forward_expand(gf, sig);
-        } else {
-            // the codes go to the host copy (queue_phase); without the device codes through the code stage
-            const bool    dev  = store.codes_on_dev();
-            ggml_tensor * rows = dev ? (kv ? lt.vc : lt.kc) : cst[kv];
-            ggml_tensor * rv   = ggml_view_3d(ctx, rows, rows->ne[0], n, G, rows->nb[1], rows->nb[2], dev ? (size_t) jb.r0*rows->nb[1] : 0);
-            ggml_build_forward_expand(gf, ggml_kvq_fit(ctx, GGML_KVQ_FIT_CODE, y, pq, rv));
-        }
+        // the codes go to the host copy (queue_job); without the device codes through the code stage
+        const bool    dev  = store.codes_on_dev();
+        ggml_tensor * rows = dev ? (kv ? lt.vc : lt.kc) : cst[kv];
+        ggml_tensor * rv   = ggml_view_3d(ctx, rows, rows->ne[0], n, G, rows->nb[1], rows->nb[2], dev ? (size_t) jb.r0*rows->nb[1] : 0);
+        ggml_build_forward_expand(gf, ggml_kvq_fit(ctx, GGML_KVQ_FIT_CODE, y, p4, rv));
     }
-
     return gf;
 }
 
@@ -569,46 +625,61 @@ void llama_kvq_fitter::upload_rows(int32_t il, int32_t r0, int32_t r1) {
     }
 }
 
-// decode thread: queues one phase of a job on the main stream, no wait
-// every phase reads the rows from the host store (the host ring copies the rows of the ring there)
-void llama_kvq_fitter::queue_phase(job & jb, int phase) {
+// decode thread: queues the graphs of a job on the main stream and the readbacks into its pinned buffer, no wait
+// every graph reads the rows from the host store (the host ring copies the rows of the ring there)
+void llama_kvq_fitter::queue_job(job & jb) {
     ggml_backend_t backend = store.backend();
     const int64_t  G       = store.n_head_kv();
-    const size_t   n_par   = (size_t) G*KVQ_NP*KVQ_D; // floats per (layer index, K or V)
-    const size_t   n_stat  = (size_t) G*(KVQ_D*KVQ_D + KVQ_D);
+    const size_t   nn      = (size_t) KVQ_D*KVQ_D;
+    const int32_t  n_layer = (int32_t) layer_ids.size();
 
-    dev_alloc();
+    // the shared memory is idle between the ubatches; this also waits for the readbacks of the last ubatches into the host store
+    store.fit_alloc();
 
-    // host ring: the rows of the last ubatches reach the host store on the copy stream
-    store.order_rows();
-
-    for (size_t li = 0; li < layer_ids.size(); ++li) {
-        const int32_t il = layer_ids[li];
-        if (phase == 2) {
-            ggml_backend_tensor_set_async(backend, par, jb.hpar + (2*li + 1)*n_par, G*par->nb[2], n_par*sizeof(float));
-        } else if (phase == 3) {
-            ggml_backend_tensor_set_async(backend, par, jb.hpar + 2*li*n_par, 0, 2*n_par*sizeof(float));
-        }
-        upload_rows(il, jb.r0, jb.r1);
-
-        ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
-        ggml_context_ptr ctx(ggml_init(gp));
-        ggml_cgraph * gf = build_phase(jb, phase, (int32_t) li, ctx.get());
-        if (!ggml_gallocr_alloc_graph(galloc.get(), gf) || ggml_backend_graph_compute_async(backend, gf) != GGML_STATUS_SUCCESS) {
-            GGML_ABORT("%s: phase %d of rows [%d, %d), layer %d failed\n", __func__, phase, jb.r0, jb.r1, il);
-        }
-
-        // the outputs, before the next graph reuses the memory
-        if (phase == 1) {
+    for (int32_t g0 = 0; g0 < n_layer; g0 += n_grp) {
+        const int32_t n_lay = std::min(n_grp, n_layer - g0);
+        for (int32_t j = 0; j < n_lay; ++j) {
+            upload_rows(layer_ids[g0 + j], jb.r0, jb.r1);
+            ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
+            ggml_context_ptr ctx(ggml_init(gp));
+            compute(build_moments(jb, j, n_lay, ctx.get()), "the moments");
+            // the metrics into rows [D, 2D) of the tables, task kv*n_lay*G + j*G + g
             for (int kv = 0; kv < 2; ++kv) {
-                float * st = jb.hstat + (2*li + kv)*n_stat;
-                ggml_backend_tensor_get_async(backend, ggml_graph_get_tensor(gf, format("kvq_fit_cov%d", kv).c_str()), st, 0, G*KVQ_D*KVQ_D*sizeof(float));
-                ggml_backend_tensor_get_async(backend, ggml_graph_get_tensor(gf, format("kvq_fit_mu%d", kv).c_str()), st + G*KVQ_D*KVQ_D, 0, G*KVQ_D*sizeof(float));
+                for (int64_t g = 0; g < G; ++g) {
+                    const size_t t = (size_t) (kv*n_lay*G + j*G + g);
+                    ggml_backend_tensor_set_async(backend, tab, jb.hmet + ((size_t) (g0 + j)*2*G + kv*G + g)*nn, t*tab->nb[2] + KVQ_D*tab->nb[1], nn*sizeof(float));
+                }
             }
-        } else if (phase == 2) {
-            ggml_backend_tensor_get_async(backend, ggml_graph_get_tensor(gf, "kvq_fit_sig"), jb.hsig + li*G*KVQ_D, 0, G*KVQ_D*sizeof(float));
-        } else if (phase == 3) {
-            // the codes to the host copy, in the layout of kc / vc; done at the synchronize of the install
+        }
+        {
+            ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
+            ggml_context_ptr ctx(ggml_init(gp));
+            ggml_cgraph * gf = build_tables(jb, n_lay, ctx.get());
+            compute(gf, "the tables");
+            ggml_tensor * res = ggml_graph_get_tensor(gf, "kvq_fit_res");
+            for (int kv = 0; kv < 2; ++kv) {
+                for (int32_t j = 0; j < n_lay; ++j) {
+                    ggml_backend_tensor_get_async(backend, res, jb.hres + ((size_t) (g0 + j)*2*G + kv*G)*KVQ_D,
+                            (size_t) (kv*n_lay*G + j*G)*KVQ_D*sizeof(float), G*KVQ_D*sizeof(float));
+                }
+            }
+        }
+        for (int32_t j = 0; j < n_lay; ++j) {
+            const int32_t li = g0 + j;
+            const int32_t il = layer_ids[li];
+            upload_rows(il, jb.r0, jb.r1);
+            ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
+            ggml_context_ptr ctx(ggml_init(gp));
+            ggml_cgraph * gf = build_codes(jb, li, j, n_lay, ctx.get());
+            compute(gf, "the codes");
+
+            // the outputs, before the next graph reuses the memory; task i = kv*n_pair + li*G + g
+            for (int kv = 0; kv < 2; ++kv) {
+                const size_t i0 = (size_t) kv*n_pair() + li*G;
+                ggml_backend_tensor_get_async(backend, ggml_graph_get_tensor(gf, format("kvq_fit_aux%d", kv).c_str()), jb.htaux + i0*3*KVQ_D, 0, G*3*KVQ_D*sizeof(float));
+                ggml_backend_tensor_get_async(backend, tinv, jb.htinv + i0*nn, kv*G*tinv->nb[2], G*nn);
+            }
+            // the codes to the host copy, in the layout of kc / vc
             const bool dev = store.codes_on_dev();
             for (int kv = 0; kv < 2; ++kv) {
                 const ggml_tensor * rows = kv ? store.get_layer(il).vc : store.get_layer(il).kc;
@@ -621,12 +692,8 @@ void llama_kvq_fitter::queue_phase(job & jb, int phase) {
             }
         }
     }
-    if (phase == 3) {
-        store.codes_written(jb.r1);
-    }
-    if (jb.ev[phase == 2 ? 1 : 0]) {
-        ggml_backend_event_record(jb.ev[phase == 2 ? 1 : 0].get(), backend);
-    }
+    store.codes_written(jb.r1);
+    ggml_backend_event_record(jb.ev.get(), backend);
 }
 
 // decode thread: the sums of the open chunk on the device, without a reset
@@ -758,10 +825,9 @@ bool llama_kvq_fitter::take(const range & r) {
         }
     }
 
-    const int32_t n_pair = (int32_t) layer_ids.size()*G;
-    const int32_t n_task = 2*n_pair;
-    const size_t  n_b    = (size_t) n_task*(KVQ_D*KVQ_D + KVQ_D)*sizeof(float) + (size_t) n_task*KVQ_NP*KVQ_D*sizeof(float) +
-                           (size_t) n_pair*KVQ_D*sizeof(float) + (size_t) n_task*KVQ_D*KVQ_D*sizeof(int8_t) + (size_t) n_task*3*KVQ_D*sizeof(float);
+    const int32_t n_task = 2*n_pair();
+    const size_t  n_b    = (size_t) n_task*KVQ_D*KVQ_D*sizeof(float) + (size_t) n_task*KVQ_D*sizeof(float) +
+                           (size_t) n_task*KVQ_D*KVQ_D*sizeof(int8_t) + (size_t) n_task*3*KVQ_D*sizeof(float);
     if (!free_bufs.empty()) {
         jb->buf = std::move(free_bufs.back());
         free_bufs.pop_back();
@@ -775,32 +841,23 @@ bool llama_kvq_fitter::take(const range & r) {
         }
     }
     uint8_t * hb = (uint8_t *) ggml_backend_buffer_get_base(jb->buf.get());
-    jb->hstat = (float *) hb;                         hb += (size_t) n_task*(KVQ_D*KVQ_D + KVQ_D)*sizeof(float);
-    jb->hpar  = (float *) hb;                         hb += (size_t) n_task*KVQ_NP*KVQ_D*sizeof(float);
-    jb->hsig  = (float *) hb;                         hb += (size_t) n_pair*KVQ_D*sizeof(float);
-    jb->htinv = (int8_t *) hb;                        hb += (size_t) n_task*KVQ_D*KVQ_D*sizeof(int8_t);
+    jb->hmet  = (float *) hb;  hb += (size_t) n_task*KVQ_D*KVQ_D*sizeof(float);
+    jb->hres  = (float *) hb;  hb += (size_t) n_task*KVQ_D*sizeof(float);
+    jb->htinv = (int8_t *) hb; hb += (size_t) n_task*KVQ_D*KVQ_D*sizeof(int8_t);
     jb->htaux = (float *) hb;
-    jb->vt.resize(n_pair);
-    for (auto & ev : jb->ev) {
-        ev.reset(ggml_backend_event_new(store.device()));
-    }
-    if (!jb->ev[0] || !jb->ev[1]) {
+    jb->ev.reset(ggml_backend_event_new(store.device()));
+    if (!jb->ev) {
         LLAMA_LOG_ERROR("%s: failed to create an event, the fit of the coarse region stops\n", __func__);
         failed = true;
         return false;
     }
 
-    queue_phase(*jb, 1);
+    host_metrics(*jb);
+    queue_job(*jb);
     store.set_n_host(std::max(store.n_host(), r.r1));
 
-    // V first: phase 2 and the V bits tasks can run while the K tasks are still queued
     {
         std::lock_guard<std::mutex> lk(m);
-        for (int32_t i = 0; i < n_task; ++i) {
-            tasks.emplace_back(jb.get(), (n_pair + i) % n_task);
-        }
-        jb->n_left[0] = n_pair;
-        jb->n_left[1] = n_pair;
         jobs.push_back(std::move(jb));
     }
     cv_work.notify_all();
@@ -821,80 +878,56 @@ void llama_kvq_fitter::spill(const llama_kv_cache & kv, llama_pos p) {
     LLAMA_LOG_INFO("%s: ring rows of the positions [%d, %d) to the host store\n", __func__, h0, (int) p);
 }
 
-// decode thread: the jobs whose tasks are done get their next phase
-//   V fit tasks done: phase 2 and the V bits tasks (per-chunk V); all tasks done: phase 3
-void llama_kvq_fitter::advance() {
-    for (size_t k = 0; ; ++k) {
-        job * jb = nullptr;
-        bool  v_done = false;
-        bool  done   = false;
-        {
-            std::lock_guard<std::mutex> lk(m);
-            if (k >= jobs.size()) {
-                return;
-            }
-            jb     = jobs[k].get();
-            v_done = jb->stage == KVQ_STAGE_FIT && jb->n_left[1] == 0;
-            done   = jb->stage <= KVQ_STAGE_BITS && jb->n_left[0] == 0 && jb->n_left[1] == 0;
-        }
-        if ((v_done || done) && jb->failed) {
-            if (done) {
-                jb->stage = KVQ_STAGE_FAILED;
-            }
-            continue;
-        }
-        if (v_done) {
-            jb->stage = KVQ_STAGE_BITS;
-            queue_phase(*jb, 2);
-            std::lock_guard<std::mutex> lk(m);
-            for (int32_t p = 0; p < n_pair(); ++p) {
-                tasks.emplace_back(jb, 2*n_pair() + p);
-            }
-            jb->n_left[1] = n_pair();
-            done = false;
-            cv_work.notify_all();
-        }
-        if (done) {
-            queue_phase(*jb, 3);
-            jb->stage = KVQ_STAGE_READY;
-        }
-    }
-}
-
 // decode thread: the finished jobs at the front join the coarse region, all: also when hold
-// the codes and tables are queued on the main stream; the wait for them (set_n_coarse or synchronize) comes before the host buffer is reused
+// the tables are queued on the main stream; the wait for them (set_n_coarse or synchronize) comes before the host buffer is reused
 void llama_kvq_fitter::install(bool all) {
     if (hold && !all) {
         return;
     }
-    const int32_t G      = store.n_head_kv();
-    const int32_t C      = store.n_chunk_rows();
-    const int32_t n_pair = (int32_t) layer_ids.size()*G;
+    const int32_t G = store.n_head_kv();
+    const int32_t C = store.n_chunk_rows();
     while (!failed) {
         std::unique_ptr<job> jb;
         {
             std::lock_guard<std::mutex> lk(m);
-            if (jobs.empty() || jobs.front()->stage < KVQ_STAGE_READY) {
+            if (jobs.empty() || !jobs.front()->done) {
                 return;
             }
             jb = std::move(jobs.front());
             jobs.pop_front();
         }
-        if (jb->stage == KVQ_STAGE_FAILED) {
-            LLAMA_LOG_ERROR("%s: the job of the rows [%d, %d) failed, the coarse region stays at %d rows\n", __func__, jb->r0, jb->r1, store.n_coarse());
-            failed = true;
+        GGML_ASSERT(jb->r0 <= store.n_coarse());
+
+        // the result row of each table (ggml_kvq_fit_table): status, ridge of the metric
+        int n_ridge = 0;
+        for (size_t li = 0; li < layer_ids.size() && !failed; ++li) {
+            for (int32_t t = 0; t < 2*G; ++t) {
+                const float * res = jb->hres + (li*2*G + t)*KVQ_D;
+                if (res[1] != 0.0f) {
+                    LLAMA_LOG_ERROR("%s: rows [%d, %d): the %s fit of layer %d, kv head %d failed (%s), the coarse region stays at %d rows\n", __func__,
+                            jb->r0, jb->r1, t < G ? "K" : "V", layer_ids[li], t % G, res[1] == 1.0f ? "metric not positive definite" : "eigen solver",
+                            store.n_coarse());
+                    failed = true;
+                    break;
+                }
+                n_ridge += res[2] > 1e-6f ? 1 : 0;
+            }
+        }
+        if (failed) {
             store.synchronize();
             release(*jb);
             return;
         }
-        GGML_ASSERT(jb->r0 <= store.n_coarse());
+        if (n_ridge > 0) {
+            LLAMA_LOG_WARN("%s: rows [%d, %d): %d metrics needed a ridge above 1e-6 of their mean diagonal\n", __func__, jb->r0, jb->r1, n_ridge);
+        }
 
         // merge: the group's table set in each chunk slot of its rows
         for (int32_t t = jb->r0/C; (int64_t) t*C < jb->r1; ++t) {
             for (size_t li = 0; li < layer_ids.size(); ++li) {
                 for (int32_t g = 0; g < G; ++g) {
                     for (int kv = 0; kv < 2; ++kv) {
-                        const size_t i = kv*n_pair + li*G + g;
+                        const size_t i = kv*n_pair() + li*G + g;
                         store.set_chunk_table(layer_ids[li], g, kv == 1, t, jb->htinv + i*KVQ_D*KVQ_D, jb->htaux + i*3*KVQ_D, true);
                     }
                 }
@@ -911,9 +944,8 @@ void llama_kvq_fitter::install(bool all) {
         const double t1 = kvq_fit_now();
         t_job.push_back(t1 - jb->t_take);
         t_wall.push_back(t1 - jb->t_snap);
-        t_cpu += jb->t_cpu;
-        LLAMA_LOG_INFO("%s: rows [%d, %d) fitted (coarse region %d rows), job %.2f s, %.2f s CPU, %.2f s since the statistics\n", __func__,
-                jb->r0, jb->r1, store.n_coarse(), t1 - jb->t_take, jb->t_cpu, t1 - jb->t_snap);
+        LLAMA_LOG_INFO("%s: rows [%d, %d) fitted (coarse region %d rows), job %.3f s, %.2f s since the statistics\n", __func__,
+                jb->r0, jb->r1, store.n_coarse(), t1 - jb->t_take, t1 - jb->t_snap);
         release(*jb);
     }
 }
@@ -938,16 +970,9 @@ void llama_kvq_fitter::poll(const llama_kv_cache & kv, llama_pos n_pos, bool lar
         t_take += t1 - t0;
     }
     if (!failed && !jobs_empty()) {
-        advance();
         install(false);
         t_install += kvq_fit_now() - t1;
     }
-}
-
-// pool mutex: the next step of the job can be queued (or it is ready)
-bool llama_kvq_fitter::can_advance(const job & jb) {
-    const bool all = jb.n_left[0] == 0 && jb.n_left[1] == 0;
-    return jb.stage >= KVQ_STAGE_READY || all || (jb.stage == KVQ_STAGE_FIT && jb.n_left[1] == 0 && !jb.failed);
 }
 
 bool llama_kvq_fitter::jobs_empty() const {
@@ -957,13 +982,12 @@ bool llama_kvq_fitter::jobs_empty() const {
 
 void llama_kvq_fitter::wait_jobs() {
     while (true) {
-        advance();
         install(true);
         std::unique_lock<std::mutex> lk(m);
         if (failed || jobs.empty()) {
             return;
         }
-        cv_done.wait(lk, [&]() { return can_advance(*jobs.front()); });
+        cv_done.wait(lk, [&]() { return jobs.front()->done; });
     }
 }
 
@@ -1001,23 +1025,15 @@ void llama_kvq_fitter::cancel(const std::function<bool(const job &)> & pred) {
             if (pred(*jb)) {
                 jb->cancel = true;
                 any = true;
-                LLAMA_LOG_INFO("%s: the job of the rows [%d, %d) is cancelled, %d K and %d V tasks left (stage %d)\n", __func__, jb->r0, jb->r1, jb->n_left[0], jb->n_left[1], jb->stage);
+                LLAMA_LOG_INFO("%s: the job of the rows [%d, %d) is cancelled (%s)\n", __func__, jb->r0, jb->r1, jb->done ? "done" : "running");
             }
         }
         if (!any) {
             return;
         }
-        // the queued tasks of these jobs are dropped, the running ones stop at their next check
-        for (auto it = tasks.begin(); it != tasks.end();) {
-            if (it->first->cancel) {
-                it->first->n_left[it->second >= n_pair() ? 1 : 0]--;
-                it = tasks.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        // the device work of a job cannot stop; the waiter may hold a pointer to it until it is done
         cv_done.wait(lk, [&]() {
-            return std::all_of(jobs.begin(), jobs.end(), [](const std::unique_ptr<job> & jb) { return !jb->cancel || jb->n_run == 0; });
+            return std::all_of(jobs.begin(), jobs.end(), [](const std::unique_ptr<job> & jb) { return !jb->cancel || jb->done; });
         });
         for (auto it = jobs.begin(); it != jobs.end();) {
             if ((*it)->cancel) {
@@ -1154,7 +1170,7 @@ void llama_kvq_fitter::state_write_data(llama_io_write_i & io) const {
 void llama_kvq_fitter::state_read_data(llama_io_read_i & io) {
     {
         std::lock_guard<std::mutex> lk(m);
-        GGML_ASSERT(jobs.empty() && tasks.empty());
+        GGML_ASSERT(jobs.empty());
     }
     const int32_t C      = store.n_chunk_rows();
     const size_t  n_gram = kvq_fit_n_gram(store);
@@ -1251,15 +1267,14 @@ void llama_kvq_fitter::get_progress(llama_kvq_fit_progress & out) const {
     out.n_drop   = n_drop;
     out.t_job    = t_job;
     out.t_wall   = t_wall;
-    out.t_cpu     = t_cpu;
     out.t_take    = t_take;
     out.t_install = t_install;
     std::lock_guard<std::mutex> lk(m);
     for (const auto & jb : jobs) {
-        if (jb->stage < KVQ_STAGE_READY) {
-            out.n_running++;
-        } else {
+        if (jb->done) {
             out.n_ready++;
+        } else {
+            out.n_running++;
         }
     }
 }

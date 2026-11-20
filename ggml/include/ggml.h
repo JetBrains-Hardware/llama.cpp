@@ -2636,12 +2636,25 @@ extern "C" {
     // GGML_KVQ_FIT_CODE: x = y; writes rows in place: code_c = clamp(floor(y[c]/g/step[c]), -2^(b-1), 2^(b-1) - 1) for bits b > 0,
     //                    field code_c + 2^(b-1) at the bit offset of c (layout of ggml_kvq_attn), the unused bits 0;
     //                    den > 0: g as GAIN, the low 16 bits of word nw - 1 hold g as f16; den == 0: g = 1
+    //
+    // the table of a task (ggml_kvq_fit_table), f32 [D, 2*D + 3, B], rows of D values:
+    //   [0, D):  fwd, element [c, i] = fwd[i][c] (the par of ROT)
+    //   [D, 2D): inv, row D + c = inv[c][:], x = y inv + mu
+    //   2D:      mu
+    //   2D + 1:  sigma[c] = sqrt(eigenvalue c), ascending
+    //   2D + 2:  [0] den (sum of sigma^2, V tasks only, else 0), [1] status (0 ok, 1 metric not positive definite, 2 no
+    //            convergence of the eigen solver), [2] ridge of the metric (1e-6, 1e-4 or 1e-2 of its mean diagonal), rest 0
+    //   rows [2D - 1, 2D + 3) are a GAIN par (row 3 = den)
     enum ggml_kvq_fit_mode {
-        GGML_KVQ_FIT_MEAN = 0,
-        GGML_KVQ_FIT_COV  = 1,
-        GGML_KVQ_FIT_ROT  = 2,
-        GGML_KVQ_FIT_GAIN = 3,
-        GGML_KVQ_FIT_CODE = 4,
+        GGML_KVQ_FIT_MEAN     = 0,
+        GGML_KVQ_FIT_COV      = 1,
+        GGML_KVQ_FIT_ROT      = 2,
+        GGML_KVQ_FIT_GAIN     = 3,
+        GGML_KVQ_FIT_CODE     = 4,
+        GGML_KVQ_FIT_TABLE    = 5, // ggml_kvq_fit_table
+        GGML_KVQ_FIT_BITS     = 6, // ggml_kvq_fit_bits
+        GGML_KVQ_FIT_PACK_INV = 7, // ggml_kvq_fit_pack
+        GGML_KVQ_FIT_PACK_AUX = 8, // ggml_kvq_fit_pack
     };
 
     GGML_API struct ggml_tensor * ggml_kvq_fit(
@@ -2650,6 +2663,45 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * par,   // ROT, GAIN, CODE
             struct ggml_tensor  * rows); // CODE
+
+    // the table of each task from the moments of its rows: metric M (symmetric, positive semi-definite), M + ridge = L L^T
+    // (Cholesky in double, ridge 1e-6, 1e-4, 1e-2 of the mean diagonal until it works), S = L^T (cov/n_tok) L = U diag(lambda) U^T
+    // (lambda ascending, each column of U with its largest |entry| positive), fwd = L U, inv = U^T L^-1; tasks b >= n_k are V (den)
+    // tab:    [D, 2*D + 3, B] f32, rows contiguous, in place; in: rows [0, D) cov = sum over the n_tok rows of (x - mu)(x - mu)^T,
+    //         rows [D, 2D) metric, row 2D mu; out: the table (see ggml_kvq_fit_mode), the result is a view of tab
+    // work:   i8 [>= ggml_kvq_fit_table_work_size(D, B)] scratch of the backend, or NULL (the backend allocates it)
+    // not bit-exact between backends (the eigen solver)
+    GGML_API struct ggml_tensor * ggml_kvq_fit_table(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * tab,
+            struct ggml_tensor  * work,
+            int                   n_tok,
+            int                   n_k);
+
+    GGML_API size_t ggml_kvq_fit_table_work_size(int64_t D, int64_t B);
+
+    // bits and steps of each task from sigma: bits[c] in 0..8 by reverse water-filling of sigma^2 with sum round(avg_bits*D)
+    // (ties to the lowest component), step[c] = s(bits[c])*sigma[c] with the step of the MSE-optimal uniform quantizer of a Gaussian
+    // sigma:  [D, 1, B] f32, any nb2
+    // par:    [D, >= 4, B] f32, row 3 element 0 = den
+    // result: [D, 4, B] f32, the par of GAIN and CODE: step (0 for 0 bits), bits, bit offset of each component in the packed row
+    //         (components in packed order: bits descending, ties by component), den
+    GGML_API struct ggml_tensor * ggml_kvq_fit_bits(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sigma,
+            struct ggml_tensor  * par,
+            float                 avg_bits);
+
+    // the kernel tables of ggml_kvq_attn for each task, components in packed order (see ggml_kvq_fit_bits)
+    // x:    [D, D + 1, B] f32, rows [0, D) inv[c][:], row D mu (rows [D, 2D + 1) of a table)
+    // par:  [D, 4, B] f32, the result of ggml_kvq_fit_bits (den > 0: V)
+    // inv:  NULL: result f32 [D, 3, B] = tab_aux: [c] step*s, [D + i] mu[i], [2D + c] bits, s = max_i |inv[c][i]|/127 (0 for 0 bits)
+    //       else i8 [D, D, B], rows contiguous: written in place, round(inv[c][i]/s) at [c, i] (K) or [i, c] (V), the result is a view
+    GGML_API struct ggml_tensor * ggml_kvq_fit_pack(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * par,
+            struct ggml_tensor  * inv);
 
     // custom operators
 

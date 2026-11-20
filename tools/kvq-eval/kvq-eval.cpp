@@ -9,7 +9,7 @@
 // --kvq-perf: no logits processing, decode times per chunk only
 //
 // --kvq-lib: the two-tier cache with the setup of llama-server --kvq (common_params::kvq), K2V1 tables fitted per chunk during the prefill
-//   chunks of --kvq-fit-chunk (default 8192), --kvq-fit-threads 8; waits for the fitter after the prefill
+//   chunks of --kvq-fit-chunk (default 8192); waits for the fitter after the prefill
 //   --kvq-pf-n 1024, --kvq-cap 0 (max_batch x pf-n), --kvq-lead 2: the prefetch of the resident rows (llama_kvq_params)
 //   --kvq-scr-block N: the scratch attention of a large ubatch in key blocks of N rows, 0: one attention with a mask (llama_kvq_params::scr_block)
 //   the ring has max(batch, 4096) + 256 cells (--kvq-tail of the server), or --kvq-ring N cells
@@ -67,7 +67,6 @@ struct kvq_args {
 
     bool        lib_on       = false;
     int32_t     fit_chunk    = 8192;
-    int32_t     lib_threads  = 8;
     bool        rm_test      = false;
     bool        rb_test      = false;
     bool        lib_hold     = false;
@@ -129,8 +128,6 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.lib_on = true;
         } else if (a == "--kvq-fit-chunk" && has_val) {
             args.fit_chunk = std::stoi(argv[++i]);
-        } else if (a == "--kvq-fit-threads" && has_val) {
-            args.lib_threads = std::stoi(argv[++i]);
         } else if (a == "--kvq-rm-test") {
             args.rm_test = true;
         } else if (a == "--kvq-rb-test") {
@@ -182,7 +179,7 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
     if (args.tokens_path.empty() || args.prefix_len < 0) {
         LOG_ERR("usage: %s -m model.gguf --kvq-tokens ids.bin --kvq-prefix-len s [--kvq-chunk 64] [--kvq-save-ref ref.bin] [--kvq-ref ref.bin [--kvq-csv out.csv] [--kvq-ref2 ref2.bin]]\n"
                 "       [--kvq-no-rot] [--kvq-perf] [--kvq-rb-test] [--kvq-state-save|--kvq-state-load FNAME [--kvq-state-ckpt P]]\n"
-                "       [--kvq-lib [--kvq-fit-chunk 8192] [--kvq-fit-threads 8] [--kvq-pf-n 1024] [--kvq-cap 0] [--kvq-lead 2] [--kvq-scr-block 16384]\n"
+                "       [--kvq-lib [--kvq-fit-chunk 8192] [--kvq-pf-n 1024] [--kvq-cap 0] [--kvq-lead 2] [--kvq-scr-block 16384]\n"
                 "                  [--kvq-ring N] [--kvq-rem own|merge] [--kvq-min-rows 256] [--kvq-rm-test] [--kvq-lib-hold] [--kvq-turns S1,S2,... [--kvq-turn-gen N]]] [common args]\n", argv[0]);
         return false;
     }
@@ -194,8 +191,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
         LOG_ERR("%s: --kvq-rm-test and --kvq-lib-hold need --kvq-lib\n", __func__);
         return false;
     }
-    if (args.lib() && (args.fit_chunk <= 0 || args.lib_threads < 1)) {
-        LOG_ERR("%s: bad --kvq-fit-chunk or --kvq-fit-threads\n", __func__);
+    if (args.lib() && (args.fit_chunk <= 0)) {
+        LOG_ERR("%s: bad --kvq-fit-chunk\n", __func__);
         return false;
     }
     return true;
@@ -446,9 +443,9 @@ static void kvq_print_progress(llama_memory_t mem) {
                 pr.n_tail_wait, pr.t_tail_wait, pr.n_spill, pr.n_fold, pr.t_fold, pr.n_settle, pr.t_settle);
     }
     if (!pr.t_job.empty()) {
-        LOG("kvq: fit: %.2f s CPU per chunk; decode thread per chunk: readback and phase 1 %.1f ms (with the wait for the queued ubatches), "
-            "later phases and install %.1f ms; s per job since its start/since the statistics: %s\n",
-                pr.t_cpu/pr.t_job.size(), 1e3*pr.t_take/pr.t_job.size(), 1e3*pr.t_install/pr.t_job.size(), tj.c_str());
+        LOG("kvq: fit: decode thread per chunk: readback, metrics and queued graphs %.1f ms (with the wait for the queued ubatches), "
+            "install %.1f ms; s per job since its start/since the statistics: %s\n",
+                1e3*pr.t_take/pr.t_job.size(), 1e3*pr.t_install/pr.t_job.size(), tj.c_str());
     }
 }
 
@@ -750,7 +747,6 @@ int main(int argc, char ** argv) {
     // --kvq-lib: the two-tier cache of the server (common_params::kvq), set up by common_init_from_params
     if (args.lib()) {
         params.kvq.enabled      = true;
-        params.kvq.n_threads    = args.lib_threads;
         params.kvq.chunk        = args.fit_chunk;
         params.kvq.rem          = args.lib_rem;
         params.kvq.min_rows     = args.lib_min_rows;

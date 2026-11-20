@@ -10652,6 +10652,226 @@ struct test_kvq_fit : public test_case {
     }
 };
 
+// GGML_OP_KVQ_FIT, ggml_kvq_fit_table: the eigen solver of the backend may run in float, the CPU runs in double
+struct test_kvq_fit_table : public test_case {
+    const int64_t D;
+    const int64_t B;
+    const int     n_tok;
+    const int     n_k;
+    const double  lmin; // the smallest eigenvalue of cov/n_tok, the largest is 1
+
+    std::string vars() override {
+        return VARS_TO_STR5(D, B, n_tok, n_k, lmin);
+    }
+
+    // a float eigen solver: the eigenvectors of the smallest eigenvalues to about eps*n*lambda_max/gap (NMSE 4.5e-5 at lmin 0.01, D 256)
+    double max_nmse_err() override {
+        return lmin < 0.05 ? 1e-4 : 1e-6;
+    }
+
+    test_kvq_fit_table(int64_t D = 256, int64_t B = 8, int n_tok = 1000, int n_k = 4, double lmin = 0.01) : D(D), B(B), n_tok(n_tok), n_k(n_k), lmin(lmin) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // in place: rows [0, D) cov, [D, 2D) metric, 2D mu
+        ggml_tensor * tab  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 2*D + 3, B);
+        ggml_tensor * work = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, ggml_kvq_fit_table_work_size(D, B));
+        ggml_set_name(tab,  "tab");
+        ggml_set_name(work, "work");
+        ggml_tensor * out = ggml_kvq_fit_table(ctx, tab, work, n_tok, n_k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // a random orthogonal matrix (Gram-Schmidt of a Gaussian one), row-major
+    static std::vector<double> orth(int64_t n, std::mt19937 & gen) {
+        std::normal_distribution<double> nd;
+        std::vector<double> q(n*n);
+        for (auto & v : q) {
+            v = nd(gen);
+        }
+        for (int64_t c = 0; c < n; ++c) {
+            for (int64_t p = 0; p < c; ++p) {
+                double dot = 0.0;
+                for (int64_t i = 0; i < n; ++i) {
+                    dot += q[i*n + c]*q[i*n + p];
+                }
+                for (int64_t i = 0; i < n; ++i) {
+                    q[i*n + c] -= dot*q[i*n + p];
+                }
+            }
+            double nrm = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                nrm += q[i*n + c]*q[i*n + c];
+            }
+            for (int64_t i = 0; i < n; ++i) {
+                q[i*n + c] /= sqrt(nrm);
+            }
+        }
+        return q;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x7AB1E);
+        std::uniform_real_distribution<float> uf(-1.0f, 1.0f);
+        std::normal_distribution<double> nd;
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "tab") != 0) {
+                continue;
+            }
+            std::vector<float> data(ggml_nelements(t), 0.0f);
+            const int64_t ts = (2*D + 3)*D; // floats per task
+            {
+                // cov = n_tok * Q diag(lambda) Q^T, lambda from 1 down to lmin
+                for (int64_t b = 0; b < B; ++b) {
+                    const std::vector<double> q = orth(D, gen);
+                    for (int64_t i = 0; i < D; ++i) {
+                        for (int64_t j = 0; j < D; ++j) {
+                            double s = 0.0;
+                            for (int64_t c = 0; c < D; ++c) {
+                                s += q[i*D + c]*pow(lmin, (double) c/(D - 1))*q[j*D + c];
+                            }
+                            data[b*ts + i*D + j] = (float) (s*n_tok);
+                        }
+                    }
+                }
+            }
+            {
+                // I + 0.1 R^T R / 64 with 64 random rows; task 1: R^T R of 512 rows alone (a query metric)
+                for (int64_t b = 0; b < B; ++b) {
+                    const int64_t nq = b == 1 ? 512 : 64;
+                    std::vector<double> r(nq*D);
+                    for (auto & v : r) {
+                        v = nd(gen);
+                    }
+                    for (int64_t i = 0; i < D; ++i) {
+                        for (int64_t j = 0; j < D; ++j) {
+                            double s = 0.0;
+                            for (int64_t k = 0; k < nq; ++k) {
+                                s += r[k*D + i]*r[k*D + j];
+                            }
+                            data[b*ts + (D + i)*D + j] = (float) (b == 1 ? s : (i == j ? 1.0 : 0.0) + 0.1*s/nq);
+                        }
+                    }
+                }
+            }
+            for (int64_t b = 0; b < B; ++b) {
+                for (int64_t i = 0; i < D; ++i) {
+                    data[b*ts + 2*D*D + i] = uf(gen);
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
+// GGML_OP_KVQ_FIT, ggml_kvq_fit_bits
+struct test_kvq_fit_bits : public test_case {
+    const int64_t D;
+    const int64_t B;
+    const float   avg_bits;
+
+    std::string vars() override {
+        return VARS_TO_STR3(D, B, avg_bits);
+    }
+
+    test_kvq_fit_bits(int64_t D = 256, int64_t B = 8, float avg_bits = 2.0f) : D(D), B(B), avg_bits(avg_bits) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * sigma = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 1, B);
+        ggml_tensor * par   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 4, B);
+        ggml_set_name(sigma, "sigma");
+        ggml_set_name(par,   "par");
+        ggml_tensor * out = ggml_kvq_fit_bits(ctx, sigma, par, avg_bits);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0xB175);
+        std::uniform_real_distribution<float> uf(0.0f, 1.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<float> data(ggml_nelements(t), 0.0f);
+            if (strcmp(t->name, "sigma") == 0) {
+                // log-uniform over four decades, ascending like the eigenvalues
+                for (int64_t b = 0; b < B; ++b) {
+                    std::vector<float> s(D);
+                    for (auto & v : s) {
+                        v = powf(10.0f, -4.0f*uf(gen));
+                    }
+                    std::sort(s.begin(), s.end());
+                    std::copy(s.begin(), s.end(), data.begin() + b*D);
+                }
+            } else {
+                // den: V for the odd tasks
+                for (int64_t b = 0; b < B; ++b) {
+                    data[(b*4 + 3)*D] = b % 2 ? 1.0f + uf(gen) : 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
+// GGML_OP_KVQ_FIT, ggml_kvq_fit_pack
+struct test_kvq_fit_pack : public test_case {
+    const int64_t D;
+    const int64_t B;
+    const bool    pack_inv; // the int8 inverse table, else tab_aux
+
+    std::string vars() override {
+        return VARS_TO_STR3(D, B, pack_inv);
+    }
+
+    test_kvq_fit_pack(int64_t D = 256, int64_t B = 4, bool pack_inv = true) : D(D), B(B), pack_inv(pack_inv) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, D + 1, B);
+        ggml_tensor * par = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 4, B);
+        ggml_set_name(x,   "x");
+        ggml_set_name(par, "par");
+        ggml_tensor * inv = nullptr;
+        if (pack_inv) {
+            // the slices of the tasks every second slice of a larger table, as K and V of a store
+            ggml_tensor * all = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, D, D, 2*B);
+            ggml_set_name(all, "inv");
+            inv = ggml_view_3d(ctx, all, D, D, B, all->nb[1], 2*all->nb[2], all->nb[2]);
+        }
+        ggml_tensor * out = ggml_kvq_fit_pack(ctx, x, par, inv);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x9AC4);
+        std::uniform_real_distribution<float> uf(-1.0f, 1.0f);
+        std::uniform_int_distribution<int> ub(0, 4);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<float> data(ggml_nelements(t), 0.0f);
+            if (strcmp(t->name, "par") == 0) {
+                for (int64_t b = 0; b < B; ++b) {
+                    float * p = data.data() + b*4*D;
+                    for (int64_t c = 0; c < D; ++c) {
+                        const int nb = ub(gen) == 0 ? 0 : 1 + ub(gen);
+                        p[c]     = nb ? 0.5f + 0.5f*uf(gen) : 0.0f;
+                        p[D + c] = (float) nb;
+                    }
+                    p[3*D] = b % 2 ? 2.0f : 0.0f;
+                }
+            } else if (strcmp(t->name, "inv") == 0) {
+                std::vector<int8_t> z(ggml_nelements(t), 7);
+                ggml_backend_tensor_set(t, z.data(), 0, ggml_nbytes(t));
+                continue;
+            } else {
+                for (auto & v : data) {
+                    v = uf(gen);
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -11503,6 +11723,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_kvq_fit(GGML_KVQ_FIT_GAIN, 300, 4, 9, true));
     test_cases.emplace_back(new test_kvq_fit(GGML_KVQ_FIT_GAIN, 8192, 4, 9, true));
+    test_cases.emplace_back(new test_kvq_fit_table(256, 8, 1000, 4));
+    test_cases.emplace_back(new test_kvq_fit_table(256, 8, 1000, 4, 0.1));
+    test_cases.emplace_back(new test_kvq_fit_table(64, 3, 100, 1));
+    for (float avg_bits : { 1.0f, 2.0f, 3.5f }) {
+        test_cases.emplace_back(new test_kvq_fit_bits(256, 8, avg_bits));
+    }
+    test_cases.emplace_back(new test_kvq_fit_bits(64, 3, 2.0f));
+    for (bool pack_inv : { true, false }) {
+        test_cases.emplace_back(new test_kvq_fit_pack(256, 4, pack_inv));
+        test_cases.emplace_back(new test_kvq_fit_pack(64, 3, pack_inv));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -14479,6 +14710,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // the tables of one attention layer of the kvq fitter (K and V of 4 kv heads)
+    test_cases.emplace_back(new test_kvq_fit_table(256, 8, 8192, 4));
 
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

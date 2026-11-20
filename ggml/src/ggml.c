@@ -6830,6 +6830,93 @@ struct ggml_tensor * ggml_kvq_fit(
     return result;
 }
 
+static bool ggml_kvq_fit_rows_ok(const struct ggml_tensor * t, int64_t D, int64_t n, int64_t B) {
+    return t->type == GGML_TYPE_F32 && t->ne[0] == D && t->ne[1] >= n && t->ne[2] == B && t->ne[3] == 1 &&
+           t->nb[0] == sizeof(float) && t->nb[1] == D*sizeof(float);
+}
+
+// per task: three double and one float matrix, the QL rotations (1.5 D^2 float pairs), small arrays; 16 arrays aligned to 256 bytes
+size_t ggml_kvq_fit_table_work_size(int64_t D, int64_t B) {
+    return (size_t) B*(40*D*D + 288*D + 64) + 16*256;
+}
+
+struct ggml_tensor * ggml_kvq_fit_table(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * tab,
+        struct ggml_tensor  * work,
+        int                   n_tok,
+        int                   n_k) {
+    const int64_t D = tab->ne[0];
+    const int64_t B = tab->ne[2];
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(tab, D, 2*D + 3, B) && tab->ne[1] == 2*D + 3);
+    GGML_ASSERT(work == NULL || (work->type == GGML_TYPE_I8 && ggml_nbytes(work) >= ggml_kvq_fit_table_work_size(D, B)));
+    GGML_ASSERT(n_tok >= 1 && n_k >= 0 && n_k <= B);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, tab);
+
+    ggml_set_op_params_i32(result, 0, GGML_KVQ_FIT_TABLE);
+    ggml_set_op_params_i32(result, 1, n_k);
+    ggml_set_op_params_i32(result, 2, n_tok);
+
+    result->op     = GGML_OP_KVQ_FIT;
+    result->src[0] = tab;
+    result->src[1] = work;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kvq_fit_bits(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sigma,
+        struct ggml_tensor  * par,
+        float                 avg_bits) {
+    const int64_t D = sigma->ne[0];
+    const int64_t B = sigma->ne[2];
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(sigma, D, 1, B) && sigma->ne[1] == 1);
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(par, D, 4, B));
+    GGML_ASSERT(avg_bits >= 0.0f && avg_bits <= 8.0f);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 4, B);
+
+    ggml_set_op_params_i32(result, 0, GGML_KVQ_FIT_BITS);
+    ggml_set_op_params_f32(result, 1, avg_bits);
+
+    result->op     = GGML_OP_KVQ_FIT;
+    result->src[0] = sigma;
+    result->src[1] = par;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kvq_fit_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * par,
+        struct ggml_tensor  * inv) {
+    const int64_t D = x->ne[0];
+    const int64_t B = x->ne[2];
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(x, D, D + 1, B) && x->ne[1] == D + 1);
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(par, D, 4, B) && par->ne[1] == 4);
+
+    struct ggml_tensor * result;
+    if (inv) {
+        GGML_ASSERT(inv->type == GGML_TYPE_I8 && inv->ne[0] == D && inv->ne[1] == D && inv->ne[2] == B && inv->ne[3] == 1);
+        GGML_ASSERT(inv->nb[0] == 1 && inv->nb[1] == (size_t) D);
+        result = ggml_view_tensor(ctx, inv);
+    } else {
+        result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 3, B);
+    }
+
+    ggml_set_op_params_i32(result, 0, inv ? GGML_KVQ_FIT_PACK_INV : GGML_KVQ_FIT_PACK_AUX);
+
+    result->op     = GGML_OP_KVQ_FIT;
+    result->src[0] = x;
+    result->src[1] = par;
+    result->src[2] = inv;
+
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {

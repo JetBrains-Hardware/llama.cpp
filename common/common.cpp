@@ -1394,7 +1394,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.kvq.enabled) {
         kvq_cfg.tail = params.kvq.tail;
 
-        kvq_cfg.fit.n_threads = params.kvq.n_threads > 0 ? params.kvq.n_threads : std::min(4, common_cpu_get_num_math());
         kvq_cfg.fit.chunk     = params.kvq.chunk;
         kvq_cfg.fit.rem       = params.kvq.rem;
         kvq_cfg.fit.min_rows  = params.kvq.min_rows;
@@ -1415,8 +1414,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.kvq.enabled) {
         const llama_kvq_fit_params & fp = kvq_cfg.fit;
         const llama_kvq_params     & kp = kvq_cfg.params;
-        COM_INF("%s: two-tier KV cache: chunks of %d rows, K%dV%d, %d fit threads, prefetch_n = %d, resident_cap = %d, lead = %d, rows after the last chunk: %s\n", __func__,
-                fp.chunk, fp.bits_k, fp.bits_v, fp.n_threads, kp.prefetch_n, llama_kvq_resident_slots(kp), kp.lead, fp.rem == LLAMA_KVQ_REM_MERGE ? "merge" : "own");
+        COM_INF("%s: two-tier KV cache: chunks of %d rows, K%dV%d, prefetch_n = %d, resident_cap = %d, lead = %d, rows after the last chunk: %s\n", __func__,
+                fp.chunk, fp.bits_k, fp.bits_v, kp.prefetch_n, llama_kvq_resident_slots(kp), kp.lead, fp.rem == LLAMA_KVQ_REM_MERGE ? "merge" : "own");
     }
 
     pimpl->context.reset(lctx);

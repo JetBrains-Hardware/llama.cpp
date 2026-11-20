@@ -12202,6 +12202,427 @@ static float kvq_fit_gain(const float * y, int64_t D, float den) {
     return (float) sqrt(ss/den) + 1e-8f;
 }
 
+// symmetric eigen decomposition, Householder tridiagonalization + implicit QL (EISPACK tred2/tql2)
+// a [n*n] in, column c of the row-major a = eigenvector c out; w = eigenvalues, ascending
+static bool kvq_fit_eigh(int n, double * a, double * w) {
+    std::vector<double> e(n, 0.0);
+    double * d = w;
+    auto V = [&](int i, int j) -> double & { return a[(size_t) i*n + j]; };
+
+    for (int j = 0; j < n; j++) {
+        d[j] = V(n - 1, j);
+    }
+    for (int i = n - 1; i > 0; i--) {
+        double scale = 0.0;
+        double h     = 0.0;
+        for (int k = 0; k < i; k++) {
+            scale += fabs(d[k]);
+        }
+        if (scale == 0.0) {
+            e[i] = d[i - 1];
+            for (int j = 0; j < i; j++) {
+                d[j]    = V(i - 1, j);
+                V(i, j) = 0.0;
+                V(j, i) = 0.0;
+            }
+        } else {
+            for (int k = 0; k < i; k++) {
+                d[k] /= scale;
+                h += d[k]*d[k];
+            }
+            double f = d[i - 1];
+            double g = sqrt(h);
+            if (f > 0) {
+                g = -g;
+            }
+            e[i]     = scale*g;
+            h        = h - f*g;
+            d[i - 1] = f - g;
+            for (int j = 0; j < i; j++) {
+                e[j] = 0.0;
+            }
+            for (int j = 0; j < i; j++) {
+                f       = d[j];
+                V(j, i) = f;
+                g       = e[j] + V(j, j)*f;
+                for (int k = j + 1; k <= i - 1; k++) {
+                    g    += V(k, j)*d[k];
+                    e[k] += V(k, j)*f;
+                }
+                e[j] = g;
+            }
+            f = 0.0;
+            for (int j = 0; j < i; j++) {
+                e[j] /= h;
+                f += e[j]*d[j];
+            }
+            const double hh = f/(h + h);
+            for (int j = 0; j < i; j++) {
+                e[j] -= hh*d[j];
+            }
+            for (int j = 0; j < i; j++) {
+                f = d[j];
+                g = e[j];
+                for (int k = j; k <= i - 1; k++) {
+                    V(k, j) -= (f*e[k] + g*d[k]);
+                }
+                d[j]    = V(i - 1, j);
+                V(i, j) = 0.0;
+            }
+        }
+        d[i] = h;
+    }
+    for (int i = 0; i < n - 1; i++) {
+        V(n - 1, i) = V(i, i);
+        V(i, i)     = 1.0;
+        const double h = d[i + 1];
+        if (h != 0.0) {
+            for (int k = 0; k <= i; k++) {
+                d[k] = V(k, i + 1)/h;
+            }
+            for (int j = 0; j <= i; j++) {
+                double g = 0.0;
+                for (int k = 0; k <= i; k++) {
+                    g += V(k, i + 1)*V(k, j);
+                }
+                for (int k = 0; k <= i; k++) {
+                    V(k, j) -= g*d[k];
+                }
+            }
+        }
+        for (int k = 0; k <= i; k++) {
+            V(k, i + 1) = 0.0;
+        }
+    }
+    for (int j = 0; j < n; j++) {
+        d[j]        = V(n - 1, j);
+        V(n - 1, j) = 0.0;
+    }
+    V(n - 1, n - 1) = 1.0;
+    for (int i = 1; i < n; i++) {
+        e[i - 1] = e[i];
+    }
+    e[n - 1] = 0.0;
+
+    double f    = 0.0;
+    double tst1 = 0.0;
+    const double eps = DBL_EPSILON;
+    for (int l = 0; l < n; l++) {
+        tst1 = std::max(tst1, fabs(d[l]) + fabs(e[l]));
+        int m = l;
+        while (m < n - 1 && fabs(e[m]) > eps*tst1) {
+            m++;
+        }
+        if (m > l) {
+            int iter = 0;
+            do {
+                if (++iter > 100) {
+                    return false;
+                }
+                double g = d[l];
+                double p = (d[l + 1] - g)/(2.0*e[l]);
+                double r = hypot(p, 1.0);
+                if (p < 0) {
+                    r = -r;
+                }
+                d[l]     = e[l]/(p + r);
+                d[l + 1] = e[l]*(p + r);
+                const double dl1 = d[l + 1];
+                double h = g - d[l];
+                for (int i = l + 2; i < n; i++) {
+                    d[i] -= h;
+                }
+                f += h;
+                p = d[m];
+                double c  = 1.0;
+                double c2 = c;
+                double c3 = c;
+                const double el1 = e[l + 1];
+                double s  = 0.0;
+                double s2 = 0.0;
+                for (int i = m - 1; i >= l; i--) {
+                    c3 = c2;
+                    c2 = c;
+                    s2 = s;
+                    g  = c*e[i];
+                    h  = c*p;
+                    r  = hypot(p, e[i]);
+                    e[i + 1] = s*r;
+                    s  = e[i]/r;
+                    c  = p/r;
+                    p  = c*d[i] - s*g;
+                    d[i + 1] = h + s*(c*g + s*d[i]);
+                    for (int k = 0; k < n; k++) {
+                        h = V(k, i + 1);
+                        V(k, i + 1) = s*V(k, i) + c*h;
+                        V(k, i)     = c*V(k, i) - s*h;
+                    }
+                }
+                p    = -s*s2*c3*el1*e[l]/dl1;
+                e[l] = s*p;
+                d[l] = c*p;
+            } while (fabs(e[l]) > eps*tst1);
+        }
+        d[l] = d[l] + f;
+        e[l] = 0.0;
+    }
+    // ascending, stable for equal eigenvalues
+    for (int i = 0; i < n - 1; i++) {
+        int k = i;
+        double p = d[i];
+        for (int j = i + 1; j < n; j++) {
+            if (d[j] < p) {
+                k = j;
+                p = d[j];
+            }
+        }
+        if (k != i) {
+            d[k] = d[i];
+            d[i] = p;
+            for (int j = 0; j < n; j++) {
+                std::swap(V(j, i), V(j, k));
+            }
+        }
+    }
+    return true;
+}
+
+// one task of ggml_kvq_fit_table, all in double
+static void kvq_fit_table_task(const float * cov, const float * metric, const float * mu, int64_t n_tok, int n, bool is_v, float * out) {
+    const size_t nn = (size_t) n*n;
+    std::fill(out, out + (size_t) (2*n + 3)*n, 0.0f);
+    float * res = out + (size_t) (2*n + 2)*n;
+
+    double tr = 0.0;
+    for (int i = 0; i < n; i++) {
+        tr += metric[(size_t) i*n + i];
+    }
+    // L lower, row-major
+    std::vector<double> l(nn);
+    bool chol = false;
+    for (const double ridge : { 1e-6, 1e-4, 1e-2 }) {
+        for (size_t j = 0; j < nn; j++) {
+            l[j] = metric[j];
+        }
+        for (int i = 0; i < n; i++) {
+            l[(size_t) i*n + i] += ridge*tr/n;
+        }
+        chol = true;
+        for (int j = 0; j < n && chol; j++) {
+            double s = l[(size_t) j*n + j];
+            for (int k = 0; k < j; k++) {
+                s -= l[(size_t) j*n + k]*l[(size_t) j*n + k];
+            }
+            if (!(s > 0.0)) {
+                chol = false;
+                break;
+            }
+            const double ljj = sqrt(s);
+            l[(size_t) j*n + j] = ljj;
+            for (int i = j + 1; i < n; i++) {
+                double v = l[(size_t) i*n + j];
+                for (int k = 0; k < j; k++) {
+                    v -= l[(size_t) i*n + k]*l[(size_t) j*n + k];
+                }
+                l[(size_t) i*n + j] = v/ljj;
+            }
+            for (int i = 0; i < j; i++) {
+                l[(size_t) i*n + j] = 0.0;
+            }
+        }
+        res[2] = (float) ridge;
+        if (chol) {
+            break;
+        }
+    }
+    if (!chol) {
+        res[1] = 1.0f;
+        return;
+    }
+
+    // S = L^T cov L / n_tok
+    std::vector<double> t(nn, 0.0);
+    std::vector<double> s(nn, 0.0);
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; k < n; k++) {
+            const double v = (double) cov[(size_t) i*n + k]/n_tok;
+            for (int j = 0; j <= k; j++) {
+                t[(size_t) i*n + j] += v*l[(size_t) k*n + j];
+            }
+        }
+    }
+    for (int k = 0; k < n; k++) {
+        for (int i = 0; i <= k; i++) {
+            const double v = l[(size_t) k*n + i];
+            for (int j = 0; j < n; j++) {
+                s[(size_t) i*n + j] += v*t[(size_t) k*n + j];
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < i; j++) {
+            const double v = 0.5*(s[(size_t) i*n + j] + s[(size_t) j*n + i]);
+            s[(size_t) i*n + j] = v;
+            s[(size_t) j*n + i] = v;
+        }
+    }
+    std::vector<double> lam(n);
+    if (!kvq_fit_eigh(n, s.data(), lam.data())) {
+        res[1] = 2.0f;
+        return;
+    }
+    // U = s, column c = eigenvector c, with its largest |entry| positive (the first one on ties)
+    for (int c = 0; c < n; c++) {
+        int im = 0;
+        for (int i = 1; i < n; i++) {
+            if (fabs(s[(size_t) i*n + c]) > fabs(s[(size_t) im*n + c])) {
+                im = i;
+            }
+        }
+        if (s[(size_t) im*n + c] < 0.0) {
+            for (int i = 0; i < n; i++) {
+                s[(size_t) i*n + c] = -s[(size_t) i*n + c];
+            }
+        }
+    }
+
+    // L^-1, lower
+    std::vector<double> li(nn, 0.0);
+    for (int j = 0; j < n; j++) {
+        li[(size_t) j*n + j] = 1.0/l[(size_t) j*n + j];
+        for (int i = j + 1; i < n; i++) {
+            double v = 0.0;
+            for (int k = j; k < i; k++) {
+                v += l[(size_t) i*n + k]*li[(size_t) k*n + j];
+            }
+            li[(size_t) i*n + j] = -v/l[(size_t) i*n + i];
+        }
+    }
+    // fwd = L U (row i of the result = fwd[i][:]), inv = U^T L^-1 (row n + c = inv[c][:])
+    std::vector<double> acc(n);
+    for (int i = 0; i < n; i++) {
+        std::fill(acc.begin(), acc.end(), 0.0);
+        for (int k = 0; k <= i; k++) {
+            const double v = l[(size_t) i*n + k];
+            for (int c = 0; c < n; c++) {
+                acc[c] += v*s[(size_t) k*n + c];
+            }
+        }
+        for (int c = 0; c < n; c++) {
+            out[(size_t) i*n + c] = (float) acc[c];
+        }
+    }
+    for (int c = 0; c < n; c++) {
+        std::fill(acc.begin(), acc.end(), 0.0);
+        for (int k = 0; k < n; k++) {
+            const double v = s[(size_t) k*n + c];
+            for (int j = 0; j <= k; j++) {
+                acc[j] += v*li[(size_t) k*n + j];
+            }
+        }
+        for (int j = 0; j < n; j++) {
+            out[(size_t) (n + c)*n + j] = (float) acc[j];
+        }
+    }
+    double den = 0.0;
+    for (int c = 0; c < n; c++) {
+        out[(size_t) 2*n*n + c] = mu[c];
+        const float sg = (float) sqrt(std::max(lam[c], 1e-30));
+        out[(size_t) (2*n + 1)*n + c] = sg;
+        den += (double) sg*sg;
+    }
+    res[0] = is_v ? (float) den : 0.0f;
+}
+
+// step in units of sigma of the MSE-optimal uniform quantizer for a Gaussian, by bits (Max 1960)
+static const float kvq_fit_gauss_step[9] = { 0.0f, 1.596f, 0.9957f, 0.5860f, 0.3352f, 0.1881f, 0.1041f, 0.0569f, 0.0308f };
+
+// one task of ggml_kvq_fit_bits: out = step, bits, offsets, den row
+static void kvq_fit_bits_task(const float * sigma, float den, float avg_bits, int n, float * out) {
+    const int max_bits = 8;
+    const int64_t target = std::clamp<int64_t>((int64_t) nearbyint((double) avg_bits*n), 0, (int64_t) n*max_bits);
+
+    std::vector<double> ideal(n);
+    double lo = INFINITY;
+    double hi = -INFINITY;
+    for (int c = 0; c < n; c++) {
+        const double var = (double) sigma[c]*sigma[c];
+        ideal[c] = 0.5*log2(std::max(var, 1e-30));
+        lo = std::min(lo, ideal[c]);
+        hi = std::max(hi, ideal[c]);
+    }
+    lo -= 20;
+    hi += 20;
+    double th = 0.0;
+    for (int it = 0; it < 60; it++) {
+        th = (lo + hi)/2;
+        double sum = 0.0;
+        for (int c = 0; c < n; c++) {
+            sum += std::clamp(ideal[c] - th, 0.0, (double) max_bits);
+        }
+        if (sum > target) {
+            lo = th;
+        } else {
+            hi = th;
+        }
+    }
+    std::vector<int> b(n);
+    int64_t sum = 0;
+    for (int c = 0; c < n; c++) {
+        ideal[c] -= th;
+        b[c] = (int) std::clamp(nearbyint(ideal[c]), 0.0, (double) max_bits);
+        sum += b[c];
+    }
+    // one bit per pass; ties go to the lowest index
+    while (sum != target) {
+        int best = -1;
+        for (int c = 0; c < n; c++) {
+            const double d = b[c] - ideal[c];
+            if (sum > target) {
+                if (b[c] > 0 && (best < 0 || d > b[best] - ideal[best])) {
+                    best = c;
+                }
+            } else {
+                if (b[c] < max_bits && (best < 0 || d < b[best] - ideal[best])) {
+                    best = c;
+                }
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        b[best] += sum > target ? -1 : 1;
+        sum     += sum > target ? -1 : 1;
+    }
+
+    std::fill(out, out + 4*(size_t) n, 0.0f);
+    int o = 0;
+    for (int nb = max_bits; nb >= 0; nb--) {
+        for (int c = 0; c < n; c++) {
+            if (b[c] != nb) {
+                continue;
+            }
+            out[c]       = nb ? kvq_fit_gauss_step[nb]*sigma[c] : 0.0f;
+            out[n + c]   = (float) nb;
+            out[2*n + c] = (float) o;
+            o += nb;
+        }
+    }
+    out[3*n] = den;
+}
+
+// packed position -> component (bits descending, ties by component)
+static void kvq_fit_pack_perm(const float * bits, int n, std::vector<int> & perm) {
+    perm.clear();
+    for (int nb = 8; nb >= 0; nb--) {
+        for (int c = 0; c < n; c++) {
+            if ((int) bits[c] == nb) {
+                perm.push_back(c);
+            }
+        }
+    }
+}
+
 // reference implementation, the arithmetic of the CPU codec
 void ggml_compute_forward_kvq_fit(
         const ggml_compute_params * params,
@@ -12211,6 +12632,61 @@ void ggml_compute_forward_kvq_fit(
     const ggml_tensor * rows = dst->src[2];
 
     const int32_t mode = ggml_get_op_params_i32(dst, 0);
+
+    if (mode >= GGML_KVQ_FIT_TABLE) {
+        // one task per thread
+        const int     n = (int) x->ne[0];
+        const int64_t B = x->ne[2];
+        auto row = [](const ggml_tensor * t, int64_t b, int64_t j) { return (const float *) ((const char *) t->data + b*t->nb[2] + j*t->nb[1]); };
+        std::vector<int> perm;
+        for (int64_t b = params->ith; b < B; b += params->nth) {
+            float * out = (float *) ((char *) dst->data + b*dst->nb[2]);
+            switch (mode) {
+                case GGML_KVQ_FIT_TABLE: {
+                    // in place: the inputs are rows of the table
+                    const int n_k   = ggml_get_op_params_i32(dst, 1);
+                    const int n_tok = ggml_get_op_params_i32(dst, 2);
+                    const std::vector<float> in(row(x, b, 0), row(x, b, 0) + (size_t) (2*n + 1)*n);
+                    kvq_fit_table_task(in.data(), in.data() + (size_t) n*n, in.data() + (size_t) 2*n*n, n_tok, n, b >= n_k, out);
+                } break;
+                case GGML_KVQ_FIT_BITS: {
+                    kvq_fit_bits_task(row(x, b, 0), row(par, b, 3)[0], ggml_get_op_params_f32(dst, 1), n, out);
+                } break;
+                case GGML_KVQ_FIT_PACK_INV:
+                case GGML_KVQ_FIT_PACK_AUX: {
+                    const float * step = row(par, b, 0);
+                    const float * bits = row(par, b, 1);
+                    const bool    is_v = row(par, b, 3)[0] != 0.0f;
+                    kvq_fit_pack_perm(bits, n, perm);
+                    for (int c = 0; c < n; c++) {
+                        const int     pc  = perm[c];
+                        const float * inv = row(x, b, pc);
+                        float m = 0.0f;
+                        for (int i = 0; i < n && bits[pc] != 0.0f; i++) {
+                            m = std::max(m, fabsf(inv[i]));
+                        }
+                        const float s = m/127.0f;
+                        if (mode == GGML_KVQ_FIT_PACK_AUX) {
+                            out[c]       = bits[pc] != 0.0f ? step[pc]*s : 0.0f;
+                            out[2*n + c] = bits[pc];
+                            continue;
+                        }
+                        int8_t * q = (int8_t *) dst->data + b*dst->nb[2];
+                        for (int i = 0; i < n; i++) {
+                            const int8_t v = s > 0.0f ? (int8_t) std::clamp(nearbyintf(inv[i]/s), -127.0f, 127.0f) : 0;
+                            q[is_v ? c*dst->nb[1] + i : i*dst->nb[1] + c] = v;
+                        }
+                    }
+                    if (mode == GGML_KVQ_FIT_PACK_AUX) {
+                        memcpy(out + n, row(x, b, n), n*sizeof(float));
+                    }
+                } break;
+                default:
+                    GGML_ABORT("unknown kvq_fit mode %d", mode);
+            }
+        }
+        return;
+    }
 
     const int64_t D = x->ne[0];
     const int64_t n = x->ne[1];

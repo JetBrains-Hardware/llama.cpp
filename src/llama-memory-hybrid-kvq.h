@@ -116,11 +116,8 @@ public:
     // ggml_backend_sched copy callback, see llama_kvq_store::copy
     bool sched_copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
-    // fit mode: the device buffers that only the prompt ubatches use (the scratch, the fitter stage)
-    // alloc: the scratch, for a reserve graph (the fitter allocates its own at its next phase)
-    // release: after the end of a prompt or a fold (the fitter stage; the scratch memory stays, the packed path shares it)
+    // fit mode: the scratch, for a reserve graph (the fitter and the packed path share its memory)
     bool prompt_bufs_alloc();
-    void prompt_bufs_release();
 
     // the context: switch to the buffers of the generation phase, called by fit_wait before the device codes are allocated
     void set_tg_cb(std::function<void()> cb) { tg_cb = std::move(cb); }

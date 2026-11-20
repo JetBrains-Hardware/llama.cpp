@@ -2461,16 +2461,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVQ").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"--kvq-threads"}, "N",
-        "two-tier KV cache: CPU threads that fit the tables of the chunks (the rows are coded on the GPU), at a low priority (default: 4, at most the physical cores)",
-        [](common_params & params, int value) {
-            if (value < 1) {
-                throw std::invalid_argument("invalid value");
-            }
-            params.kvq.n_threads = value;
-        }
-    ).set_env("LLAMA_ARG_KVQ_THREADS").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
         {"--kvq-prefetch-n"}, "N",
         string_format("two-tier KV cache: rows per (kv head, position) prefetched to the resident set (default: %d)", params.kvq.prefetch_n),
         [](common_params & params, int value) {

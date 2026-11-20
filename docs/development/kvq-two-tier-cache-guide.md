@@ -64,7 +64,6 @@ Server flags of the two-tier cache (`common/arg.cpp`); defaults are the measured
 |---|---|---|
 | `--kvq` | off | turns the two-tier cache on, with the forced settings above |
 | `--kvq-scr-block N` | 16384 | prompt attention over the host rows in mask-free key blocks of N rows (rounded down to 256). 0 = one flash attention with a mask over all rows: the old numerics, bit-identical to a full device cache, 30% slower at 250k and 1.3 GB more prompt-phase VRAM. 8k saves 64 MiB for +3.5% prompt time; 32k and 64k are slower. Env `LLAMA_ARG_KVQ_SCR_BLOCK` |
-| `--kvq-threads N` | 4 | CPU threads of the table fit; the end-of-prompt wait is 0.55 s with 4, 0.30 with 8, 0.21 with 12, about 2 s with 1. Does not change the output |
 | `--kvq-chunk N` | 8192 | rows per fitted chunk (one table set per chunk); 16k halves the tables (268 -> about 135 MiB at 256k) for a small quality cost (mean KL ratio 1.12) |
 | `--kvq-rem own|merge` | own | how the rows after the last complete chunk are fitted at the end of a prompt |
 | `--kvq-min-rows N` | 256 | `own`: fewer rows after the last complete chunk stay precise in the ring |
@@ -93,7 +92,7 @@ Memory layout and test knobs:
 | `LLAMA_KVQ_FOLD_EVERY=N` | off | test knob: a fold whenever N reply rows follow the coarse region (the only way to exercise folds in kvq-eval) |
 | `LLAMA_KVQ_UP_REPEAT=k` | 1 | test knob: every base upload of the resident rows (rotating buffers: every round; own buffers: the mirror after a prompt) and every tail upload k times, emulates a slower bus; k = 2 is about PCIe 4.0, k = 3 about PCIe 3.0 on the RTX 5090 (the join uploads of the fetched rows are not repeated) |
 
-Which knobs change the generated ids (the known batch-boundary effect, not a bug): `--ubatch-size`, `--batch-size`, `--spec-draft-n-ubatch`, `--kvq-scr-block` (any non-zero value against 0 and against each other), `--spec-draft-n-max`. Which do not: `--kvq-threads`, `--no-phase-buffers`, `LLAMA_RS_REPLAY`, the codes-in-host-memory mechanism, slot save and restore.
+Which knobs change the generated ids (the known batch-boundary effect, not a bug): `--ubatch-size`, `--batch-size`, `--spec-draft-n-ubatch`, `--kvq-scr-block` (any non-zero value against 0 and against each other), `--spec-draft-n-max`. Which do not: `--no-phase-buffers`, `LLAMA_RS_REPLAY`, the codes-in-host-memory mechanism, slot save and restore.
 
 ## 5. Memory
 
@@ -133,7 +132,7 @@ Headroom = 15,872 minus the largest sample of the session. In A the decode phase
 | kvq codes + tables | 0 | 1,831 | pinned host copy during the prompt |
 | kvq scratch, shared with resident / tail / staging | 540 | 540 | one layer of exact rows; decode uses about 330 of it (88 with `--kvq-layer-bufs 2`) |
 | kvq other | 17 | 17 | slot lists, counters |
-| kvq fitter | 86 | 0 | allocated per prompt |
+| kvq fitter | 1 | 1 | since the GPU table fit (2026-11-20) it works in the kvq scratch memory between the ubatches; was 86 in the prompt phase (session 250k: load 14,039 -> 13,951, run max 15,269 unchanged; 24k: -88 everywhere) |
 | target compute buffer | 485 | 72 | 1,570 at ubatch 4096; decode size is learned (high-water mark) |
 | drafter compute buffer | 120 | 9 | injection graph |
 | layer input buffer (5 layers for the drafter) | 400 | 1 | n_batch rows in the prompt, 8 in decode |
