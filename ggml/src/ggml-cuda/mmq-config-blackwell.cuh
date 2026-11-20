@@ -33,5 +33,9 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
 
+    if (type == GGML_TYPE_NVFP4 && J == 512 && !fallback) {
+        return ggml_cuda_mmq_config(type, 256, 1, 64, J, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, false, false);
+    }
+
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 }

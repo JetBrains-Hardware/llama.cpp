@@ -4,6 +4,13 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#include <cuda_fp4.h>
+#include <cuda_fp8.h>
+#endif
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -161,12 +168,134 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+
+static constexpr int compact_nvfp4_tokens = 512;
+static constexpr int compact_nvfp4_rows = 64;
+static constexpr int compact_nvfp4_threads = 256;
+
+static __global__ void mmq_pack_compact_nvfp4_input(
+        const float * input, block_fp4_mmq * packed, float * scales, int k, int m) {
+    const size_t id = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int row = id / k;
+    const int offset = id % k;
+    const int lane = threadIdx.x % QK_NVFP4_SUB;
+    const float x = input[id];
+    float amax = fabsf(x);
+#pragma unroll
+    for (int delta = QK_NVFP4_SUB/2; delta > 0; delta /= 2) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta, QK_NVFP4_SUB));
+    }
+    const __nv_fp8_e4m3 scale(amax > 0 ? fmaxf(amax / 6, 0x1p-9f) : 1);
+    const uint32_t code = __nv_fp4_e2m1(x * (1.0f / float(scale))).__x;
+    const uint32_t next = __shfl_xor_sync(0xffffffff, code, 1, QK_NVFP4_SUB);
+    auto & dst = packed[(offset / QK_FP4_MMQ)*m + row];
+    if (lane == 0) {
+        reinterpret_cast<uint8_t *>(dst.d4)[offset % QK_FP4_MMQ / QK_NVFP4_SUB] = scale.__x;
+        if (offset == 0) {
+            scales[row] = 1.0f / 64.0f;
+        }
+    }
+    if ((lane & 1) == 0) {
+        dst.qs[offset % QK_FP4_MMQ / 2] = code | (next << 4);
+    }
+}
+
+template<ggml_type compact_type>
+static __global__ __launch_bounds__(compact_nvfp4_threads, 1) void mmq_compact_nvfp4(
+        const char * weights, const block_fp4_mmq * packed, const float * scales, float * out, int k, int n, int m) {
+#ifdef BLACKWELL_MMA_AVAILABLE
+    extern __shared__ int ids[];
+    const int worker = threadIdx.y*WARP_SIZE + threadIdx.x;
+    ids[worker] = worker;
+    ids[worker + compact_nvfp4_threads] = worker + compact_nvfp4_threads;
+    const int row = blockIdx.x*compact_nvfp4_rows;
+    const int token = blockIdx.y*compact_nvfp4_tokens;
+    const int stride = k / QK_NVFP4;
+    // Weight offsets use 64-value NVFP4 units, including for compact sources.
+    mul_mat_q_process_tile<GGML_TYPE_NVFP4, compact_nvfp4_tokens, false, false, GGML_PREC_Q4, false, compact_type>(
+        weights, nullptr, row*stride, reinterpret_cast<const int *>(packed + token), ids, out + token*n + row, nullptr,
+        scales + token, GGML_GLU_OP_COUNT, 0.0f, nullptr, nullptr, stride, m, n,
+        compact_nvfp4_rows - 1, compact_nvfp4_tokens, 0, stride);
+#else
+    GGML_UNUSED_VARS(weights, packed, scales, out, k, n, m);
+    NO_DEVICE_CODE;
+#endif
+}
+
+template<ggml_type compact_type>
+static void mmq_launch_compact_nvfp4(
+        cudaStream_t stream, const ggml_tensor * weight, ggml_tensor * dst, const block_fp4_mmq * packed,
+        const float * scales, size_t shared_bytes, int k, int n, int m) {
+    CUDA_SET_SHARED_MEMORY_LIMIT((mmq_compact_nvfp4<compact_type>), shared_bytes);
+    mmq_compact_nvfp4<compact_type><<<dim3(n/compact_nvfp4_rows, m/compact_nvfp4_tokens),
+                                    dim3(WARP_SIZE, compact_nvfp4_threads/WARP_SIZE), shared_bytes, stream>>>(
+        static_cast<const char *>(weight->data), packed, scales, static_cast<float *>(dst->data), k, n, m);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static bool ggml_cuda_try_compact_nvfp4(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_COMPACT_NVFP4");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled || (weight->type != GGML_TYPE_IQ3_S && weight->type != GGML_TYPE_IQ4_XS)) {
+        return false;
+    }
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const auto prec = ggml_prec_get_src(dst, 1);
+    if ((prec != GGML_PREC_UNDEFINED && prec != GGML_PREC_Q8) ||
+        !weight->buffer || ggml_backend_buffer_get_type(weight->buffer) != ggml_backend_cuda_buffer_type(ctx.device) ||
+        ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        weight->view_src || (weight->flags & GGML_TENSOR_FLAG_PARAM) ||
+        !ggml_is_matrix(weight) || !ggml_is_matrix(input) ||
+        !ggml_is_contiguous(weight) || !ggml_is_contiguous(input) || !ggml_is_contiguous(dst) ||
+        k <= 0 || k > 32768 || k % MMQ_ITER_K_FP4 != 0 || n <= 0 || n > 65536 || n % 128 != 0 ||
+        (m != 512 && m != 2048)) {
+        return false;
+    }
+
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    if (!blackwell_mma_available(device.cc)) {
+        return false;
+    }
+    const auto config = ggml_cuda_mmq_get_config(GGML_TYPE_NVFP4, compact_nvfp4_tokens, false, device.cc, GGML_PREC_Q4);
+    const size_t shared_bytes = mmq_get_nbytes_shared(config, device.cc);
+    if (shared_bytes > device.smpbo) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<block_fp4_mmq> packed(ctx.pool(), size_t(k/QK_FP4_MMQ)*m);
+    ggml_cuda_pool_alloc<float> scales(ctx.pool(), m);
+    mmq_pack_compact_nvfp4_input<<<size_t(k)*m/256, 256, 0, stream>>>(
+        static_cast<const float *>(input->data), packed.get(), scales.get(), k, m);
+    CUDA_CHECK(cudaGetLastError());
+    if (weight->type == GGML_TYPE_IQ3_S) {
+        mmq_launch_compact_nvfp4<GGML_TYPE_IQ3_S>(stream, weight, dst, packed.get(), scales.get(), shared_bytes, k, n, m);
+    } else {
+        mmq_launch_compact_nvfp4<GGML_TYPE_IQ4_XS>(stream, weight, dst, packed.get(), scales.get(), shared_bytes, k, n, m);
+    }
+    return true;
+}
+
+#endif
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    if (!ids && !fusion && ggml_cuda_try_compact_nvfp4(ctx, src0, src1, dst)) {
+        return;
+    }
+#endif
 
     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
     // Fused scale (no gate): dst is the MUL that applies the weight scale to the MUL_MAT.

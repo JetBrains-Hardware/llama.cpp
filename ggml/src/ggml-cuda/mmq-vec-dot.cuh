@@ -1185,7 +1185,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int ntx           = rows_per_warp / tile_C::I;
     constexpr int nfrags        = MMQ_TILE_NE_K / tile_A::J;
 
-    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+    // A 512-token tile shares its 64 weight rows across two warp groups.
+    constexpr int consumer_tokens = J == 512 ? 256 : J;
+    const int weight_warp = J == 512 ? threadIdx.y % 4 : threadIdx.y;
+    const int token_base = J == 512 ? (threadIdx.y / 4) * consumer_tokens : 0;
+    y += (token_base + (weight_warp % ntx) * tile_C::J) * MMQ_TILE_Y_K;
 
     const int *      x_qs = (const int *) x;
     const uint32_t * x_sc = (const uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
@@ -1196,7 +1200,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     // see https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-block-scaling
     const int tidx_A = threadIdx.x / 4 + (threadIdx.x % 2) * 8;
     const int tidx_B = threadIdx.x / 4;
-    const int i0     = (threadIdx.y / ntx) * rows_per_warp;
+    const int i0     = (weight_warp / ntx) * rows_per_warp;
 
     tile_A   A[ntx][nfrags];
     uint32_t scaleA[ntx][nfrags];
@@ -1212,7 +1216,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+    for (int j0 = 0; j0 < consumer_tokens; j0 += ntx * tile_C::J) {
         tile_B   B[nfrags];
         uint32_t scaleB[nfrags];
 

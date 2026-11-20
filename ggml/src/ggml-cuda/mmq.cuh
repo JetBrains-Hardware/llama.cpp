@@ -459,6 +459,7 @@ static __device__ __forceinline__ const block_t * ggml_cuda_mmq_x_row(
 }
 
 #include "mmq-load-tiles.cuh"
+#include "mmq-compact-nvfp4.cuh"
 #include "mmq-vec-dot.cuh"
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
@@ -524,7 +525,11 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback, prec_src1);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
 
-    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
+    constexpr bool paired = type == GGML_TYPE_NVFP4 && prec_src1 == GGML_PREC_Q4 && J == 512 && !has_fusion;
+    constexpr int consumer_tokens = paired ? 256 : J;
+    const int weight_warp = paired ? threadIdx.y % 4 : threadIdx.y;
+    const int token_base = paired ? (threadIdx.y / 4) * consumer_tokens : 0;
+    const int i0 = (weight_warp / ntx) * (ntx*tile_C::I);
 
     const bool y_scale_used = type == GGML_TYPE_NVFP4 && y_scale != nullptr;
 
@@ -534,12 +539,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     const float scale_gate = fused_nvfp4 && gate_scale ? *gate_scale : 1.0f;
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+    for (int j0 = 0; j0 < consumer_tokens; j0 += ntx*tile_C::J) {
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
 #pragma unroll
             for (int l = 0; l < (has_fusion ? tile_C::ne/2 : tile_C::ne); ++l) {
-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                const int j = token_base + j0 + (weight_warp % ntx) * tile_C::J + tile_C::get_j(l);
 
                 if (j >= j_sup) {
                     continue;
@@ -934,7 +939,7 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 // ---------------------------------------------------------------------------------------------
 
 // has_fusion: x and x_gate are the up and gate weights.
-template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1, bool has_fusion>
+template <ggml_type type, int J, bool fallback, bool fixup, ggml_prec prec_src1, bool has_fusion, ggml_type compact_type = GGML_TYPE_COUNT>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -974,7 +979,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
+#if defined(BLACKWELL_MMA_AVAILABLE) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+        if constexpr (compact_type != GGML_TYPE_COUNT) {
+            ggml_cuda_mmq_load_compact_nvfp4<compact_type, J>(x, tile_x, offset_x + kb0, stride_row_x);
+        } else
+#endif
+        {
+            load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
+        }
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll

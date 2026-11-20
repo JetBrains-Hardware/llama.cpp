@@ -334,6 +334,12 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_FA_QUANTS           | `all` or `type_K-type_V` list | q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16 | Select which K/V type combinations to compile the FlashAttention CUDA kernels for. `all` compiles every combination, but compilation takes much longer. Otherwise a `;`-separated list of `type_K-type_V` pairs; f16-f16 is always compiled. Combinations that were not compiled fall back to f16-f16 kernel with a warning. Legal types: f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0. |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Deprecated alias for `GGML_CUDA_FA_QUANTS=all`.                                                                                                                                                                                                                                                                                                                               |
 
+### Experimental in-flight NVFP4 prefill
+
+With CUDA 12.8 or later and native FP4 tensor cores, set `GGML_CUDA_COMPACT_NVFP4=1` to try in-flight NVFP4 conversion for eligible dense `IQ3_S` and `IQ4_XS` projections at 512 or 2048 input tokens per matrix multiplication. The kernel keeps the original GGUF weights and shares each expanded weight tile across two 256-token groups in shared memory. It uses temporary activation storage.
+
+The experiment rounds weights and activations to NVFP4 during the operation, which can change model outputs. It is disabled by default. Unsupported devices, fused projections and other batch sizes fall back to the existing path.
+
 ## MUSA
 
 This provides GPU acceleration using a Moore Threads GPU. Make sure to have the [MUSA SDK](https://developer.mthreads.com/musa/musa-sdk) installed.
