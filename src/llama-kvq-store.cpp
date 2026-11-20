@@ -526,8 +526,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     // as weights: the ops that read these tensors run on their device
     ggml_backend_buffer_set_usage(buf_dev.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // every write of the codes and tables goes to a pinned host copy; the device copy exists only in the decode phase
-    // (codes_alloc, codes_free)
+    // every write of the codes and tables goes to a pinned host copy; the device copy exists only in the decode phase with
+    // prefill_free_codes (codes_alloc, codes_free), otherwise from enable on
     {
         for (auto & l : layers) {
             const ggml_tensor * ts[4] = { l.t.kc, l.t.vc, l.t.tinv, l.t.taux };
@@ -699,7 +699,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     LLAMA_LOG_INFO("%s: n_coarse = %d of %d rows, %d chunks of %d rows, K %d / V %d bits (%d / %d words), resident slots %d + %d sinks\n", __func__,
             n_coarse_, n_rows, n_chunk, n_crow, bits_k, bits_v, nwk, nwv, cap, n_sink);
     LLAMA_LOG_INFO("%s: device: codes %.1f MiB, tables %.1f MiB (%s), resident %.1f MiB, ring %.1f MiB, scratch %.1f MiB (%s), other %.1f MiB; host: store %.1f MiB (%s), codes and tables %.1f MiB, ring %.1f MiB, other %.1f MiB\n", __func__,
-            mi.codes/1048576.0, mi.tables/1048576.0, "decode phase only", mi.resident/1048576.0, mi.ring/1048576.0, mi.scratch/1048576.0, scr_ok ? "used" : "not used", mi.other_dev/1048576.0,
+            mi.codes/1048576.0, mi.tables/1048576.0, "freed in a prompt only with --kvq-prefill-free-codes", mi.resident/1048576.0, mi.ring/1048576.0, mi.scratch/1048576.0, scr_ok ? "used" : "not used", mi.other_dev/1048576.0,
             mi.host_store/1048576.0, mi.pinned ? "pinned" : "pageable", mi.host_codes/1048576.0, mi.host_ring/1048576.0, mi.host_other/1048576.0);
 }
 
@@ -1056,6 +1056,12 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
 
     reset_resident();
     reset_counters();
+
+    // the device copy of the codes and tables lives with the context, unless a prompt frees it (scr_alloc)
+    prefill_free_codes = p.prefill_free_codes;
+    if (!prefill_free_codes && !codes_alloc()) {
+        return false;
+    }
 
     LLAMA_LOG_INFO("%s: max_batch = %d, prefetch_n = %d, resident = %d, lead = %d\n", __func__, p.max_batch, p.prefetch_n, cap, p.lead);
     LLAMA_LOG_INFO("%s: staging: device %.1f MiB, pinned host %.1f MiB; mirrors: pinned host %.1f MiB\n", __func__,
@@ -1887,7 +1893,7 @@ void llama_kvq_store::reset_counters() {
 
 bool llama_kvq_store::scr_alloc() {
     const int64_t t0 = ggml_time_us();
-    // the scratch attention does not read the codes, the fitter writes them to the host copy
+    // the scratch attention does not read the codes, the fitter writes them to the host copy (prefill_free_codes)
     codes_free();
     if (scr_mode == 1) {
         return true;
@@ -2010,7 +2016,7 @@ bool llama_kvq_store::codes_alloc() {
 }
 
 void llama_kvq_store::codes_free() {
-    if (!buf_codes) {
+    if (!buf_codes || !prefill_free_codes) {
         return;
     }
     const int64_t t0 = ggml_time_us();

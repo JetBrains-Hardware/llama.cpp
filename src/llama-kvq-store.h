@@ -195,9 +195,10 @@ public:
     void fit_alloc();
     ggml_backend_buffer_t shared_buffer() const { return buf_scr.get(); }
 
-    // every write of the codes and tables goes to a pinned host copy first (same bytes as kc, vc, tinv, taux); the device copy exists
-    // only for the packed path: scr_alloc frees it, codes_alloc (end of a prompt, or dec_alloc) allocates it and queues the upload
-    // of the host copy on the main stream
+    // every write of the codes and tables goes to a pinned host copy first (same bytes as kc, vc, tinv, taux); the device copy is
+    // allocated by enable and stays (writes update both). With llama_kvq_params::prefill_free_codes it exists only for the packed
+    // path: scr_alloc frees it, codes_alloc (end of a prompt, or dec_alloc) allocates it and queues the upload of the host copy on
+    // the main stream
     uint8_t * host_codes(int32_t il, bool is_v) const;
     void      codes_written(int32_t r1); // the fitter queued the codes of rows before r1 into the host copy
     bool      codes_alloc();
@@ -276,6 +277,7 @@ private:
     std::vector<ggml_backend_buffer_ptr> buf_hcodes; // host copy, one per layer
     int32_t                 hc_hi      = 0;     // the host copy holds the codes of the rows that a later upload needs before this
     uint32_t                codes_gen_ = 0;
+    bool                    prefill_free_codes = false; // llama_kvq_params::prefill_free_codes
     ggml_context_ptr        ctx_alias;
     ggml_context_ptr        ctx_host;
     ggml_backend_buffer_ptr buf_dev;

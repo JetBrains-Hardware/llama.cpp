@@ -1403,6 +1403,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         kvq_cfg.params.lead         = params.kvq.lead;
         kvq_cfg.params.layer_bufs   = params.kvq.layer_bufs;
         kvq_cfg.params.scr_block    = params.kvq.scr_block;
+        kvq_cfg.params.prefill_free_codes = params.kvq.prefill_free_codes;
     }
 
     llama_context * lctx = params.kvq.enabled ? llama_init_from_model_kvq(model, cparams, kvq_cfg) : llama_init_from_model(model, cparams);

@@ -147,6 +147,9 @@ struct llama_kvq_params {
                                   // resident set); < 0 or at least the attention layer count: one buffer per layer, its rows stay on the device
     int32_t scr_block     = 16384; // fit mode, tail: the scratch attention reads the host rows in key blocks of this many rows (rounded down to 256) without a mask,
                                    // the rest with a mask, merged by the log-sum-exp; 0: one attention with a mask over all rows
+    bool    prefill_free_codes = false; // fit mode: free the device copy of the codes and tables (kc, vc, tinv, taux; the pinned host copy holds them) while a
+                                        // prompt is processed and allocate it again at its end (saves their size in the prompt phase, 1.8 GB at 250k);
+                                        // false: allocated once, for the life of the context. Needs n_seq_max 1
 };
 
 // the evictable resident slots of the parameters; the default holds the whole prefetch request of every packed ubatch,

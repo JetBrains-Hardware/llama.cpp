@@ -484,6 +484,10 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         LLAMA_LOG_ERROR("%s: the fit mode needs an empty memory with a single KV stream\n", __func__);
         return false;
     }
+    if (p.prefill_free_codes && kv->get_n_seq_max() > 1) {
+        LLAMA_LOG_ERROR("%s: --kvq-prefill-free-codes needs n_seq_max = 1 (got %u)\n", __func__, kv->get_n_seq_max());
+        return false;
+    }
     // the smallest coarse region: the prefetch selects prefetch_n rows that are not sinks
     const int32_t min_first = p.prefetch_n + p.n_sink;
     if (fp.chunk <= p.n_sink || fp.chunk < min_first || fp.min_rows < 1 || (int64_t) n_ctx_max < fp.chunk ||

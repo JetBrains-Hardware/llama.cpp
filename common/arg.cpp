@@ -2516,6 +2516,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVQ_SCR_BLOCK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kvq-prefill-free-codes"},
+        "two-tier KV cache: free the device copy of the codes and tables (1.8 GB at 250k) while a prompt is processed and allocate it again at the end of the prompt; "
+        "the pinned host copy holds them; needed to fit 250k into 15.5 GiB, refused with more than one sequence (default: the device copy stays allocated)",
+        [](common_params & params) {
+            params.kvq.prefill_free_codes = true;
+        }
+    ).set_env("LLAMA_ARG_KVQ_PREFILL_FREE_CODES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--kvq-tail"}, "N",
         "two-tier KV cache: cells of the ring of q8_0 rows that are not coded yet, in pinned host memory (default: max(batch size, 4096) + 256)",
         [](common_params & params, int value) {
