@@ -71,7 +71,8 @@ public:
     // fit mode: the end of the sequence only, see llama_kvq_fit_params; the rows before p0 that leave the coarse region stay in the host store
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
-    // two-tier mode: abort (seq_keep: unless it keeps sequence 0)
+    // fit mode: seq_rm of the end per sequence (seq_id -1: every sequence), seq_keep empties the other sequences
+    // seq_cp, seq_add and seq_div abort in two-tier mode (seq_cp: the sequences do not share rows yet)
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id) override;
     void seq_add (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -82,7 +83,7 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
-    // fit mode: the state of sequence 0 (see state_write in the .cpp), the save waits for the jobs in flight
+    // fit mode: the state of one sequence (see state_write in the .cpp; seq_id -1: sequence 0, with several sequences an id is needed), the save waits for the jobs in flight
     // the partial state is the recurrent one; other two-tier modes: a state write or read of the K/V throws
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
@@ -160,8 +161,11 @@ private:
 
     // tail: before the batch is placed: the room in the ring for its positions (large batches: the jobs of the complete chunks, then
     // a spill of the ring rows to the host store; small batches: the jobs in flight are added first, a fold at a position set by p0)
-    // the sequence is the one of the batch
-    bool tail_wait(const llama_batch_allocr & balloc);
+    // sequence seq with its n_tokens tokens of the batch (a ubatch is one sequence, see init_batch)
+    bool tail_wait(const llama_batch_allocr & balloc, llama_seq_id seq, uint32_t n_tokens);
+
+    // the sequence holds nothing: its ring cells and recurrent cell, jobs, coarse region, host rows and pages
+    void seq_clear(llama_seq_id seq);
 
     // throws if the K/V state cannot be saved or loaded
     void state_check(llama_seq_id seq_id, llama_state_seq_flags flags) const;

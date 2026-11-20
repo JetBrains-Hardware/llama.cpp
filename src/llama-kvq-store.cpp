@@ -348,8 +348,8 @@ static int kvq_popcount(uint64_t x) {
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
         int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min, bool host_prealloc, size_t host_max_bytes) :
     n_rows_(n_rows), n_crow(n_chunk_rows) {
-    if (kv.get_n_stream() != 1) {
-        throw std::runtime_error("packed two-tier mode needs a single KV stream");
+    if (kv.get_n_stream() != 1 && kv.get_n_stream() != kv.get_n_seq_max()) {
+        throw std::runtime_error("packed two-tier mode needs one KV stream or one per sequence");
     }
     if (!kv.get_ring()) {
         throw std::runtime_error("packed two-tier mode needs the attention cache as a ring (llama_kvq_config::tail)");
@@ -377,6 +377,12 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     // one state per sequence of the memory (the page table, the boundaries, the resident set, the query sums)
     const int32_t n_sq = (int32_t) std::max<uint32_t>(1, kv.get_n_seq_max());
     seqs.resize(n_sq);
+    // the ring cells of a sequence are in its stream of the cache
+    ring_strm.resize(n_sq);
+    for (int32_t i = 0; i < n_sq; ++i) {
+        ring_strm[i] = kv.get_n_stream() == 1 ? 0 : (int32_t) kv.get_stream(i);
+    }
+    n_ring_strm = (int32_t) kv.get_n_stream();
     // every sequence can hold one partial page of its own besides the pages of the longest one
     const int32_t n_pg = n_chunk + n_sq - 1;
 
@@ -631,6 +637,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
 
     for (auto & l : layers) {
         GGML_ASSERT(l.k_cache->nb[1] == G*ROW && l.v_cache->nb[1] == G*ROW);
+        GGML_ASSERT(l.k_cache->nb[2] == (size_t) n_cell*G*ROW && l.v_cache->nb[2] == (size_t) n_cell*G*ROW);
     }
 
     {
@@ -687,8 +694,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
             LLAMA_LOG_INFO("%s: resident rows: %d attention layers with their own device buffer (pinned mirrors, uploaded after a reset x %d)\n", __func__,
                     n_att, up_rep);
         }
-        LLAMA_LOG_INFO("%s: ring of %lld cells in pinned host memory, %d rotating device tail buffers of %.1f MiB (tail upload after the join of layer i - 3%s)\n", __func__,
-                (long long) n_cell, N_TBUF, 2.0*ggml_nbytes(tbufs[0].k)/1048576.0, layers[0].tb_next >= 0 ? "" : ", by the joins");
+        LLAMA_LOG_INFO("%s: ring of %lld cells per stream (%d streams) in pinned host memory, %d rotating device tail buffers of %.1f MiB (tail upload after the join of layer i - 3%s)\n", __func__,
+                (long long) n_cell, n_ring_strm, N_TBUF, 2.0*ggml_nbytes(tbufs[0].k)/1048576.0, layers[0].tb_next >= 0 ? "" : ", by the joins");
     }
 
     const llama_kvq_memory_info mi = memory_info();
@@ -1231,14 +1238,15 @@ void llama_kvq_store::issue_tail(layer & l, ggml_backend_event_t ev, ggml_backen
     }
     const tail_buf & tb = tbufs[l.tbuf];
     const size_t nb1 = (size_t) G*ROW;
+    const size_t off = ring_off(cur);
     int64_t bytes = 0;
     // the occupied cells only: all cells cost 0.25 - 0.8 ms per verify batch (measured)
     const int64_t lo = tb_lo.load();
     const int64_t hi = tb_hi.load();
     for (int r = 0; r < up_rep; ++r) {
         kvq_cell_runs(n_cell, lo, hi, [&](int64_t c, int64_t n) {
-            ggml_backend_tensor_set_async(stream, tb.k, (const uint8_t *) l.k_cache->data + c*nb1, c*nb1, n*nb1);
-            ggml_backend_tensor_set_async(stream, tb.v, (const uint8_t *) l.v_cache->data + c*nb1, c*nb1, n*nb1);
+            ggml_backend_tensor_set_async(stream, tb.k, (const uint8_t *) l.k_cache->data + off + c*nb1, c*nb1, n*nb1);
+            ggml_backend_tensor_set_async(stream, tb.v, (const uint8_t *) l.v_cache->data + off + c*nb1, c*nb1, n*nb1);
             bytes += 2*n*nb1;
         });
     }
@@ -1253,9 +1261,10 @@ void llama_kvq_store::read_ring(layer & l) {
     ggml_backend_event_wait(cp, l.ev_cpy.get());
     const tail_buf & tb = tbufs[l.tbuf];
     const size_t nb1 = (size_t) G*ROW;
+    const size_t off = ring_off(cur);
     kvq_cell_runs(n_cell, ub_p0, ub_p1, [&](int64_t c, int64_t n) {
-        ggml_backend_tensor_get_async(cp, tb.k, (uint8_t *) l.k_cache->data + c*nb1, c*nb1, n*nb1);
-        ggml_backend_tensor_get_async(cp, tb.v, (uint8_t *) l.v_cache->data + c*nb1, c*nb1, n*nb1);
+        ggml_backend_tensor_get_async(cp, tb.k, (uint8_t *) l.k_cache->data + off + c*nb1, c*nb1, n*nb1);
+        ggml_backend_tensor_get_async(cp, tb.v, (uint8_t *) l.v_cache->data + off + c*nb1, c*nb1, n*nb1);
         l.cnt.rb_bytes += 2*n*nb1;
     });
     ggml_backend_event_record(l.ev_rb.get(), cp);
@@ -1280,10 +1289,11 @@ void llama_kvq_store::ring_copy(int32_t sq, bool to_store, int32_t p0, int32_t p
     }
     const double t0 = kvq_now();
     const size_t nb1 = (size_t) G*ROW;
+    const size_t off = ring_off(sq);
     for (auto & l : layers) {
         for (int32_t p = p0; p < p1; ++p) {
-            uint8_t * rk = (uint8_t *) l.k_cache->data + (p % n_cell)*nb1;
-            uint8_t * rv = (uint8_t *) l.v_cache->data + (p % n_cell)*nb1;
+            uint8_t * rk = (uint8_t *) l.k_cache->data + off + (p % n_cell)*nb1;
+            uint8_t * rv = (uint8_t *) l.v_cache->data + off + (p % n_cell)*nb1;
             for (int32_t g = 0; g < G; ++g) {
                 uint8_t * s = row_ptr(sq, l.li, g, p);
                 if (to_store) {
@@ -1388,6 +1398,13 @@ void llama_kvq_store::use_seq(int32_t s) {
     // the prefetches, the base uploads and the mirror writes of the ubatch before work on its sequence
     drop_pending();
     reset_base();
+    // an own device buffer of a layer holds the resident rows of the sequence before: the next join uploads the mirror of this one
+    for (auto & l : layers) {
+        if (l.own) {
+            l.own_stale = true;
+            l.own_sinks = false;
+        }
+    }
     cur = s;
 }
 
@@ -2123,7 +2140,7 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     for (const auto & b : tbufs) {
         mi.ring += ggml_nbytes(b.k) + ggml_nbytes(b.v);
     }
-    mi.host_ring  = layers.size()*2*(size_t) n_cell*G*ROW;
+    mi.host_ring  = layers.size()*2*(size_t) n_cell*G*ROW*n_ring_strm;
     mi.other_dev += ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
     mi.scratch    = scr ? ggml_nbytes(scr) : 0;
     mi.host_other += buf_pin ? ggml_backend_buffer_get_size(buf_pin.get()) : 0;

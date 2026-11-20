@@ -432,7 +432,8 @@ llama_context::llama_context(
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
-    if (cparams.kv_unified) {
+    // the two-tier cache: a sequence can use the whole context (its pool of pages is shared), the ring streams are internal to it
+    if (cparams.kv_unified || kvq_tail > 0) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;

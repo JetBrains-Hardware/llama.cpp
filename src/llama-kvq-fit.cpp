@@ -797,7 +797,7 @@ bool llama_kvq_fitter::in_flight(int32_t seq, const range & r) const {
 
 // the ring cells of the positions [p0, p1) hold them, for the sequence only
 bool llama_kvq_fitter::check_ring(int32_t seq, const llama_kv_cache & kv, int32_t p0, int32_t p1) {
-    const auto & cells = kv.get_cells(0);
+    const auto & cells = kv.get_cells(seq);
     const int64_t size = cells.size();
     if (p1 - p0 > size) {
         LLAMA_LOG_ERROR("%s: the positions [%d, %d) are not in the ring of %lld cells, the fit of the coarse region stops\n", __func__, p0, p1, (long long) size);

@@ -87,7 +87,8 @@ bool llama_memory_hybrid::prepare_batch(
                   uint32_t   n_ubatch,
                       bool   embd_all,
  std::vector<llama_ubatch> & ubatches,
-           slot_info_vec_t & heads_attn) {
+           slot_info_vec_t & heads_attn,
+                  uint32_t   n_seqs_max) {
     do {
         balloc.split_reset();
 
@@ -108,7 +109,7 @@ bool llama_memory_hybrid::prepare_batch(
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, n_seqs_max);
             }
 
             if (ubatch.n_tokens == 0) {

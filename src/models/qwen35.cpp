@@ -425,7 +425,7 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
     auto inp = std::make_unique<llm_graph_input_kvq>(mctx_kvq);
 
     if (inp->params.enabled) {
-        GGML_ASSERT(ubatch.n_seqs_unq == 1 && ubatch.seq_id_unq[0] == 0 && "two-tier attention supports a single sequence");
+        GGML_ASSERT(ubatch.n_seqs_unq == 1 && "two-tier attention needs a ubatch of one sequence");
         GGML_ASSERT(mctx_kvq->get_store() != nullptr);
 
         const int64_t n_kv = mctx_kvq->get_attn()->get_n_kv();
