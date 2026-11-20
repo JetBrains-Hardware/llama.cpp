@@ -828,10 +828,10 @@ struct server_slot {
     void print_timings_kvq() const {
         llama_memory_t mem = llama_get_memory(ctx_tgt);
 
-        // the server has one slot with --kvq: the fit progress is the one of its sequence 0 (the counters are totals)
+        // the fit progress is the one of the sequence of the slot (the counters are totals)
         llama_kvq_fit_progress fp;
         llama_kvq_counters_all ca;
-        if (!llama_memory_kvq_fit_get_progress(mem, 0, fp) || !llama_memory_kvq_get_counters(mem, ca)) {
+        if (!llama_memory_kvq_fit_get_progress(mem, id, fp) || !llama_memory_kvq_get_counters(mem, ca)) {
             return;
         }
         llama_kvq_counters s;
@@ -1136,30 +1136,36 @@ private:
 
     common_speculative_init_result_ptr spec_init;
 
-    // --kvq: progress of the fitter at the previous log
-    int32_t kvq_n_coarse_last = 0;
-    int32_t kvq_n_drop_last   = 0;
-    bool    kvq_failed_last   = false;
+    // --kvq: progress of the fitter of each slot at the previous log
+    struct kvq_progress_last {
+        int32_t n_coarse = 0;
+        int32_t n_drop   = 0;
+        bool    failed   = false;
+    };
+    std::vector<kvq_progress_last> kvq_last;
 
-    // --kvq: a log line when the coarse region changes (cheap, no sync)
+    // --kvq: a log line when the coarse region of a slot changes (cheap, no sync)
     void kvq_log_progress() {
-        llama_kvq_fit_progress fp;
-        // one slot with --kvq: sequence 0
-        if (!llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), 0, fp)) {
-            return;
+        kvq_last.resize(slots.size());
+        for (const auto & slot : slots) {
+            llama_kvq_fit_progress fp;
+            if (!llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), slot.id, fp)) {
+                return;
+            }
+            auto & last = kvq_last[slot.id];
+            if (fp.n_drop != last.n_drop) {
+                SLT_INF(slot, "kvq: the coarse region dropped back to %d rows (%d drops so far)\n", fp.n_coarse, fp.n_drop);
+            } else if (fp.n_coarse != last.n_coarse && !fp.t_job.empty()) {
+                SLT_INF(slot, "kvq: coarse region = %d rows (%d chunks), last job %.2f s (%.2f s since its statistics), %d jobs running\n",
+                        fp.n_coarse, fp.n_chunk, fp.t_job.back(), fp.t_wall.back(), fp.n_running);
+            }
+            if (fp.failed && !last.failed) {
+                SLT_WRN(slot, "%s", "kvq: the fit failed, the coarse region does not grow\n");
+            }
+            last.n_coarse = fp.n_coarse;
+            last.n_drop   = fp.n_drop;
+            last.failed   = fp.failed;
         }
-        if (fp.n_drop != kvq_n_drop_last) {
-            SRV_INF("kvq: the coarse region dropped back to %d rows (%d drops so far)\n", fp.n_coarse, fp.n_drop);
-        } else if (fp.n_coarse != kvq_n_coarse_last && !fp.t_job.empty()) {
-            SRV_INF("kvq: coarse region = %d rows (%d chunks), last job %.2f s (%.2f s since its statistics), %d jobs running\n",
-                    fp.n_coarse, fp.n_chunk, fp.t_job.back(), fp.t_wall.back(), fp.n_running);
-        }
-        if (fp.failed && !kvq_failed_last) {
-            SRV_WRN("%s", "kvq: the fit failed, the coarse region does not grow\n");
-        }
-        kvq_n_coarse_last = fp.n_coarse;
-        kvq_n_drop_last   = fp.n_drop;
-        kvq_failed_last   = fp.failed;
     }
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1186,6 +1192,9 @@ private:
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
+
+    // --kvq: tokens of the batch from the current offset that decode() dropped with their failed slot (0 = none)
+    int32_t kvq_n_dropped = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -3666,6 +3675,14 @@ private:
                 llama_synchronize(ctx_tgt);
 #endif
 
+                if (ok && kvq_n_dropped > 0) {
+                    // --kvq: the slot of these tokens failed (pool full), nothing to post-process for them
+                    off_next = off + kvq_n_dropped;
+                    kvq_n_dropped = 0;
+                    n_batch = llama_n_batch(ctx_tgt);
+                    continue;
+                }
+
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
@@ -4710,6 +4727,37 @@ private:
 
         kvq_log_progress();
 
+        if (ret == 1 && params_base.kvq.enabled) {
+            // the pool of pages is full (a batch is all or nothing, nothing of it was decoded)
+            if (try_clear_idle_slots()) {
+                SRV_WRN("%s", "kvq: the pool of pages is full, retrying after purging an idle slot\n");
+                return false;
+            }
+
+            // tokens of the slot at the start of the view; a view with several slots is cut after the first one
+            const int32_t id_slot = batch.tokens[off].id_slot;
+            int32_t run = 0;
+            while (off + run < batch.size() && batch.tokens[off + run].id_slot == id_slot) {
+                run++;
+            }
+            if (run < batch.view.size()) {
+                SRV_WRN("kvq: the pool of pages is full, retrying slot by slot, off = %d, n_batch = %d -> %d\n", off, n_batch, run);
+                n_batch = run;
+                return false;
+            }
+
+            // only this slot is in the view and it gets no page: it fails, the other slots go on
+            for (auto & slot : slots) {
+                if (slot.id == id_slot && slot.is_processing()) {
+                    send_error(slot, "kvq: the pool of pages is full, the slot cannot grow its context (" + std::to_string(slot.prompt.n_tokens()) + " tokens held)");
+                    slot.release();
+                    slot.prompt_clear();
+                }
+            }
+            kvq_n_dropped = run;
+            return true;
+        }
+
         if (ret != 0) {
             {
                 std::string err;
@@ -5421,6 +5469,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
+                if (params.kvq.enabled) {
+                    // the children continue from a copy of the prompt state of the parent slot (seq_cp)
+                    throw std::runtime_error("n > 1 is not supported with --kvq (the K/V of a slot cannot be copied)");
+                }
                 int n_children = task.params.n_cmpl - 1;
                 for (int j = 0; j < n_children; j++) {
                     task.add_child(task.id, rd.get_new_id());
