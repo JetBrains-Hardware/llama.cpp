@@ -13,14 +13,14 @@
 //   rows:  q8_0 rows [G][rows][K row, V row]
 //   kc:    host codes of K [G][rows][kc_row bytes], vc: of V [G][rows][vc_row bytes] (the row layout of the device kc / vc)
 //   tinv:  the tables of the chunk slot [2*G][tinv_slot bytes], taux: [2*G][taux_slot bytes]
-// rows = C, the last page of n_rows only the rows that remain
+// every page has C rows (the last page of n_rows is not shortened)
 class llama_kvq_pool {
 public:
     struct layout {
         int32_t n_layers = 0;
         int32_t G        = 0; // kv heads
         int32_t C        = 0; // rows of a chunk
-        int32_t n_rows   = 0; // rows of all pages
+        int32_t n_rows   = 0; // rows of the sequence, the pages are ceil(n_rows/C)
         size_t  row_b    = 0; // bytes of the K and V row of a position
         size_t  kc_row   = 0;
         size_t  vc_row   = 0;
@@ -33,7 +33,7 @@ public:
 
     int32_t n_pages() const { return (int32_t) bufs.size(); }
 
-    // rows of a page
+    // rows of a page (C)
     int32_t rows(int32_t page) const { return nrow[page]; }
 
     // allocates the page (a pinned host buffer, or pageable if it fails), false if both fail

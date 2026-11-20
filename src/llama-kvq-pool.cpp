@@ -10,7 +10,7 @@ llama_kvq_pool::llama_kvq_pool(ggml_backend_buffer_type_t buft_host, const layou
     }
     for (int32_t p = 0; p < n_pages; ++p) {
         const size_t G = lay.G;
-        const size_t R = nrow[p] = std::min(lay.C, lay.n_rows - p*lay.C);
+        const size_t R = nrow[p] = lay.C;
         const size_t sz[5] = { G*R*lay.row_b, G*R*lay.kc_row, G*R*lay.vc_row, 2*G*lay.tinv_slot, 2*G*lay.taux_slot };
         size_t off = 0;
         for (int k = 0; k < 5; ++k) {

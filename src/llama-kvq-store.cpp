@@ -459,7 +459,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         }
     }
 
-    ctx_dev   = init_ctx(layers.size()*8 + 4 + 2*N_TBUF);
+    ctx_dev   = init_ctx(layers.size()*8 + 5 + 2*N_TBUF);
     ctx_codes = init_ctx(layers.size()*4);
     ctx_alias = init_ctx(n_bufs);
     ctx_host  = init_ctx(layers.size()*KIND_COUNT);
@@ -486,8 +486,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
 
     for (auto & l : layers) {
         layer_tensors & t = l.t;
-        t.kc   = ggml_new_tensor_3d(ctx_codes.get(), GGML_TYPE_I32, nwk, n_rows, G);
-        t.vc   = ggml_new_tensor_3d(ctx_codes.get(), GGML_TYPE_I32, nwv + 1, n_rows, G);
+        t.kc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwk, n_crow, G, n_chunk);
+        t.vc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwv + 1, n_crow, G, n_chunk);
         t.tinv = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I8, D, D, 2*G, n_chunk);
         t.taux = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_F32, D, 3, 2*G, n_chunk);
         t.rkv_h = bufs[l.buf].rkv_h;
@@ -509,6 +509,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
     bias    = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_rows);
     ggml_set_name(bias,    "kvq_bias");
+    pt      = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_I32, n_chunk);
+    ggml_set_name(pt,      "kvq_pt");
 
     // the scratch of the large ubatches, one row per position of the coarse region, then one per ring cell (see scr_alloc)
     n_scr   = n_rows + cells.size();
@@ -545,6 +547,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         for (int32_t c = 0; c < n_chunk; ++c) {
             page_tab[c] = c;
         }
+        ggml_backend_tensor_set(pt, page_tab.data(), 0, ggml_nbytes(pt));
     }
     // set_rows has no q8_0 to q8_0 copy, so the scatter writes the rows of rkv as groups of 4 bytes (f32, half the threads of f16)
     for (size_t b = 0; b < bufs.size(); ++b) {
@@ -705,12 +708,12 @@ ggml_tensor * llama_kvq_store::get_ridx(ggml_context * ctx, int32_t il) const {
 
 ggml_tensor * llama_kvq_store::get_kc(ggml_context * ctx, int32_t il) const {
     ggml_tensor * t = get_layer(il).kc;
-    return ggml_view_3d(ctx, t, t->ne[0], n_coarse_, G, t->nb[1], t->nb[2], 0);
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], 0);
 }
 
 ggml_tensor * llama_kvq_store::get_vc(ggml_context * ctx, int32_t il) const {
     ggml_tensor * t = get_layer(il).vc;
-    return ggml_view_3d(ctx, t, t->ne[0], n_coarse_, G, t->nb[1], t->nb[2], 0);
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], 0);
 }
 
 std::vector<int32_t> llama_kvq_store::layer_ids() const {
@@ -747,7 +750,7 @@ void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t 
     GGML_ASSERT(!async || backend_main);
     const layer & l = layers.at(layer_of_il.at(il));
     const layer_tensors & t = l.t;
-    const int64_t m = (int64_t) c*2*G + 2*g + (is_v ? 1 : 0);
+    const int64_t m = (int64_t) page_tab[c]*2*G + 2*g + (is_v ? 1 : 0);
     memcpy(htinv_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), inv, t.tinv->nb[2]);
     memcpy(htaux_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), aux, t.taux->nb[2]);
     if (!codes_on_dev()) {
@@ -1958,16 +1961,15 @@ void llama_kvq_store::codes_up(int32_t n, bool async) {
     for (auto & l : layers) {
         for (int k = 0; k < 2; ++k) {
             ggml_tensor * t = k ? l.t.vc : l.t.kc;
-            for (int32_t g = 0; g < G; ++g) {
-                chunk_runs(0, n, [&](int32_t p, int32_t m) {
-                    const size_t off = g*t->nb[2] + (size_t) p*t->nb[1];
-                    const uint8_t * src = hcode_ptr(l.li, k == 1, g, p);
-                    if (async) {
-                        ggml_backend_tensor_set_async(backend_main, t, src, off, (size_t) m*t->nb[1]);
-                    } else {
-                        ggml_backend_tensor_set(t, src, off, (size_t) m*t->nb[1]);
-                    }
-                });
+            // one copy per page: the host page section [G][C][row] is the device page [nwords, C, G]
+            for (int32_t c = 0; c < n_tab; ++c) {
+                const int32_t   pg  = page_tab[c];
+                const uint8_t * src = k ? pages->vc_ptr(pg, (int32_t) l.li) : pages->kc_ptr(pg, (int32_t) l.li);
+                if (async) {
+                    ggml_backend_tensor_set_async(backend_main, t, src, (size_t) pg*t->nb[3], t->nb[3]);
+                } else {
+                    ggml_backend_tensor_set(t, src, (size_t) pg*t->nb[3], t->nb[3]);
+                }
             }
         }
         for (int k = 2; k < 4; ++k) {
@@ -1975,9 +1977,9 @@ void llama_kvq_store::codes_up(int32_t n, bool async) {
             for (int32_t c = 0; c < n_tab; ++c) {
                 const uint8_t * src = k == 3 ? htaux_ptr(l.li, c, 0) : htinv_ptr(l.li, c, 0);
                 if (async) {
-                    ggml_backend_tensor_set_async(backend_main, t, src, (size_t) c*t->nb[3], t->nb[3]);
+                    ggml_backend_tensor_set_async(backend_main, t, src, (size_t) page_tab[c]*t->nb[3], t->nb[3]);
                 } else {
-                    ggml_backend_tensor_set(t, src, (size_t) c*t->nb[3], t->nb[3]);
+                    ggml_backend_tensor_set(t, src, (size_t) page_tab[c]*t->nb[3], t->nb[3]);
                 }
             }
         }
@@ -2004,8 +2006,8 @@ bool llama_kvq_store::codes_alloc() {
     const int64_t t1 = ggml_time_us();
     codes_up(n, async);
     {
-        const size_t sz_rows = (size_t) n*(ggml_nbytes(layers[0].t.kc) + ggml_nbytes(layers[0].t.vc))/n_rows_*layers.size();
-        const size_t sz_tabs = (size_t) ((n + n_crow - 1)/n_crow)*(ggml_nbytes(layers[0].t.tinv) + ggml_nbytes(layers[0].t.taux))/n_chunk*layers.size();
+        const size_t sz_rows = (size_t) ((n + n_crow - 1)/n_crow)*(layers[0].t.kc->nb[3] + layers[0].t.vc->nb[3])*layers.size();
+        const size_t sz_tabs = (size_t) ((n + n_crow - 1)/n_crow)*(layers[0].t.tinv->nb[3] + layers[0].t.taux->nb[3])*layers.size();
         LLAMA_LOG_INFO("%s: codes and tables (%.1f MiB) on the device in %.2f ms, upload of the host copy of the rows [0, %d) and %d chunk slots (%.1f MiB) %s\n", __func__,
                 ggml_backend_buffer_get_size(buf_codes.get())/1048576.0, (t1 - t0)/1000.0, n, (n + n_crow - 1)/n_crow, (sz_rows + sz_tabs)/1048576.0,
                 async ? "queued" : "done");

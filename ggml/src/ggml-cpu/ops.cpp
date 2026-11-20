@@ -11943,6 +11943,7 @@ void ggml_compute_forward_kvq_attn(
     const ggml_tensor * rkv  = dst->src[7];
     const ggml_tensor * ridx = dst->src[8];
     const ggml_tensor * mask = dst->src[9];
+    const ggml_tensor * pt   = dst->src[10];
 
     const float   scale  = ggml_get_op_params_f32(dst, 0);
     const int32_t n_crow = ggml_get_op_params_i32(dst, 1);
@@ -11957,9 +11958,14 @@ void ggml_compute_forward_kvq_attn(
     const int64_t G        = k->ne[2];
     const int64_t n_rep    = n_head/G;
     const int64_t n_tail   = k->ne[1];
-    const int64_t n_coarse = kc ? kc->ne[1] : 0;
+    const int64_t n_coarse = kc ? ggml_get_op_params_i32(dst, 3) : 0;
     const int64_t n_chunk  = kc ? (n_coarse + n_crow - 1)/n_crow : 0;
     const int64_t cap      = rkv ? rkv->ne[1] : 0;
+
+    // physical page of logical chunk t
+    auto page_of = [&](int64_t t) -> int64_t {
+        return *(const int32_t *) ((const char *) pt->data + t*pt->nb[0]);
+    };
 
     float * out_attn  = do_attn  ? (float *) dst->data : nullptr;
     float * out_score = do_score ? (float *) dst->data : nullptr;
@@ -11971,13 +11977,13 @@ void ggml_compute_forward_kvq_attn(
         return mask ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) mask->data + row*mask->nb[0] + l*mask->nb[1])) : 0.0;
     };
     auto aux_at = [&](int64_t i, int64_t r, int64_t m, int64_t t) -> float {
-        return *(const float *) ((const char *) taux->data + i*taux->nb[0] + r*taux->nb[1] + m*taux->nb[2] + t*taux->nb[3]);
+        return *(const float *) ((const char *) taux->data + i*taux->nb[0] + r*taux->nb[1] + m*taux->nb[2] + page_of(t)*taux->nb[3]);
     };
     // inverse transform entry inv[c][i] of table m of chunk t
     auto inv_at = [&](int64_t c, int64_t i, int64_t m, int64_t t) -> float {
         const int64_t i0 = m % 2 == 0 ? c : i;
         const int64_t i1 = m % 2 == 0 ? i : c;
-        return *(const int8_t *) ((const char *) tinv->data + i0*tinv->nb[0] + i1*tinv->nb[1] + m*tinv->nb[2] + t*tinv->nb[3]);
+        return *(const int8_t *) ((const char *) tinv->data + i0*tinv->nb[0] + i1*tinv->nb[1] + m*tinv->nb[2] + page_of(t)*tinv->nb[3]);
     };
     auto row_f32 = [&](const ggml_tensor * t, int64_t i1, int64_t i2, int64_t i3, float * y) {
         ggml_get_type_traits(t->type)->to_float((const char *) t->data + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3], y, D);
@@ -12041,7 +12047,7 @@ void ggml_compute_forward_kvq_attn(
                 }
                 const int64_t j1 = std::min(n_coarse, (t + 1)*n_crow);
                 for (int64_t j = t*n_crow; j < j1; j++) {
-                    const int32_t * row = (const int32_t *) ((const char *) kc->data + j*kc->nb[1] + g*kc->nb[2]);
+                    const int32_t * row = (const int32_t *) ((const char *) kc->data + (j - t*n_crow)*kc->nb[1] + g*kc->nb[2] + page_of(t)*kc->nb[3]);
                     double s = qmu;
                     for (int64_t c = 0; c < D; c++) {
                         if (bits[c] > 0) {
@@ -12156,7 +12162,7 @@ void ggml_compute_forward_kvq_attn(
                     if (w == 0.0) {
                         continue;
                     }
-                    const int32_t * row  = (const int32_t *) ((const char *) vc->data + j*vc->nb[1] + g*vc->nb[2]);
+                    const int32_t * row  = (const int32_t *) ((const char *) vc->data + (j - t*n_crow)*vc->nb[1] + g*vc->nb[2] + page_of(t)*vc->nb[3]);
                     const double    gain = GGML_CPU_FP16_TO_FP32((ggml_fp16_t) (row[nwv] & 0xFFFF));
                     wsum += w;
                     for (int64_t c = 0; c < D; c++) {
