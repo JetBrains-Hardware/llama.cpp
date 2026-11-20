@@ -11,13 +11,13 @@ llama_kvq_pool::llama_kvq_pool(ggml_backend_buffer_type_t buft_host, const layou
     for (int32_t p = 0; p < n_pages; ++p) {
         const size_t G = lay.G;
         const size_t R = nrow[p] = lay.C;
-        const size_t sz[5] = { G*R*lay.row_b, G*R*lay.kc_row, G*R*lay.vc_row, 2*G*lay.tinv_slot, 2*G*lay.taux_slot };
+        const size_t sz[4] = { G*R*lay.row_b, G*R*lay.kc_row, G*R*lay.vc_row, 2*G*lay.tab_slot };
         size_t off = 0;
-        for (int k = 0; k < 5; ++k) {
+        for (int k = 0; k < 4; ++k) {
             offs[p][k] = off;
             off += sz[k];
         }
-        offs[p][5] = off;
+        offs[p][4] = off;
     }
     for (int32_t p = 0; p < n_pages; ++p) {
         if (!alloc(p)) {
@@ -27,7 +27,7 @@ llama_kvq_pool::llama_kvq_pool(ggml_backend_buffer_type_t buft_host, const layou
 }
 
 size_t llama_kvq_pool::bytes(int32_t page) const {
-    return (size_t) lay.n_layers*offs[page][5];
+    return (size_t) lay.n_layers*offs[page][4];
 }
 
 size_t llama_kvq_pool::bytes_rows(int32_t page) const {

@@ -516,7 +516,7 @@ void llama_model_qwen35::graph::build_kvq_prefetch(
 
     ggml_tensor * k = store->get_ring(ctx0, il, false, inp->mctx->get_n_kv());
 
-    ggml_tensor * score = ggml_kvq_attn(ctx0, q, store->get_kc(ctx0, il), nullptr, t.tinv, t.taux, store->get_pt(), k, nullptr, nullptr, nullptr,
+    ggml_tensor * score = ggml_kvq_attn(ctx0, q, store->get_kc(ctx0, il), nullptr, t.tab, store->get_pt(), k, nullptr, nullptr, nullptr,
             inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse, store->n_chunk_rows(), GGML_KVQ_SCORE);
     cb(score, "kvq_eq_score", il);
 
@@ -601,7 +601,7 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
         store->build_join(ctx0, gf, sched, il, params.prefetch_n, n_tokens);
     }
 
-    ggml_tensor * out = ggml_kvq_attn(ctx0, q_cur, kc, vc, t.tinv, t.taux, store->get_pt(), k, v, t.rkv, ridx, mask, kq_scale, (int) n_coarse, (int) n_crow, GGML_KVQ_ATTN);
+    ggml_tensor * out = ggml_kvq_attn(ctx0, q_cur, kc, vc, t.tab, store->get_pt(), k, v, t.rkv, ridx, mask, kq_scale, (int) n_coarse, (int) n_crow, GGML_KVQ_ATTN);
     cb(out, "kvq_attn", il);
 
     ggml_tensor * cur = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]);

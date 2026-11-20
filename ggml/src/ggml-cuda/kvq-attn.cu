@@ -1819,14 +1819,13 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q    = dst->src[0];
     const ggml_tensor * kc   = dst->src[1];
     const ggml_tensor * vc   = dst->src[2];
-    const ggml_tensor * tinv = dst->src[3];
-    const ggml_tensor * taux = dst->src[4];
-    const ggml_tensor * k    = dst->src[5];
-    const ggml_tensor * v    = dst->src[6];
-    const ggml_tensor * rkv  = dst->src[7];
-    const ggml_tensor * ridx = dst->src[8];
-    const ggml_tensor * mask = dst->src[9];
-    const ggml_tensor * pt   = dst->src[10];
+    const ggml_tensor * tab  = dst->src[3];
+    const ggml_tensor * k    = dst->src[4];
+    const ggml_tensor * v    = dst->src[5];
+    const ggml_tensor * rkv  = dst->src[6];
+    const ggml_tensor * ridx = dst->src[7];
+    const ggml_tensor * mask = dst->src[8];
+    const ggml_tensor * pt   = dst->src[9];
 
     const int  mode  = ggml_get_op_params_i32(dst, 2);
     const bool attn  = mode == GGML_KVQ_ATTN;
@@ -1868,8 +1867,9 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (kc) {
         a.kc = (const char *) kc->data; a.kc_nb1 = kc->nb[1]; a.kc_nb2 = kc->nb[2]; a.kc_nb3 = kc->nb[3];
         a.pt = (const int32_t *) pt->data;
-        a.tinv = (const int8_t *) tinv->data; a.tinv_nb2 = tinv->nb[2]; a.tinv_nb3 = tinv->nb[3];
-        a.taux = (const float *) taux->data; a.taux_nb2 = taux->nb[2]/sizeof(float); a.taux_nb3 = taux->nb[3]/sizeof(float);
+        // a slot of the table tensor: the inverse table (D*D bytes) then the aux floats
+        a.tinv = (const int8_t *) tab->data; a.tinv_nb2 = tab->nb[1]; a.tinv_nb3 = tab->nb[2];
+        a.taux = (const float *) ((const char *) tab->data + KVQ_D*KVQ_D); a.taux_nb2 = tab->nb[1]/sizeof(float); a.taux_nb3 = tab->nb[2]/sizeof(float);
         if (attn) {
             a.vc = (const char *) vc->data; a.vc_nb1 = vc->nb[1]; a.vc_nb2 = vc->nb[2]; a.vc_nb3 = vc->nb[3];
         }
@@ -1954,9 +1954,9 @@ bool ggml_cuda_kvq_attn_supported(int device, const ggml_tensor * op) {
     const ggml_tensor * q    = op->src[0];
     const ggml_tensor * kc   = op->src[1];
     const ggml_tensor * vc   = op->src[2];
-    const ggml_tensor * k    = op->src[5];
-    const ggml_tensor * v    = op->src[6];
-    const ggml_tensor * rkv  = op->src[7];
+    const ggml_tensor * k    = op->src[4];
+    const ggml_tensor * v    = op->src[5];
+    const ggml_tensor * rkv  = op->src[6];
 
     // 64 rows of mask per thread block of 128 threads: at most 8 positions
     if (q->ne[0] != KVQ_D || q->ne[2] > 8 || (q->ne[1]/k->ne[2])*q->ne[2] > 48) {

@@ -73,12 +73,11 @@ public:
         KIND_COUNT    = 5,
     };
 
-    // kc, vc, tinv, taux: in their own device buffer, with a pinned host copy in fit mode (see codes_alloc)
+    // kc, vc, tab: in their own device buffer, with a pinned host copy in fit mode (see codes_alloc)
     struct layer_tensors {
         ggml_tensor * kc    = nullptr; // i32 [nwk, C, G, n_pages], page = C rows, a page of a layer is contiguous
         ggml_tensor * vc    = nullptr; // i32 [nwv + 1, C, G, n_pages]
-        ggml_tensor * tinv  = nullptr; // i8 [D, D, 2*G, n_pages]
-        ggml_tensor * taux  = nullptr; // f32 [D, 3, 2*G, n_pages]
+        ggml_tensor * tab   = nullptr; // i8 [D*D + 3*D*4, 2*G, n_pages]: per slot the inverse table bytes, then the aux floats
         ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2], alias of the start of rkv_h (of the device buffer of the layer)
         ggml_tensor * rkv_h = nullptr; // f32 [ROW/4, 2*G*cap_tot + N_TRASH], row (kv*G + g)*cap_tot + slot, then the trash rows
         ggml_tensor * ridx  = nullptr; // i32 [cap_tot, G]
@@ -208,7 +207,7 @@ public:
     void fit_alloc();
     ggml_backend_buffer_t shared_buffer() const { return buf_scr.get(); }
 
-    // every write of the codes and tables goes to a pinned host copy first (same bytes as kc, vc, tinv, taux); the device copy is
+    // every write of the codes and tables goes to a pinned host copy first (same bytes as kc, vc, tab); the device copy is
     // allocated by enable and stays (writes update both). With llama_kvq_params::prefill_free_codes it exists only for the packed
     // path: scr_alloc frees it, codes_alloc (end of a prompt, or dec_alloc) allocates it and queues the upload of the host copy on
     // the main stream
@@ -290,7 +289,7 @@ private:
     std::unordered_map<const ggml_tensor *, std::pair<size_t, int>> trig_of; // trigger -> layer index, kind
 
     ggml_context_ptr        ctx_dev;
-    ggml_context_ptr        ctx_codes; // kc, vc, tinv, taux
+    ggml_context_ptr        ctx_codes; // kc, vc, tab
     ggml_backend_buffer_ptr buf_codes;
     std::unique_ptr<llama_kvq_pool> pages; // pinned host pages: rows, host copy of the codes and tables (see llama-kvq-pool.h)
     std::vector<int32_t>    page_tab;  // chunk -> page, the identity
@@ -380,8 +379,11 @@ private:
         return (is_v ? pages->vc_ptr(pg, (int32_t) li) : pages->kc_ptr(pg, (int32_t) li)) + ((size_t) g*pages->rows(pg) + pos%n_crow)*nb;
     }
     // slot m = 2*g + (V ? 1 : 0) of the tables of chunk c
-    uint8_t * htinv_ptr(size_t li, int32_t c, int32_t m) const { return pages->tinv_ptr(page_tab[c], (int32_t) li) + (size_t) m*D*D; }
-    uint8_t * htaux_ptr(size_t li, int32_t c, int32_t m) const { return pages->taux_ptr(page_tab[c], (int32_t) li) + (size_t) m*D*3*sizeof(float); }
+    // (a slot: the inverse table, D*D bytes, then the aux floats, 3*D)
+    static constexpr size_t TAB_SLOT = (size_t) D*D + (size_t) 3*D*sizeof(float);
+    uint8_t * htab_ptr (size_t li, int32_t c, int32_t m) const { return pages->tab_ptr(page_tab[c], (int32_t) li) + (size_t) m*TAB_SLOT; }
+    uint8_t * htinv_ptr(size_t li, int32_t c, int32_t m) const { return htab_ptr(li, c, m); }
+    uint8_t * htaux_ptr(size_t li, int32_t c, int32_t m) const { return htab_ptr(li, c, m) + (size_t) D*D; }
 
     // rows per kv head of one request
     int64_t n_req(int64_t n_top, int64_t L) const;
