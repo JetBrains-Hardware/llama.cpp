@@ -7,11 +7,11 @@
 // s[d] = sqrt(rms_batch(x[d] / rms(x column)) / max_rows|W[:, d]|), which leaves the product unchanged. The scales are a pure
 // function of the call's inputs (no calibration state), so results do not depend on earlier requests.
 //
-// Used only for wide expanding projections (rows >= 3 x columns: the FFN gate / up projections). Measured on
-// two 27B models: projections that read intermediate activations (rows <= columns) are far outside the error
-// of the per-32 XMX kernel with any row / column scale scheme (int8-audit.hpp), and the attention-side
-// projections (rows 1.2-2.4 x columns) pass that per-call error check but raised perplexity by up to 7% on
-// some inputs. Both stay on the f16 route.
+// A preset (GGML_SYCL_INT8_PRESET) chooses which projections use the path:
+//   fast (default)  every q4_K / q6_K projection of a prompt batch, except the vocabulary projection.
+//                   Measured on two 27B models: perplexity changes by -0.02% to +0.17%.
+//   safe            only the wide projections (rows >= 3 x columns: FFN gate / up). Perplexity stays within
+//                   +-0.1% of the f16 route.
 //
 // Scales. The equalization factors are a statistic of the activations that changes little from one batch to
 // the next, so by default they are kept per weight tensor together with the row scales (calibration) and, while
@@ -22,6 +22,7 @@
 // with factors much worse than its own.
 // With GGML_SYCL_INT8_CALIB=0 nothing is kept: every call derives all scales from its own inputs.
 //   GGML_SYCL_INT8_GEMM=0            turn the path off
+//   GGML_SYCL_INT8_PRESET=fast|safe  which projections use the path (see above)
 //   GGML_SYCL_INT8_GEMM_MIN_COLS=<n> smallest batch that takes it (default 512)
 //   GGML_SYCL_INT8_CALIB=0           per-call scales, no state kept between calls
 //   GGML_SYCL_INT8_DRIFT=<x>         calibrate again when the estimated noise power with the kept factors is
@@ -30,7 +31,11 @@
 //   GGML_SYCL_INT8_WCACHE_RESERVE_MB=<n>  free device memory to leave untouched by the copies (default 2048)
 //   GGML_SYCL_INT8_GEMM_STATS=1      print call / calibration / cache counters at exit (2: also per-stage
 //                                    times, with waits)
-//   GGML_SYCL_INT8_GEMM_MIN_RATIO / _MAX_RATIO   limit the path by rows / columns of the weight (diagnostics)
+//   GGML_SYCL_INT8_GEMM_MIN_RATIO / _MAX_RATIO   limit the path by rows / columns of the weight (diagnostics).
+//                                    The presets set min to 0 (fast) or 3 (safe) and max to 8, so the
+//                                    vocabulary projection stays on f16.
+//   GGML_SYCL_INT8_GEMM_SKIP=<a,b>   weights whose name contains one of these strings do not use the path
+//                                    (diagnostics)
 #ifndef GGML_SYCL_INT8_GEMM_HPP
 #define GGML_SYCL_INT8_GEMM_HPP
 
@@ -39,12 +44,16 @@
 #include <memory>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
 
 struct ggml_sycl_int8_gemm_cfg {
     bool    enabled  = true;
     int     min_cols = 512;
-    float   min_ratio = 3.0f;     // rows / columns of the weight must be above 1 and within [min_ratio, max_ratio]
+    float   min_ratio = 0.0f;     // rows / columns of the weight must be within [min_ratio, max_ratio]
     float   max_ratio = 8.0f;     // FFN expansions are 2.7 .. 8; the vocabulary projection (logits) stays f16
+    std::vector<std::string> skip; // substrings of weight names kept off the path (diagnostics)
     bool    calib    = true;      // keep the scales per weight tensor
     float   drift    = 1.15f;     // calibrate again above this ratio of estimated noise power, kept / fresh factors
     size_t  wcache_cap     = SIZE_MAX;            // bytes of s8 weight copies allowed
@@ -61,7 +70,19 @@ static ggml_sycl_int8_gemm_cfg & ggml_sycl_int8_gemm_config() {
         ggml_sycl_int8_gemm_cfg c;
         if (const char * e = getenv("GGML_SYCL_INT8_GEMM")) c.enabled = atoi(e) != 0;
         if (const char * e = getenv("GGML_SYCL_INT8_GEMM_MIN_COLS")) c.min_cols = std::max(1, atoi(e));
+        if (const char * e = getenv("GGML_SYCL_INT8_PRESET")) {
+            if (std::string(e) == "safe") c.min_ratio = 3.0f;
+            else if (std::string(e) != "fast") fprintf(stderr, "ggml-sycl: unknown GGML_SYCL_INT8_PRESET '%s', using fast\n", e);
+        }
         if (const char * e = getenv("GGML_SYCL_INT8_GEMM_MIN_RATIO")) c.min_ratio = (float) atof(e);
+        if (const char * e = getenv("GGML_SYCL_INT8_GEMM_SKIP")) {
+            std::string str(e);
+            for (size_t pos = 0; pos < str.size();) {
+                const size_t end = std::min(str.find(',', pos), str.size());
+                if (end > pos) c.skip.push_back(str.substr(pos, end - pos));
+                pos = end + 1;
+            }
+        }
         if (const char * e = getenv("GGML_SYCL_INT8_GEMM_MAX_RATIO")) c.max_ratio = (float) atof(e);
         if (const char * e = getenv("GGML_SYCL_INT8_CALIB")) c.calib = atoi(e) != 0;
         if (const char * e = getenv("GGML_SYCL_INT8_DRIFT")) c.drift = (float) atof(e);
@@ -118,9 +139,11 @@ static ggml_sycl_int8_gemm_timer & ggml_sycl_int8_gemm_timers() {
 static inline bool ggml_sycl_int8_gemm_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1, int64_t ncols) {
     const auto & cfg = ggml_sycl_int8_gemm_config();
     const float ratio = (float) src0->ne[1] / (float) src0->ne[0];
+    for (const auto & name : cfg.skip) {
+        if (strstr(src0->name, name.c_str()) != nullptr) return false;
+    }
     return cfg.enabled && ratio >= cfg.min_ratio && ratio <= cfg.max_ratio && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) && src1->type == GGML_TYPE_F32 &&
-           ncols >= cfg.min_cols && src0->ne[1] > src0->ne[0] && src0->ne[0] % QK_K == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
-           ggml_is_contiguous(src0);
+           ncols >= cfg.min_cols && src0->ne[0] % QK_K == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 && ggml_is_contiguous(src0);
 }
 
 static inline void ggml_sycl_int8_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {

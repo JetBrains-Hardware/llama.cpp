@@ -3287,7 +3287,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
         src0_reordered = src0_extra->optimized_feature.reorder;
     }
 #if GGML_SYCL_DNNL
-    // prompt batches of expanding q4_K / q6_K projections: int8 GEMM (int8-gemm.hpp)
+    // prompt batches of q4_K / q6_K projections: int8 GEMM (int8-gemm.hpp)
     const bool int8_gemm_ok = src0_reordered && row_diff == src0->ne[1] && g_ggml_sycl_enable_dnn &&
                               ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) && ggml_sycl_src1_f16_ok(dst) &&
                               ggml_prec_get_acc(dst) == GGML_PREC_UNDEFINED && ggml_sycl_int8_gemm_shape_ok(src0, src1, src1_ncols);
@@ -6872,6 +6872,12 @@ static bool ggml_sycl_glu_f16_only(ggml_backend_sycl_context & ctx, const ggml_c
     if (reader == nullptr) {
         return false;
     }
+#if GGML_SYCL_DNNL
+    // the int8 GEMM reads f32
+    if (ggml_sycl_int8_gemm_shape_ok(reader->src[0], node, node->ne[1])) {
+        return false;
+    }
+#endif
     queue_ptr stream = ctx.stream();
     auto & cache = ctx.src1_f16_cache;
     const size_t ne = (size_t) ggml_nelements(node);
