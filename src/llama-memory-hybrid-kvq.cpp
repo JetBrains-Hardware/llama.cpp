@@ -58,16 +58,34 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
     LLAMA_LOG_INFO("%s: tail: the attention cache is a ring of %u cells for %u positions\n", "llama_memory_hybrid_kvq", get_mem_attn()->get_size(), n_ctx_max);
 }
 
+static llama_seq_id kvq_batch_seq(const llama_batch_allocr & balloc, int32_t n_seq);
+
 llama_memory_context_ptr llama_memory_hybrid_kvq::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     std::vector<llama_ubatch> ubatches;
     slot_info_vec_t heads_attn;
 
+    // the pages of the chunks of the batch positions first: a full pool fails the batch like a full cache
+    llama_seq_id seq_pg  = 0;
+    int32_t      n_pg0   = 0;
+    if (fitter) {
+        seq_pg = kvq_batch_seq(balloc, store->n_seq());
+        n_pg0  = store->n_page_chunks(seq_pg);
+        const llama_pos p_end = balloc.seq_pos_max(seq_pg);
+        if (p_end >= 0 && !store->reserve(seq_pg, p_end + 1)) {
+            return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+    }
+
     // the slots of the whole batch are placed here, so the ring needs the room for all of it now
     if (fitter && !tail_wait(balloc)) {
+        store->release_from(seq_pg, n_pg0);
         return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
     if (!prepare_batch(balloc, n_ubatch, embd_all, ubatches, heads_attn)) {
+        if (fitter) {
+            store->release_from(seq_pg, n_pg0);
+        }
         return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
@@ -221,6 +239,8 @@ void llama_memory_hybrid_kvq::clear(bool data) {
             fitter->remove(s, 0);
             seqs[s].n_released = 0;
         }
+        // the sequences hold no rows: their pages go back to the pool
+        store->release_all();
         return;
     }
 
@@ -240,6 +260,10 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         const llama_pos q0      = std::max<llama_pos>(p0, 0);
         const llama_pos q1      = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
         if (q0 >= q1 || q0 > pos_max) {
+            // nothing to remove, the chunks after the positions have no rows: their pages (a failed batch) go back
+            if (q0 < q1) {
+                store->release_from(seq, (pos_max + 1 + store->n_chunk_rows() - 1)/store->n_chunk_rows());
+            }
             return llama_memory_hybrid::seq_rm(seq_id, p0, p1);
         }
         if (q1 <= pos_max) {
@@ -251,6 +275,8 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         // the rows before q0 that leave the coarse region stay in the host store, the next fit_wait fits them again
         fitter->remove(seq, q0);
         seqs[seq].n_released = std::min(seqs[seq].n_released, q0);
+        // the pages of the chunks without rows go back to the pool, the chunk that keeps rows stays
+        store->release_from(seq, (q0 + store->n_chunk_rows() - 1)/store->n_chunk_rows());
         return true;
     }
 
@@ -449,6 +475,10 @@ void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_
             throw std::runtime_error(format("the ring holds positions [%d, %d], expected the positions after the %d rows of the host store, below %u", p_min, p_max, h, n_ctx_max));
         }
 
+        // the pages of the rows of the state
+        if (!store->reserve(seq, h)) {
+            throw std::runtime_error("no pages for the rows of the state: the page pool of the two-tier cache is full");
+        }
         kvq_section_read(io, "store data",  [&]() { store->state_read_data(seq, io, n, h); });
         kvq_section_read(io, "fitter data", [&]() { fitter->state_read_data(seq, io); });
         seqs[seq].n_released = h;
@@ -538,7 +568,8 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         // the fitter works in the shared memory of the store
         const int32_t G      = (int32_t) model.hparams.n_head_kv(kv->get_layer_ids()[0]);
         const size_t  sh_min = llama_kvq_fitter::shared_min(G, llama_kvq_fitter::stage_rows(n_rows, fp), fp.bits_k, fp.bits_v);
-        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, llama_kvq_resident_slots(p), p.n_sink, p.layer_bufs, n_gate, sh_min);
+        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, llama_kvq_resident_slots(p), p.n_sink, p.layer_bufs, n_gate, sh_min,
+                p.host_prealloc, (size_t) std::max(0, p.host_max_mib)*1024*1024);
         store->set_backend(backends);
         if (!store->scratch_ok()) {
             throw std::runtime_error("the two-tier cache needs the scratch attention (pinned host memory, LLAMA_KVQ_SCRATCH not 0)");
@@ -657,6 +688,15 @@ bool llama_memory_kvq_get_counters(llama_memory_t mem, llama_kvq_counters_all & 
         return false;
     }
     kvq->get_store()->get_counters(out);
+    return true;
+}
+
+bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_memory_info & out) {
+    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(mem);
+    if (!kvq || !kvq->get_store()) {
+        return false;
+    }
+    out = kvq->get_store()->memory_info();
     return true;
 }
 

@@ -346,7 +346,7 @@ static int kvq_popcount(uint64_t x) {
 }
 
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-        int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min) :
+        int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min, bool host_prealloc, size_t host_max_bytes) :
     n_rows_(n_rows), n_crow(n_chunk_rows) {
     if (kv.get_n_stream() != 1) {
         throw std::runtime_error("packed two-tier mode needs a single KV stream");
@@ -377,6 +377,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     // one state per sequence of the memory (the page table, the boundaries, the resident set, the query sums)
     const int32_t n_sq = (int32_t) std::max<uint32_t>(1, kv.get_n_seq_max());
     seqs.resize(n_sq);
+    // every sequence can hold one partial page of its own besides the pages of the longest one
+    const int32_t n_pg = n_chunk + n_sq - 1;
 
     layers.resize(ids.size());
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -493,9 +495,9 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
 
     for (auto & l : layers) {
         layer_tensors & t = l.t;
-        t.kc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwk, n_crow, G, n_chunk);
-        t.vc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwv + 1, n_crow, G, n_chunk);
-        t.tab  = ggml_new_tensor_3d(ctx_codes.get(), GGML_TYPE_I8, TAB_SLOT, 2*G, n_chunk);
+        t.kc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwk, n_crow, G, n_pg);
+        t.vc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwv + 1, n_crow, G, n_pg);
+        t.tab  = ggml_new_tensor_3d(ctx_codes.get(), GGML_TYPE_I8, TAB_SLOT, 2*G, n_pg);
         t.rkv_h = bufs[l.buf].rkv_h;
         ggml_format_name(t.kc,    "kvq_kc-%d",    l.il);
         ggml_format_name(t.vc,    "kvq_vc-%d",    l.il);
@@ -552,15 +554,16 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         pl.vc_row    = layers[0].t.vc->nb[1];
         pl.tab_slot  = layers[0].t.tab->nb[1];
         GGML_ASSERT(pl.tab_slot == TAB_SLOT && TAB_SLOT % sizeof(float) == 0);
-        pages.reset(new llama_kvq_pool(buft_host, pl, n_chunk));
-        // the pool has the pages of one sequence for now: sequence 0 owns them, the identity
+        if (host_prealloc && host_max_bytes > 0) {
+            LLAMA_LOG_WARN("%s: --kvq-host-prealloc allocates every page at load, --kvq-host-max-mib is ignored\n", __func__);
+            host_max_bytes = 0;
+        }
+        pages.reset(new llama_kvq_pool(buft_host, pl, n_pg, host_prealloc, host_max_bytes));
+        // no sequence has a page yet: the device page tables are zero (buf_dev is cleared)
         for (auto & q : seqs) {
             q.page_tab.assign(n_chunk, -1);
+            q.n_page = 0;
         }
-        for (int32_t c = 0; c < n_chunk; ++c) {
-            seqs[0].page_tab[c] = c;
-        }
-        ggml_backend_tensor_set(seqs[0].pt, seqs[0].page_tab.data(), 0, ggml_nbytes(seqs[0].pt));
     }
     // set_rows has no q8_0 to q8_0 copy, so the scatter writes the rows of rkv as groups of 4 bytes (f32, half the threads of f16)
     for (size_t b = 0; b < bufs.size(); ++b) {
@@ -703,6 +706,13 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     LLAMA_LOG_INFO("%s: device: codes %.1f MiB, tables %.1f MiB (%s), resident %.1f MiB, ring %.1f MiB, scratch %.1f MiB (%s), other %.1f MiB; host: store %.1f MiB (%s), codes and tables %.1f MiB, ring %.1f MiB, other %.1f MiB\n", __func__,
             mi.codes/1048576.0, mi.tables/1048576.0, "freed in a prompt only with --kvq-prefill-free-codes", mi.resident/1048576.0, mi.ring/1048576.0, mi.scratch/1048576.0, scr_ok ? "used" : "not used", mi.other_dev/1048576.0,
             mi.host_store/1048576.0, mi.pinned ? "pinned" : "pageable", mi.host_codes/1048576.0, mi.host_ring/1048576.0, mi.host_other/1048576.0);
+    {
+        const size_t pb = pages->bytes(0);
+        LLAMA_LOG_INFO("%s: pool of %d pages (%d chunks + %d), device reserved for all of them: codes %.1f MiB + tables %.1f MiB; host: one page is %.1f MiB, %s%s\n", __func__,
+                pages->n_pages(), n_chunk, n_sq - 1, mi.codes/1048576.0, mi.tables/1048576.0, pb/1048576.0,
+                host_prealloc ? "all pages allocated at load" : "pages allocated on demand (--kvq-host-prealloc: at load)",
+                pages->max_host_bytes() > 0 ? format(", capped at %.1f MiB", pages->max_host_bytes()/1048576.0).c_str() : "");
+    }
 }
 
 llama_kvq_store::~llama_kvq_store() {
@@ -2117,12 +2127,104 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     mi.other_dev += ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
     mi.scratch    = scr ? ggml_nbytes(scr) : 0;
     mi.host_other += buf_pin ? ggml_backend_buffer_get_size(buf_pin.get()) : 0;
+    mi.pages       = pages->n_pages();
+    mi.pages_free  = pages->n_free();
     for (int32_t p = 0; p < pages->n_pages(); ++p) {
-        mi.host_store += pages->bytes_rows(p);
-        mi.host_codes += pages->bytes_codes(p);
+        if (pages->allocated(p)) {
+            mi.pages_host++;
+            mi.host_store += pages->bytes_rows(p);
+            mi.host_codes += pages->bytes_codes(p);
+        }
     }
+    const llama_kvq_pool::stats ps = pages->get_stats();
+    mi.n_page_wait = ps.n_wait;
+    mi.t_page_wait = ps.t_wait;
+    mi.n_page_alloc = ps.n_alloc;
+    mi.t_page_alloc = ps.t_alloc;
     mi.pinned = pages->pinned();
     return mi;
+}
+
+// the pages of the sequence for the chunks of the positions [0, n_pos), see the declaration
+bool llama_kvq_store::reserve(int32_t seq, int32_t n_pos) {
+    seq_state & q = seqs[seq];
+    if (n_pos <= 0) {
+        return true;
+    }
+    const int32_t n_c = (n_pos + n_crow - 1)/n_crow;
+    if (n_c > n_chunk) {
+        LLAMA_LOG_ERROR("%s: the kvq pool cannot hold %d positions of sequence %d (%d chunks of %d rows)\n", __func__, n_pos, seq, n_chunk, n_crow);
+        return false;
+    }
+    const int32_t add = n_c - q.n_page;
+    if (add <= 0) {
+        return true;
+    }
+    std::vector<int32_t> pg(add);
+    if (!pages->pick(add, pg.data())) {
+        LLAMA_LOG_ERROR("%s: the kvq page pool is full: sequence %d needs %d more pages (%d positions, pages of %d rows), %d of %d are free\n", __func__,
+                seq, add, n_pos, n_crow, pages->n_free(), pages->n_pages());
+        return false;
+    }
+    if (!pages->host_fits(pg.data(), add)) {
+        LLAMA_LOG_ERROR("%s: the kvq host memory cap is reached: sequence %d needs %d more pages of %.1f MiB, %.1f of %.1f MiB are allocated or queued (--kvq-host-max-mib)\n", __func__,
+                seq, add, pages->bytes(0)/1048576.0, pages->host_bytes()/1048576.0, pages->max_host_bytes()/1048576.0);
+        return false;
+    }
+    // the allocations run in the background thread, the pages are used after the wait (it is counted when it blocks)
+    for (int32_t p : pg) {
+        pages->queue(p);
+    }
+    for (int32_t p : pg) {
+        if (!pages->wait(p)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the host memory of page %d (%.1f MiB) of the kvq pool\n", __func__, p, pages->bytes(p)/1048576.0);
+            return false;
+        }
+    }
+    for (int32_t i = 0; i < add; ++i) {
+        pages->take(pg[i]);
+        q.page_tab[q.n_page + i] = pg[i];
+    }
+    q.n_page = n_c;
+    pt_up(seq);
+    // the next page of a sequence is allocated while this batch runs
+    pages->queue_ahead();
+    return true;
+}
+
+void llama_kvq_store::release_from(int32_t seq, int32_t c0) {
+    seq_state & q = seqs[seq];
+    c0 = std::max(c0, 0);
+    if (c0 >= q.n_page) {
+        return;
+    }
+    // queued graphs and phases may still read the pages and the page table
+    synchronize();
+    for (int32_t c = c0; c < q.n_page; ++c) {
+        pages->give(q.page_tab[c]);
+        q.page_tab[c] = -1;
+    }
+    q.n_page = c0;
+    pt_up(seq);
+}
+
+void llama_kvq_store::release_all() {
+    for (int32_t s = 0; s < n_seq(); ++s) {
+        release_from(s, 0);
+    }
+}
+
+void llama_kvq_store::pt_up(int32_t seq) {
+    seq_state & q = seqs[seq];
+    q.pt_h.resize(n_chunk);
+    for (int32_t c = 0; c < n_chunk; ++c) {
+        q.pt_h[c] = std::max(q.page_tab[c], 0);
+    }
+    if (backend_main) {
+        ggml_backend_tensor_set_async(backend_main, q.pt, q.pt_h.data(), 0, ggml_nbytes(q.pt));
+    } else {
+        ggml_backend_tensor_set(q.pt, q.pt_h.data(), 0, ggml_nbytes(q.pt));
+    }
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kvq_store::memory_breakdown() const {
@@ -2137,7 +2239,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kvq_store::memory_breakdown()
         res[ggml_backend_buffer_get_type(buf_codes.get())] += ggml_backend_buffer_get_size(buf_codes.get());
     }
     for (int32_t p = 0; p < pages->n_pages(); ++p) {
-        res[ggml_backend_buffer_get_type(pages->buffer(p).get())] += ggml_backend_buffer_get_size(pages->buffer(p).get());
+        if (pages->allocated(p)) {
+            res[ggml_backend_buffer_get_type(pages->buffer(p).get())] += ggml_backend_buffer_get_size(pages->buffer(p).get());
+        }
     }
     return res;
 }

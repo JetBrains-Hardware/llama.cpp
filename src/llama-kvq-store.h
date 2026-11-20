@@ -94,12 +94,16 @@ public:
 
     // the tensors hold n_rows coarse rows, table sets of n_chunk_rows rows (fit mode)
     // the region of every sequence starts empty and grows (set_n_coarse), the query statistics tensors of every sequence are allocated
-    // (kv.get_n_seq_max() sequences; only sequence 0 owns pages for now)
+    // (kv.get_n_seq_max() sequences)
+    // the pool has ceil(n_rows / n_chunk_rows) + n_seq_max - 1 pages, the device codes and tables of all of them are allocated here;
+    // a sequence takes the pages of its chunks when a batch needs them (reserve), the host memory of a page is allocated on demand
+    // (llama_kvq_pool); host_prealloc: all of it here; host_max_bytes: cap of the host memory of the pages, 0: none
     // n_gate > 0: also the gate statistics tensors, n_gate = n_head*D
     // layer_bufs: device buffers of the resident rows (llama_kvq_params::layer_bufs)
     // shared_min: the smallest shared memory (the fitter works in it, llama_kvq_fitter::shared_min)
     llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-            int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate = 0, size_t shared_min = 0);
+            int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate = 0, size_t shared_min = 0,
+            bool host_prealloc = false, size_t host_max_bytes = 0);
     ~llama_kvq_store();
 
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
@@ -243,6 +247,16 @@ public:
     ggml_tensor * get_pt(int32_t seq) const { return seqs[seq].pt; }
     int32_t page_of_chunk(int32_t seq, int32_t c) const { return seqs[seq].page_tab[c]; }
 
+    // the pages of the sequence: it holds one for each chunk [0, n_page_chunks(seq)) (the chunks of its rows), the free page with the lowest id
+    // reserve: the sequence takes the pages of the chunks of the positions [0, n_pos), waits for their host memory; false (one log line,
+    // nothing taken) if there are not enough free pages, the cap of the host memory is reached or a host allocation fails
+    // release_from: it gives back the pages of the chunks from c0 on; release_all: of every sequence (a chunk page whose rows are gone)
+    // both reset the kept sums of the page and upload the page table of the sequence when it changed (main stream, before the next graph)
+    bool    reserve(int32_t seq, int32_t n_pos);
+    void    release_from(int32_t seq, int32_t c0);
+    void    release_all();
+    int32_t n_page_chunks(int32_t seq) const { return seqs[seq].n_page; }
+
     // the sums of the sequence over the queries (qacc: f32 [D, D, G], q q^T over the query heads of each kv head; fit mode) and the
     // gates (gacc: f32 [n_gate], sigmoid(gate) over the tokens, nullptr without n_gate) of layer il
     ggml_tensor * get_qacc(int32_t seq, int32_t il) const { return seqs[seq].qacc[layer_of_il.at(il)]; }
@@ -293,7 +307,9 @@ private:
         int32_t st_ok    = 0; // decode thread: the host store holds the rows of the positions [n_host, st_ok)
         int32_t rg_ok    = 0; // decode thread: the host ring holds the rows of the positions [n_host, rg_ok)
         int32_t hc_hi    = 0; // the host copy holds the codes of the rows that a later upload needs before this
-        std::vector<int32_t> page_tab; // chunk -> page, -1: none
+        std::vector<int32_t> page_tab; // chunk -> page, -1: none; the chunks [0, n_page) have a page
+        int32_t              n_page = 0;
+        std::vector<int32_t> pt_h;     // the host copy of the page table that was uploaded last
         ggml_tensor *        pt = nullptr; // its device copy
         std::vector<ggml_tensor *> qacc;   // per layer: f32 [D, D, G], sum of q q^T over the query heads of each kv head (fit mode)
         std::vector<ggml_tensor *> gacc;   // per layer: f32 [n_gate], sum of sigmoid(gate) over the tokens (fit mode with n_gate > 0)
@@ -406,17 +422,22 @@ private:
     // host side of the rows, codes and tables of the chunk of a position, through its page in the page table of the sequence (layer index li)
     uint8_t * row_ptr(int32_t s, size_t li, int32_t g, int32_t pos) const {
         const int32_t pg = seqs[s].page_tab[pos/n_crow];
+        GGML_ASSERT(pg >= 0 && "kvq: a row of a chunk without a page");
         return pages->rows_ptr(pg, (int32_t) li) + ((size_t) g*pages->rows(pg) + pos%n_crow)*2*ROW;
     }
     uint8_t * hcode_ptr(int32_t s, size_t li, bool is_v, int32_t g, int32_t pos) const {
         const int32_t pg = seqs[s].page_tab[pos/n_crow];
+        GGML_ASSERT(pg >= 0 && "kvq: a row of a chunk without a page");
         const size_t  nb = (size_t) (is_v ? nwv + 1 : nwk)*sizeof(int32_t);
         return (is_v ? pages->vc_ptr(pg, (int32_t) li) : pages->kc_ptr(pg, (int32_t) li)) + ((size_t) g*pages->rows(pg) + pos%n_crow)*nb;
     }
     // slot m = 2*g + (V ? 1 : 0) of the tables of chunk c
     // (a slot: the inverse table, D*D bytes, then the aux floats, 3*D)
     static constexpr size_t TAB_SLOT = (size_t) D*D + (size_t) 3*D*sizeof(float);
-    uint8_t * htab_ptr (int32_t s, size_t li, int32_t c, int32_t m) const { return pages->tab_ptr(seqs[s].page_tab[c], (int32_t) li) + (size_t) m*TAB_SLOT; }
+    uint8_t * htab_ptr (int32_t s, size_t li, int32_t c, int32_t m) const {
+        GGML_ASSERT(seqs[s].page_tab[c] >= 0 && "kvq: the tables of a chunk without a page");
+        return pages->tab_ptr(seqs[s].page_tab[c], (int32_t) li) + (size_t) m*TAB_SLOT;
+    }
     uint8_t * htinv_ptr(int32_t s, size_t li, int32_t c, int32_t m) const { return htab_ptr(s, li, c, m); }
     uint8_t * htaux_ptr(int32_t s, size_t li, int32_t c, int32_t m) const { return htab_ptr(s, li, c, m) + (size_t) D*D; }
 
@@ -426,6 +447,9 @@ private:
 
     // the ubatch works on this sequence from now on: the queued work of another sequence is dropped first
     void use_seq(int32_t s);
+
+    // the page table of the sequence to the device (-1 as page 0, the op reads the chunks of the coarse region only)
+    void pt_up(int32_t seq);
 
     // rows per kv head of one request
     int64_t n_req(int64_t n_top, int64_t L) const;

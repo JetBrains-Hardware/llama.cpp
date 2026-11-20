@@ -847,6 +847,11 @@ struct server_slot {
                 fp.n_coarse, fp.n_chunk, fp.n_host, fp.n_drop, fp.failed, fp.n_fold, fp.t_fold, fp.n_settle, fp.t_settle,
                 ca.n_ubatch, ca.n_tokens, s.pf_fetch, s.bytes/1048576.0, 1e3*s.t_join/n_ub, 1e3*s.t_upload/n_ub);
         llama_memory_kvq_reset_counters(mem);
+        llama_kvq_memory_info mi;
+        if (llama_memory_kvq_get_memory_info(mem, mi)) {
+            SLT_INF(*this, "kvq: pool: %d of %d pages held, pinned host memory of %d pages = %.1f MiB (%d allocations in %.2f s, %d waits that blocked %.3f s)\n",
+                    mi.pages - mi.pages_free, mi.pages, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.n_page_alloc, mi.t_page_alloc, mi.n_page_wait, mi.t_page_wait);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -4872,6 +4877,11 @@ private:
                     llama_kvq_fit_progress fp;
                     llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), slot.id, fp);
                     SLT_INF(slot, "kvq: waited %.3f s for the fitter at the end of the prompt, coarse region %d rows\n", (ggml_time_us() - t_wait_start)*1e-6, fp.n_coarse);
+                    llama_kvq_memory_info mi;
+                    if (llama_memory_kvq_get_memory_info(llama_get_memory(ctx_tgt), mi)) {
+                        SLT_INF(slot, "kvq: pool: %d of %d pages held, pinned host memory of %d pages = %.1f MiB (%d allocations in %.2f s, %d waits that blocked %.3f s)\n",
+                                mi.pages - mi.pages_free, mi.pages, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.n_page_alloc, mi.t_page_alloc, mi.n_page_wait, mi.t_page_wait);
+                    }
                 }
 
                 if (slot.can_speculate()) {

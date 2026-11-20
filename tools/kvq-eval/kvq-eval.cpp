@@ -13,6 +13,7 @@
 //   --kvq-pf-n 1024, --kvq-cap 0 (max_batch x pf-n), --kvq-lead 2: the prefetch of the resident rows (llama_kvq_params)
 //   --kvq-scr-block N: the scratch attention of a large ubatch in key blocks of N rows, 0: one attention with a mask (llama_kvq_params::scr_block)
 //   --kvq-prefill-free-codes: free the device copy of the codes and tables during a prompt (llama_kvq_params::prefill_free_codes)
+//   --kvq-host-prealloc, --kvq-host-max-mib N: the pinned host memory of the pages of the pool at load, a cap of it (llama_kvq_params)
 //   the ring has max(batch, 4096) + 256 cells (--kvq-tail of the server), or --kvq-ring N cells
 //   --kvq-rem own|merge, --kvq-min-rows N: the rows after the last complete chunk (llama_kvq_rem)
 //   --kvq-rm-test: functional check of clear and seq_rm on the first chunk, no scoring
@@ -63,6 +64,8 @@ struct kvq_args {
     int32_t     pk_lead      = 2;
     int32_t     pk_scr_block = 16384;
     bool        pk_free_codes = false;
+    bool        pk_host_prealloc = false;
+    int32_t     pk_host_max_mib  = 0;
 
     bool        no_rot = false;
     bool        perf   = false;
@@ -124,6 +127,10 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.pk_scr_block = std::stoi(argv[++i]);
         } else if (a == "--kvq-prefill-free-codes") {
             args.pk_free_codes = true;
+        } else if (a == "--kvq-host-prealloc") {
+            args.pk_host_prealloc = true;
+        } else if (a == "--kvq-host-max-mib" && has_val) {
+            args.pk_host_max_mib = std::stoi(argv[++i]);
         } else if (a == "--kvq-no-rot") {
             args.no_rot = true;
         } else if (a == "--kvq-perf") {
@@ -431,7 +438,18 @@ static void kvq_print_scratch(llama_memory_t mem) {
             (long long) t.n_scr, t.scr_bytes/1073741824.0, t.t_scr);
 }
 
+static void kvq_print_pool(llama_memory_t mem) {
+    llama_kvq_memory_info mi;
+    if (!llama_memory_kvq_get_memory_info(mem, mi)) {
+        return;
+    }
+    LOG("kvq: pool: %d of %d pages held, host memory of %d pages: %.1f MiB (store %.1f + codes and tables %.1f, %s), %d allocations (%.2f s), %d waits that blocked (%.3f s)\n",
+            mi.pages - mi.pages_free, mi.pages, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.host_store/1048576.0, mi.host_codes/1048576.0,
+            mi.pinned ? "pinned" : "pageable", mi.n_page_alloc, mi.t_page_alloc, mi.n_page_wait, mi.t_page_wait);
+}
+
 static void kvq_print_progress(llama_memory_t mem) {
+    kvq_print_pool(mem);
     llama_kvq_fit_progress pr;
     if (!llama_memory_kvq_fit_get_progress(mem, 0, pr)) {
         return;
@@ -760,6 +778,8 @@ int main(int argc, char ** argv) {
         params.kvq.lead         = args.pk_lead;
         params.kvq.scr_block    = args.pk_scr_block;
         params.kvq.prefill_free_codes = args.pk_free_codes;
+        params.kvq.host_prealloc      = args.pk_host_prealloc;
+        params.kvq.host_max_mib       = args.pk_host_max_mib;
     }
     if (args.rm_test || args.rb_test) {
         // recurrent snapshots for a seq_rm into the last ubatch
