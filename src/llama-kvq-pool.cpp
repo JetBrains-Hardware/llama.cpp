@@ -4,7 +4,7 @@
 #include <stdexcept>
 
 llama_kvq_pool::llama_kvq_pool(ggml_backend_buffer_type_t buft_host, const layout & lay, int32_t n_pages) :
-    lay(lay), buft(buft_host), bufs(n_pages), base(n_pages, nullptr), offs(n_pages), nrow(n_pages) {
+    lay(lay), buft(buft_host), bufs(n_pages), base(n_pages, nullptr), offs(n_pages), nrow(n_pages), kept(n_pages) {
     if (lay.C <= 0 || n_pages <= 0 || (int64_t) n_pages*lay.C < lay.n_rows || (int64_t) (n_pages - 1)*lay.C >= lay.n_rows) {
         throw std::runtime_error("kvq pool: bad page layout");
     }

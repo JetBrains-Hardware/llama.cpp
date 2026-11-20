@@ -97,11 +97,11 @@ public:
 
     bool fit_enable(const llama_kvq_fit_params & fparams, const llama_kvq_params & params);
 
-    // fit mode, the decode thread before each ubatch of n_tokens tokens (see llama_kvq_fitter::poll)
-    void fit_poll(uint32_t n_tokens);
-    // the end of a prompt, see llama_memory_kvq_fit_wait
-    bool fit_wait();
-    bool fit_get_progress(llama_kvq_fit_progress & out) const;
+    // fit mode, the decode thread before each ubatch of n_tokens tokens of sequence seq (see llama_kvq_fitter::poll)
+    void fit_poll(llama_seq_id seq, uint32_t n_tokens);
+    // the end of a prompt of the sequence, see llama_memory_kvq_fit_wait
+    bool fit_wait(llama_seq_id seq);
+    bool fit_get_progress(llama_seq_id seq, llama_kvq_fit_progress & out) const;
     bool fit_set_hold(bool hold);
 
     // nullptr before fit_enable
@@ -129,32 +129,38 @@ private:
 
     const uint32_t n_ctx_max; // positions of the context
 
-    // tail: the positions [0, n_released) are not in the ring (their rows are in the host store)
-    llama_pos n_released = 0;
+    // the state of one sequence (one per sequence of the memory, sized in fit_enable)
+    struct seq_state {
+        // tail: the positions [0, n_released) are not in the ring (their rows are in the host store)
+        llama_pos n_released = 0;
 
-    int32_t n_tail_wait = 0;
-    double  t_tail_wait = 0.0;
-    int32_t n_fold      = 0;
-    double  t_fold      = 0.0;
-    int32_t n_settle    = 0;
-    double  t_settle    = 0.0;
+        int32_t n_tail_wait = 0;
+        double  t_tail_wait = 0.0;
+        int32_t n_fold      = 0;
+        double  t_fold      = 0.0;
+        int32_t n_settle    = 0;
+        double  t_settle    = 0.0;
+    };
+    std::vector<seq_state> seqs;
+
     int32_t fold_every  = 0; // LLAMA_KVQ_FOLD_EVERY (test knob): fold the reply rows when this many follow the coarse region
 
     // positions in the sequence: the ring, or the host store when the ring is empty
-    llama_pos n_pos() const;
+    llama_pos n_pos(llama_seq_id seq) const;
 
-    // tail: removes the rows of the host store from the ring
-    void tail_release();
+    // tail: removes the rows of the host store of the sequence from the ring
+    void tail_release(llama_seq_id seq);
 
-    // tail: host store rows [p_lo, p_hi) back into the ring, the host store ends at p_lo
-    bool tail_restore(llama_pos p_lo, llama_pos p_hi);
+    // tail: host store rows [p_lo, p_hi) of the sequence back into the ring, the host store ends at p_lo
+    bool tail_restore(llama_seq_id seq, llama_pos p_lo, llama_pos p_hi);
 
-    // the layout of the positions [0, n) (llama_kvq_fitter::settle), the rows after its coarse region in the ring
+    // the layout of the positions [0, n) of the sequence (llama_kvq_fitter::settle), the rows after its coarse region in the ring
     // end: the end of a prompt, the decode phase starts during the fit (see tg_cb)
-    bool settle(llama_pos n, bool end = false);
+    bool settle(llama_seq_id seq, llama_pos n, bool end = false);
 
     // tail: before the batch is placed: the room in the ring for its positions (large batches: the jobs of the complete chunks, then
     // a spill of the ring rows to the host store; small batches: the jobs in flight are added first, a fold at a position set by p0)
+    // the sequence is the one of the batch
     bool tail_wait(const llama_batch_allocr & balloc);
 
     // throws if the K/V state cannot be saved or loaded

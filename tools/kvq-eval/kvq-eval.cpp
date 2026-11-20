@@ -433,7 +433,7 @@ static void kvq_print_scratch(llama_memory_t mem) {
 
 static void kvq_print_progress(llama_memory_t mem) {
     llama_kvq_fit_progress pr;
-    if (!llama_memory_kvq_fit_get_progress(mem, pr)) {
+    if (!llama_memory_kvq_fit_get_progress(mem, 0, pr)) {
         return;
     }
     std::string tj;
@@ -497,7 +497,7 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
     };
     auto coarse = [&]() {
         llama_kvq_fit_progress pr;
-        llama_memory_kvq_fit_get_progress(mem, pr);
+        llama_memory_kvq_fit_get_progress(mem, 0, pr);
         return pr;
     };
     auto compare = [&](const std::vector<float> & a, const std::vector<float> & b, const char * what) {
@@ -534,11 +534,11 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
 
     // the end of the prompt fits the rows after the first chunk, a small batch after it
     const int32_t a = C + 497;
-    if (!kvq_prefill(ctx, ids, a, n_batch) || !llama_memory_kvq_fit_wait(mem)) {
+    if (!kvq_prefill(ctx, ids, a, n_batch) || !llama_memory_kvq_fit_wait(mem, 0)) {
         return false;
     }
     check(coarse().n_coarse == layout_end(a) && coarse().n_running == 0, "the end of the prompt fits up to the layout end");
-    if (!kvq_decode_last(ctx, ids, a, a + 4, n_vocab, la) || !llama_memory_kvq_fit_wait(mem)) {
+    if (!kvq_decode_last(ctx, ids, a, a + 4, n_vocab, la) || !llama_memory_kvq_fit_wait(mem, 0)) {
         return false;
     }
     check(coarse().n_coarse == layout_end(a + 4), "the next end of the prompt fits the 4 new rows too");
@@ -551,7 +551,7 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
         return false;
     }
     compare(la, lb, "logits at a + 3 before (packed) and after the removal (scratch)");
-    if (!llama_memory_kvq_fit_wait(mem)) {
+    if (!llama_memory_kvq_fit_wait(mem, 0)) {
         return false;
     }
     check(coarse().n_coarse == layout_end(a + 4) && coarse().n_host == std::max(layout_end(a + 4), C), "the end of the prompt fits them again");
@@ -583,7 +583,7 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
     check(coarse().n_coarse == 0 && coarse().n_host == 0 && llama_memory_seq_pos_max(mem, 0) == -1, "the memory is empty, no coarse rows");
 
     // a few rows after the chunk: own with fewer than min_rows stays precise in the ring
-    if (!kvq_prefill(ctx, ids, C + 8, n_batch) || !llama_memory_kvq_fit_wait(mem)) {
+    if (!kvq_prefill(ctx, ids, C + 8, n_batch) || !llama_memory_kvq_fit_wait(mem, 0)) {
         return false;
     }
     check(coarse().n_coarse == layout_end(C + 8) && !coarse().failed, "a new prefill fits up to the layout end again");
@@ -593,7 +593,7 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
     }
 
     // the complete chunk and a group or own chunk after it: across the chunk boundary
-    if (!kvq_prefill(ctx, ids, C + 1000, n_batch, C + 12) || !llama_memory_kvq_fit_wait(mem)) {
+    if (!kvq_prefill(ctx, ids, C + 1000, n_batch, C + 12) || !llama_memory_kvq_fit_wait(mem, 0)) {
         return false;
     }
     check(coarse().n_coarse == layout_end(C + 1000), "the end of the prompt fits up to the layout end");
@@ -603,7 +603,7 @@ static bool kvq_rm_test(llama_context * ctx, const std::vector<llama_token> & id
 
     // the geometry of the earlier version of this test: the first chunk coarse, 2 positions in the ring, a ring removal after them
     check(llama_memory_seq_rm(mem, 0, -1, -1), "seq_rm(0, -1, -1) succeeds");
-    if (!kvq_prefill(ctx, ids, C - 2, n_batch) || !kvq_decode_last(ctx, ids, C - 2, C + 2, n_vocab, lc) || !llama_memory_kvq_fit_wait(mem)) {
+    if (!kvq_prefill(ctx, ids, C - 2, n_batch) || !kvq_decode_last(ctx, ids, C - 2, C + 2, n_vocab, lc) || !llama_memory_kvq_fit_wait(mem, 0)) {
         return false;
     }
     check(coarse().n_coarse == layout_end(C + 2), "the end of the prompt fits up to the layout end");
@@ -627,7 +627,7 @@ static bool kvq_rb_test(llama_context * ctx, const std::vector<llama_token> & id
     if ((int32_t) ids.size() < b + 8) {
         return false;
     }
-    auto wait = [&]() { return !lib || llama_memory_kvq_fit_wait(mem); };
+    auto wait = [&]() { return !lib || llama_memory_kvq_fit_wait(mem, 0); };
     for (int prior = 0; prior < 2; ++prior) {
         std::vector<float> la, lb, lx;
         llama_memory_clear(mem, true);
@@ -680,12 +680,12 @@ static bool kvq_turns(llama_context * ctx, const std::vector<llama_token> & ids,
             return false;
         }
         const int64_t t1 = ggml_time_us();
-        if (lib && !llama_memory_kvq_fit_wait(mem)) {
+        if (lib && !llama_memory_kvq_fit_wait(mem, 0)) {
             return false;
         }
         const int64_t t2 = ggml_time_us();
         llama_kvq_fit_progress pr;
-        llama_memory_kvq_fit_get_progress(mem, pr);
+        llama_memory_kvq_fit_get_progress(mem, 0, pr);
         LOG("kvq: turn %zu: prefill [%d, %d) %.2f s, end-of-prompt fit %.3f s, coarse rows %d, host rows %d\n",
                 t, p, s_t, (t1 - t0)*1e-6, (t2 - t1)*1e-6, pr.n_coarse, pr.n_host);
         p = s_t;
@@ -848,7 +848,7 @@ int main(int argc, char ** argv) {
             LOG("kvq: state: refused %s, the memory is empty\n", f.c_str());
         }
         const int32_t n_chk = std::min<int32_t>(2048, s);
-        if (!kvq_prefill(ctx, ids, n_chk, params.n_batch) || (args.lib() && !llama_memory_kvq_fit_wait(llama_get_memory(ctx)))) {
+        if (!kvq_prefill(ctx, ids, n_chk, params.n_batch) || (args.lib() && !llama_memory_kvq_fit_wait(llama_get_memory(ctx), 0))) {
             LOG_ERR("%s: the prefill after the refused loads failed\n", __func__);
             return 1;
         }
@@ -918,7 +918,7 @@ int main(int argc, char ** argv) {
 
     if (args.lib()) {
         const int64_t t0 = ggml_time_us();
-        if (!llama_memory_kvq_fit_wait(llama_get_memory(ctx))) {
+        if (!llama_memory_kvq_fit_wait(llama_get_memory(ctx), 0)) {
             return 1;
         }
         LOG_INF("%s: waited %.2f s for the fitter\n", __func__, (ggml_time_us() - t0)/1e6);
@@ -956,7 +956,7 @@ int main(int argc, char ** argv) {
         if (args.lib()) {
             kvq_print_progress(mem);
         }
-        if (!kvq_prefill(ctx, ids, s, params.n_batch, ckpt) || (args.lib() && !llama_memory_kvq_fit_wait(mem))) {
+        if (!kvq_prefill(ctx, ids, s, params.n_batch, ckpt) || (args.lib() && !llama_memory_kvq_fit_wait(mem, 0))) {
             return 1;
         }
         LOG("kvq: state: rolled back to position %d and processed the prefix again\n", ckpt);
@@ -1030,7 +1030,7 @@ int main(int argc, char ** argv) {
         return true;
     }, [&]() {
         llama_kvq_fit_progress pr;
-        if (args.lib() && llama_memory_kvq_fit_get_progress(llama_get_memory(ctx), pr)) {
+        if (args.lib() && llama_memory_kvq_fit_get_progress(llama_get_memory(ctx), 0, pr)) {
             busy   = pr.n_running > 0;
             coarse = pr.n_coarse;
         }

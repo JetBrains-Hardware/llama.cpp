@@ -23,6 +23,7 @@ static double kvq_fit_now() {
 
 // task i = kv*n_pair + layer index*G + kv head, kv = 0 for K, 1 for V; the host arrays are per task
 struct llama_kvq_fitter::job {
+    int32_t seq = 0; // the sequence of the rows
     int32_t r0 = 0; // rows [r0, r1), the table set of the chunk slots r0/C .. (r1 - 1)/C
     int32_t r1 = 0;
 
@@ -87,7 +88,10 @@ llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_
         }
     }
     n_stage = stage_rows(store.n_rows(), fparams);
-    slot_fit.assign(n_chk, range());
+    std::vector<seq_fit>(store.n_seq()).swap(seqs);
+    for (auto & q : seqs) {
+        q.slot_fit.assign(n_chk, range());
+    }
 
     n_rep = n_head/G;
     if (n_rep < 1 || n_rep*G != n_head || wo.size() != layer_ids.size()) {
@@ -95,7 +99,7 @@ llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_
     }
     for (size_t li = 0; li < layer_ids.size(); ++li) {
         const ggml_tensor * w  = wo[li];
-        const ggml_tensor * ga = store.get_layer(layer_ids[li]).gacc;
+        const ggml_tensor * ga = store.get_gacc(0, layer_ids[li]);
         if (w == nullptr || ga == nullptr || ggml_n_dims(w) != 2 || w->ne[0] != (int64_t) n_head*KVQ_D || ga->ne[0] != w->ne[0] ||
                 (w->type != GGML_TYPE_F32 && ggml_get_type_traits(w->type)->to_float == nullptr) ||
                 (n_rep*KVQ_D) % ggml_blck_size(w->type) != 0) {
@@ -135,8 +139,10 @@ llama_kvq_fitter::~llama_kvq_fitter() {
     cv_work.notify_all();
     waiter.join();
     // queued graphs use the buffers; the backend may be freed already, the events are not
-    for (auto & jb : jobs) {
-        ggml_backend_event_synchronize(jb->ev.get());
+    for (auto & q : seqs) {
+        for (auto & jb : q.jobs) {
+            ggml_backend_event_synchronize(jb->ev.get());
+        }
     }
 }
 
@@ -361,10 +367,12 @@ void llama_kvq_fitter::loop() {
             if (stop) {
                 return true;
             }
-            for (auto & j : jobs) {
-                if (!j->done) {
-                    jb = j.get();
-                    return true;
+            for (auto & q : seqs) {
+                for (auto & j : q.jobs) {
+                    if (!j->done) {
+                        jb = j.get();
+                        return true;
+                    }
                 }
             }
             return false;
@@ -616,7 +624,7 @@ ggml_cgraph * llama_kvq_fitter::build_codes(const job & jb, int32_t li, int32_t 
         const int32_t C = store.n_chunk_rows();
         store.chunk_runs(jb.r0, jb.r1, [&](int32_t p, int32_t m) {
             ggml_tensor * rv = ggml_view_3d(ctx, rows, rows->ne[0], m, G, rows->nb[1], rows->nb[2],
-                    (size_t) store.page_of_chunk(p/C)*rows->nb[3] + (size_t) (p % C)*rows->nb[1]);
+                    (size_t) store.page_of_chunk(jb.seq, p/C)*rows->nb[3] + (size_t) (p % C)*rows->nb[1]);
             ggml_tensor * yv = m == n ? y : ggml_view_3d(ctx, y, y->ne[0], m, G, y->nb[1], y->nb[2], (size_t) (p - jb.r0)*y->nb[1]);
             ggml_build_forward_expand(gf, ggml_kvq_fit(ctx, GGML_KVQ_FIT_CODE, yv, p4, rv));
         });
@@ -625,14 +633,14 @@ ggml_cgraph * llama_kvq_fitter::build_codes(const job & jb, int32_t li, int32_t 
 }
 
 // host store rows [r0, r1) of layer il -> stage rows [0, r1 - r0), one copy per kv head (the same layout), main stream
-void llama_kvq_fitter::upload_rows(int32_t il, int32_t r0, int32_t r1) {
+void llama_kvq_fitter::upload_rows(int32_t seq, int32_t il, int32_t r0, int32_t r1) {
     if (r1 <= r0) {
         return;
     }
     const int64_t G = store.n_head_kv();
     for (int64_t g = 0; g < G; ++g) {
         store.chunk_runs(r0, r1, [&](int32_t p, int32_t n) {
-            ggml_backend_tensor_set_async(store.backend(), stage, store.host_row(il, g, p), g*stage->nb[3] + (size_t) (p - r0)*2*KVQ_ROW, (size_t) n*2*KVQ_ROW);
+            ggml_backend_tensor_set_async(store.backend(), stage, store.host_row(seq, il, g, p), g*stage->nb[3] + (size_t) (p - r0)*2*KVQ_ROW, (size_t) n*2*KVQ_ROW);
         });
     }
 }
@@ -651,7 +659,7 @@ void llama_kvq_fitter::queue_job(job & jb) {
     for (int32_t g0 = 0; g0 < n_layer; g0 += n_grp) {
         const int32_t n_lay = std::min(n_grp, n_layer - g0);
         for (int32_t j = 0; j < n_lay; ++j) {
-            upload_rows(layer_ids[g0 + j], jb.r0, jb.r1);
+            upload_rows(jb.seq, layer_ids[g0 + j], jb.r0, jb.r1);
             ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
             ggml_context_ptr ctx(ggml_init(gp));
             compute(build_moments(jb, j, n_lay, ctx.get()), "the moments");
@@ -679,7 +687,7 @@ void llama_kvq_fitter::queue_job(job & jb) {
         for (int32_t j = 0; j < n_lay; ++j) {
             const int32_t li = g0 + j;
             const int32_t il = layer_ids[li];
-            upload_rows(il, jb.r0, jb.r1);
+            upload_rows(jb.seq, il, jb.r0, jb.r1);
             ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
             ggml_context_ptr ctx(ggml_init(gp));
             ggml_cgraph * gf = build_codes(jb, li, j, n_lay, ctx.get());
@@ -699,46 +707,57 @@ void llama_kvq_fitter::queue_job(job & jb) {
                 for (int64_t g = 0; g < G; ++g) {
                     store.chunk_runs(jb.r0, jb.r1, [&](int32_t p, int32_t n) {
                         const int32_t C   = store.n_chunk_rows();
-                        const size_t  off = dev ? (size_t) store.page_of_chunk(p/C)*src->nb[3] + g*src->nb[2] + (size_t) (p % C)*rows->nb[1]
+                        const size_t  off = dev ? (size_t) store.page_of_chunk(jb.seq, p/C)*src->nb[3] + g*src->nb[2] + (size_t) (p % C)*rows->nb[1]
                                                 : g*src->nb[2] + (size_t) (p - jb.r0)*rows->nb[1];
-                        ggml_backend_tensor_get_async(backend, src, store.host_codes(il, kv == 1, g, p), off, (size_t) n*rows->nb[1]);
+                        ggml_backend_tensor_get_async(backend, src, store.host_codes(jb.seq, il, kv == 1, g, p), off, (size_t) n*rows->nb[1]);
                     });
                 }
             }
         }
     }
-    store.codes_written(jb.r1);
+    store.codes_written(jb.seq, jb.r1);
     ggml_backend_event_record(jb.ev.get(), backend);
 }
 
 // decode thread: the sums of the open chunk on the device, without a reset
-void llama_kvq_fitter::read_acc(std::vector<float> & gram, std::vector<float> & gsum) {
+void llama_kvq_fitter::read_acc(int32_t seq, std::vector<float> & gram, std::vector<float> & gsum) {
     const size_t nn = (size_t) KVQ_D*KVQ_D*store.n_head_kv();
     gram.resize(nn*layer_ids.size());
     gsum.resize((size_t) n_head*KVQ_D*layer_ids.size());
     store.synchronize();
     for (size_t li = 0; li < layer_ids.size(); ++li) {
-        ggml_tensor * acc = store.get_layer(layer_ids[li]).qacc;
+        ggml_tensor * acc = store.get_qacc(seq, layer_ids[li]);
         ggml_backend_tensor_get(acc, gram.data() + li*nn, 0, ggml_nbytes(acc));
-        ggml_tensor * gacc = store.get_layer(layer_ids[li]).gacc;
+        ggml_tensor * gacc = store.get_gacc(seq, layer_ids[li]);
         ggml_backend_tensor_get(gacc, gsum.data() + li*gacc->ne[0], 0, ggml_nbytes(gacc));
     }
 }
 
 // decode thread, n_pos positions in the sequence: the statistics of the complete chunks, the sums of the ubatches of a chunk
 // are computed when it is complete, then they start again from 0 (a ubatch counts for the chunk of its first position)
-void llama_kvq_fitter::snapshots(llama_pos n_pos) {
+void llama_kvq_fitter::snapshots(int32_t seq, llama_pos n_pos) {
+    seq_fit & sq = seqs[seq];
     const int32_t C = store.n_chunk_rows();
-    while (!failed && (int64_t) (n_snap + 1)*C <= store.n_rows() && n_pos >= (n_snap + 1)*C) {
+    while (!sq.failed && (int64_t) (sq.n_snap + 1)*C <= store.n_rows() && n_pos >= (sq.n_snap + 1)*C) {
         std::vector<float> gram;
         std::vector<float> gsum;
-        read_acc(gram, gsum);
-        set_stats(nullptr, nullptr);
-        acc_pos = -1;
-        grams.push_back(std::move(gram));
-        gsums.push_back(std::move(gsum));
-        t_snaps.push_back(kvq_fit_now());
-        n_snap++;
+        read_acc(seq, gram, gsum);
+        set_stats(seq, nullptr, nullptr);
+        sq.acc_pos = -1;
+        // the sums of the chunk go into its page
+        llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(store.page_of_chunk(seq, sq.n_snap));
+        ks.gram   = std::move(gram);
+        ks.gsum   = std::move(gsum);
+        ks.t_snap = kvq_fit_now();
+        sq.n_snap++;
+    }
+}
+
+// the kept sums of the chunks [c0, n_snap) of the sequence are dropped (n_snap is set by the caller)
+void llama_kvq_fitter::drop_sums(int32_t seq, int32_t c0) {
+    for (int32_t c = c0; c < seqs[seq].n_snap; ++c) {
+        llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(store.page_of_chunk(seq, c));
+        ks = llama_kvq_pool::sums();
     }
 }
 
@@ -765,30 +784,31 @@ std::vector<llama_kvq_fitter::range> llama_kvq_fitter::layout(llama_pos n) const
     return res;
 }
 
-bool llama_kvq_fitter::fitted(const range & r) const {
+bool llama_kvq_fitter::fitted(int32_t seq, const range & r) const {
     const int32_t C = store.n_chunk_rows();
-    return r.r1 <= store.n_coarse() && slot_fit[r.r0/C] == r;
+    return r.r1 <= store.n_coarse(seq) && seqs[seq].slot_fit[r.r0/C] == r;
 }
 
-bool llama_kvq_fitter::in_flight(const range & r) const {
+bool llama_kvq_fitter::in_flight(int32_t seq, const range & r) const {
     std::lock_guard<std::mutex> lk(m);
+    const auto & jobs = seqs[seq].jobs;
     return std::any_of(jobs.begin(), jobs.end(), [&](const std::unique_ptr<job> & jb) { return jb->r0 == r.r0 && jb->r1 == r.r1; });
 }
 
-// the ring cells of the positions [p0, p1) hold them, for sequence 0 only
-bool llama_kvq_fitter::check_ring(const llama_kv_cache & kv, int32_t p0, int32_t p1) {
+// the ring cells of the positions [p0, p1) hold them, for the sequence only
+bool llama_kvq_fitter::check_ring(int32_t seq, const llama_kv_cache & kv, int32_t p0, int32_t p1) {
     const auto & cells = kv.get_cells(0);
     const int64_t size = cells.size();
     if (p1 - p0 > size) {
         LLAMA_LOG_ERROR("%s: the positions [%d, %d) are not in the ring of %lld cells, the fit of the coarse region stops\n", __func__, p0, p1, (long long) size);
-        failed = true;
+        seqs[seq].failed = true;
         return false;
     }
     for (int64_t p = p0; p < p1; ++p) {
         const int64_t j = p % size;
-        if (cells.is_empty(j) || cells.pos_get(j) != p || !cells.seq_has(j, 0) || cells.seq_count(j) != 1) {
-            LLAMA_LOG_ERROR("%s: cell %lld does not hold position %lld of sequence 0 only, the fit of the coarse region stops\n", __func__, (long long) j, (long long) p);
-            failed = true;
+        if (cells.is_empty(j) || cells.pos_get(j) != p || !cells.seq_has(j, seq) || cells.seq_count(j) != 1) {
+            LLAMA_LOG_ERROR("%s: cell %lld does not hold position %lld of sequence %d only, the fit of the coarse region stops\n", __func__, (long long) j, (long long) p, seq);
+            seqs[seq].failed = true;
             return false;
         }
     }
@@ -797,12 +817,14 @@ bool llama_kvq_fitter::check_ring(const llama_kv_cache & kv, int32_t p0, int32_t
 
 // decode thread: a new job for the rows of r with their statistics, phase 1 and the fit tasks
 // the ring rows go to the host store, so n_host covers r afterwards
-bool llama_kvq_fitter::take(const range & r) {
+bool llama_kvq_fitter::take(int32_t seq, const range & r) {
+    seq_fit & sq = seqs[seq];
     const int32_t C  = store.n_chunk_rows();
     const int32_t G  = store.n_head_kv();
     GGML_ASSERT(r.r0 % C == 0 && r.r1 > r.r0 && r.r1 - r.r0 <= n_stage);
 
     auto jb = std::make_unique<job>();
+    jb->seq    = seq;
     jb->r0     = r.r0;
     jb->r1     = r.r1;
     jb->t_take = kvq_fit_now();
@@ -816,16 +838,17 @@ bool llama_kvq_fitter::take(const range & r) {
         std::vector<float> gram;
         std::vector<float> gsum;
         if ((k + 1)*C <= r.r1) {
-            GGML_ASSERT(k < n_snap);
-            gram = grams[k];
-            gsum = gsums[k];
-            jb->t_snap = t_snaps[k];
+            GGML_ASSERT(k < sq.n_snap);
+            const llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(store.page_of_chunk(seq, k));
+            gram = ks.gram;
+            gsum = ks.gsum;
+            jb->t_snap = ks.t_snap;
         } else {
-            GGML_ASSERT(k == n_snap);
-            read_acc(gram, gsum);
-            acc_pos  = r.r1;
-            acc_gram = gram;
-            acc_gsum = gsum;
+            GGML_ASSERT(k == sq.n_snap);
+            read_acc(seq, gram, gsum);
+            sq.acc_pos  = r.r1;
+            sq.acc_gram = gram;
+            sq.acc_gsum = gsum;
         }
         if (jb->gram.empty()) {
             jb->gram = std::move(gram);
@@ -851,7 +874,7 @@ bool llama_kvq_fitter::take(const range & r) {
         jb->buf.reset(b != nullptr ? b : ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), n_b));
         if (!jb->buf) {
             LLAMA_LOG_ERROR("%s: failed to allocate %.1f MiB for a job, the fit of the coarse region stops\n", __func__, n_b/1048576.0);
-            failed = true;
+            sq.failed = true;
             return false;
         }
     }
@@ -863,72 +886,73 @@ bool llama_kvq_fitter::take(const range & r) {
     jb->ev.reset(ggml_backend_event_new(store.device()));
     if (!jb->ev) {
         LLAMA_LOG_ERROR("%s: failed to create an event, the fit of the coarse region stops\n", __func__);
-        failed = true;
+        sq.failed = true;
         return false;
     }
 
     host_metrics(*jb);
     queue_job(*jb);
-    store.set_n_host(std::max(store.n_host(), r.r1));
+    store.set_n_host(seq, std::max(store.n_host(seq), r.r1));
 
     {
         std::lock_guard<std::mutex> lk(m);
-        jobs.push_back(std::move(jb));
+        sq.jobs.push_back(std::move(jb));
     }
     cv_work.notify_all();
     return true;
 }
 
-void llama_kvq_fitter::spill(const llama_kv_cache & kv, llama_pos p) {
-    const int32_t h0 = store.n_host();
-    if (failed || p <= h0) {
+void llama_kvq_fitter::spill(int32_t seq, const llama_kv_cache & kv, llama_pos p) {
+    const int32_t h0 = store.n_host(seq);
+    if (seqs[seq].failed || p <= h0) {
         return;
     }
-    if (!check_ring(kv, h0, p)) {
+    if (!check_ring(seq, kv, h0, p)) {
         return;
     }
     // the host ring: the host store has the rows of the ring (llama_kvq_store::sync_store)
-    store.set_n_host(p);
-    n_spill++;
+    store.set_n_host(seq, p);
+    seqs[seq].n_spill++;
     LLAMA_LOG_INFO("%s: ring rows of the positions [%d, %d) to the host store\n", __func__, h0, (int) p);
 }
 
 // decode thread: the finished jobs at the front join the coarse region, all: also when hold
 // the tables are queued on the main stream; the wait for them (set_n_coarse or synchronize) comes before the host buffer is reused
-void llama_kvq_fitter::install(bool all) {
+void llama_kvq_fitter::install(int32_t seq, bool all) {
     if (hold && !all) {
         return;
     }
+    seq_fit & sq = seqs[seq];
     const int32_t G = store.n_head_kv();
     const int32_t C = store.n_chunk_rows();
-    while (!failed) {
+    while (!sq.failed) {
         std::unique_ptr<job> jb;
         {
             std::lock_guard<std::mutex> lk(m);
-            if (jobs.empty() || !jobs.front()->done) {
+            if (sq.jobs.empty() || !sq.jobs.front()->done) {
                 return;
             }
-            jb = std::move(jobs.front());
-            jobs.pop_front();
+            jb = std::move(sq.jobs.front());
+            sq.jobs.pop_front();
         }
-        GGML_ASSERT(jb->r0 <= store.n_coarse());
+        GGML_ASSERT(jb->r0 <= store.n_coarse(seq));
 
         // the result row of each table (ggml_kvq_fit_table): status, ridge of the metric
         int n_ridge = 0;
-        for (size_t li = 0; li < layer_ids.size() && !failed; ++li) {
+        for (size_t li = 0; li < layer_ids.size() && !sq.failed; ++li) {
             for (int32_t t = 0; t < 2*G; ++t) {
                 const float * res = jb->hres + (li*2*G + t)*KVQ_D;
                 if (res[1] != 0.0f) {
                     LLAMA_LOG_ERROR("%s: rows [%d, %d): the %s fit of layer %d, kv head %d failed (%s), the coarse region stays at %d rows\n", __func__,
                             jb->r0, jb->r1, t < G ? "K" : "V", layer_ids[li], t % G, res[1] == 1.0f ? "metric not positive definite" : "eigen solver",
-                            store.n_coarse());
-                    failed = true;
+                            store.n_coarse(seq));
+                    sq.failed = true;
                     break;
                 }
                 n_ridge += res[2] > 1e-6f ? 1 : 0;
             }
         }
-        if (failed) {
+        if (sq.failed) {
             store.synchronize();
             release(*jb);
             return;
@@ -943,98 +967,103 @@ void llama_kvq_fitter::install(bool all) {
                 for (int32_t g = 0; g < G; ++g) {
                     for (int kv = 0; kv < 2; ++kv) {
                         const size_t i = kv*n_pair() + li*G + g;
-                        store.set_chunk_table(layer_ids[li], g, kv == 1, t, jb->htinv + i*KVQ_D*KVQ_D, jb->htaux + i*3*KVQ_D, true);
+                        store.set_chunk_table(seq, layer_ids[li], g, kv == 1, t, jb->htinv + i*KVQ_D*KVQ_D, jb->htaux + i*3*KVQ_D, true);
                     }
                 }
             }
-            slot_fit[t] = { jb->r0, jb->r1 };
+            sq.slot_fit[t] = { jb->r0, jb->r1 };
         }
-        const int32_t n0 = store.n_coarse();
+        const int32_t n0 = store.n_coarse(seq);
         if (jb->r1 > n0) {
-            store.set_n_coarse(jb->r1);
+            store.set_n_coarse(seq, jb->r1);
         } else {
             store.synchronize();
         }
 
         const double t1 = kvq_fit_now();
-        t_job.push_back(t1 - jb->t_take);
-        t_wall.push_back(t1 - jb->t_snap);
+        sq.t_job.push_back(t1 - jb->t_take);
+        sq.t_wall.push_back(t1 - jb->t_snap);
         LLAMA_LOG_INFO("%s: rows [%d, %d) fitted (coarse region %d rows), job %.3f s, %.2f s since the statistics\n", __func__,
-                jb->r0, jb->r1, store.n_coarse(), t1 - jb->t_take, t1 - jb->t_snap);
+                jb->r0, jb->r1, store.n_coarse(seq), t1 - jb->t_take, t1 - jb->t_snap);
         release(*jb);
     }
 }
 
-void llama_kvq_fitter::poll(const llama_kv_cache & kv, llama_pos n_pos, bool large) {
+void llama_kvq_fitter::poll(int32_t seq, const llama_kv_cache & kv, llama_pos n_pos, bool large) {
+    seq_fit & sq = seqs[seq];
     const int32_t C  = store.n_chunk_rows();
     const double  t0 = kvq_fit_now();
-    const int32_t s0 = n_snap;
-    snapshots(n_pos);
-    bool took = n_snap != s0;
+    const int32_t s0 = sq.n_snap;
+    snapshots(seq, n_pos);
+    bool took = sq.n_snap != s0;
     // the complete chunks, in order; also a chunk whose tables came from a group or a shorter fit
     // merge: a chunk is fitted alone once the next one is complete too, before that it is the head of the group
     const int32_t lag = fparams.rem == LLAMA_KVQ_REM_MERGE ? 1 : 0;
-    for (int32_t k = 0; large && !failed && k + lag < n_snap; ++k) {
+    for (int32_t k = 0; large && !sq.failed && k + lag < sq.n_snap; ++k) {
         const range r = { k*C, (k + 1)*C };
-        if (!fitted(r) && !in_flight(r)) {
-            took = take(r) || took;
+        if (!fitted(seq, r) && !in_flight(seq, r)) {
+            took = take(seq, r) || took;
         }
     }
     const double t1 = kvq_fit_now();
     if (took) {
-        t_take += t1 - t0;
+        sq.t_take += t1 - t0;
     }
-    if (!failed && !jobs_empty()) {
-        install(false);
-        t_install += kvq_fit_now() - t1;
+    if (!sq.failed && !jobs_empty(seq)) {
+        install(seq, false);
+        sq.t_install += kvq_fit_now() - t1;
     }
 }
 
-bool llama_kvq_fitter::jobs_empty() const {
+bool llama_kvq_fitter::jobs_empty(int32_t seq) const {
     std::lock_guard<std::mutex> lk(m);
-    return jobs.empty();
+    return seqs[seq].jobs.empty();
 }
 
-void llama_kvq_fitter::wait_jobs() {
+void llama_kvq_fitter::wait_jobs(int32_t seq) {
+    const seq_fit & sq = seqs[seq];
     while (true) {
-        install(true);
+        install(seq, true);
         std::unique_lock<std::mutex> lk(m);
-        if (failed || jobs.empty()) {
+        if (sq.failed || sq.jobs.empty()) {
             return;
         }
-        cv_done.wait(lk, [&]() { return jobs.front()->done; });
+        cv_done.wait(lk, [&]() { return sq.jobs.front()->done; });
     }
 }
 
-llama_pos llama_kvq_fitter::settle(const llama_kv_cache & kv, llama_pos n, const std::function<void(llama_pos)> & queued) {
-    snapshots(n);
+llama_pos llama_kvq_fitter::settle(int32_t seq, const llama_kv_cache & kv, llama_pos n, const std::function<void(llama_pos)> & queued) {
+    seq_fit & sq = seqs[seq];
+    snapshots(seq, n);
     const std::vector<range> lay = layout(n);
     const llama_pos e = lay.empty() ? 0 : lay.back().r1;
-    if (failed) {
-        return store.n_coarse();
+    if (sq.failed) {
+        return store.n_coarse(seq);
     }
 
     // e.g. merge: the job of the last complete chunk alone, which the group replaces
-    cancel([&](const job & jb) {
+    cancel(seq, [&](const job & jb) {
         return std::find(lay.begin(), lay.end(), range{ jb.r0, jb.r1 }) == lay.end();
     });
     for (const range & r : lay) {
-        if (!fitted(r) && !in_flight(r) && !take(r)) {
+        if (!fitted(seq, r) && !in_flight(seq, r) && !take(seq, r)) {
             break;
         }
     }
-    if (queued && !failed) {
+    if (queued && !sq.failed) {
         queued(e);
     }
-    wait_jobs();
-    return failed ? store.n_coarse() : e;
+    wait_jobs(seq);
+    return sq.failed ? store.n_coarse(seq) : e;
 }
 
-// decode thread: cancels the jobs of pred, waits for their running tasks and drops them
-void llama_kvq_fitter::cancel(const std::function<bool(const job &)> & pred) {
+// decode thread: cancels the jobs of the sequence of pred, waits for their running tasks and drops them
+void llama_kvq_fitter::cancel(int32_t seq, const std::function<bool(const job &)> & pred) {
+    seq_fit & sq = seqs[seq];
     std::vector<std::unique_ptr<job>> gone;
     {
         std::unique_lock<std::mutex> lk(m);
+        auto & jobs = sq.jobs;
         bool any = false;
         for (auto & jb : jobs) {
             if (pred(*jb)) {
@@ -1052,7 +1081,7 @@ void llama_kvq_fitter::cancel(const std::function<bool(const job &)> & pred) {
         });
         for (auto it = jobs.begin(); it != jobs.end();) {
             if ((*it)->cancel) {
-                n_cancel++;
+                sq.n_cancel++;
                 gone.push_back(std::move(*it));
                 it = jobs.erase(it);
             } else {
@@ -1067,61 +1096,62 @@ void llama_kvq_fitter::cancel(const std::function<bool(const job &)> & pred) {
     }
 }
 
-void llama_kvq_fitter::remove(llama_pos p0) {
+void llama_kvq_fitter::remove(int32_t seq, llama_pos p0) {
+    seq_fit & sq = seqs[seq];
     const int32_t C  = store.n_chunk_rows();
     const int32_t c0 = p0 / C;
 
-    cancel([&](const job & jb) { return jb.r1 > p0; });
+    cancel(seq, [&](const job & jb) { return jb.r1 > p0; });
 
     // a removal in the chunk that collects statistics keeps the removed queries, unless all of them go or the removal goes back
     // to the end of the last fit of its rows; into a complete chunk: its statistics are collected again from the ones read when it was complete
-    if (n_snap <= c0) {
-        if (p0 == (llama_pos) c0*C && n_snap == c0) {
+    if (sq.n_snap <= c0) {
+        if (p0 == (llama_pos) c0*C && sq.n_snap == c0) {
             store.synchronize();
-            set_stats(nullptr, nullptr);
-        } else if (p0 == acc_pos && n_snap == c0) {
+            set_stats(seq, nullptr, nullptr);
+        } else if (p0 == sq.acc_pos && sq.n_snap == c0) {
             store.synchronize();
-            set_stats(&acc_gram, &acc_gsum);
+            set_stats(seq, &sq.acc_gram, &sq.acc_gsum);
         }
-        if (p0 < acc_pos) {
-            acc_pos = -1;
+        if (p0 < sq.acc_pos) {
+            sq.acc_pos = -1;
         }
     } else {
-        acc_pos = -1;
+        sq.acc_pos = -1;
         store.synchronize();
         if (p0 > (llama_pos) c0*C) {
-            set_stats(&grams[c0], &gsums[c0]);
+            const llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(store.page_of_chunk(seq, c0));
+            set_stats(seq, &ks.gram, &ks.gsum);
         } else {
-            set_stats(nullptr, nullptr);
+            set_stats(seq, nullptr, nullptr);
         }
-        grams.resize(c0);
-        gsums.resize(c0);
-        t_snaps.resize(c0);
-        n_snap = c0;
+        drop_sums(seq, c0);
+        sq.n_snap = c0;
     }
 
     // the coarse rows at or after p0: back to the chunk grid, the rows before p0 stay in the host store
-    if (store.n_coarse() > p0) {
-        const int32_t n0 = store.n_coarse();
-        store.set_n_coarse(c0*C);
-        for (int32_t t = c0; t < (int32_t) slot_fit.size(); ++t) {
-            slot_fit[t] = range();
+    if (store.n_coarse(seq) > p0) {
+        const int32_t n0 = store.n_coarse(seq);
+        store.set_n_coarse(seq, c0*C);
+        for (int32_t t = c0; t < (int32_t) sq.slot_fit.size(); ++t) {
+            sq.slot_fit[t] = range();
         }
-        n_drop++;
+        sq.n_drop++;
         LLAMA_LOG_INFO("%s: the removal from position %d drops the coarse rows [%d, %d), the host store keeps [%d, %d)\n", __func__,
                 p0, c0*C, n0, c0*C, (int) p0);
     }
-    store.set_n_host(std::min<int32_t>(store.n_host(), p0));
+    store.set_n_host(seq, std::min<int32_t>(store.n_host(seq), p0));
     if (p0 == 0) {
-        failed = false;
+        sq.failed = false;
     }
 }
 
-void llama_kvq_fitter::state_write_meta(llama_io_write_i & io) const {
+void llama_kvq_fitter::state_write_meta(int32_t seq, llama_io_write_i & io) const {
     {
         std::lock_guard<std::mutex> lk(m);
-        if (failed || !jobs.empty()) {
-            throw std::runtime_error(format("the kvq fitter is not idle (failed = %d, %zu jobs), the state is not saved", failed ? 1 : 0, jobs.size()));
+        const seq_fit & sq = seqs[seq];
+        if (sq.failed || !sq.jobs.empty()) {
+            throw std::runtime_error(format("the kvq fitter is not idle (failed = %d, %zu jobs), the state is not saved", sq.failed ? 1 : 0, sq.jobs.size()));
         }
     }
     // element 2: V fitted per chunk (1; 0 was an offline V table file), element 3: the query heads of the gate statistics,
@@ -1149,43 +1179,47 @@ static size_t kvq_fit_n_gram(const llama_kvq_store & store) {
 }
 
 // the fitted range of each chunk slot of the coarse region, the statistics of the complete chunks, the device sums of the open chunk
-void llama_kvq_fitter::state_write_data(llama_io_write_i & io) const {
+void llama_kvq_fitter::state_write_data(int32_t seq, llama_io_write_i & io) const {
+    const seq_fit & sq   = seqs[seq];
     const int32_t C      = store.n_chunk_rows();
-    const int32_t n_slot = (store.n_coarse() + C - 1)/C;
+    const int32_t n_slot = (store.n_coarse(seq) + C - 1)/C;
     const size_t  n_gram = kvq_fit_n_gram(store);
     const size_t  n_gsum = (size_t) n_head*KVQ_D*layer_ids.size();
     io.write(&n_slot, sizeof(n_slot));
     for (int32_t t = 0; t < n_slot; ++t) {
-        io.write(&slot_fit[t].r0, sizeof(int32_t));
-        io.write(&slot_fit[t].r1, sizeof(int32_t));
+        io.write(&sq.slot_fit[t].r0, sizeof(int32_t));
+        io.write(&sq.slot_fit[t].r1, sizeof(int32_t));
     }
-    io.write(&n_snap, sizeof(n_snap));
-    for (int32_t c = 0; c < n_snap; ++c) {
-        GGML_ASSERT(grams[c].size() == n_gram && gsums[c].size() == n_gsum);
-        io.write(grams[c].data(), n_gram*sizeof(float));
+    io.write(&sq.n_snap, sizeof(sq.n_snap));
+    for (int32_t c = 0; c < sq.n_snap; ++c) {
+        const llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(store.page_of_chunk(seq, c));
+        GGML_ASSERT(ks.gram.size() == n_gram && ks.gsum.size() == n_gsum);
+        io.write(ks.gram.data(), n_gram*sizeof(float));
         if (n_gsum > 0) {
-            io.write(gsums[c].data(), n_gsum*sizeof(float));
+            io.write(ks.gsum.data(), n_gsum*sizeof(float));
         }
     }
     for (int32_t il : layer_ids) {
-        const auto & t = store.get_layer(il);
-        io.write_tensor(t.qacc, 0, ggml_nbytes(t.qacc));
-        io.write_tensor(t.gacc, 0, ggml_nbytes(t.gacc));
+        ggml_tensor * qacc = store.get_qacc(seq, il);
+        ggml_tensor * gacc = store.get_gacc(seq, il);
+        io.write_tensor(qacc, 0, ggml_nbytes(qacc));
+        io.write_tensor(gacc, 0, ggml_nbytes(gacc));
     }
-    io.write(&acc_pos, sizeof(acc_pos));
-    if (acc_pos >= 0) {
-        GGML_ASSERT(acc_gram.size() == n_gram && acc_gsum.size() == n_gsum);
-        io.write(acc_gram.data(), n_gram*sizeof(float));
+    io.write(&sq.acc_pos, sizeof(sq.acc_pos));
+    if (sq.acc_pos >= 0) {
+        GGML_ASSERT(sq.acc_gram.size() == n_gram && sq.acc_gsum.size() == n_gsum);
+        io.write(sq.acc_gram.data(), n_gram*sizeof(float));
         if (n_gsum > 0) {
-            io.write(acc_gsum.data(), n_gsum*sizeof(float));
+            io.write(sq.acc_gsum.data(), n_gsum*sizeof(float));
         }
     }
 }
 
-void llama_kvq_fitter::state_read_data(llama_io_read_i & io) {
+void llama_kvq_fitter::state_read_data(int32_t seq, llama_io_read_i & io) {
+    seq_fit & sq = seqs[seq];
     {
         std::lock_guard<std::mutex> lk(m);
-        GGML_ASSERT(jobs.empty());
+        GGML_ASSERT(sq.jobs.empty());
     }
     const int32_t C      = store.n_chunk_rows();
     const size_t  n_gram = kvq_fit_n_gram(store);
@@ -1193,10 +1227,10 @@ void llama_kvq_fitter::state_read_data(llama_io_read_i & io) {
 
     int32_t n_slot = 0;
     io.read(&n_slot, sizeof(n_slot));
-    if (n_slot != (store.n_coarse() + C - 1)/C) {
-        throw std::runtime_error(format("kvq state with %d fitted chunk slots for a coarse region of %d rows", n_slot, store.n_coarse()));
+    if (n_slot != (store.n_coarse(seq) + C - 1)/C) {
+        throw std::runtime_error(format("kvq state with %d fitted chunk slots for a coarse region of %d rows", n_slot, store.n_coarse(seq)));
     }
-    std::fill(slot_fit.begin(), slot_fit.end(), range());
+    std::fill(sq.slot_fit.begin(), sq.slot_fit.end(), range());
     for (int32_t t = 0; t < n_slot; ++t) {
         range r;
         io.read(&r.r0, sizeof(int32_t));
@@ -1204,41 +1238,45 @@ void llama_kvq_fitter::state_read_data(llama_io_read_i & io) {
         if (r.r0 < 0 || r.r0 > t*C || r.r1 <= t*C || r.r1 - r.r0 > n_stage) {
             throw std::runtime_error(format("kvq state with the rows [%d, %d) fitted for chunk %d", r.r0, r.r1, t));
         }
-        slot_fit[t] = r;
+        sq.slot_fit[t] = r;
     }
     int32_t ns = 0;
     io.read(&ns, sizeof(ns));
     if (ns < 0 || (int64_t) ns*C > store.n_rows()) {
         throw std::runtime_error(format("kvq state with %d complete chunks", ns));
     }
-    grams.assign(ns, {});
-    gsums.assign(ns, {});
-    t_snaps.assign(ns, kvq_fit_now());
+    // the kept sums go into the pages of the chunks
+    drop_sums(seq, 0);
+    sq.n_snap = 0;
     for (int32_t c = 0; c < ns; ++c) {
-        grams[c].resize(n_gram);
-        io.read(grams[c].data(), n_gram*sizeof(float));
-        gsums[c].resize(n_gsum);
+        llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(store.page_of_chunk(seq, c));
+        ks.gram.resize(n_gram);
+        io.read(ks.gram.data(), n_gram*sizeof(float));
+        ks.gsum.resize(n_gsum);
         if (n_gsum > 0) {
-            io.read(gsums[c].data(), n_gsum*sizeof(float));
+            io.read(ks.gsum.data(), n_gsum*sizeof(float));
         }
+        ks.t_snap = kvq_fit_now();
+        sq.n_snap = c + 1;
     }
-    n_snap = ns;
-    failed = false;
+    sq.n_snap = ns;
+    sq.failed = false;
     store.synchronize();
     for (int32_t il : layer_ids) {
-        const auto & t = store.get_layer(il);
-        io.read_tensor(t.qacc, 0, ggml_nbytes(t.qacc));
-        io.read_tensor(t.gacc, 0, ggml_nbytes(t.gacc));
+        ggml_tensor * qacc = store.get_qacc(seq, il);
+        ggml_tensor * gacc = store.get_gacc(seq, il);
+        io.read_tensor(qacc, 0, ggml_nbytes(qacc));
+        io.read_tensor(gacc, 0, ggml_nbytes(gacc));
     }
-    io.read(&acc_pos, sizeof(acc_pos));
-    acc_gram.clear();
-    acc_gsum.clear();
-    if (acc_pos >= 0) {
-        acc_gram.resize(n_gram);
-        io.read(acc_gram.data(), n_gram*sizeof(float));
-        acc_gsum.resize(n_gsum);
+    io.read(&sq.acc_pos, sizeof(sq.acc_pos));
+    sq.acc_gram.clear();
+    sq.acc_gsum.clear();
+    if (sq.acc_pos >= 0) {
+        sq.acc_gram.resize(n_gram);
+        io.read(sq.acc_gram.data(), n_gram*sizeof(float));
+        sq.acc_gsum.resize(n_gsum);
         if (n_gsum > 0) {
-            io.read(acc_gsum.data(), n_gsum*sizeof(float));
+            io.read(sq.acc_gsum.data(), n_gsum*sizeof(float));
         }
     }
 }
@@ -1252,11 +1290,10 @@ void llama_kvq_fitter::release(job & jb) {
 }
 
 // decode thread, after a synchronize: the device statistics from the host copies, or 0 (nullptr or no copy)
-void llama_kvq_fitter::set_stats(const std::vector<float> * gram, const std::vector<float> * gsum) {
+void llama_kvq_fitter::set_stats(int32_t seq, const std::vector<float> * gram, const std::vector<float> * gsum) {
     for (size_t li = 0; li < layer_ids.size(); ++li) {
-        const auto & t = store.get_layer(layer_ids[li]);
         for (int k = 0; k < 2; ++k) {
-            ggml_tensor * acc = k == 0 ? t.qacc : t.gacc;
+            ggml_tensor * acc = k == 0 ? store.get_qacc(seq, layer_ids[li]) : store.get_gacc(seq, layer_ids[li]);
             const std::vector<float> * src = k == 0 ? gram : gsum;
             if (acc == nullptr) {
                 continue;
@@ -1271,21 +1308,22 @@ void llama_kvq_fitter::set_stats(const std::vector<float> * gram, const std::vec
     }
 }
 
-void llama_kvq_fitter::get_progress(llama_kvq_fit_progress & out) const {
+void llama_kvq_fitter::get_progress(int32_t seq, llama_kvq_fit_progress & out) const {
+    const seq_fit & sq = seqs[seq];
     out = {};
-    out.n_coarse = store.n_coarse();
-    out.n_chunk  = (store.n_coarse() + store.n_chunk_rows() - 1)/store.n_chunk_rows();
-    out.n_host   = store.n_host();
-    out.n_spill  = n_spill;
-    out.failed   = failed;
-    out.n_cancel = n_cancel;
-    out.n_drop   = n_drop;
-    out.t_job    = t_job;
-    out.t_wall   = t_wall;
-    out.t_take    = t_take;
-    out.t_install = t_install;
+    out.n_coarse = store.n_coarse(seq);
+    out.n_chunk  = (store.n_coarse(seq) + store.n_chunk_rows() - 1)/store.n_chunk_rows();
+    out.n_host   = store.n_host(seq);
+    out.n_spill  = sq.n_spill;
+    out.failed   = sq.failed;
+    out.n_cancel = sq.n_cancel;
+    out.n_drop   = sq.n_drop;
+    out.t_job    = sq.t_job;
+    out.t_wall   = sq.t_wall;
+    out.t_take    = sq.t_take;
+    out.t_install = sq.t_install;
     std::lock_guard<std::mutex> lk(m);
-    for (const auto & jb : jobs) {
+    for (const auto & jb : sq.jobs) {
         if (jb->done) {
             out.n_ready++;
         } else {

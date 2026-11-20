@@ -31,6 +31,9 @@ class llama_io_read_i;
 // a waiter thread waits for the events; the decode thread (poll, wait, remove) never waits for device work it queued in the
 // same poll, except in settle and wait_jobs
 // a range is always fitted from scratch: its tables are a function of its rows and statistics only
+// per sequence (seq_fit, one per sequence of the store): the jobs, the number of complete chunks, the fitted range of each chunk slot, the sums
+// of the open chunk, the failed flag, the progress; the kept sums of the complete chunks are in the pages of the pool (llama_kvq_pool::sums)
+// shared: the device state of the fitter (the shared memory of the store), the o_proj grams, the waiter thread, the host buffers of the jobs
 class llama_kvq_fitter {
 public:
     // V is fitted per chunk: wo = o_proj weight per attention layer (store with gate statistics), n_head query heads
@@ -39,23 +42,23 @@ public:
             const std::vector<const ggml_tensor *> & wo, int32_t n_head, int32_t min_first);
     ~llama_kvq_fitter();
 
-    // before each ubatch, n_pos positions in the sequence: reads the statistics of the complete chunks; large (prefill): starts
-    // the jobs of the complete chunks (a later removal into one cancels it); moves the jobs on, adds the finished ones (unless hold)
-    void poll(const llama_kv_cache & kv, llama_pos n_pos, bool large);
+    // before each ubatch of sequence seq, n_pos positions in the sequence: reads the statistics of the complete chunks; large (prefill):
+    // starts the jobs of the complete chunks (a later removal into one cancels it); moves the jobs on, adds the finished ones (unless hold)
+    void poll(int32_t seq, const llama_kv_cache & kv, llama_pos n_pos, bool large);
 
-    // waits for the jobs in flight and adds them
-    void wait_jobs();
+    // waits for the jobs in flight of the sequence and adds them
+    void wait_jobs(int32_t seq);
 
     // the layout of the positions [0, n) (see llama_kvq_rem): starts the jobs that are missing, cancels the ones that the
     // layout does not have, waits for all and adds them. Returns the end of the coarse region of the layout
     // queued (optional): called with that end after the jobs are started, before the wait (the GPU is idle during the CPU tasks)
-    llama_pos settle(const llama_kv_cache & kv, llama_pos n, const std::function<void(llama_pos)> & queued = nullptr);
+    llama_pos settle(int32_t seq, const llama_kv_cache & kv, llama_pos n, const std::function<void(llama_pos)> & queued = nullptr);
 
-    // the ring rows of the positions [n_host, p) to the host store, no fit
-    void spill(const llama_kv_cache & kv, llama_pos p);
+    // the ring rows of the positions [n_host, p) of the sequence to the host store, no fit
+    void spill(int32_t seq, const llama_kv_cache & kv, llama_pos p);
 
-    // the positions [p0, inf) were removed: cancels the jobs with rows there, the coarse region drops back to the chunk of p0
-    void remove(llama_pos p0);
+    // the positions [p0, inf) of the sequence were removed: cancels the jobs with rows there, the coarse region drops back to the chunk of p0
+    void remove(int32_t seq, llama_pos p0);
 
     // the smallest shared memory of the store for a fit of one layer per group, n_stage rows per job
     static size_t shared_min(int32_t n_head_kv, int32_t n_stage, int32_t bits_k, int32_t bits_v);
@@ -63,19 +66,21 @@ public:
     // the rows of the largest job
     static int32_t stage_rows(int32_t n_rows, const llama_kvq_fit_params & fparams);
 
-    bool has_jobs() const { return !jobs_empty(); }
+    bool has_jobs(int32_t seq) const { return !jobs_empty(seq); }
 
-    void get_progress(llama_kvq_fit_progress & out) const;
+    // the state and progress of the sequence (the jobs, the counters and times of its fits)
+    void get_progress(int32_t seq, llama_kvq_fit_progress & out) const;
 
+    // all sequences
     void set_hold(bool value) { hold = value; }
 
-    // state save and load, the decode thread: the fitted ranges, the statistics of the complete chunks and the sums of the open chunk
+    // state save and load of a sequence, the decode thread: the fitted ranges, the statistics of the complete chunks and the sums of the open chunk
     // the save needs a fitter without jobs (after wait_jobs), else it throws
-    // state_read_meta throws on a mismatch; state_read_data after remove(0) and the store's state_read_data
-    void state_write_meta(llama_io_write_i & io) const;
-    void state_write_data(llama_io_write_i & io) const;
+    // state_read_meta throws on a mismatch; state_read_data after remove(seq, 0) and the store's state_read_data
+    void state_write_meta(int32_t seq, llama_io_write_i & io) const;
+    void state_write_data(int32_t seq, llama_io_write_i & io) const;
     void state_read_meta (llama_io_read_i  & io) const;
-    void state_read_data (llama_io_read_i  & io);
+    void state_read_data (int32_t seq, llama_io_read_i  & io);
 
 private:
     struct job;
@@ -101,21 +106,36 @@ private:
     std::vector<const ggml_tensor *> wo;
     std::vector<std::vector<float>>  wo_gram; // [n_rep][D*D]
 
-    // statistics of the complete chunks [0, n_snap), read when the chunk was complete: to fit it, and to restore them after a seq_rm into it
-    int32_t n_snap = 0;
-    std::vector<std::vector<float>> grams;
-    std::vector<std::vector<float>> gsums;
-    std::vector<double>             t_snaps;
+    // the state of one sequence
+    struct seq_fit {
+        // statistics of the complete chunks [0, n_snap), read when the chunk was complete: to fit it, and to restore them after a seq_rm into it
+        // they are kept in the pages of the chunks (llama_kvq_pool::chunk_sums, through the page table of the sequence in the store)
+        int32_t n_snap = 0;
 
-    // per chunk slot: the range whose fit gave its tables, r0 = -1: none
-    std::vector<range> slot_fit;
+        // per chunk slot: the range whose fit gave its tables, r0 = -1: none
+        std::vector<range> slot_fit;
 
-    // the device sums of the open chunk when the rows up to acc_pos were fitted, -1: none; a removal back to acc_pos restores them
-    int32_t            acc_pos = -1;
-    std::vector<float> acc_gram;
-    std::vector<float> acc_gsum;
+        // the device sums of the open chunk when the rows up to acc_pos were fitted, -1: none; a removal back to acc_pos restores them
+        int32_t            acc_pos = -1;
+        std::vector<float> acc_gram;
+        std::vector<float> acc_gsum;
 
-    bool failed = false;
+        bool failed = false;
+
+        // the jobs of the sequence, in the order of the takes (pool mutex)
+        std::deque<std::unique_ptr<job>> jobs;
+
+        // progress
+        int32_t n_cancel = 0;
+        int32_t n_drop   = 0;
+        int32_t n_spill  = 0;
+        std::vector<double> t_job;
+        std::vector<double> t_wall;
+        double t_take    = 0.0;
+        double t_install = 0.0;
+    };
+    std::vector<seq_fit> seqs;
+
     bool hold   = false;
 
     // device state: own buffer (idx, tinv); in the shared memory of the store at fixed offsets: stage, cst, tab, then the
@@ -135,37 +155,28 @@ private:
     mutable std::mutex      m;
     std::condition_variable cv_work;
     std::condition_variable cv_done;
-    std::deque<std::unique_ptr<job>>     jobs; // in the order of the takes
     std::thread                          waiter;
     std::vector<ggml_backend_buffer_ptr> free_bufs; // host buffers of finished jobs
     bool stop = false;
-
-    // progress
-    int32_t n_cancel = 0;
-    int32_t n_drop   = 0;
-    int32_t n_spill  = 0;
-    std::vector<double> t_job;
-    std::vector<double> t_wall;
-    double t_take    = 0.0;
-    double t_install = 0.0;
 
     // (layer, kv head) pairs, task i < n_pair is K, then V
     int32_t n_pair() const;
 
     std::vector<range> layout(llama_pos n) const;
-    bool fitted(const range & r) const;
-    bool in_flight(const range & r) const;
-    bool jobs_empty() const;
-    void snapshots(llama_pos n_pos);
-    void read_acc(std::vector<float> & gram, std::vector<float> & gsum);
-    bool check_ring(const llama_kv_cache & kv, int32_t p0, int32_t p1);
-    bool take(const range & r);
-    void cancel(const std::function<bool(const job &)> & pred);
-    void install(bool all);
+    bool fitted(int32_t seq, const range & r) const;
+    bool in_flight(int32_t seq, const range & r) const;
+    bool jobs_empty(int32_t seq) const;
+    void snapshots(int32_t seq, llama_pos n_pos);
+    void read_acc(int32_t seq, std::vector<float> & gram, std::vector<float> & gsum);
+    bool check_ring(int32_t seq, const llama_kv_cache & kv, int32_t p0, int32_t p1);
+    bool take(int32_t seq, const range & r);
+    void cancel(int32_t seq, const std::function<bool(const job &)> & pred);
+    void install(int32_t seq, bool all);
+    void drop_sums(int32_t seq, int32_t c0);
     void dev_init();
     size_t plan(ggml_cgraph * gf, size_t lo, bool place);
     void compute(ggml_cgraph * gf, const char * what);
-    void upload_rows(int32_t il, int32_t r0, int32_t r1);
+    void upload_rows(int32_t seq, int32_t il, int32_t r0, int32_t r1);
     void host_metrics(job & jb);
     void queue_job(job & jb);
     ggml_tensor * tab_view(int kv, int32_t j, int32_t n_lay, size_t row0, int64_t n_rows, ggml_context * ctx) const;
@@ -176,6 +187,6 @@ private:
     void compute_wo_gram(int32_t p);
     void compute_wo_gram_dev(std::vector<char> & on_dev);
     void metric_v(const job & jb, int32_t p, float * m);
-    void set_stats(const std::vector<float> * gram, const std::vector<float> * gsum);
+    void set_stats(int32_t seq, const std::vector<float> * gram, const std::vector<float> * gsum);
     void loop();
 };

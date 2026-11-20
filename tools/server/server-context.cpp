@@ -828,9 +828,10 @@ struct server_slot {
     void print_timings_kvq() const {
         llama_memory_t mem = llama_get_memory(ctx_tgt);
 
+        // the server has one slot with --kvq: the fit progress is the one of its sequence 0 (the counters are totals)
         llama_kvq_fit_progress fp;
         llama_kvq_counters_all ca;
-        if (!llama_memory_kvq_fit_get_progress(mem, fp) || !llama_memory_kvq_get_counters(mem, ca)) {
+        if (!llama_memory_kvq_fit_get_progress(mem, 0, fp) || !llama_memory_kvq_get_counters(mem, ca)) {
             return;
         }
         llama_kvq_counters s;
@@ -1138,7 +1139,8 @@ private:
     // --kvq: a log line when the coarse region changes (cheap, no sync)
     void kvq_log_progress() {
         llama_kvq_fit_progress fp;
-        if (!llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), fp)) {
+        // one slot with --kvq: sequence 0
+        if (!llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), 0, fp)) {
             return;
         }
         if (fp.n_drop != kvq_n_drop_last) {
@@ -4866,9 +4868,9 @@ private:
                 // --kvq: the prompt is done when it is fitted up to its end (the rows after the last complete chunk too) and no fit work runs
                 if (params_base.kvq.enabled) {
                     const int64_t t_wait_start = ggml_time_us();
-                    llama_memory_kvq_fit_wait(llama_get_memory(ctx_tgt));
+                    llama_memory_kvq_fit_wait(llama_get_memory(ctx_tgt), slot.id);
                     llama_kvq_fit_progress fp;
-                    llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), fp);
+                    llama_memory_kvq_fit_get_progress(llama_get_memory(ctx_tgt), slot.id, fp);
                     SLT_INF(slot, "kvq: waited %.3f s for the fitter at the end of the prompt, coarse region %d rows\n", (ggml_time_us() - t_wait_start)*1e-6, fp.n_coarse);
                 }
 
