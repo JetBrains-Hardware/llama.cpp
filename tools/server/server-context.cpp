@@ -4390,7 +4390,40 @@ private:
                             }
                             if (is_shared_done) {
                                 SLT_TRC(slot, " - copying shared prompt (%d tokens) to child %d\n", slot.prompt.n_tokens(), other.id);
-                                slot.copy_prompt_to(other);
+                                if (params_base.kvq.enabled) {
+                                    // --kvq: the copy may need a free page of the pool, seq_cp would abort: ask first, purge idle slots while
+                                    // that helps, else every task of the request gets the error (as at DONE_PROMPT of an n > 1 request)
+                                    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+                                    slot.mem.seq_rm(other.id, -1, -1);
+                                    bool ok = true;
+                                    while (!llama_memory_kvq_seq_cp_try(mem_tgt, slot.id, other.id)) {
+                                        if (!try_clear_idle_slots()) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        SRV_WRN("%s", "kvq: the pool of pages is full for the copy of the shared prompt, retrying after purging an idle slot\n");
+                                    }
+                                    if (!ok) {
+                                        const std::string err = "kvq: the pool of pages is full, cannot copy the shared prompt";
+                                        for (auto & child : slots) {
+                                            if (child.state == SLOT_STATE_WAIT_OTHER && child.task && child.task->id_parent == slot.task->id) {
+                                                send_error(child, err);
+                                                child.release();
+                                                slot.mem.seq_rm(child.id, -1, -1);
+                                            }
+                                        }
+                                        send_error(slot, err);
+                                        slot.release();
+                                        return;
+                                    }
+                                    if (slot.mem.ctx_dft) {
+                                        llama_memory_seq_rm(llama_get_memory(slot.mem.ctx_dft), other.id,     -1, -1);
+                                        llama_memory_seq_cp(llama_get_memory(slot.mem.ctx_dft), slot.id, other.id, -1, -1);
+                                    }
+                                    other.prompt = slot.prompt.clone();
+                                } else {
+                                    slot.copy_prompt_to(other);
+                                }
                                 other.state = SLOT_STATE_STARTED;
                             } else {
                                 wait_shared = true;
