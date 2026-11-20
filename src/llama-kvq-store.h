@@ -75,10 +75,10 @@ public:
 
     // kc, vc, tinv, taux: in their own device buffer, with a pinned host copy in fit mode (see codes_alloc)
     struct layer_tensors {
-        ggml_tensor * kc    = nullptr; // i32 [nwk, n_rows, G]
-        ggml_tensor * vc    = nullptr; // i32 [nwv + 1, n_rows, G]
-        ggml_tensor * tinv  = nullptr; // i8 [D, D, 2*G, n_chunk]
-        ggml_tensor * taux  = nullptr; // f32 [D, 3, 2*G, n_chunk]
+        ggml_tensor * kc    = nullptr; // i32 [nwk, C, G, n_pages], page = C rows, a page of a layer is contiguous
+        ggml_tensor * vc    = nullptr; // i32 [nwv + 1, C, G, n_pages]
+        ggml_tensor * tinv  = nullptr; // i8 [D, D, 2*G, n_pages]
+        ggml_tensor * taux  = nullptr; // f32 [D, 3, 2*G, n_pages]
         ggml_tensor * rkv   = nullptr; // q8_0 [D, cap_tot, G, 2], alias of the start of rkv_h (of the device buffer of the layer)
         ggml_tensor * rkv_h = nullptr; // f32 [ROW/4, 2*G*cap_tot + N_TRASH], row (kv*G + g)*cap_tot + slot, then the trash rows
         ggml_tensor * ridx  = nullptr; // i32 [cap_tot, G]
@@ -230,9 +230,13 @@ public:
     // ridx without the flag column
     ggml_tensor * get_ridx(ggml_context * ctx, int32_t il) const;
 
-    // kc and vc of the current coarse region
+    // kc and vc of the pages (the op reads the first n_coarse rows through the page table)
     ggml_tensor * get_kc(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_vc(ggml_context * ctx, int32_t il) const;
+
+    // i32 [n_chunk]: the page of each chunk (device), the page table input of ggml_kvq_attn
+    ggml_tensor * get_pt() const { return pt; }
+    int32_t page_of_chunk(int32_t c) const { return page_tab[c]; }
 
     int32_t n_coarse()     const { return n_coarse_; }
     int32_t n_host()       const { return n_host_; }
@@ -290,6 +294,7 @@ private:
     ggml_backend_buffer_ptr buf_codes;
     std::unique_ptr<llama_kvq_pool> pages; // pinned host pages: rows, host copy of the codes and tables (see llama-kvq-pool.h)
     std::vector<int32_t>    page_tab;  // chunk -> page, the identity
+    ggml_tensor *           pt = nullptr; // its device copy
     int32_t                 hc_hi      = 0;     // the host copy holds the codes of the rows that a later upload needs before this
     uint32_t                codes_gen_ = 0;
     bool                    prefill_free_codes = false; // llama_kvq_params::prefill_free_codes

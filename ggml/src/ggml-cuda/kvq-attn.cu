@@ -41,8 +41,9 @@ struct kvq_args {
     float scale2;           // scale*log2(e)
 
     const float * q; int64_t q_nb1, q_nb2;          // in elements
-    const char  * kc; int64_t kc_nb1, kc_nb2;
-    const char  * vc; int64_t vc_nb1, vc_nb2;
+    const char  * kc; int64_t kc_nb1, kc_nb2, kc_nb3; // kc_nb3: one page
+    const char  * vc; int64_t vc_nb1, vc_nb2, vc_nb3;
+    const int32_t * pt;                             // logical chunk -> physical page of the codes and tables
     const int8_t * tinv; int64_t tinv_nb2, tinv_nb3; // in elements
     const float * taux; int64_t taux_nb2, taux_nb3; // in elements
     const int32_t * ridx; int64_t ridx_nb1;         // in elements
@@ -243,8 +244,8 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep(const kvq_args a, const
     float * s_q   = (float *) kvq_smem;   // [N][D]
     float * s_acc = s_q + N*KVQ_D;        // [D/32][N][32], per warp
 
-    const int8_t * invk = a.tinv + t*a.tinv_nb3 + (2*g)*a.tinv_nb2;
-    const float * auxk = a.taux + t*a.taux_nb3 + (2*g)*a.taux_nb2;
+    const int8_t * invk = a.tinv + (int64_t) a.pt[t]*a.tinv_nb3 + (2*g)*a.tinv_nb2;
+    const float * auxk = a.taux + (int64_t) a.pt[t]*a.taux_nb3 + (2*g)*a.taux_nb2;
     const float * auxv = auxk + a.taux_nb2;
 
     for (int e = tid; e < N*KVQ_D; e += KVQ_D) {
@@ -396,8 +397,8 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep_c(const kvq_args a, con
     extern __shared__ __align__(16) char kvq_smem[];
     float * s_q = (float *) kvq_smem; // [NG][D]
 
-    const int8_t * invk = a.tinv + t*a.tinv_nb3 + (2*g)*a.tinv_nb2;
-    const float * auxk = a.taux + t*a.taux_nb3 + (2*g)*a.taux_nb2;
+    const int8_t * invk = a.tinv + (int64_t) a.pt[t]*a.tinv_nb3 + (2*g)*a.tinv_nb2;
+    const float * auxk = a.taux + (int64_t) a.pt[t]*a.taux_nb3 + (2*g)*a.taux_nb2;
     const float * auxv = auxk + a.taux_nb2;
 
     if (grp < (int) gridDim.y - 1) {
@@ -572,7 +573,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
             const int di = KVQ_NTHREADS % a.nwk;
             int r = tid / a.nwk;
             int i = tid % a.nwk;
-            const char * src = a.kc + tr*a.kc_nb1 + g*a.kc_nb2;
+            const char * src = a.kc + (tr - (int64_t) t*a.n_crow)*a.kc_nb1 + g*a.kc_nb2 + (int64_t) a.pt[t]*a.kc_nb3;
             while (r < nr) {
                 kvq_cp4(sk + (i + 1)*KVQ_LDR + r, src + r*a.kc_nb1 + 4*i);
                 i += di;
@@ -589,7 +590,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
             const int di = KVQ_NTHREADS % nwv1;
             int r = tid / nwv1;
             int i = tid % nwv1;
-            const char * src = a.vc + tr*a.vc_nb1 + g*a.vc_nb2;
+            const char * src = a.vc + (tr - (int64_t) t*a.n_crow)*a.vc_nb1 + g*a.vc_nb2 + (int64_t) a.pt[t]*a.vc_nb3;
             while (r < nr) {
                 kvq_cp4(sv + (i + 1)*KVQ_LDR + r, src + r*a.vc_nb1 + 4*i);
                 i += di;
@@ -1437,7 +1438,7 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_merge(const kvq_args a) {
     const int c   = threadIdx.x;
     const int N   = a.N;
 
-    const float * aux = a.taux + t*a.taux_nb3 + (2*g + 1)*a.taux_nb2;
+    const float * aux = a.taux + (int64_t) a.pt[t]*a.taux_nb3 + (2*g + 1)*a.taux_nb2;
 
     const int64_t ip0 = (int64_t) g*a.n_part + (int64_t) t*a.n_cbpc;
     const int64_t ic  = (int64_t) g*a.n_chunk + t;
@@ -1474,8 +1475,8 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_combine(const kvq_args a) {
     __shared__ float s_y[8][KVQ_D];
     __shared__ float s_out[KVQ_D/WARP_SIZE][8][WARP_SIZE]; // per warp, summed in a fixed order
 
-    const int8_t * inv = a.tinv + t*a.tinv_nb3 + (2*g + 1)*a.tinv_nb2;
-    const float * aux = a.taux + t*a.taux_nb3 + (2*g + 1)*a.taux_nb2;
+    const int8_t * inv = a.tinv + (int64_t) a.pt[t]*a.tinv_nb3 + (2*g + 1)*a.tinv_nb2;
+    const float * aux = a.taux + (int64_t) a.pt[t]*a.taux_nb3 + (2*g + 1)*a.taux_nb2;
 
     const int64_t ic = (int64_t) g*a.n_chunk + t;
     const int     i  = WARP_SIZE*slice + lane;
@@ -1825,6 +1826,7 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * rkv  = dst->src[7];
     const ggml_tensor * ridx = dst->src[8];
     const ggml_tensor * mask = dst->src[9];
+    const ggml_tensor * pt   = dst->src[10];
 
     const int  mode  = ggml_get_op_params_i32(dst, 2);
     const bool attn  = mode == GGML_KVQ_ATTN;
@@ -1842,7 +1844,7 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     a.L        = (int) q->ne[2];
     a.cols     = a.n_rep*a.L;
     a.N        = GGML_PAD(a.cols, 8);
-    a.n_coarse = kc ? (int) kc->ne[1] : 0;
+    a.n_coarse = kc ? ggml_get_op_params_i32(dst, 3) : 0;
     a.n_crow   = ggml_get_op_params_i32(dst, 1);
     a.n_chunk  = kc ? (a.n_coarse + a.n_crow - 1)/a.n_crow : 0;
     a.rows_blk = kvq_rows_per_block(a.n_coarse, a.G, ggml_cuda_info().devices[ctx.device].nsm);
@@ -1864,11 +1866,12 @@ void ggml_cuda_op_kvq_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     a.q_nb1 = q->nb[1]/sizeof(float);
     a.q_nb2 = q->nb[2]/sizeof(float);
     if (kc) {
-        a.kc = (const char *) kc->data; a.kc_nb1 = kc->nb[1]; a.kc_nb2 = kc->nb[2];
+        a.kc = (const char *) kc->data; a.kc_nb1 = kc->nb[1]; a.kc_nb2 = kc->nb[2]; a.kc_nb3 = kc->nb[3];
+        a.pt = (const int32_t *) pt->data;
         a.tinv = (const int8_t *) tinv->data; a.tinv_nb2 = tinv->nb[2]; a.tinv_nb3 = tinv->nb[3];
         a.taux = (const float *) taux->data; a.taux_nb2 = taux->nb[2]/sizeof(float); a.taux_nb3 = taux->nb[3]/sizeof(float);
         if (attn) {
-            a.vc = (const char *) vc->data; a.vc_nb1 = vc->nb[1]; a.vc_nb2 = vc->nb[2];
+            a.vc = (const char *) vc->data; a.vc_nb1 = vc->nb[1]; a.vc_nb2 = vc->nb[2]; a.vc_nb3 = vc->nb[3];
         }
     }
     if (a.cap > 0) {
@@ -1959,10 +1962,10 @@ bool ggml_cuda_kvq_attn_supported(int device, const ggml_tensor * op) {
     if (q->ne[0] != KVQ_D || q->ne[2] > 8 || (q->ne[1]/k->ne[2])*q->ne[2] > 48) {
         return false;
     }
-    if (kc && (kc->ne[0] > 32 || kc->nb[1] % 4 != 0 || kc->nb[2] % 4 != 0)) {
+    if (kc && (kc->ne[0] > 32 || kc->nb[1] % 4 != 0 || kc->nb[2] % 4 != 0 || kc->nb[3] % 4 != 0)) {
         return false;
     }
-    if (vc && (vc->ne[0] > 33 || vc->nb[1] % 4 != 0 || vc->nb[2] % 4 != 0)) {
+    if (vc && (vc->ne[0] > 33 || vc->nb[1] % 4 != 0 || vc->nb[2] % 4 != 0 || vc->nb[3] % 4 != 0)) {
         return false;
     }
     // the precise rows are q8_0 only

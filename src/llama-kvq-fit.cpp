@@ -607,8 +607,19 @@ ggml_cgraph * llama_kvq_fitter::build_codes(const job & jb, int32_t li, int32_t 
         // the codes go to the host copy (queue_job); without the device codes through the code stage
         const bool    dev  = store.codes_on_dev();
         ggml_tensor * rows = dev ? (kv ? lt.vc : lt.kc) : cst[kv];
-        ggml_tensor * rv   = ggml_view_3d(ctx, rows, rows->ne[0], n, G, rows->nb[1], rows->nb[2], dev ? (size_t) jb.r0*rows->nb[1] : 0);
-        ggml_build_forward_expand(gf, ggml_kvq_fit(ctx, GGML_KVQ_FIT_CODE, y, p4, rv));
+        if (!dev) {
+            ggml_tensor * rv = ggml_view_3d(ctx, rows, rows->ne[0], n, G, rows->nb[1], rows->nb[2], 0);
+            ggml_build_forward_expand(gf, ggml_kvq_fit(ctx, GGML_KVQ_FIT_CODE, y, p4, rv));
+            continue;
+        }
+        // the rows of the device codes are in pages: one op per chunk run of the job (a merge group crosses a chunk)
+        const int32_t C = store.n_chunk_rows();
+        store.chunk_runs(jb.r0, jb.r1, [&](int32_t p, int32_t m) {
+            ggml_tensor * rv = ggml_view_3d(ctx, rows, rows->ne[0], m, G, rows->nb[1], rows->nb[2],
+                    (size_t) store.page_of_chunk(p/C)*rows->nb[3] + (size_t) (p % C)*rows->nb[1]);
+            ggml_tensor * yv = m == n ? y : ggml_view_3d(ctx, y, y->ne[0], m, G, y->nb[1], y->nb[2], (size_t) (p - jb.r0)*y->nb[1]);
+            ggml_build_forward_expand(gf, ggml_kvq_fit(ctx, GGML_KVQ_FIT_CODE, yv, p4, rv));
+        });
     }
     return gf;
 }
@@ -687,8 +698,10 @@ void llama_kvq_fitter::queue_job(job & jb) {
                 ggml_tensor       * src  = dev ? const_cast<ggml_tensor *>(rows) : cst[kv];
                 for (int64_t g = 0; g < G; ++g) {
                     store.chunk_runs(jb.r0, jb.r1, [&](int32_t p, int32_t n) {
-                        ggml_backend_tensor_get_async(backend, src, store.host_codes(il, kv == 1, g, p),
-                                g*src->nb[2] + (size_t) (dev ? p : p - jb.r0)*rows->nb[1], (size_t) n*rows->nb[1]);
+                        const int32_t C   = store.n_chunk_rows();
+                        const size_t  off = dev ? (size_t) store.page_of_chunk(p/C)*src->nb[3] + g*src->nb[2] + (size_t) (p % C)*rows->nb[1]
+                                                : g*src->nb[2] + (size_t) (p - jb.r0)*rows->nb[1];
+                        ggml_backend_tensor_get_async(backend, src, store.host_codes(il, kv == 1, g, p), off, (size_t) n*rows->nb[1]);
                     });
                 }
             }

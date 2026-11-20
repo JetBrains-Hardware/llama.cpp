@@ -436,6 +436,26 @@ static void test_equivalence(ggml_backend_t cpu, ggml_backend_t gpu) {
             }
             printf(", repeats differ %d", n_diff);
             CHECK(n_diff == 0, "%s %s: %d repeated calls differ from the first", ec.name, ggml_backend_name(be), n_diff);
+
+            // shuffled pages in a pool with 3 spare pages: the same bits as the identity page table
+            int n_page_diff = 0;
+            if (P.n_coarse > 0) {
+                kvq_problem Pp = P;
+                Pp.n_pages = P.n_chunk + 3;
+                Pp.pt.resize(P.n_chunk);
+                std::vector<int32_t> pool(Pp.n_pages);
+                std::iota(pool.begin(), pool.end(), 0);
+                std::mt19937 prng(77 + P.n_chunk);
+                std::shuffle(pool.begin(), pool.end(), prng);
+                std::copy(pool.begin(), pool.begin() + P.n_chunk, Pp.pt.begin());
+                for (int mode : modes) {
+                    const std::vector<float> r0 = run_kvq(be, P, mode);
+                    const std::vector<float> r  = run_kvq(be, Pp, mode);
+                    n_page_diff += r.size() != r0.size() || memcmp(r.data(), r0.data(), r0.size()*sizeof(float)) != 0;
+                }
+            }
+            printf(", shuffled pages differ %d", n_page_diff);
+            CHECK(n_page_diff == 0, "%s %s: the shuffled page table gives other bits", ec.name, ggml_backend_name(be));
             printf("\n");
         }
     }
