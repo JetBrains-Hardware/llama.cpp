@@ -473,12 +473,15 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
         inp->fit          = true;
         inp->codes_gen    = inp->store->codes_gen();
         bool all_packed = true;
+        // the reserve of the packed decode graph: every stream at its largest coarse region (all rows of the store)
+        const bool pk_reserve = mctx_kvq->packed_reserve();
         for (int64_t s = 0; s < S; ++s) {
             inp->seqs.push_back(ubatch.seq_id_unq[s]);
-            inp->n_coarse_s.push_back(inp->store->n_coarse(inp->seqs[s]));
-            inp->n_host_s.push_back(inp->store->n_host(inp->seqs[s]));
+            inp->n_coarse_s.push_back(pk_reserve ? inp->store->n_rows() : inp->store->n_coarse(inp->seqs[s]));
+            inp->n_host_s.push_back(pk_reserve ? inp->store->n_rows() : inp->store->n_host(inp->seqs[s]));
             all_packed &= llama_kvq_use_packed(inp->params, n_tokens/S, inp->n_coarse_s[s], inp->n_host_s[s]);
         }
+        GGML_ASSERT(!pk_reserve || (all_packed && S > 1));
         inp->n_coarse     = *std::max_element(inp->n_coarse_s.begin(), inp->n_coarse_s.end());
         inp->n_host       = inp->n_host_s[0];
         inp->packed_small = all_packed;

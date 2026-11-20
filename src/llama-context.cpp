@@ -1007,6 +1007,33 @@ void llama_context::sched_reserve() {
         graph_has_logits = true;
     }
 
+    // several sequences: the packed decode graph (every stream of a packed ubatch at its largest coarse region, max_batch tokens
+    // per stream) is reserved at load, so the compute buffers do not grow when decoding starts to pack
+    if (kvq && !cparams.training && kvq->n_packed_streams() > 1 && !model.no_alloc()) {
+        const uint32_t n_pk   = kvq->n_packed_streams();
+        const uint32_t n_pk_l = (uint32_t) std::max(1, kvq->get_params().max_batch);
+        std::vector<size_t> before(backend_ptrs.size(), 0);
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            before[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+        llama_memory_context_ptr mctx_pk = kvq->init_full_packed();
+        if (!mctx_pk || !graph_reserve(n_pk*n_pk_l, n_pk, n_pk*n_pk_l, mctx_pk.get(), false)) {
+            throw std::runtime_error(format("failed to reserve the compute buffers of the packed decode graph (%u sequences x %u tokens, "
+                    "--kvq with --parallel %u): lower --parallel or the context size", n_pk, n_pk_l, n_seqs));
+        }
+        size_t grow = 0;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (!ggml_backend_buft_is_host(backend_buft[i])) {
+                grow += ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) - std::min(before[i], ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]));
+            }
+        }
+        const size_t per = kvq->get_store()->stream_device_bytes();
+        LLAMA_LOG_INFO("%s: packed decoding reserved at load: %u streams (--parallel %u, at most %u tokens per stream), device memory %.1f MiB per stream "
+                "(resident rows, tail buffers, staging), %.1f MiB for all, plus %.1f MiB of compute buffer\n", __func__, n_pk, n_seqs, n_pk_l,
+                per/1048576.0, per*n_pk/1048576.0, grow/1048576.0);
+        graph_has_logits = true;
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -2058,6 +2085,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // a two-tier cache with several sequences reserves every graph it can run at load: a compute buffer larger than the reserve is a bug
+        if (mem_kvq && !phase_on && cparams.n_seq_max > 1) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const size_t sz = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+                if (backend_buf_exp_size[i] > 1 && sz > backend_buf_exp_size[i]) {
+                    LLAMA_LOG_WARN("%s: the %s compute buffer grew from %.2f to %.2f MiB (not covered by the reserve)\n", __func__,
+                            ggml_backend_buft_name(backend_buft[i]), backend_buf_exp_size[i]/1048576.0, sz/1048576.0);
+                    backend_buf_exp_size[i] = sz;
+                }
+            }
         }
 
         gf_res_prev_active = res;

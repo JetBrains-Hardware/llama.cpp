@@ -270,6 +270,14 @@ llama_memory_context_ptr llama_memory_hybrid_kvq::init_full() {
     return std::make_unique<llama_memory_hybrid_kvq_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_kvq::init_full_packed() {
+    return std::make_unique<llama_memory_hybrid_kvq_context>(this, true);
+}
+
+uint32_t llama_memory_hybrid_kvq::n_packed_streams() const {
+    return store && params.enabled && store->scratch_ok() ? (uint32_t) store->n_streams() : 0;
+}
+
 bool llama_memory_hybrid_kvq::get_can_shift() const {
     return false;
 }
@@ -807,6 +815,15 @@ llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(llama_memory_hy
     kv_attn(mem->get_mem_attn()),
     params(kvq_params_reserve(mem->get_params())),
     store(mem->fit_graph_kind() > 0 ? mem->get_store() : nullptr),
+    status(llama_memory_hybrid_context::get_status()) {
+}
+
+llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(llama_memory_hybrid_kvq * mem, bool packed_reserve) :
+    llama_memory_hybrid_context(mem),
+    kv_attn(mem->get_mem_attn()),
+    params(mem->get_params()),
+    is_packed_reserve(packed_reserve),
+    store(mem->get_store()),
     status(llama_memory_hybrid_context::get_status()) {
 }
 
