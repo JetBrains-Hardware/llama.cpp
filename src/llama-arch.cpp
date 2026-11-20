@@ -1495,6 +1495,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_LFM3:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_INKLING2:
+        case LLM_ARCH_SENSENOVA_LOOP:
             return true;
         default:
             return false;
