@@ -89,12 +89,14 @@ protected:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
     // split the batch into ubatches and prepare both caches for them, false on failure
+    // n_seqs_max: most sequences in a ubatch (1: the two-tier cache)
     bool prepare_batch(
             llama_batch_allocr & balloc,
                       uint32_t   n_ubatch,
                           bool   embd_all,
      std::vector<llama_ubatch> & ubatches,
-               slot_info_vec_t & heads_attn);
+               slot_info_vec_t & heads_attn,
+                      uint32_t   n_seqs_max = UINT32_MAX);
 
 private:
     const llama_hparams & hparams;

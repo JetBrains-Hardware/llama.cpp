@@ -49,43 +49,67 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
         no_alloc,
         type_k, type_v, v_trans, kvq_ring_cells(n_tail, kv_size), n_swa, swa_type,
         type_r, type_s, rs_size,
-        n_seq_max, n_rs_seq, rs_replay, offload, unified,
+        n_seq_max, n_rs_seq, rs_replay, offload, /* one ring stream per sequence, whatever the context does with its cells */ false,
         filter_attn, filter_recr,
         /* attn_rot */ false),
     model(model),
     n_ctx_max(kv_size) {
+    GGML_UNUSED(unified);
     get_mem_attn()->set_ring(true);
-    LLAMA_LOG_INFO("%s: tail: the attention cache is a ring of %u cells for %u positions\n", "llama_memory_hybrid_kvq", get_mem_attn()->get_size(), n_ctx_max);
+    LLAMA_LOG_INFO("%s: tail: the attention cache is a ring of %u cells per stream (%u streams) for %u positions\n", "llama_memory_hybrid_kvq",
+            get_mem_attn()->get_size(), get_mem_attn()->get_n_stream(), n_ctx_max);
 }
-
-static llama_seq_id kvq_batch_seq(const llama_batch_allocr & balloc, int32_t n_seq);
 
 llama_memory_context_ptr llama_memory_hybrid_kvq::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     std::vector<llama_ubatch> ubatches;
     slot_info_vec_t heads_attn;
 
-    // the pages of the chunks of the batch positions first: a full pool fails the batch like a full cache
-    llama_seq_id seq_pg  = 0;
-    int32_t      n_pg0   = 0;
+    // the sequences of the batch and the number of their tokens: a ubatch is one sequence, the batch is split by sequence
+    std::vector<llama_seq_id> bseq;
+    std::vector<uint32_t>     bnum;
     if (fitter) {
-        seq_pg = kvq_batch_seq(balloc, store->n_seq());
-        n_pg0  = store->n_page_chunks(seq_pg);
-        const llama_pos p_end = balloc.seq_pos_max(seq_pg);
-        if (p_end >= 0 && !store->reserve(seq_pg, p_end + 1)) {
+        const llama_batch & b = balloc.get_batch();
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            if (b.n_seq_id[i] != 1 || b.seq_id[i][0] < 0 || b.seq_id[i][0] >= store->n_seq()) {
+                LLAMA_LOG_ERROR("%s: the two-tier cache needs one sequence id below n_seq_max (%d) for every token\n", __func__, store->n_seq());
+                return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            }
+            const auto it = std::find(bseq.begin(), bseq.end(), b.seq_id[i][0]);
+            if (it == bseq.end()) {
+                bseq.push_back(b.seq_id[i][0]);
+                bnum.push_back(1);
+            } else {
+                bnum[it - bseq.begin()]++;
+            }
+        }
+    }
+
+    // the pages of the chunks of the batch positions first: a full pool fails the batch like a full cache
+    std::vector<int32_t> n_pg0(bseq.size(), 0);
+    auto release = [&](size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            store->release_from(bseq[i], n_pg0[i]);
+        }
+    };
+    for (size_t i = 0; i < bseq.size(); ++i) {
+        n_pg0[i] = store->n_page_chunks(bseq[i]);
+        const llama_pos p_end = balloc.seq_pos_max(bseq[i]);
+        if (p_end >= 0 && !store->reserve(bseq[i], p_end + 1)) {
+            release(i);
             return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
     }
 
     // the slots of the whole batch are placed here, so the ring needs the room for all of it now
-    if (fitter && !tail_wait(balloc)) {
-        store->release_from(seq_pg, n_pg0);
-        return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    for (size_t i = 0; i < bseq.size(); ++i) {
+        if (!tail_wait(balloc, bseq[i], bnum[i])) {
+            release(bseq.size());
+            return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
     }
 
-    if (!prepare_batch(balloc, n_ubatch, embd_all, ubatches, heads_attn)) {
-        if (fitter) {
-            store->release_from(seq_pg, n_pg0);
-        }
+    if (!prepare_batch(balloc, n_ubatch, embd_all, ubatches, heads_attn, fitter ? 1 : UINT32_MAX)) {
+        release(bseq.size());
         return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
@@ -97,16 +121,7 @@ llama_pos llama_memory_hybrid_kvq::n_pos(llama_seq_id seq) const {
     return std::max<llama_pos>(p + 1, store ? store->n_host(seq) : 0);
 }
 
-// the sequence of a batch (one sequence per batch for now: the one of its first token)
-static llama_seq_id kvq_batch_seq(const llama_batch_allocr & balloc, int32_t n_seq) {
-    const llama_batch & b = balloc.get_batch();
-    GGML_ASSERT(b.n_tokens > 0 && b.n_seq_id[0] > 0);
-    GGML_ASSERT(b.seq_id[0][0] >= 0 && b.seq_id[0][0] < n_seq && "the two-tier cache needs a sequence id below n_seq_max");
-    return b.seq_id[0][0];
-}
-
-bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
-    const llama_seq_id seq = kvq_batch_seq(balloc, store->n_seq());
+bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc, llama_seq_id seq, uint32_t n_tokens) {
     seq_state & sq = seqs[seq];
     const llama_pos p0    = balloc.seq_pos_min(seq);
     const llama_pos p_end = balloc.seq_pos_max(seq);
@@ -118,7 +133,7 @@ bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
     const int64_t t0 = ggml_time_us();
 
     // small batches attend through the packed path: the jobs in flight join first, so the path does not depend on their timing
-    const bool small = balloc.get_n_tokens() <= (uint32_t) params.max_batch;
+    const bool small = n_tokens <= (uint32_t) params.max_batch;
     if (small && fitter->has_jobs(seq)) {
         fitter->wait_jobs(seq);
         tail_release(seq);
@@ -248,10 +263,30 @@ void llama_memory_hybrid_kvq::clear(bool data) {
     params.enabled = false;
 }
 
+// the sequence holds nothing: its ring cells and recurrent cell, jobs, coarse region, host rows, pages (the other sequences stay)
+void llama_memory_hybrid_kvq::seq_clear(llama_seq_id seq) {
+    if (store->n_seq() == 1) {
+        clear(false);
+        return;
+    }
+    llama_memory_hybrid::seq_rm(seq, -1, -1);
+    fitter->remove(seq, 0);
+    seqs[seq].n_released = 0;
+    store->release_from(seq, 0);
+}
+
 bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (fitter) {
-        if (seq_id > 0) {
-            GGML_ABORT("seq_rm of sequence %d is not supported by the two-tier KV cache (--kvq): the cache holds one sequence only (seq 0). Use n_seq_max = 1 (server: -np 1), or run without --kvq.", seq_id);
+        if (seq_id >= store->n_seq()) {
+            GGML_ABORT("seq_rm of sequence %d: the two-tier KV cache (--kvq) has %d sequences (n_seq_max)", seq_id, store->n_seq());
+        }
+        if (seq_id < 0 && store->n_seq() > 1) {
+            // every sequence
+            bool ok = true;
+            for (llama_seq_id s = 0; s < store->n_seq(); ++s) {
+                ok = seq_rm(s, p0, p1) && ok;
+            }
+            return ok;
         }
         // the attention positions: a restored recurrent checkpoint can end before them; the ring is empty when they end with the host store
         // (seq_id -1 is every sequence, here the one)
@@ -289,15 +324,27 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 
 void llama_memory_hybrid_kvq::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (params.enabled || store) {
-        GGML_ABORT("seq_cp is not supported by the two-tier KV cache (--kvq): the cache holds one sequence only (seq 0). Use n_seq_max = 1 (server: -np 1), or run without --kvq.");
+        GGML_ABORT("seq_cp is not supported by the two-tier KV cache (--kvq) yet: its sequences do not share rows. Run without --kvq, or do not copy a sequence.");
     }
 
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid_kvq::seq_keep(llama_seq_id seq_id) {
+    if (fitter) {
+        // the other sequences are emptied: their pages, fitter, store, ring and recurrent state
+        for (llama_seq_id s = 0; s < store->n_seq(); ++s) {
+            if (s != seq_id) {
+                seq_rm(s, -1, -1);
+            }
+        }
+        if (seq_id >= 0 && seq_id < store->n_seq()) {
+            llama_memory_hybrid::seq_keep(seq_id);
+        }
+        return;
+    }
     if ((params.enabled || store) && seq_id != 0) {
-        GGML_ABORT("seq_keep of sequence %d is not supported by the two-tier KV cache (--kvq): the cache holds one sequence only (seq 0). Use n_seq_max = 1 (server: -np 1), or run without --kvq.", seq_id);
+        GGML_ABORT("seq_keep of sequence %d is not supported by the two-tier KV cache (--kvq) without the fit mode", seq_id);
     }
 
     llama_memory_hybrid::seq_keep(seq_id);
@@ -339,7 +386,7 @@ llama_pos llama_memory_hybrid_kvq::seq_pos_max(llama_seq_id seq_id) const {
     return res;
 }
 
-// state of the fit mode, sequence 0 (seq_id -1 is the same):
+// state of the fit mode, one sequence (seq_id -1 is sequence 0 with one sequence, with several an id is needed):
 //   magic, version, then six sections, each as (u64 byte size, data):
 //     store meta, fitter meta (layout, bits, rem policy, min rows; checked before any data is read)
 //     ring: the plain state of the attention cache, the positions after the rows of the host store
@@ -396,8 +443,11 @@ void llama_memory_hybrid_kvq::state_check(llama_seq_id seq_id, llama_state_seq_f
     if (!fitter) {
         throw std::runtime_error("the K/V state of the two-tier cache can be saved and loaded only in the fit mode (--kvq)");
     }
-    if (seq_id > 0) {
-        throw std::runtime_error(format("the two-tier cache holds sequence 0 only, not %d", seq_id));
+    if (seq_id >= store->n_seq()) {
+        throw std::runtime_error(format("the two-tier cache has %d sequences, not %d", store->n_seq(), seq_id));
+    }
+    if (seq_id < 0 && store->n_seq() > 1) {
+        throw std::runtime_error("the K/V state of the two-tier cache with several sequences needs a sequence id");
     }
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         throw std::runtime_error("the K/V state of the two-tier cache cannot be kept on the device");
@@ -444,8 +494,8 @@ void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_
     state_check(seq_id, flags);
     const llama_seq_id seq = std::max<llama_seq_id>(seq_id, 0);
 
-    // the memory starts empty and stays empty after a failed read: cancels the jobs, drops the coarse region
-    clear(false);
+    // the sequence starts empty and stays empty after a failed read: cancels its jobs, drops its coarse region
+    seq_clear(seq);
 
     try {
         uint32_t magic   = 0;
@@ -484,25 +534,24 @@ void llama_memory_hybrid_kvq::state_read(llama_io_read_i & io, llama_seq_id seq_
         seqs[seq].n_released = h;
         store->ring_loaded(seq, p_max >= 0 ? p_max + 1 : h);
 
-        // the resident slots start empty
-        if (!store->enable(params)) {
-            throw std::runtime_error("failed to reset the resident rows");
+        // the resident slots start empty (one sequence: all the parameters again, as before; several: the slots of this sequence only)
+        if (store->n_seq() == 1) {
+            if (!store->enable(params)) {
+                throw std::runtime_error("failed to reset the resident rows");
+            }
+        } else {
+            store->reset_resident(seq);
         }
         LLAMA_LOG_INFO("%s: coarse region of %d rows, %d rows in the host store, %d positions in the ring\n", __func__,
                 n, h, p_max >= 0 ? p_max - p_min + 1 : 0);
     } catch (...) {
-        clear(false);
+        seq_clear(seq);
         throw;
     }
 }
 
 bool llama_memory_hybrid_kvq::set_params(const llama_kvq_params & p) {
     if (p.enabled) {
-        // one stream: the cell flags come from the positions of a single sequence
-        if (get_mem_attn()->get_n_stream() != 1) {
-            LLAMA_LOG_ERROR("%s: two-tier mode needs a single KV stream\n", __func__);
-            return false;
-        }
         if (p.n_sink < 0) {
             LLAMA_LOG_ERROR("%s: bad parameters\n", __func__);
             return false;
@@ -526,8 +575,12 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         return false;
     }
     const llama_kv_cache * kv = get_mem_attn();
-    if (kv->get_n_stream() != 1 || kv->seq_pos_max(0) >= 0) {
-        LLAMA_LOG_ERROR("%s: the fit mode needs an empty memory with a single KV stream\n", __func__);
+    bool empty = kv->get_n_stream() == 1 || kv->get_n_stream() == kv->get_n_seq_max();
+    for (uint32_t s = 0; s < kv->get_n_seq_max(); ++s) {
+        empty = empty && kv->seq_pos_max(s) < 0;
+    }
+    if (!empty) {
+        LLAMA_LOG_ERROR("%s: the fit mode needs an empty memory with one KV stream or one per sequence\n", __func__);
         return false;
     }
     if (p.prefill_free_codes && kv->get_n_seq_max() > 1) {
@@ -788,12 +841,13 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggm
     if (mask == nullptr || mask->buffer == nullptr) {
         return;
     }
-    GGML_ASSERT(kv_attn->get_n_stream() == 1 && ggml_backend_buffer_is_host(mask->buffer));
+    GGML_ASSERT(ubatch->n_seqs_unq == 1 && ggml_backend_buffer_is_host(mask->buffer));
     GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_coarse && mask->ne[1] == ubatch->n_tokens);
     GGML_ASSERT(early == nullptr || (ggml_backend_buffer_is_host(early->buffer) && ggml_are_same_shape(early, mask) && ggml_is_contiguous(early)));
 
-    const auto & cells = kv_attn->get_cells(0);
+    // the cells of the ring stream of the sequence of the ubatch
     const llama_seq_id seq = ubatch->seq_id_unq[0];
+    const auto & cells = kv_attn->get_cells(seq);
 
     const int64_t n_kv  = mask->ne[0] - n_coarse;
     const int64_t n_tok = mask->ne[1];
@@ -845,11 +899,11 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, cons
     if (mask == nullptr || mask->buffer == nullptr) {
         return;
     }
-    GGML_ASSERT(kv_attn->get_n_stream() == 1 && ggml_backend_buffer_is_host(mask->buffer));
+    GGML_ASSERT(ubatch->n_seqs_unq == 1 && ggml_backend_buffer_is_host(mask->buffer));
     GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && r0 >= 0 && r0 <= n_host && r0 + mask->ne[0] > n_host && mask->ne[1] == ubatch->n_tokens);
 
-    const auto & cells = kv_attn->get_cells(0);
     const llama_seq_id seq = ubatch->seq_id_unq[0];
+    const auto & cells = kv_attn->get_cells(seq);
 
     // mask column c is scratch row r0 + c
     const int64_t n_cols = mask->ne[0];

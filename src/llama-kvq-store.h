@@ -376,7 +376,11 @@ private:
         ggml_tensor * v = nullptr;
     };
     std::vector<tail_buf> tbufs;
-    int64_t n_cell = 0; // cells of the ring
+    int64_t n_cell = 0; // cells of the ring (of one stream)
+    std::vector<int32_t> ring_strm; // per sequence: its stream of the cache (the ring cells of a sequence are in its stream)
+    int32_t n_ring_strm = 1;        // streams of the cache
+    // byte offset of the stream of sequence s in K and V of a layer of the ring (nb[2] of the cache tensor)
+    size_t ring_off(int32_t s) const { return (size_t) ring_strm[s]*(size_t) n_cell*(size_t) G*ROW; }
     int32_t ub_p0  = 0; // decode thread: positions [ub_p0, ub_p1) of the current ubatch (packed or scratch)
     int32_t ub_p1  = 0;
     std::atomic<int32_t> tb_lo{0}; // the worker uploads the cells of the positions [tb_lo, tb_hi)

@@ -21,6 +21,8 @@
 //   --kvq-turns S1,S2,...: the prefix in turns: prefill up to S_i (batches at multiples of the batch size), the end of the prompt,
 //                          --kvq-turn-gen N greedy tokens (1 per decode, not printed), back to S_i (recurrent checkpoint), the next turn
 // --kvq-rb-test: ring rollbacks with and without an earlier rollback (also without --kvq-lib), no scoring
+// --kvq-multi-seq N [--kvq-multi-off K] [--kvq-multi-ex] [--kvq-multi-full]: N sequences in the memory, interleaved by the tool (see kvq_multi);
+//   --kvq-offset K: the token file from token K on, the reference run of a sequence of that mode
 // --kvq-state-save / --kvq-state-load FNAME: the sequence state after the prefill (and the wait), or instead of the prefill;
 //   --kvq-state-ckpt P: a recurrent checkpoint at P, rollback to it after the save or load and prefill again (FNAME.ckpt)
 // --kvq-state-refuse F1,F2,...: each state file must be refused by the load (another version, a wrong section size), the memory must
@@ -85,6 +87,14 @@ struct kvq_args {
     std::string state_load;     // sequence state file instead of the prefill
     std::vector<std::string> state_refuse; // state files that the load must refuse
     int32_t     state_ckpt = 0; // recurrent checkpoint at this position, rollback to it after the save or load and prefill again
+
+    // several sequences (--kvq-multi-seq N, the memory has N sequences), see kvq_multi
+    int32_t     multi      = 0;
+    int32_t     multi_off  = 997;   // sequence k starts k*multi_off tokens into the token file
+    int32_t     offset     = 0;     // drop the first tokens of the file (the single-sequence run of the sequence of the multi mode with that offset)
+    bool        multi_ex   = false; // the script of the sequences: rollback, empty, state round trip, then seq_keep
+    int32_t     multi_short = 0;    // the first sequences only prefill one batch (debugging: the others get later pages)
+    bool        multi_full = false; // the pool is too small for all sequences: a decode that fails ends that sequence, it is run again alone at the end
 
     bool lib() const { return lib_on; }
 };
@@ -178,6 +188,18 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             }
         } else if (a == "--kvq-state-ckpt" && has_val) {
             args.state_ckpt = std::stoi(argv[++i]);
+        } else if (a == "--kvq-multi-seq" && has_val) {
+            args.multi = std::stoi(argv[++i]);
+        } else if (a == "--kvq-multi-off" && has_val) {
+            args.multi_off = std::stoi(argv[++i]);
+        } else if (a == "--kvq-offset" && has_val) {
+            args.offset = std::stoi(argv[++i]);
+        } else if (a == "--kvq-multi-ex") {
+            args.multi_ex = true;
+        } else if (a == "--kvq-multi-short" && has_val) {
+            args.multi_short = std::stoi(argv[++i]);
+        } else if (a == "--kvq-multi-full") {
+            args.multi_full = true;
         } else if (a.rfind("--kvq-", 0) == 0) {
             LOG_ERR("%s: unknown or incomplete argument '%s'\n", __func__, a.c_str());
             return false;
@@ -191,7 +213,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
         LOG_ERR("usage: %s -m model.gguf --kvq-tokens ids.bin --kvq-prefix-len s [--kvq-chunk 64] [--kvq-save-ref ref.bin] [--kvq-ref ref.bin [--kvq-csv out.csv] [--kvq-ref2 ref2.bin]]\n"
                 "       [--kvq-no-rot] [--kvq-perf] [--kvq-rb-test] [--kvq-state-save|--kvq-state-load FNAME [--kvq-state-ckpt P]]\n"
                 "       [--kvq-lib [--kvq-fit-chunk 8192] [--kvq-pf-n 1024] [--kvq-cap 0] [--kvq-lead 2] [--kvq-scr-block 16384]\n"
-                "                  [--kvq-ring N] [--kvq-rem own|merge] [--kvq-min-rows 256] [--kvq-rm-test] [--kvq-lib-hold] [--kvq-turns S1,S2,... [--kvq-turn-gen N]]] [common args]\n", argv[0]);
+                "                  [--kvq-ring N] [--kvq-rem own|merge] [--kvq-min-rows 256] [--kvq-rm-test] [--kvq-lib-hold] [--kvq-turns S1,S2,... [--kvq-turn-gen N]]]\n"
+                "       [--kvq-multi-seq N [--kvq-multi-off K] [--kvq-multi-ex] [--kvq-multi-full]] [--kvq-offset K] [common args]\n", argv[0]);
         return false;
     }
     if (args.chunk <= 0) {
@@ -736,6 +759,278 @@ static bool kvq_turns(llama_context * ctx, const std::vector<llama_token> & ids,
     return true;
 }
 
+// --kvq-multi-seq N: N sequences in one memory, processed interleaved by this tool, one sequence per decode and the same batch boundaries as the
+// single-sequence run of each. Sequence k is the token file from k*multi_off on (its own positions start at 0). The logits of each sequence go to
+// <--kvq-save-ref>.sK in the format of the single-sequence run, so with the same ubatches they are byte-identical to a run with
+// --kvq-multi-seq 1 --kvq-offset k*multi_off (or, for k = 0, to the run without the mode)
+
+// the steps of a sequence
+enum kvq_step_kind { ST_PRE, ST_WAIT, ST_SCORE, ST_DEC, ST_RB, ST_CLEAR, ST_SAVE, ST_LOAD };
+
+struct kvq_step {
+    kvq_step_kind kind;
+    int32_t       a = 0;
+    int32_t       b = 0;
+};
+
+struct kvq_seq_run {
+    int32_t                  seq = 0;
+    std::vector<llama_token> ids;
+    int32_t                  s = 0; // the end of the prompt
+    std::vector<kvq_step>    steps;
+    size_t                   next   = 0;
+    bool                     failed = false;
+    std::string              path;
+    std::ofstream            out;
+};
+
+static std::vector<kvq_step> kvq_multi_steps(const kvq_args & args, const kvq_seq_run & r, int32_t n_batch) {
+    std::vector<kvq_step> st;
+    const int32_t e = (int32_t) r.ids.size() - 1;
+    // the prompt in the batches of kvq_prefill
+    auto pre = [&](int32_t n_end) {
+        for (int32_t i = 0, n = 0; i < n_end; i += n) {
+            n = std::min((i/n_batch + 1)*n_batch, n_end) - i;
+            st.push_back({ ST_PRE, i, i + n });
+        }
+    };
+    if (!args.multi_ex) {
+        pre(r.s);
+        st.push_back({ ST_WAIT });
+        for (int32_t p = r.s; p < e; p += args.chunk) {
+            st.push_back({ ST_SCORE, p, std::min(args.chunk, e - p) });
+        }
+        return st;
+    }
+    // rollback, empty, state round trip: positions P ... P + 12 of the sequence
+    const int32_t P = args.fit_chunk + 900;
+    pre(P);
+    st.push_back({ ST_WAIT });
+    st.push_back({ ST_DEC, P, P + 4 });
+    st.push_back({ ST_RB, P + 1 }); // back into the last ubatch
+    st.push_back({ ST_DEC, P + 1, P + 4 });
+    st.push_back({ ST_SAVE, P + 4 });
+    st.push_back({ ST_DEC, P + 4, P + 8 });
+    st.push_back({ ST_CLEAR });
+    st.push_back({ ST_LOAD, P + 4 });
+    st.push_back({ ST_DEC, P + 4, P + 8 });
+    st.push_back({ ST_DEC, P + 8, P + 12 });
+    return st;
+}
+
+static bool kvq_multi(llama_context * ctx, const llama_vocab * vocab, const std::vector<llama_token> & ids_all, int32_t s_all, const kvq_args & args,
+        int32_t n_batch, int32_t n_vocab, const std::string & ref_base) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    const int32_t  N   = args.multi;
+    const bool     lib = args.lib();
+
+    std::vector<kvq_seq_run> runs(N);
+    for (int32_t k = 0; k < N; ++k) {
+        kvq_seq_run & r = runs[k];
+        const int32_t off = k*args.multi_off;
+        if (off >= (int32_t) ids_all.size()) {
+            LOG_ERR("%s: sequence %d starts after the end of the token file\n", __func__, k);
+            return false;
+        }
+        r.seq = k;
+        r.ids.assign(ids_all.begin() + off, ids_all.end());
+        r.s   = s_all - off;
+        if (!kvq_check_segment(vocab, r.ids, r.s)) {
+            return false;
+        }
+        if (args.multi_ex && (int32_t) r.ids.size() < args.fit_chunk + 900 + 16) {
+            LOG_ERR("%s: sequence %d is too short for --kvq-multi-ex\n", __func__, k);
+            return false;
+        }
+        r.steps = kvq_multi_steps(args, r, n_batch);
+        if (k < args.multi_short) {
+            r.steps.resize(1);
+        }
+        r.path  = ref_base.empty() ? std::string() : ref_base + ".s" + std::to_string(k);
+    }
+
+    const auto open_out = [&](kvq_seq_run & r) {
+        if (r.path.empty()) {
+            return true;
+        }
+        r.out.close();
+        r.out.clear();
+        r.out.open(r.path, std::ios::binary);
+        kvq_ref_header hdr;
+        memcpy(hdr.magic, kvq_magic, sizeof(kvq_magic));
+        hdr.n_vocab    = n_vocab;
+        hdr.prefix_len = r.s;
+        hdr.n_tokens   = (int32_t) r.ids.size();
+        r.out.write((const char *) &hdr, sizeof(hdr));
+        r.out.write((const char *) r.ids.data(), r.ids.size()*sizeof(llama_token));
+        return (bool) r.out;
+    };
+    for (auto & r : runs) {
+        if (!open_out(r)) {
+            LOG_ERR("%s: failed to write %s\n", __func__, r.path.c_str());
+            return false;
+        }
+    }
+
+    std::vector<float> lp(n_vocab);
+    const auto write_lp = [&](kvq_seq_run & r, const float * logits) {
+        kvq_log_softmax(logits, n_vocab, lp.data());
+        if (r.out.is_open()) {
+            r.out.write((const char *) lp.data(), n_vocab*sizeof(float));
+        }
+    };
+
+    // 0: done, 1: no room in the cache (with --kvq-multi-full), -1: error
+    const auto decode = [&](kvq_seq_run & r, int32_t p0, int32_t p1, bool all_logits) {
+        common_batch batch(ctx);
+        for (int32_t p = p0; p < p1; ++p) {
+            batch.add(r.ids[p], p, r.seq, all_logits || p == p1 - 1);
+        }
+        const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        return ret == 0 ? 0 : (ret == 1 && args.multi_full ? 1 : -1);
+    };
+
+    // one step of the sequence, false on an error; r.failed: the decode had no room
+    const auto run_step = [&](kvq_seq_run & r, const kvq_step & st) {
+        switch (st.kind) {
+            case ST_PRE: {
+                const int d = decode(r, st.a, st.b, false);
+                r.failed = d == 1;
+                return d >= 0;
+            }
+            case ST_WAIT:
+                return !lib || llama_memory_kvq_fit_wait(mem, r.seq);
+            case ST_SCORE: {
+                const int d = decode(r, st.a, st.a + st.b, true);
+                r.failed = d == 1;
+                if (d != 0) {
+                    return d >= 0;
+                }
+                for (int32_t j = 0; j < st.b; ++j) {
+                    if (st.a + j - r.s >= kvq_n_skip) {
+                        write_lp(r, llama_get_logits_ith(ctx, j));
+                    }
+                }
+                return true;
+            }
+            case ST_DEC: {
+                const int d = decode(r, st.a, st.b, false);
+                r.failed = d == 1;
+                if (d != 0) {
+                    return d >= 0;
+                }
+                write_lp(r, llama_get_logits_ith(ctx, -1));
+                return true;
+            }
+            case ST_RB:
+                return llama_memory_seq_rm(mem, r.seq, st.a, -1);
+            case ST_CLEAR:
+                return llama_memory_seq_rm(mem, r.seq, -1, -1) && llama_memory_seq_pos_max(mem, r.seq) == -1;
+            case ST_SAVE: {
+                const std::string f = (r.path.empty() ? "kvq-multi-state" : r.path) + ".state";
+                if (llama_memory_seq_pos_max(mem, r.seq) != st.a - 1) {
+                    return false;
+                }
+                return llama_state_seq_save_file(ctx, f.c_str(), r.seq, r.ids.data(), st.a) != 0;
+            }
+            case ST_LOAD: {
+                const std::string f = (r.path.empty() ? "kvq-multi-state" : r.path) + ".state";
+                std::vector<llama_token> toks(r.ids.size());
+                size_t n_tok = 0;
+                const size_t n_read = llama_state_seq_load_file(ctx, f.c_str(), r.seq, toks.data(), toks.size(), &n_tok);
+                std::remove(f.c_str());
+                return n_read != 0 && n_tok == (size_t) st.a && llama_memory_seq_pos_max(mem, r.seq) == st.a - 1 &&
+                        std::equal(toks.begin(), toks.begin() + st.a, r.ids.begin());
+            }
+        }
+        return false;
+    };
+
+    const char * kind_name[] = { "prefill", "wait", "score", "decode", "rollback", "clear", "state save", "state load" };
+
+    // the sequences take their steps in turn
+    const int64_t t0 = ggml_time_us();
+    for (bool any = true; any; ) {
+        any = false;
+        for (auto & r : runs) {
+            if (r.failed || r.next >= r.steps.size()) {
+                continue;
+            }
+            any = true;
+            const kvq_step st = r.steps[r.next++];
+            if (!run_step(r, st)) {
+                LOG_ERR("%s: sequence %d: step %zu (%s) failed\n", __func__, r.seq, r.next - 1, kind_name[st.kind]);
+                return false;
+            }
+            if (r.failed) {
+                // no room: its rows go back to the pool, the other sequences go on
+                LOG("kvq: multi: sequence %d: the %s at step %zu returned 1 (no room), the sequence is emptied\n", r.seq, kind_name[st.kind], r.next - 1);
+                kvq_print_pool(mem);
+                if (!llama_memory_seq_rm(mem, r.seq, -1, -1) || llama_memory_seq_pos_max(mem, r.seq) != -1) {
+                    LOG_ERR("%s: cannot empty sequence %d\n", __func__, r.seq);
+                    return false;
+                }
+                LOG("kvq: multi: sequence %d emptied, the pool:\n", r.seq);
+                kvq_print_pool(mem);
+            }
+        }
+    }
+    llama_synchronize(ctx);
+    LOG("kvq: multi: %d sequences, %.2f s\n", N, (ggml_time_us() - t0)/1e6);
+
+    // seq_keep: only sequence 0 stays, and goes on
+    if (args.multi_ex) {
+        if (runs[0].failed) {
+            LOG_ERR("%s: sequence 0 failed\n", __func__);
+            return false;
+        }
+        const llama_pos p0 = llama_memory_seq_pos_max(mem, 0);
+        llama_memory_seq_keep(mem, 0);
+        bool ok = llama_memory_seq_pos_max(mem, 0) == p0;
+        for (int32_t k = 1; k < N; ++k) {
+            ok = ok && llama_memory_seq_pos_max(mem, k) == -1;
+        }
+        LOG("kvq: multi: seq_keep(0): sequence 0 at position %d, the others empty: %s; the pool:\n", p0, ok ? "ok" : "FAILED");
+        kvq_print_pool(mem);
+        if (!ok || !run_step(runs[0], { ST_DEC, p0 + 1, p0 + 5 })) {
+            return false;
+        }
+    }
+
+    // the sequences that had no room run again alone, in the pages that the others gave back
+    for (auto & r : runs) {
+        if (!r.failed) {
+            continue;
+        }
+        for (auto & q : runs) {
+            if (!q.failed && !llama_memory_seq_rm(mem, q.seq, -1, -1)) {
+                return false;
+            }
+        }
+        LOG("kvq: multi: sequence %d again alone, the pool:\n", r.seq);
+        kvq_print_pool(mem);
+        r.failed = false;
+        r.next   = 0;
+        if (!open_out(r)) {
+            return false;
+        }
+        while (r.next < r.steps.size()) {
+            if (!run_step(r, r.steps[r.next++]) || r.failed) {
+                LOG_ERR("%s: sequence %d alone: step %zu failed\n", __func__, r.seq, r.next - 1);
+                return false;
+            }
+        }
+        llama_synchronize(ctx);
+    }
+    for (auto & r : runs) {
+        r.out.close();
+    }
+    if (lib) {
+        kvq_print_progress(mem);
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -750,7 +1045,13 @@ int main(int argc, char ** argv) {
     if (!kvq_read_tokens(args.tokens_path, ids)) {
         return 1;
     }
-    const int32_t s = args.prefix_len;
+    // --kvq-offset: the file from this token on (the single-sequence run of a sequence of the multi mode)
+    if (args.offset < 0 || args.offset >= args.prefix_len) {
+        LOG_ERR("%s: --kvq-offset must be in [0, prefix length)\n", __func__);
+        return 1;
+    }
+    ids.erase(ids.begin(), ids.begin() + args.offset);
+    const int32_t s = args.prefix_len - args.offset;
     const int32_t e = (int32_t) ids.size() - 1;
 
     common_params params;
@@ -763,7 +1064,7 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: setting n_ctx = %d (was %d)\n", __func__, n_ctx_min, params.n_ctx);
         params.n_ctx = n_ctx_min;
     }
-    params.n_parallel = 1;
+    params.n_parallel = std::max(1, args.multi);
     params.n_batch    = std::max(params.n_batch, args.chunk);
 
     // --kvq-lib: the two-tier cache of the server (common_params::kvq), set up by common_init_from_params
@@ -781,7 +1082,7 @@ int main(int argc, char ** argv) {
         params.kvq.host_prealloc      = args.pk_host_prealloc;
         params.kvq.host_max_mib       = args.pk_host_max_mib;
     }
-    if (args.rm_test || args.rb_test) {
+    if (args.rm_test || args.rb_test || args.multi_ex) {
         // recurrent snapshots for a seq_rm into the last ubatch
         params.n_rs_seq = 4;
     }
@@ -820,6 +1121,14 @@ int main(int argc, char ** argv) {
 
     const int32_t n_scored = e - s - kvq_n_skip;
     LOG_INF("%s: n_tokens = %d, s = %d, e = %d, n_scored = %d, n_vocab = %d, chunk = %d\n", __func__, (int) ids.size(), s, e, n_scored, n_vocab, args.chunk);
+
+    if (args.multi > 0) {
+        const bool ok_multi = kvq_multi(ctx, vocab, ids, s, args, params.n_batch, n_vocab, args.ref_out_path);
+        LOG("\n");
+        llama_perf_context_print(ctx);
+        common_memory_breakdown_print(ctx);
+        return ok_multi ? 0 : 1;
+    }
 
     std::ofstream ref_out;
     if (!args.ref_out_path.empty()) {

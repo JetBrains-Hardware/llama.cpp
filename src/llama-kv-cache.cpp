@@ -1040,7 +1040,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
         if (ring) {
-            GGML_ASSERT(n_stream == 1);
+            // cell = position mod size in the stream of the sequence
             for (uint32_t i = 0; i < n_tokens; ++i) {
                 const llama_pos pos = ubatch.pos[i];
                 const uint32_t  idx = pos >= 0 ? (uint32_t) (pos % (llama_pos) cells.size()) : 0;
@@ -1318,7 +1318,7 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
 }
 
 void llama_kv_cache::ring_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    GGML_ASSERT(ring && n_stream == 1 && p0 >= 0 && seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    GGML_ASSERT(ring && p0 >= 0 && seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -1672,7 +1672,8 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const int64_t offs = sinfo.strm[s]*get_size();
+        // a ring (the two-tier cache) is written through its tail buffer of one stream, the cells of a stream start at 0
+        const int64_t offs = ring ? 0 : sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
@@ -1689,7 +1690,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*get_size();
+            const int64_t offs = ring ? 0 : sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
