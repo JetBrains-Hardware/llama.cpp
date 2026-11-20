@@ -623,7 +623,7 @@ struct common_params {
     struct {
         bool        enabled      = false;
         int32_t     prefetch_n   = 1024; // rows per (kv head, position) of the early query
-        int32_t     resident_cap = 0;    // resident rows per (layer, kv head), 0: max_batch x prefetch_n
+        int32_t     resident_cap = 0;    // resident rows per (layer, kv head) and per packed stream, 0: max_batch x prefetch_n
         int32_t     lead         = 2;    // layers between the early query and its attention
         int32_t     layer_bufs   = -1;   // device buffers of the resident rows: -1 one per attention layer, N >= 2 rotating
         int32_t     tail         = -1;   // cells of the ring of the rows that are not coded yet (pinned host memory), -1: max(n_batch, 4096) + 256
@@ -632,7 +632,7 @@ struct common_params {
         int32_t     min_rows     = 256;  // own: the smallest chunk of these rows, fewer stay precise
         int32_t     scr_block    = 16384; // rows per key block of the scratch attention of a prompt, 0: one attention with a mask
         bool        prefill_free_codes = false; // free the device copy of the codes and tables while a prompt is processed
-        bool        host_prealloc = false; // allocate the pinned host memory of every page of the pool at load (default: on demand)
+        bool        host_prealloc = false; // allocate the pinned host memory of every page of the pool at load and never give it back (default: on demand, given back when released)
         int32_t     host_max_mib  = 0;     // cap of the pinned host memory of the pages, MiB, 0: none
         int32_t     host_keep_mib = 0;     // free pages keep up to this many MiB of pinned host memory, the rest goes back to the OS (0: all of it), ignored with host_prealloc
     } kvq;
