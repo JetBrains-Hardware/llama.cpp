@@ -553,8 +553,12 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers");
 
     // enqueue the copy operation - the buffer copy will be performed during the next update
-    sc_info.ssrc.push_back(s0);
-    sc_info.sdst.push_back(s1);
+    // a ring (the two-tier cache) is host memory that its owner copies (llama_kvq_store::ring_fork): the cells it holds are the few rows
+    // after the host store, not the stream
+    if (!ring) {
+        sc_info.ssrc.push_back(s0);
+        sc_info.sdst.push_back(s1);
+    }
 
     v_cells[s1].reset();
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {

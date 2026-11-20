@@ -849,8 +849,8 @@ struct server_slot {
         llama_memory_kvq_reset_counters(mem);
         llama_kvq_memory_info mi;
         if (llama_memory_kvq_get_memory_info(mem, mi)) {
-            SLT_INF(*this, "kvq: pool: %d of %d pages held, pinned host memory of %d pages = %.1f MiB (%d allocations in %.2f s, %d freed in %.2f s, %d waits that blocked %.3f s)\n",
-                    mi.pages - mi.pages_free, mi.pages, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.n_page_alloc, mi.t_page_alloc, mi.n_page_free, mi.t_page_free, mi.n_page_wait, mi.t_page_wait);
+            SLT_INF(*this, "kvq: pool: %d of %d pages held (%d shared), pinned host memory of %d pages = %.1f MiB (%d allocations in %.2f s, %d freed in %.2f s, %d waits that blocked %.3f s)\n",
+                    mi.pages - mi.pages_free, mi.pages, mi.pages_shared, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.n_page_alloc, mi.t_page_alloc, mi.n_page_free, mi.t_page_free, mi.n_page_wait, mi.t_page_wait);
         }
     }
 
@@ -4847,6 +4847,11 @@ private:
                     // children with their own prompt are started at the end of the shared prefix
                     GGML_ASSERT(slot.task->n_tokens_shared == 0);
 
+                    // --kvq: the parent is fitted to the end of its prompt first, the children share its complete chunk pages and copy the last one
+                    // (the end of the prompt of a child then has nothing left to fit)
+                    if (params_base.kvq.enabled && child == children.front()) {
+                        llama_memory_kvq_fit_wait(llama_get_memory(ctx_tgt), slot.id);
+                    }
                     slot.copy_state_to(*child);
                     child->state = SLOT_STATE_DONE_PROMPT;
                 }
@@ -4927,8 +4932,8 @@ private:
                     SLT_INF(slot, "kvq: waited %.3f s for the fitter at the end of the prompt, coarse region %d rows\n", (ggml_time_us() - t_wait_start)*1e-6, fp.n_coarse);
                     llama_kvq_memory_info mi;
                     if (llama_memory_kvq_get_memory_info(llama_get_memory(ctx_tgt), mi)) {
-                        SLT_INF(slot, "kvq: pool: %d of %d pages held, pinned host memory of %d pages = %.1f MiB (%d allocations in %.2f s, %d freed in %.2f s, %d waits that blocked %.3f s)\n",
-                                mi.pages - mi.pages_free, mi.pages, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.n_page_alloc, mi.t_page_alloc, mi.n_page_free, mi.t_page_free, mi.n_page_wait, mi.t_page_wait);
+                        SLT_INF(slot, "kvq: pool: %d of %d pages held (%d shared), pinned host memory of %d pages = %.1f MiB (%d allocations in %.2f s, %d freed in %.2f s, %d waits that blocked %.3f s)\n",
+                                mi.pages - mi.pages_free, mi.pages, mi.pages_shared, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.n_page_alloc, mi.t_page_alloc, mi.n_page_free, mi.t_page_free, mi.n_page_wait, mi.t_page_wait);
                     }
                 }
 
@@ -5469,10 +5474,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
-                if (params.kvq.enabled) {
-                    // the children continue from a copy of the prompt state of the parent slot (seq_cp)
-                    throw std::runtime_error("n > 1 is not supported with --kvq (the K/V of a slot cannot be copied)");
-                }
                 int n_children = task.params.n_cmpl - 1;
                 for (int j = 0; j < n_children; j++) {
                     task.add_child(task.id, rd.get_new_id());

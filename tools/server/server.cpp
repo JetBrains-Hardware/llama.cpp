@@ -117,8 +117,8 @@ static server_role_type server_role_detect(const common_params & params, server_
     return has_model ? SERVER_ROLE_INSTANCE : SERVER_ROLE_ROUTER;
 }
 
-// --kvq: the two-tier KV cache keeps the state of each slot's sequence in a pool of pages shared by all the slots, and cannot copy or shift the K/V (no seq_cp, context
-// shift or cache reuse), the settings it needs are forced with a warning, the others are an error
+// --kvq: the two-tier KV cache keeps the state of each slot's sequence in a pool of pages shared by all the slots, and cannot shift the K/V (no context
+// shift or cache reuse; a slot copies another with seq_cp, shared chunk pages), the settings it needs are forced with a warning, the others are an error
 static bool server_kvq_prepare_params(common_params & params) {
     // ubatches of up to this many tokens use the packed attention (llama_kvq_params::max_batch)
     const int32_t kvq_max_batch = llama_kvq_params().max_batch;
@@ -133,6 +133,10 @@ static bool server_kvq_prepare_params(common_params & params) {
     }
     if (params.n_parallel > 1 && params.kvq.prefill_free_codes) {
         SRV_ERR("--kvq: --kvq-prefill-free-codes needs one slot (-np 1), n_parallel = %d\n", params.n_parallel);
+        return false;
+    }
+    if (params.n_parallel != 1 && params.kvq.rem == 1) {
+        SRV_ERR("--kvq: --kvq-rem merge needs one slot (-np 1), n_parallel = %d: a merged group rewrites the tables of the last complete chunk, and the chunk pages that slots share (n > 1 completions) must never change; use --kvq-rem own\n", params.n_parallel);
         return false;
     }
     if (params.n_parallel > 1 && !params.kv_unified) {

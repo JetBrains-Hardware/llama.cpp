@@ -98,6 +98,13 @@ struct kvq_args {
     bool        multi_full = false; // the pool is too small for all sequences: a decode that fails ends that sequence, it is run again alone at the end
     bool        multi_pack = false; // the score steps of several sequences with the same number of tokens are one decode (one packed ubatch)
 
+    // shared prefix (--kvq-multi-fork P, with --kvq-multi-seq 3): sequence 0 processes the positions [0, P), seq_cp(0, 1) and seq_cp(0, 2), then the
+    // three go on: 0 and 2 with the token file, 1 with the file from the token multi_off after P on (see kvq_multi)
+    int32_t     fork_at    = 0;
+    bool        fork_wait  = false; // the end of the prompt (fit_wait) of sequence 0 before the copy (the server's order)
+    bool        fork_ex    = false; // after the copy each sequence runs the rollback / state script, also a rollback into a shared chunk
+    int32_t     fork_only  = -1;    // --kvq-multi-seq 1: the same steps of stream K alone, no copy (the reference run)
+
     bool lib() const { return lib_on; }
 };
 
@@ -206,6 +213,14 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.multi_full = true;
         } else if (a == "--kvq-multi-pack") {
             args.multi_pack = true;
+        } else if (a == "--kvq-multi-fork" && has_val) {
+            args.fork_at = std::stoi(argv[++i]);
+        } else if (a == "--kvq-fork-wait") {
+            args.fork_wait = true;
+        } else if (a == "--kvq-fork-ex") {
+            args.fork_ex = true;
+        } else if (a == "--kvq-fork-only" && has_val) {
+            args.fork_only = std::stoi(argv[++i]);
         } else if (a.rfind("--kvq-", 0) == 0) {
             LOG_ERR("%s: unknown or incomplete argument '%s'\n", __func__, a.c_str());
             return false;
@@ -472,8 +487,8 @@ static void kvq_print_pool(llama_memory_t mem) {
     if (!llama_memory_kvq_get_memory_info(mem, mi)) {
         return;
     }
-    LOG("kvq: pool: %d of %d pages held, host memory of %d pages: %.1f MiB (store %.1f + codes and tables %.1f, %s), %d allocations (%.2f s), %d freed (%.2f s), %d waits that blocked (%.3f s)\n",
-            mi.pages - mi.pages_free, mi.pages, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.host_store/1048576.0, mi.host_codes/1048576.0,
+    LOG("kvq: pool: %d of %d pages held (%d shared), host memory of %d pages: %.1f MiB (store %.1f + codes and tables %.1f, %s), %d allocations (%.2f s), %d freed (%.2f s), %d waits that blocked (%.3f s)\n",
+            mi.pages - mi.pages_free, mi.pages, mi.pages_shared, mi.pages_host, (mi.host_store + mi.host_codes)/1048576.0, mi.host_store/1048576.0, mi.host_codes/1048576.0,
             mi.pinned ? "pinned" : "pageable", mi.n_page_alloc, mi.t_page_alloc, mi.n_page_free, mi.t_page_free, mi.n_page_wait, mi.t_page_wait);
 }
 
@@ -800,6 +815,40 @@ static std::vector<kvq_step> kvq_multi_steps(const kvq_args & args, const kvq_se
             st.push_back({ ST_PRE, i, i + n });
         }
     };
+    if (args.fork_at > 0) {
+        // shared prefix: the steps after the copy (the prefix [0, P) of sequence 0 is run before it, kvq_fork_prefix)
+        const int32_t P = args.fork_at;
+        auto pre_from = [&](int32_t a, int32_t b) {
+            for (int32_t i = a, n = 0; i < b; i += n) {
+                n = std::min((i/n_batch + 1)*n_batch, b) - i;
+                st.push_back({ ST_PRE, i, i + n });
+            }
+        };
+        if (!args.fork_ex) {
+            pre_from(P, r.s);
+            st.push_back({ ST_WAIT });
+            for (int32_t p = r.s; p < e; p += args.chunk) {
+                st.push_back({ ST_SCORE, p, std::min(args.chunk, e - p) });
+            }
+            return st;
+        }
+        // a rollback of 3 positions into the last complete chunk (a page that the sequences share: copy on write), the prompt again, then
+        // rollback, empty, state round trip as --kvq-multi-ex at Q
+        const int32_t Q = P + 1114;
+        st.push_back({ ST_RB, P - 3 });
+        pre_from(P - 3, Q);
+        st.push_back({ ST_WAIT });
+        st.push_back({ ST_DEC, Q, Q + 4 });
+        st.push_back({ ST_RB, Q + 1 });
+        st.push_back({ ST_DEC, Q + 1, Q + 4 });
+        st.push_back({ ST_SAVE, Q + 4 });
+        st.push_back({ ST_DEC, Q + 4, Q + 8 });
+        st.push_back({ ST_CLEAR });
+        st.push_back({ ST_LOAD, Q + 4 });
+        st.push_back({ ST_DEC, Q + 4, Q + 8 });
+        st.push_back({ ST_DEC, Q + 8, Q + 12 });
+        return st;
+    }
     if (!args.multi_ex) {
         pre(r.s);
         st.push_back({ ST_WAIT });
@@ -831,16 +880,33 @@ static bool kvq_multi(llama_context * ctx, const llama_vocab * vocab, const std:
     const bool     lib = args.lib();
 
     std::vector<kvq_seq_run> runs(N);
+    const bool fork = args.fork_at > 0;
+    if (fork && (!(N == 3 && args.fork_only < 0) && !(N == 1 && args.fork_only >= 0 && args.fork_only < 3))) {
+        LOG_ERR("%s: --kvq-multi-fork needs --kvq-multi-seq 3, or --kvq-multi-seq 1 with --kvq-fork-only K (K < 3)\n", __func__);
+        return false;
+    }
+    if (fork && args.fork_ex && (args.fork_at % args.fit_chunk != 2 || args.fork_at < 2*args.fit_chunk || !args.fork_wait)) {
+        LOG_ERR("%s: --kvq-fork-ex needs --kvq-fork-wait and a fork position 2 past the end of a chunk (it rolls back 3 positions into the chunk)\n", __func__);
+        return false;
+    }
     for (int32_t k = 0; k < N; ++k) {
         kvq_seq_run & r = runs[k];
-        const int32_t off = k*args.multi_off;
-        if (off >= (int32_t) ids_all.size()) {
+        // the sequence k of the multi mode starts k*multi_off tokens into the file; the streams of the fork mode: 0 and 2 are the file, 1 is the file
+        // up to P and from the token multi_off after P on
+        const int32_t stream = fork && args.fork_only >= 0 ? args.fork_only : k;
+        const int32_t off = fork ? 0 : k*args.multi_off;
+        if (off >= (int32_t) ids_all.size() || (fork && args.fork_at + args.multi_off >= s_all)) {
             LOG_ERR("%s: sequence %d starts after the end of the token file\n", __func__, k);
             return false;
         }
         r.seq = k;
         r.ids.assign(ids_all.begin() + off, ids_all.end());
         r.s   = s_all - off;
+        if (fork && stream == 1) {
+            r.ids.resize(args.fork_at);
+            r.ids.insert(r.ids.end(), ids_all.begin() + args.fork_at + args.multi_off, ids_all.end());
+            r.s = s_all - args.multi_off;
+        }
         if (!kvq_check_segment(vocab, r.ids, r.s)) {
             return false;
         }
@@ -954,6 +1020,33 @@ static bool kvq_multi(llama_context * ctx, const llama_vocab * vocab, const std:
 
     const char * kind_name[] = { "prefill", "wait", "score", "decode", "rollback", "clear", "state save", "state load" };
 
+    // shared prefix: sequence 0 (or the one sequence of the reference run) processes [0, P), then it is copied to the others
+    if (fork) {
+        kvq_seq_run & r0 = runs[0];
+        for (int32_t i = 0, n = 0; i < args.fork_at; i += n) {
+            n = std::min((i/n_batch + 1)*n_batch, args.fork_at) - i;
+            if (!run_step(r0, { ST_PRE, i, i + n })) {
+                return false;
+            }
+        }
+        if (args.fork_wait && lib && !run_step(r0, { ST_WAIT })) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        LOG("kvq: multi: sequence 0 at position %d, the pool:\n", args.fork_at);
+        kvq_print_pool(mem);
+        for (int32_t k = 1; k < N; ++k) {
+            const int64_t t_cp = ggml_time_us();
+            llama_memory_seq_cp(mem, 0, k, -1, -1);
+            LOG("kvq: multi: seq_cp(0, %d): %.4f s, sequence %d at position %d, the pool:\n", k, (ggml_time_us() - t_cp)/1e6, k, llama_memory_seq_pos_max(mem, k));
+            if (llama_memory_seq_pos_max(mem, k) != args.fork_at - 1) {
+                LOG_ERR("%s: sequence %d is at position %d after the copy, expected %d\n", __func__, k, llama_memory_seq_pos_max(mem, k), args.fork_at - 1);
+                return false;
+            }
+            kvq_print_pool(mem);
+        }
+    }
+
     // the sequences take their steps in turn
     const int64_t t0 = ggml_time_us();
     for (bool any = true; any; ) {
@@ -1032,7 +1125,7 @@ static bool kvq_multi(llama_context * ctx, const llama_vocab * vocab, const std:
     LOG("kvq: multi: %d sequences, %.2f s%s\n", N, (ggml_time_us() - t0)/1e6, args.multi_pack ? " (score steps packed)" : "");
 
     // seq_keep: only sequence 0 stays, and goes on
-    if (args.multi_ex) {
+    if (args.multi_ex || args.fork_ex) {
         if (runs[0].failed) {
             LOG_ERR("%s: sequence 0 failed\n", __func__);
             return false;
@@ -1080,6 +1173,23 @@ static bool kvq_multi(llama_context * ctx, const llama_vocab * vocab, const std:
     }
     if (lib) {
         kvq_print_progress(mem);
+    }
+    // the pool accounting of the shared pages: when every sequence is gone no page is held and the host memory is given back
+    if (fork && lib) {
+        for (int32_t k = 0; k < N; ++k) {
+            if (!llama_memory_seq_rm(mem, k, -1, -1)) {
+                return false;
+            }
+        }
+        llama_synchronize(ctx);
+        LOG("kvq: multi: every sequence removed, the pool:\n");
+        kvq_print_pool(mem);
+        llama_kvq_memory_info mi;
+        if (!llama_memory_kvq_get_memory_info(mem, mi) || mi.pages_free != mi.pages || mi.pages_shared != 0) {
+            LOG_ERR("%s: pages are still held after every sequence was removed\n", __func__);
+            return false;
+        }
+        LOG("kvq: multi: accounting: no page held, %d pages with host memory\n", mi.pages_host);
     }
     return true;
 }
@@ -1136,7 +1246,7 @@ int main(int argc, char ** argv) {
         params.kvq.host_max_mib       = args.pk_host_max_mib;
         params.kvq.host_keep_mib      = args.pk_host_keep_mib;
     }
-    if (args.rm_test || args.rb_test || args.multi_ex) {
+    if (args.rm_test || args.rb_test || args.multi_ex || args.fork_ex) {
         // recurrent snapshots for a seq_rm into the last ubatch
         params.n_rs_seq = 4;
     }

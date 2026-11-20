@@ -348,6 +348,13 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         seqs[seq].n_released = std::min(seqs[seq].n_released, q0);
         // the pages of the chunks without rows go back to the pool, the chunk that keeps rows stays
         store->release_from(seq, (q0 + store->n_chunk_rows() - 1)/store->n_chunk_rows());
+        // the chunk that keeps rows gets new rows, the next end of prompt fits it again: it must not be a page that another sequence holds
+        // (copy on write; its kept sums and fitted range were dropped above, the copy has the rows before q0)
+        if (q0 % store->n_chunk_rows() != 0 && !store->make_private(seq, q0/store->n_chunk_rows())) {
+            LLAMA_LOG_ERROR("%s: no page for a private copy of the shared chunk %d of sequence %d: the page pool is full, the sequence is emptied\n", __func__, q0/store->n_chunk_rows(), seq);
+            seq_clear(seq);
+            return false;
+        }
         return true;
     }
 
@@ -358,12 +365,64 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     return llama_memory_hybrid::seq_rm(seq_id, p0, p1);
 }
 
+// the sequence dst becomes a copy of src, like the plain unified cache (shared cells) as far as the data goes: the complete chunk pages
+// (fitted as a whole, nothing writes them any more) are shared by reference, the last page (the chunk that is being filled or fitted) is
+// copied, the ring cells and the recurrent cell are copied, the fit state of the open chunk too; the resident set of dst starts empty
+// (as after the end of a prompt)
+// the range is the whole sequence: [0, -1) or [0, p1) with p1 beyond its last position
 void llama_memory_hybrid_kvq::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    if (params.enabled || store) {
-        GGML_ABORT("seq_cp is not supported by the two-tier KV cache (--kvq) yet: its sequences do not share rows. Run without --kvq, or do not copy a sequence.");
+    if (!fitter) {
+        if (params.enabled || store) {
+            GGML_ABORT("seq_cp is not supported by the two-tier KV cache (--kvq) without the fit mode");
+        }
+        llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        return;
+    }
+    if (seq_id_src < 0 || seq_id_src >= store->n_seq() || seq_id_dst < 0 || seq_id_dst >= store->n_seq()) {
+        GGML_ABORT("seq_cp of sequence %d to %d: the two-tier KV cache (--kvq) has %d sequences (n_seq_max)", seq_id_src, seq_id_dst, store->n_seq());
+    }
+    if (seq_id_src == seq_id_dst) {
+        return;
+    }
+    const llama_seq_id src = seq_id_src;
+    const llama_seq_id dst = seq_id_dst;
+
+    // no job in flight in src, its ring and the host store complete (the same steps as a state save)
+    fitter->wait_jobs(src);
+    tail_release(src);
+    const llama_pos n_src = n_pos(src);
+    if (p0 > 0 || (p1 >= 0 && p1 < n_src)) {
+        GGML_ABORT("seq_cp of positions [%d, %d) is not supported by the two-tier KV cache (--kvq): it copies a whole sequence ([0, -1), or up to a position at or after its last one, here %d). Copy the whole sequence and remove the end with seq_rm, or run without --kvq.", p0, p1, n_src - 1);
+    }
+    if (n_src > 0 && fitter->has_failed(src)) {
+        GGML_ABORT("seq_cp of sequence %d: its fit failed, the sequence cannot be copied", src);
     }
 
-    llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    const int64_t t0 = ggml_time_us();
+    seq_clear(dst);
+    if (n_src <= 0) {
+        return;
+    }
+    store->sync_ring(src, n_src);
+    store->synchronize();
+
+    // the ring cells and the recurrent cell (the data of the ring: here, the plain copy of the stream is deferred to the next update)
+    llama_memory_hybrid::seq_cp(src, dst, -1, -1);
+
+    const int32_t n_share = fitter->n_shared(src);
+    if (!store->fork(src, dst, n_share)) {
+        // the pool has no room for the copy of the last page: nothing was taken
+        seq_clear(dst);
+        GGML_ABORT("seq_cp of sequence %d to %d: the page pool of the two-tier cache has no page for the copy of the last page of the sequence (%d of %d pages free; --kvq-host-max-mib?)", src, dst, store->get_pool().n_free(), store->get_pool().n_pages());
+    }
+    fitter->fork(src, dst);
+    seqs[dst].n_released = seqs[src].n_released;
+    store->ring_fork(src, dst, seqs[src].n_released, n_src);
+    store->ring_loaded(dst, n_src);
+    // the decoding after a copy depends on the memory state, as after the end of a prompt
+    store->reset_resident(dst);
+    LLAMA_LOG_INFO("%s: sequence %d continues from sequence %d: %d positions, %d complete pages shared, %d pages held in all, %d shared, %.3f s\n", __func__,
+            dst, src, n_src, n_share, store->get_pool().n_pages() - store->get_pool().n_free(), store->get_pool().n_shared(), (ggml_time_us() - t0)*1e-6);
 }
 
 void llama_memory_hybrid_kvq::seq_keep(llama_seq_id seq_id) {
@@ -621,6 +680,10 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
     }
     if (p.prefill_free_codes && kv->get_n_seq_max() > 1) {
         LLAMA_LOG_ERROR("%s: --kvq-prefill-free-codes needs n_seq_max = 1 (got %u)\n", __func__, kv->get_n_seq_max());
+        return false;
+    }
+    if (fp.rem == LLAMA_KVQ_REM_MERGE && kv->get_n_seq_max() > 1) {
+        LLAMA_LOG_ERROR("%s: --kvq-rem merge needs n_seq_max = 1 (got %u): a merged group rewrites the tables of the last complete chunk, and the complete chunk pages that sequences share (seq_cp) must never change; use --kvq-rem own\n", __func__, kv->get_n_seq_max());
         return false;
     }
     // the smallest coarse region: the prefetch selects prefetch_n rows that are not sinks
