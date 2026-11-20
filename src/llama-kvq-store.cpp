@@ -488,13 +488,11 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         layer_tensors & t = l.t;
         t.kc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwk, n_crow, G, n_chunk);
         t.vc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwv + 1, n_crow, G, n_chunk);
-        t.tinv = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I8, D, D, 2*G, n_chunk);
-        t.taux = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_F32, D, 3, 2*G, n_chunk);
+        t.tab  = ggml_new_tensor_3d(ctx_codes.get(), GGML_TYPE_I8, TAB_SLOT, 2*G, n_chunk);
         t.rkv_h = bufs[l.buf].rkv_h;
         ggml_format_name(t.kc,    "kvq_kc-%d",    l.il);
         ggml_format_name(t.vc,    "kvq_vc-%d",    l.il);
-        ggml_format_name(t.tinv,  "kvq_tinv-%d",  l.il);
-        ggml_format_name(t.taux,  "kvq_taux-%d",  l.il);
+        ggml_format_name(t.tab,   "kvq_tab-%d",   l.il);
         t.qacc = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, D, D, G);
         ggml_format_name(t.qacc, "kvq_qacc-%d", l.il);
         if (n_gate > 0) {
@@ -539,9 +537,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         pl.row_b     = 2*ROW;
         pl.kc_row    = layers[0].t.kc->nb[1];
         pl.vc_row    = layers[0].t.vc->nb[1];
-        pl.tinv_slot = layers[0].t.tinv->nb[2];
-        pl.taux_slot = layers[0].t.taux->nb[2];
-        GGML_ASSERT(pl.tinv_slot == (size_t) D*D && pl.taux_slot == (size_t) D*3*sizeof(float));
+        pl.tab_slot  = layers[0].t.tab->nb[1];
+        GGML_ASSERT(pl.tab_slot == TAB_SLOT && TAB_SLOT % sizeof(float) == 0);
         pages.reset(new llama_kvq_pool(buft_host, pl, n_chunk));
         page_tab.resize(n_chunk);
         for (int32_t c = 0; c < n_chunk; ++c) {
@@ -751,18 +748,17 @@ void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t 
     const layer & l = layers.at(layer_of_il.at(il));
     const layer_tensors & t = l.t;
     const int64_t m = (int64_t) page_tab[c]*2*G + 2*g + (is_v ? 1 : 0);
-    memcpy(htinv_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), inv, t.tinv->nb[2]);
-    memcpy(htaux_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), aux, t.taux->nb[2]);
+    memcpy(htinv_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), inv, (size_t) D*D);
+    memcpy(htaux_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), aux, (size_t) D*3*sizeof(float));
     if (!codes_on_dev()) {
         return;
     }
-    // a queued upload of codes_alloc may read the host copy now: this write comes after it on the main stream
+    // one copy of the slot from the host copy; a queued upload of codes_alloc may read it now: this write comes after it on the main stream
+    const uint8_t * slot = htab_ptr(l.li, c, 2*g + (is_v ? 1 : 0));
     if (async) {
-        ggml_backend_tensor_set_async(backend_main, t.tinv, inv, m*t.tinv->nb[2], t.tinv->nb[2]);
-        ggml_backend_tensor_set_async(backend_main, t.taux, aux, m*t.taux->nb[2], t.taux->nb[2]);
+        ggml_backend_tensor_set_async(backend_main, t.tab, slot, m*t.tab->nb[1], TAB_SLOT);
     } else {
-        ggml_backend_tensor_set(t.tinv, inv, m*t.tinv->nb[2], t.tinv->nb[2]);
-        ggml_backend_tensor_set(t.taux, aux, m*t.taux->nb[2], t.taux->nb[2]);
+        ggml_backend_tensor_set(t.tab, slot, m*t.tab->nb[1], TAB_SLOT);
     }
 }
 
@@ -816,7 +812,7 @@ void llama_kvq_store::state_write_meta(llama_io_write_i & io) const {
     const layer_tensors & t = layers[0].t;
     const int32_t v[13] = {
         (int32_t) layers.size(), G, (int32_t) D, (int32_t) ROW, n_crow, nwk, nwv, n_coarse_,
-        (int32_t) t.tinv->type, (int32_t) t.tinv->nb[2], (int32_t) t.taux->type, (int32_t) t.taux->nb[2], n_host_,
+        (int32_t) GGML_TYPE_I8, (int32_t) (D*D), (int32_t) GGML_TYPE_F32, (int32_t) (D*3*sizeof(float)), n_host_,
     };
     io.write(v, sizeof(v));
     for (const auto & l : layers) {
@@ -825,7 +821,6 @@ void llama_kvq_store::state_write_meta(llama_io_write_i & io) const {
 }
 
 void llama_kvq_store::state_read_meta(llama_io_read_i & io, int32_t & n_out, int32_t & n_host_out) const {
-    const layer_tensors & t = layers[0].t;
     int32_t v[13];
     io.read(v, sizeof(v));
     if (v[0] != (int32_t) layers.size() || v[1] != G || v[2] != (int32_t) D || v[3] != (int32_t) ROW) {
@@ -836,9 +831,9 @@ void llama_kvq_store::state_read_meta(llama_io_read_i & io, int32_t & n_out, int
         throw std::runtime_error(format("kvq state with chunks of %d rows and %d / %d words per K / V row, this context: %d, %d / %d",
                 v[4], v[5], v[6], n_crow, nwk, nwv));
     }
-    if (v[8] != (int32_t) t.tinv->type || v[9] != (int32_t) t.tinv->nb[2] || v[10] != (int32_t) t.taux->type || v[11] != (int32_t) t.taux->nb[2]) {
+    if (v[8] != (int32_t) GGML_TYPE_I8 || v[9] != (int32_t) (D*D) || v[10] != (int32_t) GGML_TYPE_F32 || v[11] != (int32_t) (D*3*sizeof(float))) {
         throw std::runtime_error(format("kvq state with tables of type %d / %d (%d / %d bytes), this context: %d / %d (%d / %d bytes)",
-                v[8], v[10], v[9], v[11], (int) t.tinv->type, (int) t.taux->type, (int) t.tinv->nb[2], (int) t.taux->nb[2]));
+                v[8], v[10], v[9], v[11], (int) GGML_TYPE_I8, (int) GGML_TYPE_F32, (int) (D*D), (int) (D*3*sizeof(float))));
     }
     const int32_t n = v[7];
     const int32_t h = v[12];
@@ -878,10 +873,12 @@ void llama_kvq_store::state_write_data(llama_io_write_i & io) {
                 });
             }
         }
+        // the state holds the inverse tables of the slots of a chunk, then their aux floats, as before the slots were joined
         for (int k = 2; k < 4; ++k) {
-            const ggml_tensor * tab = k == 3 ? l.t.taux : l.t.tinv;
             for (int32_t c = 0; c < (n + n_crow - 1)/n_crow; ++c) {
-                io.write(k == 3 ? htaux_ptr(l.li, c, 0) : htinv_ptr(l.li, c, 0), tab->nb[3]);
+                for (int32_t m = 0; m < 2*G; ++m) {
+                    io.write(k == 3 ? htaux_ptr(l.li, c, m) : htinv_ptr(l.li, c, m), k == 3 ? (size_t) D*3*sizeof(float) : (size_t) D*D);
+                }
             }
         }
     }
@@ -910,9 +907,10 @@ void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n, int32_t h
             }
         }
         for (int k = 2; k < 4; ++k) {
-            const ggml_tensor * tab = k == 3 ? l.t.taux : l.t.tinv;
             for (int32_t c = 0; c < (n + n_crow - 1)/n_crow; ++c) {
-                io.read(k == 3 ? htaux_ptr(l.li, c, 0) : htinv_ptr(l.li, c, 0), tab->nb[3]);
+                for (int32_t m = 0; m < 2*G; ++m) {
+                    io.read(k == 3 ? htaux_ptr(l.li, c, m) : htinv_ptr(l.li, c, m), k == 3 ? (size_t) D*3*sizeof(float) : (size_t) D*D);
+                }
             }
         }
     }
@@ -1972,15 +1970,14 @@ void llama_kvq_store::codes_up(int32_t n, bool async) {
                 }
             }
         }
-        for (int k = 2; k < 4; ++k) {
-            ggml_tensor * t = k == 3 ? l.t.taux : l.t.tinv;
-            for (int32_t c = 0; c < n_tab; ++c) {
-                const uint8_t * src = k == 3 ? htaux_ptr(l.li, c, 0) : htinv_ptr(l.li, c, 0);
-                if (async) {
-                    ggml_backend_tensor_set_async(backend_main, t, src, (size_t) page_tab[c]*t->nb[3], t->nb[3]);
-                } else {
-                    ggml_backend_tensor_set(t, src, (size_t) page_tab[c]*t->nb[3], t->nb[3]);
-                }
+        // the tables: one copy per page (the slots [2G] of the host page are the device page)
+        for (int32_t c = 0; c < n_tab; ++c) {
+            ggml_tensor *   t   = l.t.tab;
+            const uint8_t * src = htab_ptr(l.li, c, 0);
+            if (async) {
+                ggml_backend_tensor_set_async(backend_main, t, src, (size_t) page_tab[c]*t->nb[2], t->nb[2]);
+            } else {
+                ggml_backend_tensor_set(t, src, (size_t) page_tab[c]*t->nb[2], t->nb[2]);
             }
         }
     }
@@ -2007,7 +2004,7 @@ bool llama_kvq_store::codes_alloc() {
     codes_up(n, async);
     {
         const size_t sz_rows = (size_t) ((n + n_crow - 1)/n_crow)*(layers[0].t.kc->nb[3] + layers[0].t.vc->nb[3])*layers.size();
-        const size_t sz_tabs = (size_t) ((n + n_crow - 1)/n_crow)*(layers[0].t.tinv->nb[3] + layers[0].t.taux->nb[3])*layers.size();
+        const size_t sz_tabs = (size_t) ((n + n_crow - 1)/n_crow)*layers[0].t.tab->nb[2]*layers.size();
         LLAMA_LOG_INFO("%s: codes and tables (%.1f MiB) on the device in %.2f ms, upload of the host copy of the rows [0, %d) and %d chunk slots (%.1f MiB) %s\n", __func__,
                 ggml_backend_buffer_get_size(buf_codes.get())/1048576.0, (t1 - t0)/1000.0, n, (n + n_crow - 1)/n_crow, (sz_rows + sz_tabs)/1048576.0,
                 async ? "queued" : "done");
@@ -2024,7 +2021,7 @@ void llama_kvq_store::codes_free() {
     synchronize();
     buf_codes.reset();
     for (auto & l : layers) {
-        for (ggml_tensor * t : { l.t.kc, l.t.vc, l.t.tinv, l.t.taux }) {
+        for (ggml_tensor * t : { l.t.kc, l.t.vc, l.t.tab }) {
             t->data   = nullptr;
             t->buffer = nullptr;
         }
@@ -2037,7 +2034,7 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     llama_kvq_memory_info mi;
     for (const auto & l : layers) {
         mi.codes      += ggml_nbytes(l.t.kc) + ggml_nbytes(l.t.vc);
-        mi.tables     += ggml_nbytes(l.t.tinv) + ggml_nbytes(l.t.taux);
+        mi.tables     += ggml_nbytes(l.t.tab);
         mi.other_dev  += (l.t.qacc ? ggml_nbytes(l.t.qacc) : 0) + (l.t.gacc ? ggml_nbytes(l.t.gacc) : 0);
         mi.host_other += (l.ridx.size() + l.slot_stamp.size())*sizeof(int32_t) + (l.res.size() + l.req.size())*sizeof(uint64_t);
     }

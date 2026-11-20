@@ -10394,7 +10394,7 @@ struct test_kvq_attn : public test_case {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, G*n_rep, L);
         ggml_set_name(q, "q");
 
-        ggml_tensor * kc = nullptr, * vc = nullptr, * tinv = nullptr, * taux = nullptr, * pt = nullptr;
+        ggml_tensor * kc = nullptr, * vc = nullptr, * tab = nullptr, * pt = nullptr;
         if (n_coarse > 0) {
             kc = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, nwk, n_crow, G, pages());
             ggml_set_name(kc, "kc");
@@ -10402,11 +10402,9 @@ struct test_kvq_attn : public test_case {
                 vc = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, nwv + 1, n_crow, G, pages());
                 ggml_set_name(vc, "vc");
             }
-            tinv = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, D, D, 2*G, pages());
-            taux = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 3, 2*G, pages());
+            tab  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, D*D + 3*D*sizeof(float), 2*G, pages());
             pt   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_chunk);
-            ggml_set_name(tinv, "tinv");
-            ggml_set_name(taux, "taux");
+            ggml_set_name(tab, "tab");
             ggml_set_name(pt, "pt");
         }
 
@@ -10432,7 +10430,7 @@ struct test_kvq_attn : public test_case {
         ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_coarse + n_tail, L);
         ggml_set_name(mask, "mask");
 
-        ggml_tensor * out = ggml_kvq_attn(ctx, q, kc, vc, tinv, taux, pt, k, v, rkv, ridx, mask, 1.0f/16.0f, (int) n_coarse, (int) n_crow, mode);
+        ggml_tensor * out = ggml_kvq_attn(ctx, q, kc, vc, tab, pt, k, v, rkv, ridx, mask, 1.0f/16.0f, (int) n_coarse, (int) n_crow, mode);
         ggml_set_name(out, "out");
 
         return out;
@@ -10476,23 +10474,24 @@ struct test_kvq_attn : public test_case {
                     data[i] = i % (nwv + 1) == (size_t) nwv ? ggml_fp32_to_fp16(1.0f + 0.5f*uf(gen)) : ud(gen);
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
-            } else if (strcmp(t->name, "tinv") == 0) {
-                std::vector<int8_t> data(ggml_nelements(t));
-                for (auto & x : data) {
-                    x = (int8_t) std::lround(127.0f*uf(gen));
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
-            } else if (strcmp(t->name, "taux") == 0) {
+            } else if (strcmp(t->name, "tab") == 0) {
+                // per slot: the inverse table bytes, then the aux floats:
                 // step so that (code + 0.5)*step is in [-1, 1] times the table scale 1/(8*127), 0 for 0-bit components
-                std::vector<float> data(ggml_nelements(t));
+                const size_t slot = D*D + 3*D*sizeof(float);
+                std::vector<uint8_t> data(ggml_nbytes(t));
                 for (int64_t m = 0; m < pages()*2*G; ++m) {
+                    int8_t * inv = (int8_t *) (data.data() + m*slot);
+                    for (int64_t i = 0; i < D*D; ++i) {
+                        inv[i] = (int8_t) std::lround(127.0f*uf(gen));
+                    }
                     const std::vector<int> b = random_bits(m % 2 ? nwv : nwk);
-                    float * aux = data.data() + m*3*D;
+                    float aux[3*256];
                     for (int64_t c = 0; c < D; ++c) {
                         aux[c]       = b[c] ? (1.5f + 0.5f*uf(gen))/(float) (1 << (b[c] - 1))/(8.0f*127.0f) : 0.0f;
                         aux[D + c]   = 0.5f*uf(gen);
                         aux[2*D + c] = (float) b[c];
                     }
+                    memcpy(data.data() + m*slot + D*D, aux, sizeof(aux));
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "pt") == 0) {

@@ -102,7 +102,7 @@ static kvq_graph * build_kvq(ggml_backend_t backend, const kvq_problem & P, int 
     ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, P.n_head(), P.L);
     ggml_set_name(q, "q");
 
-    ggml_tensor * kc = nullptr, * vc = nullptr, * tinv = nullptr, * taux = nullptr, * pt = nullptr;
+    ggml_tensor * kc = nullptr, * vc = nullptr, * tab = nullptr, * pt = nullptr;
     if (P.n_coarse > 0) {
         kc = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, P.nwk, P.n_crow, P.G, P.pages());
         ggml_set_name(kc, "kc");
@@ -110,11 +110,9 @@ static kvq_graph * build_kvq(ggml_backend_t backend, const kvq_problem & P, int 
             vc = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, P.nwv + 1, P.n_crow, P.G, P.pages());
             ggml_set_name(vc, "vc");
         }
-        tinv = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, D, D, 2*P.G, P.pages());
-        taux = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 3, 2*P.G, P.pages());
+        tab  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, D*D + 3*D*sizeof(float), 2*P.G, P.pages());
         pt   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, P.n_chunk);
-        ggml_set_name(tinv, "tinv");
-        ggml_set_name(taux, "taux");
+        ggml_set_name(tab, "tab");
         ggml_set_name(pt, "pt");
     }
     ggml_tensor * k = new_cache_view(ctx, P.type_tail, P.n_tail, P.G, "k");
@@ -135,7 +133,7 @@ static kvq_graph * build_kvq(ggml_backend_t backend, const kvq_problem & P, int 
 
     g->gf = ggml_new_graph_custom(ctx, 8*reps + 64, false);
     for (int r = 0; r < reps; ++r) {
-        ggml_tensor * out = ggml_kvq_attn(ctx, q, kc, vc, tinv, taux, pt, k, v, rkv, ridx, mask, P.scale, P.n_coarse, P.n_crow, mode);
+        ggml_tensor * out = ggml_kvq_attn(ctx, q, kc, vc, tab, pt, k, v, rkv, ridx, mask, P.scale, P.n_coarse, P.n_crow, mode);
         if (n_top > 0) {
             out = ggml_top_k(ctx, ggml_reshape_2d(ctx, out, P.n_coarse, P.G*P.L), n_top);
         }
@@ -173,8 +171,19 @@ static kvq_graph * build_kvq(ggml_backend_t backend, const kvq_problem & P, int 
     if (P.n_coarse > 0) {
         set_pages("kc", P.kc.data(), P.nwk*sizeof(int32_t), 0);
         set_pages("vc", P.vc.data(), (P.nwv + 1)*sizeof(int32_t), 0);
-        set_pages("tinv", P.tinv.data(), 0, (size_t) 2*P.G*D*D);
-        set_pages("taux", P.taux.data(), 0, (size_t) 2*P.G*3*D*sizeof(float));
+        // the table slots of chunk t: the inverse table bytes, then the aux floats
+        if (ggml_tensor * t = ggml_get_tensor(ctx, "tab")) {
+            const size_t slot = D*D + 3*D*sizeof(float);
+            std::vector<uint8_t> tab_data(ggml_nbytes(t), 0);
+            for (int c = 0; c < P.n_chunk; ++c) {
+                for (int m = 0; m < 2*P.G; ++m) {
+                    uint8_t * dst = tab_data.data() + (size_t) P.page(c)*t->nb[2] + (size_t) m*slot;
+                    memcpy(dst, P.tinv.data() + ((size_t) c*2*P.G + m)*D*D, (size_t) D*D);
+                    memcpy(dst + D*D, P.taux.data() + ((size_t) c*2*P.G + m)*3*D, 3*D*sizeof(float));
+                }
+            }
+            ggml_backend_tensor_set(t, tab_data.data(), 0, tab_data.size());
+        }
         std::vector<int32_t> pt_data(P.n_chunk);
         for (int c = 0; c < P.n_chunk; ++c) {
             pt_data[c] = P.page(c);

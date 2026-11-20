@@ -12,7 +12,7 @@
 // a page is the C rows of one chunk of every attention layer and kv head in one pinned host buffer, per layer:
 //   rows:  q8_0 rows [G][rows][K row, V row]
 //   kc:    host codes of K [G][rows][kc_row bytes], vc: of V [G][rows][vc_row bytes] (the row layout of the device kc / vc)
-//   tinv:  the tables of the chunk slot [2*G][tinv_slot bytes], taux: [2*G][taux_slot bytes]
+//   tab:   the tables of the chunk slot [2*G][tab_slot bytes], a slot is the inverse table bytes then the aux floats (the device tab)
 // every page has C rows (the last page of n_rows is not shortened)
 class llama_kvq_pool {
 public:
@@ -24,8 +24,7 @@ public:
         size_t  row_b    = 0; // bytes of the K and V row of a position
         size_t  kc_row   = 0;
         size_t  vc_row   = 0;
-        size_t  tinv_slot = 0;
-        size_t  taux_slot = 0;
+        size_t  tab_slot = 0;
     };
 
     // allocates every page, throws if one fails
@@ -55,8 +54,7 @@ public:
     uint8_t * rows_ptr(int32_t page, int32_t li) const { return sec(page, li, 0); } // [G][rows(page)][2*ROW]
     uint8_t * kc_ptr  (int32_t page, int32_t li) const { return sec(page, li, 1); } // [G][rows(page)][kc_row]
     uint8_t * vc_ptr  (int32_t page, int32_t li) const { return sec(page, li, 2); } // [G][rows(page)][vc_row]
-    uint8_t * tinv_ptr(int32_t page, int32_t li) const { return sec(page, li, 3); } // [2*G][tinv_slot]
-    uint8_t * taux_ptr(int32_t page, int32_t li) const { return sec(page, li, 4); } // [2*G][taux_slot]
+    uint8_t * tab_ptr (int32_t page, int32_t li) const { return sec(page, li, 3); } // [2*G][tab_slot]
 
     const layout & get_layout() const { return lay; }
 
@@ -65,10 +63,10 @@ private:
     ggml_backend_buffer_type_t buft = nullptr;
     std::vector<ggml_backend_buffer_ptr> bufs; // one per page
     std::vector<uint8_t *>               base; // their base addresses
-    std::vector<std::array<size_t, 6>>   offs; // per page: the offsets of the sections in the block of a layer, then its size
+    std::vector<std::array<size_t, 5>>   offs; // per page: the offsets of the sections in the block of a layer, then its size
     std::vector<int32_t>                 nrow; // per page: its rows
 
     uint8_t * sec(int32_t page, int32_t li, int k) const {
-        return base[page] + (size_t) li*offs[page][5] + offs[page][k];
+        return base[page] + (size_t) li*offs[page][4] + offs[page][k];
     }
 };

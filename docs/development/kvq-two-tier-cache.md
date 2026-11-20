@@ -97,7 +97,7 @@ A plain state starts with the stream count of the attention cache, so a plain co
 | Fit op (mean, covariance, rotation, V gain statistics, code and pack), CPU reference and CUDA | `ggml_kvq_fit` in `ggml/include/ggml.h`, `ggml_compute_forward_kvq_fit` in `ggml/src/ggml-cpu/ops.cpp`, `ggml/src/ggml-cuda/kvq-fit.{cu,cuh}` |
 | Host store, resident cache, prefetch worker, scratch uploads | `src/llama-kvq-store.{h,cpp}` |
 | Host pages (rows, host codes and tables of one chunk, pinned; every page has C rows) | `src/llama-kvq-pool.{h,cpp}`, `row_ptr` / `hcode_ptr` / `chunk_runs` in `src/llama-kvq-store.h` |
-| Device codes and tables in pages (`kc [nwk, C, G, n_pages]`, tables slot = page) read through the page table `pt` (`ggml_kvq_attn` source, `get_pt()`; the identity until sequences share a pool) | `src/llama-kvq-store.cpp` (`codes_up`, `set_chunk_table`), `build_codes` / `queue_job` in `src/llama-kvq-fit.cpp` |
+| Device codes and tables in pages (`kc [nwk, C, G, n_pages]`, one table tensor `tab [D*D + 3*D*4, 2G, n_pages]` per layer, slot = page) read through the page table `pt` (the op's i32 coarse index input, `get_pt()`; the identity until sequences share a pool) | `src/llama-kvq-store.cpp` (`codes_up`, `set_chunk_table`), `build_codes` / `queue_job` in `src/llama-kvq-fit.cpp` |
 | Fitter (device phases, CPU tasks) | `src/llama-kvq-fit.{h,cpp}` |
 | Memory (hybrid subclass), ring-shaped device cache | `src/llama-memory-hybrid-kvq.{h,cpp}`, `src/llama-kv-cache.{h,cpp}` |
 | Graph | `src/models/qwen35.cpp` |

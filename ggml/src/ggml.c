@@ -1218,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
-    "kvq_attn(q, kc, vc, tab_inv, tab_aux, k, v, rkv, ridx, mask, pt)",
+    "kvq_attn(q, kc, vc, tab, k, v, rkv, ridx, mask, pt)",
     "kvq_fit(x, par, rows)",
 
     "unary(x)",
@@ -6697,8 +6697,7 @@ struct ggml_tensor * ggml_kvq_attn(
         struct ggml_tensor  * q,
         struct ggml_tensor  * kc,
         struct ggml_tensor  * vc,
-        struct ggml_tensor  * tab_inv,
-        struct ggml_tensor  * tab_aux,
+        struct ggml_tensor  * tab,
         struct ggml_tensor  * pt,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
@@ -6739,11 +6738,9 @@ struct ggml_tensor * ggml_kvq_attn(
 
         GGML_ASSERT(kc->type == GGML_TYPE_I32 && kc->ne[1] == n_chunk_rows && kc->ne[2] == G && kc->ne[3] >= n_chunk);
         GGML_ASSERT(pt && pt->type == GGML_TYPE_I32 && pt->ne[0] >= n_chunk && pt->nb[0] == sizeof(int32_t));
-        GGML_ASSERT(tab_inv && tab_inv->type == GGML_TYPE_I8);
-        GGML_ASSERT(tab_inv->ne[0] == D && tab_inv->ne[1] == D && tab_inv->ne[2] == 2*G && tab_inv->ne[3] == kc->ne[3]);
-        GGML_ASSERT(tab_aux && tab_aux->type == GGML_TYPE_F32);
-        GGML_ASSERT(tab_aux->ne[0] == D && tab_aux->ne[1] == 3 && tab_aux->ne[2] == 2*G && tab_aux->ne[3] == kc->ne[3]);
-        GGML_ASSERT(ggml_is_contiguous_rows(tab_inv) && ggml_is_contiguous_rows(tab_aux));
+        GGML_ASSERT(tab && tab->type == GGML_TYPE_I8 && tab->nb[0] == 1);
+        GGML_ASSERT(tab->ne[0] == D*D + 3*D*(int64_t) sizeof(float) && tab->ne[1] == 2*G && tab->ne[2] == kc->ne[3] && tab->ne[3] == 1);
+        GGML_ASSERT(tab->nb[1] % sizeof(float) == 0 && tab->nb[2] % sizeof(float) == 0);
         if (attn) {
             GGML_ASSERT(vc && vc->type == GGML_TYPE_I32);
             GGML_ASSERT(vc->ne[0] >= 2 && vc->ne[1] == n_chunk_rows && vc->ne[2] == G && vc->ne[3] == kc->ne[3]);
@@ -6771,14 +6768,13 @@ struct ggml_tensor * ggml_kvq_attn(
     result->src[0] = q;
     result->src[1] = kc;
     result->src[2] = attn ? vc : NULL;
-    result->src[3] = kc ? tab_inv : NULL;
-    result->src[4] = kc ? tab_aux : NULL;
-    result->src[5] = k;
-    result->src[6] = attn ? v : NULL;
-    result->src[7] = attn ? rkv : NULL;
-    result->src[8] = attn && rkv ? ridx : NULL;
-    result->src[9] = mask;
-    result->src[10] = kc ? pt : NULL;
+    result->src[3] = kc ? tab : NULL;
+    result->src[4] = k;
+    result->src[5] = attn ? v : NULL;
+    result->src[6] = attn ? rkv : NULL;
+    result->src[7] = attn && rkv ? ridx : NULL;
+    result->src[8] = mask;
+    result->src[9] = kc ? pt : NULL;
 
     return result;
 }

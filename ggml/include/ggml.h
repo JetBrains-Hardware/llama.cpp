@@ -48,7 +48,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            12 // 11 would not keep sizeof(ggml_tensor) a multiple of GGML_MEM_ALIGN (GGML_OP_KVQ_ATTN has 11 sources)
+#define GGML_MAX_SRC            10
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -2568,16 +2568,21 @@ extern "C" {
     //
     // the codes and tables are stored in pages of n_chunk_rows rows, one chunk each; the page table pt maps the logical
     // chunk t to its physical page pt[t]: row r of the coarse region is row r % n_chunk_rows of page pt[r / n_chunk_rows],
-    // its tables are the slice pt[t] of tab_inv / tab_aux. Everything else (the scores, the mask, ridx) uses logical rows
+    // its tables are the slot pt[t] of tab. Everything else (the scores, the mask, ridx) uses logical rows
+    //
+    // pt is the op's i32 "coarse index" input: [n_chunk_max] now. The per-stream fields (n_coarse, n_tail, the pages) of an op call
+    // with several sequences will go into this same tensor as [header + n_chunk_max, n_stream], so the op never needs another source
     //
     // q:       [D, n_head, L]                  f32, n_head % G == 0, head h reads kv head h/(n_head/G), rows contiguous
     // kc:      [nwk, n_chunk_rows, G, n_pages] i32, packed K row of each (row of the page, kv head, page), any nb1..nb3;
     //                                          NULL: n_coarse = 0
     // vc:      [nwv + 1, n_chunk_rows, G, n_pages] i32, packed V row in words [0, nwv), V gain in the low 16 bits (f16) of word nwv
-    // tab_inv: [D, D, 2*G, n_pages]            i8, inverse transforms, (K, V) of kv head g at i2 = 2*g + (0, 1), page p at i3 = p
+    // tab:     [D*D + 3*D*4, 2*G, n_pages]     i8 (bytes), the tables, (K, V) of kv head g at i1 = 2*g + (0, 1), page p at i2 = p; a slot is
+    //            bytes [0, D*D): the inverse transform, then the aux floats (4-byte aligned, D*D is a multiple of 4):
+    //            the inverse transform, i8 [D, D]:
     //            K: element [c, i] = inv[c][i] (i0 = component), V: element [i, c] = inv[c][i] (i0 = dim)
     //            the scale of inv[c][:] is part of step[c] (src/llama-kvq-pack.h: one scale per component, max |inv[c][:]| -> 127)
-    // tab_aux: [D, 3, 2*G, n_pages]            f32, i1 = 0: step[c], 1: mu[i], 2: bits[c] (0..8, as float), same i2/i3
+    //            aux (f32 [D, 3]) at byte D*D: i1 = 0: step[c], 1: mu[i], 2: bits[c] (0..8, as float)
     // pt:      [>= n_chunk]                    i32, physical page (0 .. n_pages - 1) of each logical chunk, n_chunk = ceil(n_coarse/n_chunk_rows);
     //                                          NULL if kc is NULL; the identity is the contiguous layout
     // k, v:    [D, n_tail, G]                  q8_0, tail K/V (any nb1/nb2, e.g. a permuted cache view),
@@ -2616,8 +2621,7 @@ extern "C" {
             struct ggml_tensor  * q,
             struct ggml_tensor  * kc,
             struct ggml_tensor  * vc,
-            struct ggml_tensor  * tab_inv,
-            struct ggml_tensor  * tab_aux,
+            struct ggml_tensor  * tab,
             struct ggml_tensor  * pt,
             struct ggml_tensor  * k,
             struct ggml_tensor  * v,
