@@ -11954,16 +11954,21 @@ void ggml_compute_forward_kvq_attn(
     const int64_t D        = q->ne[0];
     const int64_t n_head   = q->ne[1];
     const int64_t L        = q->ne[2];
+    const int64_t S        = q->ne[3];
     const int64_t G        = k->ne[2];
     const int64_t n_rep    = n_head/G;
     const int64_t n_tail   = k->ne[1];
-    const int64_t n_coarse = kc ? ggml_get_op_params_i32(dst, 3) : 0;
-    const int64_t n_chunk  = kc ? (n_coarse + n_crow - 1)/n_crow : 0;
+    const int64_t n_coarse_max = kc ? ggml_get_op_params_i32(dst, 3) : 0;
     const int64_t cap      = rkv ? rkv->ne[1] : 0;
+
+    // the stream of the current task: its coarse rows and chunks, its row of the page table
+    int64_t s_cur    = 0;
+    int64_t n_coarse = 0;
+    int64_t n_chunk  = 0;
 
     // physical page of logical chunk t
     auto page_of = [&](int64_t t) -> int64_t {
-        return *(const int32_t *) ((const char *) pt->data + t*pt->nb[0]);
+        return *(const int32_t *) ((const char *) pt->data + t*pt->nb[0] + s_cur*pt->nb[1]);
     };
 
     float * out_attn  = do_attn  ? (float *) dst->data : nullptr;
@@ -11973,7 +11978,7 @@ void ggml_compute_forward_kvq_attn(
     const int nth = params->nth;
 
     auto mask_at = [&](int64_t row, int64_t l) -> double {
-        return mask ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) mask->data + row*mask->nb[0] + l*mask->nb[1])) : 0.0;
+        return mask ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) mask->data + row*mask->nb[0] + l*mask->nb[1] + s_cur*mask->nb[3])) : 0.0;
     };
     auto aux_at = [&](int64_t i, int64_t r, int64_t m, int64_t t) -> float {
         return *(const float *) ((const char *) tab->data + D*D + (i + r*D)*sizeof(float) + m*tab->nb[1] + page_of(t)*tab->nb[2]);
@@ -11989,8 +11994,8 @@ void ggml_compute_forward_kvq_attn(
     };
 
     std::vector<float>  tmp(D);
-    std::vector<double> qv(D), qt(D), acc(D), lc(n_coarse), lp(cap), lt(n_tail);
-    std::vector<char>   is_res(n_coarse);
+    std::vector<double> qv(D), qt(D), acc(D), lc(n_coarse_max), lp(cap), lt(n_tail);
+    std::vector<char>   is_res(n_coarse_max);
     std::vector<int32_t> bits(D), offs(D);
 
     // bit widths and offsets of table m of chunk t
@@ -12003,26 +12008,33 @@ void ggml_compute_forward_kvq_attn(
         }
     };
 
-    for (int64_t task = ith; task < G*L; task += nth) {
-        const int64_t g = task % G;
-        const int64_t l = task / G;
+    for (int64_t task = ith; task < S*G*L; task += nth) {
+        const int64_t g  = task % G;
+        const int64_t l  = (task / G) % L;
+        const int64_t st = task / (G*L);
+
+        s_cur    = st;
+        n_coarse = kc ? ggml_get_op_params_i32(dst, 5 + (int) st) : 0;
+        n_chunk  = kc ? (n_coarse + n_crow - 1)/n_crow : 0;
+
+        const char * ridx_s = ridx ? (const char *) ridx->data + st*ridx->nb[2] : nullptr;
 
         std::fill(is_res.begin(), is_res.end(), 0);
         for (int64_t s = 0; s < cap && do_attn; s++) {
-            const int32_t r = *(const int32_t *) ((const char *) ridx->data + s*ridx->nb[0] + g*ridx->nb[1]);
+            const int32_t r = *(const int32_t *) (ridx_s + s*ridx->nb[0] + g*ridx->nb[1]);
             if (r >= 0 && r < n_coarse) {
                 is_res[r] = 1;
             }
         }
 
         if (do_score) {
-            for (int64_t j = 0; j < n_coarse; j++) {
-                out_score[j + n_coarse*(g + G*l)] = 0.0f;
+            for (int64_t j = 0; j < n_coarse_max; j++) {
+                out_score[j + n_coarse_max*(g + G*(l + L*st))] = 0.0f;
             }
         }
 
         for (int64_t h = g*n_rep; h < (g + 1)*n_rep; h++) {
-            const float * qh = (const float *) ((const char *) q->data + h*q->nb[1] + l*q->nb[2]);
+            const float * qh = (const float *) ((const char *) q->data + h*q->nb[1] + l*q->nb[2] + st*q->nb[3]);
             for (int64_t i = 0; i < D; i++) {
                 qv[i] = qh[i];
             }
@@ -12059,10 +12071,10 @@ void ggml_compute_forward_kvq_attn(
             }
 
             for (int64_t s = 0; s < cap && do_attn; s++) {
-                const int32_t r = *(const int32_t *) ((const char *) ridx->data + s*ridx->nb[0] + g*ridx->nb[1]);
+                const int32_t r = *(const int32_t *) (ridx_s + s*ridx->nb[0] + g*ridx->nb[1]);
                 lp[s] = -INFINITY;
                 if (r >= 0 && r < n_coarse) {
-                    row_f32(rkv, s, g, 0, tmp.data());
+                    row_f32(rkv, s, g, 2*st, tmp.data());
                     double d = 0.0;
                     for (int64_t i = 0; i < D; i++) {
                         d += qv[i]*tmp[i];
@@ -12072,7 +12084,7 @@ void ggml_compute_forward_kvq_attn(
             }
 
             for (int64_t r = 0; r < n_tail; r++) {
-                row_f32(k, r, g, 0, tmp.data());
+                row_f32(k, r, g, st, tmp.data());
                 double d = 0.0;
                 for (int64_t i = 0; i < D; i++) {
                     d += qv[i]*tmp[i];
@@ -12099,7 +12111,7 @@ void ggml_compute_forward_kvq_attn(
                         z += std::exp(lt[r] - mx);
                     }
                     for (int64_t j = 0; j < n_coarse; j++) {
-                        out_score[j + n_coarse*(g + G*l)] += (float) (std::exp(lc[j] - mx)/z);
+                        out_score[j + n_coarse_max*(g + G*(l + L*st))] += (float) (std::exp(lc[j] - mx)/z);
                     }
                 }
             }
@@ -12118,7 +12130,7 @@ void ggml_compute_forward_kvq_attn(
                 mx = std::max(mx, lp[s]);
             }
 
-            float * oh = out_attn + D*(h + n_head*l);
+            float * oh = out_attn + D*(h + n_head*(l + L*st));
             if (!(mx > -INFINITY)) {
                 std::fill(oh, oh + D, 0.0f);
                 continue;
@@ -12131,7 +12143,7 @@ void ggml_compute_forward_kvq_attn(
                 const double w = std::exp(lp[s] - mx);
                 if (w > 0.0) {
                     z += w;
-                    row_f32(rkv, s, g, 1, tmp.data());
+                    row_f32(rkv, s, g, 2*st + 1, tmp.data());
                     for (int64_t i = 0; i < D; i++) {
                         acc[i] += w*tmp[i];
                     }
@@ -12141,7 +12153,7 @@ void ggml_compute_forward_kvq_attn(
                 const double w = std::exp(lt[r] - mx);
                 if (w > 0.0) {
                     z += w;
-                    row_f32(v, r, g, 0, tmp.data());
+                    row_f32(v, r, g, st, tmp.data());
                     for (int64_t i = 0; i < D; i++) {
                         acc[i] += w*tmp[i];
                     }

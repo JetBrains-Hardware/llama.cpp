@@ -2570,10 +2570,16 @@ extern "C" {
     // chunk t to its physical page pt[t]: row r of the coarse region is row r % n_chunk_rows of page pt[r / n_chunk_rows],
     // its tables are the slot pt[t] of tab. Everything else (the scores, the mask, ridx) uses logical rows
     //
-    // pt is the op's i32 "coarse index" input: [n_chunk_max] now. The per-stream fields (n_coarse, n_tail, the pages) of an op call
-    // with several sequences will go into this same tensor as [header + n_chunk_max, n_stream], so the op never needs another source
+    // streams: a call can serve S = q->ne[3] <= GGML_KVQ_MAX_STREAM independent sequences (streams) of L query positions each (the
+    // tokens of a stream are contiguous, the same L for every stream). Stream s has its own page table row, coarse rows, tail
+    // (ring), resident slots and mask; the codes, tables and the page pool are shared. S = 1 is the single-sequence call.
+    // Per-stream numbers that the host knows when it builds the graph, n_coarse[s], are op parameters (ggml_kvq_attn_streams: the
+    // largest one is op_params[3] and sizes the buffers and grids; a stream with fewer coarse rows does less work); everything
+    // else is in the tensors, one slice per stream in the last dimension (see below), so the op still has 10 sources
     //
-    // q:       [D, n_head, L]                  f32, n_head % G == 0, head h reads kv head h/(n_head/G), rows contiguous
+    // pt is the op's i32 "coarse index" input: [n_chunk_max, n_stream], the page table of stream s in column s
+    //
+    // q:       [D, n_head, L, S]               f32, n_head % G == 0, head h reads kv head h/(n_head/G), rows contiguous
     // kc:      [nwk, n_chunk_rows, G, n_pages] i32, packed K row of each (row of the page, kv head, page), any nb1..nb3;
     //                                          NULL: n_coarse = 0
     // vc:      [nwv + 1, n_chunk_rows, G, n_pages] i32, packed V row in words [0, nwv), V gain in the low 16 bits (f16) of word nwv
@@ -2583,13 +2589,18 @@ extern "C" {
     //            K: element [c, i] = inv[c][i] (i0 = component), V: element [i, c] = inv[c][i] (i0 = dim)
     //            the scale of inv[c][:] is part of step[c] (src/llama-kvq-pack.h: one scale per component, max |inv[c][:]| -> 127)
     //            aux (f32 [D, 3]) at byte D*D: i1 = 0: step[c], 1: mu[i], 2: bits[c] (0..8, as float)
-    // pt:      [>= n_chunk]                    i32, physical page (0 .. n_pages - 1) of each logical chunk, n_chunk = ceil(n_coarse/n_chunk_rows);
-    //                                          NULL if kc is NULL; the identity is the contiguous layout
-    // k, v:    [D, n_tail, G]                  q8_0, tail K/V (any nb1/nb2, e.g. a permuted cache view),
-    //                                          v not transposed; n_tail >= 1, tail row r is cache row n_coarse + r
-    // rkv:     [D, cap, G, 2]                  q8_0, resident precise K (i3 = 0) and V (i3 = 1); NULL: no resident rows
-    // ridx:    [cap, G]                        i32, coarse row held by each resident slot, -1 (or any row outside [0, n_coarse)) = empty
-    // mask:    [>= n_kv, >= L]                 f16, added to the scaled logits, element [row, l] for cache row row and position l,
+    // pt:      [>= n_chunk, S]                 i32, physical page (0 .. n_pages - 1) of each logical chunk of stream s in column s,
+    //                                          n_chunk = ceil(n_coarse/n_chunk_rows) (of the stream); NULL if kc is NULL;
+    //                                          the identity is the contiguous layout. The entries of a stream with fewer chunks than
+    //                                          the largest one are never read
+    // k, v:    [D, n_tail, G, S]               q8_0, tail K/V (any nb1..nb3, e.g. a permuted cache view with one ring per stream),
+    //                                          v not transposed; n_tail >= 1 (the same for every stream: a shorter ring is masked),
+    //                                          tail row r of stream s is cache row n_coarse[s] + r
+    // rkv:     [D, cap, G, 2*S]                q8_0, resident precise K (i3 = 2*s) and V (i3 = 2*s + 1) of stream s; NULL: no resident
+    //                                          rows. The same cap for every stream: unused slots have ridx = -1
+    // ridx:    [cap, G, S]                     i32, coarse row held by each resident slot, -1 (or any row outside [0, n_coarse[s])) = empty
+    // mask:    [>= n_kv, >= L, 1, S]           f16, added to the scaled logits, element [row, l, 0, s] for cache row row and position l of
+    //                                          stream s, n_kv >= n_coarse[s] + n_tail for every stream,
     //                                          a resident slot uses the mask of its row; NULL: no mask
     //
     // packed rows: component c of a table holds bits[c] bits, sum(bits) <= 32*nwk (K) or 32*nwv (V)
@@ -2603,11 +2614,11 @@ extern "C" {
     //
     // CUDA (Ampere or newer): D == 256, L <= 8, (n_head/G)*L <= 48, nwk <= 32, nwv <= 32, k/v/rkv row strides multiple of 16 bytes
     //
-    // mode GGML_KVQ_ATTN:  res [D, n_head, L] f32 = sum_j w_j v_j, w = softmax over the non-resident coarse rows (coarse K/V),
+    // mode GGML_KVQ_ATTN:  res [D, n_head, L, S] f32 = sum_j w_j v_j, w = softmax over the non-resident coarse rows (coarse K/V),
     //                      the resident slots (precise K/V) and the tail rows (precise K/V)
-    // mode GGML_KVQ_SCORE: res [n_coarse, G, L] f32, sum over the query heads of kv head g of softmax over all coarse rows
+    // mode GGML_KVQ_SCORE: res [n_coarse_max, G, L, S] f32, sum over the query heads of kv head g of softmax over all coarse rows
     //                      (coarse K, resident or not) and the tail rows (precise K), at the coarse rows; needs kc,
-    //                      vc, v, rkv, ridx are unused
+    //                      vc, v, rkv, ridx are unused; the rows of a stream at or after its n_coarse are 0
     //
     // an all -inf row of weights gives 0
     //
@@ -2615,6 +2626,8 @@ extern "C" {
         GGML_KVQ_ATTN  = 1,
         GGML_KVQ_SCORE = 2,
     };
+
+    #define GGML_KVQ_MAX_STREAM 8
 
     GGML_API struct ggml_tensor * ggml_kvq_attn(
             struct ggml_context * ctx,
@@ -2630,6 +2643,24 @@ extern "C" {
             struct ggml_tensor  * mask,
             float                 scale,
             int                   n_coarse,
+            int                   n_chunk_rows,
+            int                   mode);
+
+    // the same for S = q->ne[3] streams, n_coarse[s] the coarse rows of stream s (S values; ignored without kc)
+    GGML_API struct ggml_tensor * ggml_kvq_attn_streams(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kc,
+            struct ggml_tensor  * vc,
+            struct ggml_tensor  * tab,
+            struct ggml_tensor  * pt,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * rkv,
+            struct ggml_tensor  * ridx,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            const int           * n_coarse,
             int                   n_chunk_rows,
             int                   mode);
 
