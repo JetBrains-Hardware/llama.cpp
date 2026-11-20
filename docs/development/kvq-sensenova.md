@@ -27,10 +27,12 @@ Model: `SenseNova-Loop-9B-Q5_K_M.gguf` from the Hugging Face repo `sensenova/Sen
 llama-server --fit off -m SenseNova-Loop-9B-Q5_K_M.gguf --alias SenseNova-Loop-9B-Q5_K_M ^
   --host 127.0.0.1 --port 8080 --ctx-size 256000 --n-gpu-layers all --parallel 1 ^
   --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --jinja ^
-  --batch-size 4096 --ubatch-size 1024 --kvq
+  --batch-size 4096 --ubatch-size 1024 --kvq ^
+  --spec-type draft-mtp --spec-draft-n-max 1 -ctkd f16 -ctvd f16
 ```
 
-- No speculative decoding: the model's MTP layer slows the decode down on this model (one short request, greedy, RTX 5090: plain 116 t/s, plain + MTP n_max 3 74 t/s, `--kvq` 105 t/s, `--kvq` + MTP n_max 3 60 t/s, n_max 1 67 t/s; draft acceptance about 0.55).
+- MTP draft of one token (the model's own MTP layer, blk.56). Greedy decode, 4 generic prompts of up to 400 tokens, short context, RTX 5090: plain 116 t/s, plain + MTP n_max 1 144 - 169 t/s, `--kvq` 106 t/s, `--kvq` + MTP n_max 1 105 - 122 t/s; draft acceptance 0.70 - 0.91. n_max 1 is the best: every further draft token costs about 6.5 ms per step and is accepted less often (plain + MTP n_max 3: 143 t/s, acceptance 0.48).
+- This needs the commit that adds `sensenova_loop` to `llm_arch_supports_rs_rollback` (PR 32588 does not have it). Without it the server checkpoints the whole recurrent state (88 MiB) every step and restores it and decodes again after a rejected draft, and MTP makes the decode slower (plain + MTP n_max 3: 71 t/s). With it, the greedy output of MTP n_max 1 is byte-identical to the greedy output without MTP, with and without `--kvq`.
 - Sampling of the model card: temperature 1.0, top_p 0.95.
 - Memory at 256k: VRAM holds the weights (6.7 GB) and the coarse codes (K 2 bit, V 1 bit plus a gain: about 5.6 KB per token, 1.4 GB at 256k) instead of a q8_0 KV cache of about 30 KB per token (7.4 GB). The q8_0 rows of all positions are in pinned host RAM (about 7.4 GB at 256k).
 - The limits of the kvq guide apply: one slot, CUDA only, no context shift or cache reuse, no `--mmproj`, `--fit off`.
