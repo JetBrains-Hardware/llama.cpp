@@ -335,6 +335,12 @@ LLAMA_API bool llama_memory_kvq_fit_get_progress(llama_memory_t mem, llama_seq_i
 // (see llama_kvq_rem), waits for all of it; afterwards no fit work of the sequence runs. Call it between decodes, from the decode thread
 LLAMA_API bool llama_memory_kvq_fit_wait(llama_memory_t mem, llama_seq_id seq_id);
 
+// seq_cp(src, dst, 0, -1) that can fail: the whole sequence src becomes the content of dst (dst is emptied first; the complete chunk pages are
+// shared, the last page is copied, which needs a free page: llama_kvq_memory_info::pages_free). All or nothing: false, with the memory
+// unchanged, if the pool has no page (or no host memory) for the copy; also false without the kvq memory. llama_memory_seq_cp returns void and
+// aborts in that case. A caller that can report an error (llama-server, n > 1 completions) calls this one, after llama_memory_kvq_fit_wait(src)
+LLAMA_API bool llama_memory_kvq_seq_cp_try(llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
+
 // debug: hold = true: finished chunks join the coarse region only in llama_memory_kvq_fit_wait
 LLAMA_API bool llama_memory_kvq_fit_set_hold(llama_memory_t mem, bool hold);
 

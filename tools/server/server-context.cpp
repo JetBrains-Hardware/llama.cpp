@@ -898,11 +898,17 @@ struct server_slot {
         other.prompt = prompt.clone();
     }
 
-    void copy_state_to(server_slot & other) const {
+    // mem_done: the memory of the target context of other was already copied (llama_memory_kvq_seq_cp_try, --kvq)
+    void copy_state_to(server_slot & other, bool mem_done = false) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        mem.seq_rm(other.id,     -1, -1);
-        mem.seq_cp(id, other.id, -1, -1);
+        if (!mem_done) {
+            mem.seq_rm(other.id,     -1, -1);
+            mem.seq_cp(id, other.id, -1, -1);
+        } else if (mem.ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(mem.ctx_dft), other.id,     -1, -1);
+            llama_memory_seq_cp(llama_get_memory(mem.ctx_dft), id, other.id, -1, -1);
+        }
 
         other.i_batch = i_batch;
 
@@ -4840,6 +4846,7 @@ private:
 
                 // all children slots should already launched by launch_slots_with_parent_task()
                 // copy state to the child slots
+                bool kvq_copy_failed = false;
                 for (auto & child : children) {
                     SLT_TRC(slot, " - copying state to child %d\n", child->id);
 
@@ -4852,8 +4859,40 @@ private:
                     if (params_base.kvq.enabled && child == children.front()) {
                         llama_memory_kvq_fit_wait(llama_get_memory(ctx_tgt), slot.id);
                     }
-                    slot.copy_state_to(*child);
+                    bool mem_done = false;
+                    if (params_base.kvq.enabled) {
+                        // the copy of the last page needs a free page of the pool, seq_cp would abort: ask first (all or nothing), purge idle
+                        // slots while that helps, else fail like a decode that finds no room does (every slot of the request gets the error)
+                        llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+                        slot.mem.seq_rm(child->id, -1, -1);
+                        while (!llama_memory_kvq_seq_cp_try(mem_tgt, slot.id, child->id)) {
+                            if (!try_clear_idle_slots()) {
+                                kvq_copy_failed = true;
+                                break;
+                            }
+                            SRV_WRN("%s", "kvq: the pool of pages is full for the copy of the prompt (n > 1), retrying after purging an idle slot\n");
+                        }
+                        if (kvq_copy_failed) {
+                            break;
+                        }
+                        mem_done = true;
+                    }
+                    slot.copy_state_to(*child, mem_done);
                     child->state = SLOT_STATE_DONE_PROMPT;
+                }
+
+                if (kvq_copy_failed) {
+                    // ggml-org fails all slots of the request when a decode cannot go on, and so does this: the error goes to every task of
+                    // the request (the client gets one error for it), the parent and the children are released and the pool takes back
+                    // the pages of the children that were copied already. The parent's prompt stays in its slot (it is valid)
+                    const std::string err = "kvq: the pool of pages is full, cannot copy the prompt for n > 1";
+                    send_error(slot, err);
+                    slot.release();
+                    for (auto & child : children) {
+                        send_error(*child, err);
+                        child->release();
+                        slot.mem.seq_rm(child->id, -1, -1);
+                    }
                 }
             }
         }

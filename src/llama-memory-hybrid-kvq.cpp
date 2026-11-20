@@ -371,18 +371,31 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 // (as after the end of a prompt)
 // the range is the whole sequence: [0, -1) or [0, p1) with p1 beyond its last position
 void llama_memory_hybrid_kvq::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (!seq_cp_impl(seq_id_src, seq_id_dst, p0, p1, false)) {
+        // not reached: without try_pages every failure aborts inside
+        GGML_ABORT("seq_cp of sequence %d to %d failed", seq_id_src, seq_id_dst);
+    }
+}
+
+// all or nothing: false, with the memory unchanged, if the pool has no pages for the copy (the caller can purge a sequence and ask again,
+// or report an error)
+bool llama_memory_hybrid_kvq::seq_cp_try(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    return seq_cp_impl(seq_id_src, seq_id_dst, 0, -1, true);
+}
+
+bool llama_memory_hybrid_kvq::seq_cp_impl(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1, bool try_pages) {
     if (!fitter) {
         if (params.enabled || store) {
             GGML_ABORT("seq_cp is not supported by the two-tier KV cache (--kvq) without the fit mode");
         }
         llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
-        return;
+        return true;
     }
     if (seq_id_src < 0 || seq_id_src >= store->n_seq() || seq_id_dst < 0 || seq_id_dst >= store->n_seq()) {
         GGML_ABORT("seq_cp of sequence %d to %d: the two-tier KV cache (--kvq) has %d sequences (n_seq_max)", seq_id_src, seq_id_dst, store->n_seq());
     }
     if (seq_id_src == seq_id_dst) {
-        return;
+        return true;
     }
     const llama_seq_id src = seq_id_src;
     const llama_seq_id dst = seq_id_dst;
@@ -398,23 +411,31 @@ void llama_memory_hybrid_kvq::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
         GGML_ABORT("seq_cp of sequence %d: its fit failed, the sequence cannot be copied", src);
     }
 
+    const int32_t n_share = fitter->n_shared(src);
+    if (try_pages && n_src > 0 && store->n_page_chunks(src) - n_share > store->get_pool().n_free()) {
+        // the pages dst holds are not counted (the caller empties dst first): nothing was changed
+        return false;
+    }
+
     const int64_t t0 = ggml_time_us();
     seq_clear(dst);
     if (n_src <= 0) {
-        return;
+        return true;
     }
     store->sync_ring(src, n_src);
     store->synchronize();
 
+    // the pages first (it is the step that can fail, with nothing taken): the host memory cap, or or the pool
+    if (!store->fork(src, dst, n_share)) {
+        seq_clear(dst);
+        if (try_pages) {
+            return false;
+        }
+        GGML_ABORT("seq_cp of sequence %d to %d: the page pool of the two-tier cache has no page for the copy of the last page of the sequence (%d of %d pages free; --kvq-host-max-mib?). llama-server and other callers that can fail should call llama_memory_kvq_seq_cp_try (src/llama-ext.h), which returns false and changes nothing.", src, dst, store->get_pool().n_free(), store->get_pool().n_pages());
+    }
+
     // the ring cells and the recurrent cell (the data of the ring: here, the plain copy of the stream is deferred to the next update)
     llama_memory_hybrid::seq_cp(src, dst, -1, -1);
-
-    const int32_t n_share = fitter->n_shared(src);
-    if (!store->fork(src, dst, n_share)) {
-        // the pool has no room for the copy of the last page: nothing was taken
-        seq_clear(dst);
-        GGML_ABORT("seq_cp of sequence %d to %d: the page pool of the two-tier cache has no page for the copy of the last page of the sequence (%d of %d pages free; --kvq-host-max-mib?)", src, dst, store->get_pool().n_free(), store->get_pool().n_pages());
-    }
     fitter->fork(src, dst);
     seqs[dst].n_released = seqs[src].n_released;
     store->ring_fork(src, dst, seqs[src].n_released, n_src);
@@ -423,6 +444,7 @@ void llama_memory_hybrid_kvq::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     store->reset_resident(dst);
     LLAMA_LOG_INFO("%s: sequence %d continues from sequence %d: %d positions, %d complete pages shared, %d pages held in all, %d shared, %.3f s\n", __func__,
             dst, src, n_src, n_share, store->get_pool().n_pages() - store->get_pool().n_free(), store->get_pool().n_shared(), (ggml_time_us() - t0)*1e-6);
+    return true;
 }
 
 void llama_memory_hybrid_kvq::seq_keep(llama_seq_id seq_id) {
@@ -850,6 +872,14 @@ bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_memory_info 
     }
     out = kvq->get_store()->memory_info();
     return true;
+}
+
+bool llama_memory_kvq_seq_cp_try(llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    auto * kvq = dynamic_cast<llama_memory_hybrid_kvq *>(mem);
+    if (!kvq || !kvq->get_store()) {
+        return false;
+    }
+    return kvq->seq_cp_try(seq_id_src, seq_id_dst);
 }
 
 void llama_memory_kvq_reset_counters(llama_memory_t mem) {

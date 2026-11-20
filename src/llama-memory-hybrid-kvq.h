@@ -79,6 +79,8 @@ public:
     // fit mode: seq_rm of the end per sequence (seq_id -1: every sequence), seq_keep empties the other sequences
     // seq_cp copies a whole sequence (complete chunk pages shared by reference, the last page copied; a range aborts), seq_add and seq_div abort in two-tier mode
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    // the whole sequence like seq_cp, but all or nothing: false (nothing changed) if the pool has no pages for the copy of the last page(s)
+    bool seq_cp_try(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
     void seq_keep(llama_seq_id seq_id) override;
     void seq_add (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override;
@@ -129,6 +131,9 @@ public:
     void set_tg_cb(std::function<void()> cb) { tg_cb = std::move(cb); }
 
 private:
+    // seq_cp (try_pages false: aborts when the pool has no page) and seq_cp_try
+    bool seq_cp_impl(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1, bool try_pages);
+
     std::function<void()> tg_cb;
 
     const llama_model & model;
