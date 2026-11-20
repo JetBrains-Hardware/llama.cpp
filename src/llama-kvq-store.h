@@ -91,8 +91,9 @@ public:
     // the region starts empty and grows (set_n_coarse), the query statistics tensors are allocated
     // n_gate > 0: also the gate statistics tensors, n_gate = n_head*D
     // layer_bufs: device buffers of the resident rows (llama_kvq_params::layer_bufs)
+    // shared_min: the smallest shared memory (the fitter works in it, llama_kvq_fitter::shared_min)
     llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-            int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate = 0);
+            int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate = 0, size_t shared_min = 0);
     ~llama_kvq_store();
 
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
@@ -188,6 +189,11 @@ public:
     // before a packed graph zeroes the resident and tail buffers (the joins upload the mirrors of the own buffers)
     bool scr_alloc();
     bool dec_alloc();
+
+    // the fitter works in the shared memory between the ubatches: drops the queued uploads of the packed path and waits for the
+    // streams; the next scr_alloc zeroes the scratch again, the next dec_alloc restores the resident buffers
+    void fit_alloc();
+    ggml_backend_buffer_t shared_buffer() const { return buf_scr.get(); }
 
     // every write of the codes and tables goes to a pinned host copy first (same bytes as kc, vc, tinv, taux); the device copy exists
     // only for the packed path: scr_alloc frees it, codes_alloc (end of a prompt, or dec_alloc) allocates it and queues the upload
@@ -324,7 +330,7 @@ private:
     ggml_context_ptr        ctx_scr;
     ggml_backend_buffer_ptr buf_scr;
 
-    int                     scr_mode = 0;     // shared memory: set up for 1 the scratch, 2 the packed path, 0 neither
+    int                     scr_mode = 0;     // shared memory: set up for 1 the scratch, 2 the packed path, 3 the fitter, 0 none
     ggml_context_ptr        ctx_dec;          // the resident and tail buffers in the shared memory
 
 

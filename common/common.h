@@ -622,7 +622,6 @@ struct common_params {
     // two-tier KV cache of the main context (qwen35): packed attention, K and V tables fitted in the background, see llama_kvq_fit_params
     struct {
         bool        enabled      = false;
-        int32_t     n_threads    = -1;   // CPU threads of the fitter, -1: 4, at most the physical cores
         int32_t     prefetch_n   = 1024; // rows per (kv head, position) of the early query
         int32_t     resident_cap = 0;    // resident rows per (layer, kv head), 0: max_batch x prefetch_n
         int32_t     lead         = 2;    // layers between the early query and its attention

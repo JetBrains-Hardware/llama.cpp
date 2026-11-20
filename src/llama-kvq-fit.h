@@ -21,17 +21,15 @@ class llama_io_read_i;
 // fits and codes the coarse region of a packed store in fit mode (see llama_kvq_fit_params)
 // a job is a range of rows with one table set (a complete chunk, the rows after the last complete chunk, or a group of the
 // last complete chunk and these rows), its tasks are the (attention layer, kv head, K or V) triples
-// the work on the rows runs on the device, on the main stream between the ubatches; a small pool of CPU threads
-// fits the tables from the moments of the rows (K: metric of the queries of the range; V: o_proj columns scaled by the
-// mean sigmoid(gate)); one graph per attention layer and phase, the rows of a layer go through a device stage:
-//   phase 1 (take):    rows [r0, r1) from the host store (the host ring keeps it complete) -> stage; dequantize, mean, covariance -> host
-//   CPU, V tasks first: metric, llama_kvq_fit_cov (Cholesky, eigen solver, tables); K: bits, packed table
-//   phase 2 (V tasks done, per-chunk V): rows from the host store; V fwd tables up, rows rotated, scale of the shape -> host
-//   V bits (CPU):      bits, steps, packed table
-//   phase 3, install (all tasks done): rows from the host store; tables up, rows rotated, codes packed into kc and vc, the range
-//                      joins the coarse region (a range that is coarse already gets its new tables and codes in the same poll)
-// the pool threads wait for the events of the device phases; the decode thread (poll, wait, remove) never waits for
-// device work it queued in the same poll, except in settle and wait_jobs
+// the whole fit runs on the device, on the main stream between the ubatches (ggml_kvq_fit), in the shared memory of the store
+// (llama_kvq_store::fit_alloc: idle between the ubatches), the attention layers in groups of n_grp:
+//   take: the metrics from the statistics on the host (K: the queries of the range; V: o_proj columns scaled by the mean
+//         sigmoid(gate)); per group: per layer rows [r0, r1) from the host store (the host ring keeps it complete) -> stage,
+//         mean and covariance -> the tables of the group; one graph for the tables of the group (Cholesky, eigen solver);
+//         per layer the rows again: K bits; V rotated, scale of the shape, V bits; packed tables and codes -> the host copies
+//   install (the job's event): the range joins the coarse region (a range that is coarse already gets its new tables and codes)
+// a waiter thread waits for the events; the decode thread (poll, wait, remove) never waits for device work it queued in the
+// same poll, except in settle and wait_jobs
 // a range is always fitted from scratch: its tables are a function of its rows and statistics only
 class llama_kvq_fitter {
 public:
@@ -59,10 +57,11 @@ public:
     // the positions [p0, inf) were removed: cancels the jobs with rows there, the coarse region drops back to the chunk of p0
     void remove(llama_pos p0);
 
-    // the device stage and the graph allocator: allocated at the ctor and again by the first phase after dev_free
-    // dev_free: no jobs in flight, after the queued phases
-    void dev_free();
-    bool dev_allocated() const { return buf_dev != nullptr; }
+    // the smallest shared memory of the store for a fit of one layer per group, n_stage rows per job
+    static size_t shared_min(int32_t n_head_kv, int32_t n_stage, int32_t bits_k, int32_t bits_v);
+
+    // the rows of the largest job
+    static int32_t stage_rows(int32_t n_rows, const llama_kvq_fit_params & fparams);
 
     bool has_jobs() const { return !jobs_empty(); }
 
@@ -96,13 +95,11 @@ private:
 
     std::vector<int32_t> layer_ids;
 
-    // per-chunk V: Wo_r^T Wo_r of the n_rep query heads r of each (layer index, kv head), computed once by the first task
+    // per-chunk V: Wo_r^T Wo_r of the n_rep query heads r of each (layer index, kv head), computed by the ctor
     int32_t n_head = 0;
     int32_t n_rep  = 0;
-    std::vector<const ggml_tensor *>  wo;
-    std::vector<std::vector<float>>   wo_gram; // [n_rep][D*D]
-    std::vector<char>                 wo_dev;  // wo_gram computed on the device
-    std::unique_ptr<std::once_flag[]> wo_once;
+    std::vector<const ggml_tensor *> wo;
+    std::vector<std::vector<float>>  wo_gram; // [n_rep][D*D]
 
     // statistics of the complete chunks [0, n_snap), read when the chunk was complete: to fit it, and to restore them after a seq_rm into it
     int32_t n_snap = 0;
@@ -121,22 +118,25 @@ private:
     bool failed = false;
     bool hold   = false;
 
-    // device state of the phases: the identity rows, the tables of one layer, the q8_0 rows of one layer
-    ggml_context_ptr        ctx_dev;
-    ggml_backend_buffer_ptr buf_dev;
+    // device state: own buffer (idx, tinv); in the shared memory of the store at fixed offsets: stage, cst, tab, then the
+    // intermediates of each graph from plan_lo on (plan)
+    ggml_context_ptr        ctx_own;
+    ggml_backend_buffer_ptr buf_own;
+    ggml_context_ptr        ctx_shr;
     ggml_tensor *           idx     = nullptr; // i32 [n_stage, G], 0 .. n_stage - 1
-    ggml_tensor *           par     = nullptr; // f32 [D, D + 5, 2*G], per (K or V, kv head): fwd, mu, step, bits, offsets, den
+    ggml_tensor *           tinv    = nullptr; // i8 [D, D, 2*G], the packed inverse tables of one layer
     ggml_tensor *           stage   = nullptr; // q8_0 [D, 2, n_stage, G], K and V rows in the layout of the host store
-    ggml_tensor *           cst[2]  = {};      // i32 [nwk or nwv + 1, n_stage, G], phase 3 codes when the device has no kc / vc
-    ggml_gallocr_ptr        galloc;
+    ggml_tensor *           cst[2]  = {};      // i32 [nwk or nwv + 1, n_stage, G], the codes when the device has no kc / vc
+    ggml_tensor *           tab     = nullptr; // f32 [D, 2*D + 3, 2*G*n_grp], the tables of a group: K of its layers, then V
+    int32_t                 n_grp   = 0;       // attention layers per group
+    size_t                  plan_lo = 0;       // the graphs place their intermediates in the shared memory from here
     std::vector<uint8_t>    graph_meta;
 
     mutable std::mutex      m;
     std::condition_variable cv_work;
     std::condition_variable cv_done;
-    std::deque<std::pair<job *, int32_t>> tasks;
-    std::deque<std::unique_ptr<job>>      jobs; // in the order of the takes
-    std::vector<std::thread> threads;
+    std::deque<std::unique_ptr<job>>     jobs; // in the order of the takes
+    std::thread                          waiter;
     std::vector<ggml_backend_buffer_ptr> free_bufs; // host buffers of finished jobs
     bool stop = false;
 
@@ -146,36 +146,36 @@ private:
     int32_t n_spill  = 0;
     std::vector<double> t_job;
     std::vector<double> t_wall;
-    double t_cpu     = 0.0;
     double t_take    = 0.0;
     double t_install = 0.0;
 
-    // (layer, kv head) pairs, task i < n_pair is K, then V; i >= 2*n_pair: V bits task of V task i - n_pair
+    // (layer, kv head) pairs, task i < n_pair is K, then V
     int32_t n_pair() const;
 
     std::vector<range> layout(llama_pos n) const;
     bool fitted(const range & r) const;
     bool in_flight(const range & r) const;
     bool jobs_empty() const;
-    static bool can_advance(const job & jb);
     void snapshots(llama_pos n_pos);
     void read_acc(std::vector<float> & gram, std::vector<float> & gsum);
     bool check_ring(const llama_kv_cache & kv, int32_t p0, int32_t p1);
     bool take(const range & r);
     void cancel(const std::function<bool(const job &)> & pred);
-    void advance();
     void install(bool all);
-    void dev_alloc();
+    void dev_init();
+    size_t plan(ggml_cgraph * gf, size_t lo, bool place);
+    void compute(ggml_cgraph * gf, const char * what);
     void upload_rows(int32_t il, int32_t r0, int32_t r1);
-    void queue_phase(job & jb, int phase);
-    ggml_cgraph * build_phase(const job & jb, int phase, int32_t li, ggml_context * ctx);
-    void run(job & jb, int32_t i);
-    void fit_task(job & jb, int32_t i);
-    void bits_task(job & jb, int32_t i);
+    void host_metrics(job & jb);
+    void queue_job(job & jb);
+    ggml_tensor * tab_view(int kv, int32_t j, int32_t n_lay, size_t row0, int64_t n_rows, ggml_context * ctx) const;
+    ggml_cgraph * build_moments(const job & jb, int32_t j, int32_t n_lay, ggml_context * ctx);
+    ggml_cgraph * build_tables(const job & jb, int32_t n_lay, ggml_context * ctx);
+    ggml_cgraph * build_codes(const job & jb, int32_t li, int32_t j, int32_t n_lay, ggml_context * ctx);
     void release(job & jb);
     void compute_wo_gram(int32_t p);
-    void compute_wo_gram_dev();
-    void metric_v(const job & jb, int32_t p, std::vector<double> & m);
+    void compute_wo_gram_dev(std::vector<char> & on_dev);
+    void metric_v(const job & jb, int32_t p, float * m);
     void set_stats(const std::vector<float> * gram, const std::vector<float> * gsum);
     void loop();
 };

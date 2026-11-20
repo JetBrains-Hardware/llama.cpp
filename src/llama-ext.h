@@ -250,7 +250,6 @@ struct llama_kvq_fit_params {
     int32_t     chunk     = 8192;
     int32_t     bits_k    = 2;
     int32_t     bits_v    = 1;
-    int32_t     n_threads = 4; // CPU threads of the fit of the tables (about 2 CPU seconds per chunk of 8192)
     int32_t     rem       = LLAMA_KVQ_REM_OWN;
     int32_t     min_rows  = 256; // own: the smallest chunk of the rows after the last complete chunk (a covariance of fewer than D + 1 rows is rank deficient)
 };
@@ -290,9 +289,8 @@ struct llama_kvq_fit_progress {
     bool    failed    = false; // a job failed, no more chunks join the coarse region
     std::vector<double> t_job;  // seconds per job that joined the coarse region: from the start of the job to the join
     std::vector<double> t_wall; // seconds per job that joined: from the readback of the statistics to the join (with the margin)
-    double  t_cpu     = 0.0;    // CPU seconds of the tasks of these jobs
-    double  t_take    = 0.0;    // decode thread seconds of the readbacks of the statistics (with the wait for the queued ubatches) and of phase 1
-    double  t_install = 0.0;    // decode thread seconds of the later phases and of the joins
+    double  t_take    = 0.0;    // decode thread seconds of the readbacks of the statistics (with the wait for the queued ubatches), the metrics and the queued graphs
+    double  t_install = 0.0;    // decode thread seconds of the joins
     int32_t n_tail_wait = 0;    // tail mode: batches that waited for the fitter before they fit the ring
     double  t_tail_wait = 0.0;  // decode thread seconds of these waits
     int32_t n_host      = 0;    // positions [0, n_host) have their q8_0 rows in the host store

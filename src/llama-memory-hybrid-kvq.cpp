@@ -123,7 +123,6 @@ bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc) {
         if (!settle(p0)) {
             return false;
         }
-        prompt_bufs_release();
         n_fold++;
         t_fold += (ggml_time_us() - t1)*1e-6;
         LLAMA_LOG_INFO("%s: fold at position %d: coarse region %d rows, %d positions in the ring, %.3f s (%d folds, %.2f s in all)\n", __func__,
@@ -487,9 +486,9 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
     }
     // the smallest coarse region: the prefetch selects prefetch_n rows that are not sinks
     const int32_t min_first = p.prefetch_n + p.n_sink;
-    if (fp.chunk <= p.n_sink || fp.chunk < min_first || fp.n_threads < 1 || fp.min_rows < 1 || (int64_t) n_ctx_max < fp.chunk ||
+    if (fp.chunk <= p.n_sink || fp.chunk < min_first || fp.min_rows < 1 || (int64_t) n_ctx_max < fp.chunk ||
             (int64_t) kv->get_size() < 2*p.max_batch + 256) {
-        LLAMA_LOG_ERROR("%s: bad chunk (%d, %u positions, cache of %u cells), min_rows (%d) or thread count\n", __func__, fp.chunk, n_ctx_max, kv->get_size(), fp.min_rows);
+        LLAMA_LOG_ERROR("%s: bad chunk (%d, %u positions, cache of %u cells) or min_rows (%d)\n", __func__, fp.chunk, n_ctx_max, kv->get_size(), fp.min_rows);
         return false;
     }
     if (backends.empty()) {
@@ -516,7 +515,10 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
     try {
         const int32_t n_rows = (int32_t) n_ctx_max;
         const int32_t n_gate = n_head*(int32_t) llama_kvq_store::D;
-        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, llama_kvq_resident_slots(p), p.n_sink, p.layer_bufs, n_gate);
+        // the fitter works in the shared memory of the store
+        const int32_t G      = (int32_t) model.hparams.n_head_kv(kv->get_layer_ids()[0]);
+        const size_t  sh_min = llama_kvq_fitter::shared_min(G, llama_kvq_fitter::stage_rows(n_rows, fp), fp.bits_k, fp.bits_v);
+        store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, llama_kvq_resident_slots(p), p.n_sink, p.layer_bufs, n_gate, sh_min);
         store->set_backend(backends);
         if (!store->scratch_ok()) {
             throw std::runtime_error("the two-tier cache needs the scratch attention (pinned host memory, LLAMA_KVQ_SCRATCH not 0)");
@@ -574,9 +576,6 @@ bool llama_memory_hybrid_kvq::fit_wait() {
         n_settle++;
         t_settle += (ggml_time_us() - t0)*1e-6;
     }
-    if (ok) {
-        prompt_bufs_release();
-    }
     return ok;
 }
 
@@ -584,14 +583,6 @@ bool llama_memory_hybrid_kvq::prompt_bufs_alloc() {
     return !store || !store->scratch_ok() || store->scr_alloc();
 }
 
-void llama_memory_hybrid_kvq::prompt_bufs_release() {
-    if (!fitter || !store) {
-        return;
-    }
-    if (!fitter->has_jobs()) {
-        fitter->dev_free();
-    }
-}
 
 bool llama_memory_hybrid_kvq::fit_get_progress(llama_kvq_fit_progress & out) const {
     if (!fitter) {
