@@ -108,7 +108,35 @@ llama_memory_context_ptr llama_memory_hybrid_kvq::init_batch(llama_batch_allocr 
         }
     }
 
-    if (!prepare_batch(balloc, n_ubatch, embd_all, ubatches, heads_attn, fitter ? 1 : UINT32_MAX)) {
+    // the sequences whose tokens of the batch take the packed path (a whole decode / verify run each) with the same number of tokens
+    // go through one ubatch (the weights are read once for all of them), at most n_streams per ubatch; every other sequence has its
+    // own ubatches. A group of one sequence is no group
+    std::vector<std::vector<llama_seq_id>> groups;
+    if (fitter && !embd_all && store->n_streams() > 1) {
+        std::vector<std::pair<uint32_t, std::vector<llama_seq_id>>> by_len;
+        for (size_t i = 0; i < bseq.size(); ++i) {
+            if (!llama_kvq_use_packed(params, bnum[i], store->n_coarse(bseq[i]), store->n_host(bseq[i]))) {
+                continue;
+            }
+            auto it = std::find_if(by_len.begin(), by_len.end(), [&](const auto & e) { return e.first == bnum[i]; });
+            if (it == by_len.end()) {
+                by_len.push_back({ bnum[i], {} });
+                it = by_len.end() - 1;
+            }
+            it->second.push_back(bseq[i]);
+        }
+        for (auto & e : by_len) {
+            std::sort(e.second.begin(), e.second.end());
+            for (size_t i = 0; i < e.second.size(); i += store->n_streams()) {
+                const size_t n = std::min<size_t>(store->n_streams(), e.second.size() - i);
+                if (n > 1) {
+                    groups.emplace_back(e.second.begin() + i, e.second.begin() + i + n);
+                }
+            }
+        }
+    }
+
+    if (!prepare_batch(balloc, n_ubatch, embd_all, ubatches, heads_attn, fitter ? 1 : UINT32_MAX, &groups)) {
         release(bseq.size());
         return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
@@ -801,7 +829,10 @@ bool llama_memory_hybrid_kvq_context::next() {
 bool llama_memory_hybrid_kvq_context::apply() {
     // the previous ubatches are queued: the fit mode can start a job or move the coarse boundary now
     if (mem_kvq) {
-        mem_kvq->fit_poll(get_ubatch().seq_id_unq[0], get_ubatch().n_tokens);
+        const llama_ubatch & ub = get_ubatch();
+        for (uint32_t s = 0; s < ub.n_seqs_unq; ++s) {
+            mem_kvq->fit_poll(ub.seq_id_unq[s], ub.n_tokens/ub.n_seqs_unq);
+        }
     }
 
     bool res = llama_memory_hybrid_context::apply();
@@ -829,68 +860,83 @@ bool llama_memory_hybrid_kvq_context::prompt_path(const llama_ubatch & ubatch) c
     if (!params.enabled || store == nullptr) {
         return false;
     }
-    const llama_seq_id seq = ubatch.seq_id_unq[0];
-    return !llama_kvq_use_packed(params, ubatch.n_tokens, store->n_coarse(seq), store->n_host(seq));
+    // a ubatch of several sequences was made of the sequences that are on the packed path (init_batch), the others stay single
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq = ubatch.seq_id_unq[s];
+        if (!llama_kvq_use_packed(params, ubatch.n_tokens/ubatch.n_seqs_unq, store->n_coarse(seq), store->n_host(seq))) {
+            GGML_ASSERT(ubatch.n_seqs_unq == 1 && "the sequences of a packed ubatch must stay on the packed path");
+            return true;
+        }
+    }
+    return false;
 }
 
 llama_memory_status llama_memory_hybrid_kvq_context::get_status() const {
     return status;
 }
 
-void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, int32_t n_coarse) const {
+void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, const std::vector<int32_t> & n_coarse_s) const {
     if (mask == nullptr || mask->buffer == nullptr) {
         return;
     }
-    GGML_ASSERT(ubatch->n_seqs_unq == 1 && ggml_backend_buffer_is_host(mask->buffer));
-    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_coarse && mask->ne[1] == ubatch->n_tokens);
+    // the sequences of the ubatch are the streams of the mask [n_coarse_max + n_kv, L, 1, S]; stream s: the coarse rows [0, n_coarse[s]),
+    // then the ring cells (tail row r of the stream is cache row n_coarse[s] + r)
+    const int64_t S = ubatch->n_seqs_unq;
+    const int64_t L = ubatch->n_tokens/S;
+    GGML_ASSERT((int64_t) n_coarse_s.size() == S && ggml_backend_buffer_is_host(mask->buffer));
+    const int32_t n_coarse_max = *std::max_element(n_coarse_s.begin(), n_coarse_s.end());
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_coarse_max && mask->ne[1] == L && mask->ne[3] == S);
     GGML_ASSERT(early == nullptr || (ggml_backend_buffer_is_host(early->buffer) && ggml_are_same_shape(early, mask) && ggml_is_contiguous(early)));
 
-    // the cells of the ring stream of the sequence of the ubatch
-    const llama_seq_id seq = ubatch->seq_id_unq[0];
-    const auto & cells = kv_attn->get_cells(seq);
-
-    const int64_t n_kv  = mask->ne[0] - n_coarse;
-    const int64_t n_tok = mask->ne[1];
-    GGML_ASSERT(n_kv <= (int64_t) cells.size());
-
-    llama_pos p_min = ubatch->pos[0];
-    for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
-        p_min = std::min(p_min, ubatch->pos[i]);
-    }
+    const int64_t n_kv = mask->ne[0] - n_coarse_max;
 
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
 
-    // the positions before the ubatch, and the cells at or after it
-    std::vector<ggml_fp16_t> row(mask->ne[0], ninf);
-    std::fill(row.begin(), row.begin() + n_coarse, zero);
-    std::vector<std::pair<int64_t, llama_pos>> late;
-    for (int64_t j = 0; j < n_kv; ++j) {
-        if (cells.is_empty(j) || !cells.seq_has(j, seq)) {
-            continue;
-        }
-        const llama_pos p = cells.pos_get(j);
-        if (p < n_coarse) {
-            continue;
-        }
-        if (p < p_min) {
-            row[n_coarse + j] = zero;
-        } else {
-            late.push_back({ n_coarse + j, p });
-        }
-    }
+    for (int64_t st = 0; st < S; ++st) {
+        const int32_t n_coarse = n_coarse_s[st];
+        // the cells of the ring stream of the sequence
+        const llama_seq_id seq = ubatch->seq_id_unq[st];
+        const auto & cells = kv_attn->get_cells(seq);
+        GGML_ASSERT(n_kv <= (int64_t) cells.size());
 
-    ggml_fp16_t * dst = (ggml_fp16_t *) mask->data;
-    for (int64_t i = 0; i < n_tok; ++i) {
-        ggml_fp16_t * d = dst + i*mask->ne[0];
-        memcpy(d, row.data(), row.size()*sizeof(ggml_fp16_t));
-        for (const auto & c : late) {
-            if (c.second <= ubatch->pos[i]) {
-                d[c.first] = zero;
+        const llama_pos * pos = ubatch->pos + st*L;
+        llama_pos p_min = pos[0];
+        for (int64_t i = 1; i < L; ++i) {
+            p_min = std::min(p_min, pos[i]);
+        }
+
+        // the positions before the ubatch, and the cells at or after it
+        std::vector<ggml_fp16_t> row(mask->ne[0], ninf);
+        std::fill(row.begin(), row.begin() + n_coarse, zero);
+        std::vector<std::pair<int64_t, llama_pos>> late;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j) || !cells.seq_has(j, seq)) {
+                continue;
+            }
+            const llama_pos p = cells.pos_get(j);
+            if (p < n_coarse) {
+                continue;
+            }
+            if (p < p_min) {
+                row[n_coarse + j] = zero;
+            } else {
+                late.push_back({ n_coarse + j, p });
             }
         }
-        if (early) {
-            memcpy((ggml_fp16_t *) early->data + i*mask->ne[0], row.data(), row.size()*sizeof(ggml_fp16_t));
+
+        ggml_fp16_t * dst = (ggml_fp16_t *) mask->data + st*L*mask->ne[0];
+        for (int64_t i = 0; i < L; ++i) {
+            ggml_fp16_t * d = dst + i*mask->ne[0];
+            memcpy(d, row.data(), row.size()*sizeof(ggml_fp16_t));
+            for (const auto & c : late) {
+                if (c.second <= pos[i]) {
+                    d[c.first] = zero;
+                }
+            }
+            if (early) {
+                memcpy((ggml_fp16_t *) early->data + (st*L + i)*mask->ne[0], row.data(), row.size()*sizeof(ggml_fp16_t));
+            }
         }
     }
 }

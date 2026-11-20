@@ -20,6 +20,7 @@ struct kvq_fetch {
     int32_t g;
     int32_t slot;
     int32_t row;
+    int32_t st = 0; // the stream (sequence of the ubatch) of the slot
 };
 
 struct kvq_cand {
@@ -87,6 +88,7 @@ struct llama_kvq_store::layer {
     ggml_backend_event_ptr ev_rb;  // copy stream after the readback of the new rows
 
     std::vector<kvq_fetch> fetch; // of the last request
+    int32_t plan_s = 0;           // the stream the plan is making (the worker)
 
     // request of the selection in h_sel
     int64_t n_top = 0;
@@ -119,7 +121,7 @@ struct llama_kvq_store::layer {
         q.ridx[o + s] = row;
         kvq_bit_set(rb, row);
         q.slot_stamp[o + s] = q.stamp;
-        fetch.push_back({ g, s, row });
+        fetch.push_back({ g, s, row, plan_s });
     }
 
     // the slot becomes empty
@@ -186,7 +188,7 @@ struct llama_kvq_store::gather_pool {
         const int64_t i0 = n*ith/nth;
         const int64_t i1 = n*(ith + 1)/nth;
         for (int64_t i = i0; i < i1; ++i) {
-            memcpy(dst + 2*i*ROW, st->row_ptr(seq, li, fetch[i].g, fetch[i].row), 2*ROW);
+            memcpy(dst + 2*i*ROW, st->row_ptr(st->ub_seq[fetch[i].st], li, fetch[i].g, fetch[i].row), 2*ROW);
         }
     }
 
@@ -477,6 +479,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     ctx_dev   = init_ctx(layers.size()*8 + 5 + 2*N_TBUF + (size_t) n_sq*(2*layers.size() + 1));
     ctx_codes = init_ctx(layers.size()*4);
     ctx_alias = init_ctx(n_bufs);
+    n_str = std::min<int32_t>(n_sq, GGML_KVQ_MAX_STREAM);
     ctx_host  = init_ctx(layers.size()*KIND_COUNT);
 
     // the device buffers of the packed path share the memory of the scratch (the prompt path), see scr_alloc and dec_alloc:
@@ -488,13 +491,15 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     bufs.resize(n_bufs);
     // the layers share one ridx with the staging (enable)
     for (int32_t b = 0; b < n_bufs; ++b) {
-        bufs[b].rkv_h = ggml_new_tensor_2d(ctx_res, GGML_TYPE_F32, ROW/4, 2*(int64_t) G*cap_tot + N_TRASH);
+        // one slice of 2*G*cap_tot rows per stream of a packed ubatch (K and V of the slots of each kv head)
+        bufs[b].rkv_h = ggml_new_tensor_2d(ctx_res, GGML_TYPE_F32, ROW/4, 2*(int64_t) G*cap_tot*n_str + N_TRASH);
         ggml_format_name(bufs[b].rkv_h, "kvq_rkv_h-b%d", b);
     }
     tbufs.resize(N_TBUF);
     for (int32_t b = 0; b < N_TBUF; ++b) {
-        tbufs[b].k = ggml_new_tensor_2d(ctx_res, GGML_TYPE_Q8_0, D*G, n_cell);
-        tbufs[b].v = ggml_new_tensor_2d(ctx_res, GGML_TYPE_Q8_0, D*G, n_cell);
+        // the cells of the ring of stream s of a packed ubatch are the cells [s*n_cell, (s + 1)*n_cell)
+        tbufs[b].k = ggml_new_tensor_2d(ctx_res, GGML_TYPE_Q8_0, D*G, n_cell*n_str);
+        tbufs[b].v = ggml_new_tensor_2d(ctx_res, GGML_TYPE_Q8_0, D*G, n_cell*n_str);
         ggml_format_name(tbufs[b].k, "kvq_tail_k-b%d", b);
         ggml_format_name(tbufs[b].v, "kvq_tail_v-b%d", b);
     }
@@ -573,8 +578,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
     // set_rows has no q8_0 to q8_0 copy, so the scatter writes the rows of rkv as groups of 4 bytes (f32, half the threads of f16)
     for (size_t b = 0; b < bufs.size(); ++b) {
-        bufs[b].rkv = ggml_new_tensor_4d(ctx_alias.get(), GGML_TYPE_Q8_0, D, cap_tot, G, 2);
-        GGML_ASSERT(ggml_nbytes(bufs[b].rkv) == (size_t) 2*G*cap_tot*ROW);
+        bufs[b].rkv = ggml_new_tensor_4d(ctx_alias.get(), GGML_TYPE_Q8_0, D, cap_tot, G, 2*n_str);
+        GGML_ASSERT(ggml_nbytes(bufs[b].rkv) == (size_t) 2*G*cap_tot*n_str*ROW);
         ggml_format_name(bufs[b].rkv, "kvq_rkv-b%d", (int) b);
     }
     for (auto & l : layers) {
@@ -739,9 +744,18 @@ const llama_kvq_store::layer_tensors & llama_kvq_store::get_layer(int32_t il) co
     return layers.at(layer_of_il.at(il)).t;
 }
 
-ggml_tensor * llama_kvq_store::get_ridx(ggml_context * ctx, int32_t il) const {
+ggml_tensor * llama_kvq_store::get_ridx(ggml_context * ctx, int32_t il, int64_t S) const {
     ggml_tensor * r = get_layer(il).ridx;
+    if (S > 1) {
+        return ggml_view_3d(ctx, r, cap_tot, G, S, r->nb[1], r->nb[2], 0);
+    }
     return ggml_view_2d(ctx, r, cap_tot, G, r->nb[1], 0);
+}
+
+ggml_tensor * llama_kvq_store::get_rkv(ggml_context * ctx, int32_t il, int64_t S) const {
+    GGML_ASSERT(S >= 1 && S <= n_str);
+    ggml_tensor * t = get_layer(il).rkv;
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], t->ne[2], 2*S, t->nb[1], t->nb[2], t->nb[3], 0);
 }
 
 ggml_tensor * llama_kvq_store::get_kc(ggml_context * ctx, int32_t il) const {
@@ -1008,12 +1022,13 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
     buf_pin.reset();
     {
         // the staging rows (device and pinned host, one for all layers) hold a full fetch of every slot
-        const int64_t n_rows = 2*G*n_req(p.prefetch_n, p.max_batch);
-        const int64_t n_sel  = (int64_t) p.prefetch_n*G*p.max_batch;
+        // (of up to n_str streams: the fetches of the streams follow each other)
+        const int64_t n_rows = 2*G*n_req(p.prefetch_n, p.max_batch)*n_str;
+        const int64_t n_sel  = (int64_t) p.prefetch_n*G*p.max_batch*n_str;
 
         // one block [ridx | slot list | staging rows] on the device and the same layout pinned, so that a join is one copy
         auto pad = [](size_t n) { return GGML_PAD(n, 256); };
-        const size_t sz_ridx  = pad((size_t) G*cap_tot*sizeof(int32_t));
+        const size_t sz_ridx  = pad((size_t) G*cap_tot*n_str*sizeof(int32_t));
         const size_t sz_slots = pad(n_rows*sizeof(int32_t));
         const size_t sz_stage = pad(n_rows*ROW);
         const size_t sz_sel   = pad(n_sel*sizeof(int32_t));
@@ -1021,6 +1036,7 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         // a graph that is reused keeps the tensors, so they change only with the parameters that change the graph
         if (!jblk || n_rows != n_stage) {
             n_stage   = n_rows;
+            off_slots = sz_ridx;
             off_stage = sz_ridx + sz_slots;
             buf_stage.reset();
             ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
@@ -1042,7 +1058,7 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
                 ggml_backend_buffer_set_usage(buf_stage.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             }
             ggml_backend_buffer_t bs = jblk->buffer;
-            ggml_tensor * ridx  = ggml_new_tensor_2d(ctx_stage.get(), GGML_TYPE_I32, cap_tot, G);
+            ggml_tensor * ridx  = ggml_new_tensor_3d(ctx_stage.get(), GGML_TYPE_I32, cap_tot, G, n_str);
             ggml_tensor * slots = ggml_new_tensor_1d(ctx_stage.get(), GGML_TYPE_I32, n_stage);
             ggml_tensor * stage = ggml_new_tensor_2d(ctx_stage.get(), GGML_TYPE_F32, ROW/4, n_stage);
             ggml_set_name(ridx,  "kvq_ridx");
@@ -1191,7 +1207,7 @@ void llama_kvq_store::write_mirror(layer & l) {
     const size_t nb_kv = (size_t) G*cap_tot*ROW;
     for (size_t i = 0; i < l.fetch.size(); ++i) {
         const kvq_fetch & f = l.fetch[i];
-        uint8_t * dst = ls(l).mirror + ((size_t) f.g*cap_tot + f.slot)*ROW;
+        uint8_t * dst = ls(ub_seq[f.st], l).mirror + ((size_t) f.g*cap_tot + f.slot)*ROW;
         memcpy(dst,         h_stage + 2*i*ROW,       ROW);
         memcpy(dst + nb_kv, h_stage + (2*i + 1)*ROW, ROW);
     }
@@ -1206,13 +1222,16 @@ void llama_kvq_store::issue_base(layer & l, ggml_backend_event_t ev, ggml_backen
     if (ev) {
         ggml_backend_event_wait(bu, ev);
     }
+    // the mirror of each stream of the ubatch into its slice
     const size_t n = (size_t) 2*G*cap_tot*ROW;
     for (int r = 0; r < up_rep; ++r) {
-        ggml_backend_tensor_set_async(bu, l.t.rkv_h, ls(l).mirror, 0, n);
+        for (int32_t s = 0; s < ub_n; ++s) {
+            ggml_backend_tensor_set_async(bu, l.t.rkv_h, ls(ub_seq[s], l).mirror, s*n, n);
+        }
     }
     ggml_backend_event_record(l.ev_base.get(), bu);
     l.base_rec = true;
-    l.cnt.base_bytes += (int64_t) up_rep*n;
+    l.cnt.base_bytes += (int64_t) up_rep*n*ub_n;
 }
 
 // the ring cells of the positions [p0, p1) in at most two runs, f(first cell, cells)
@@ -1239,17 +1258,20 @@ void llama_kvq_store::issue_tail(layer & l, ggml_backend_event_t ev, ggml_backen
     }
     const tail_buf & tb = tbufs[l.tbuf];
     const size_t nb1 = (size_t) G*ROW;
-    const size_t off = ring_off(cur);
     int64_t bytes = 0;
     // the occupied cells only: all cells cost 0.25 - 0.8 ms per verify batch (measured)
-    const int64_t lo = tb_lo.load();
-    const int64_t hi = tb_hi.load();
     for (int r = 0; r < up_rep; ++r) {
-        kvq_cell_runs(n_cell, lo, hi, [&](int64_t c, int64_t n) {
-            ggml_backend_tensor_set_async(stream, tb.k, (const uint8_t *) l.k_cache->data + off + c*nb1, c*nb1, n*nb1);
-            ggml_backend_tensor_set_async(stream, tb.v, (const uint8_t *) l.v_cache->data + off + c*nb1, c*nb1, n*nb1);
-            bytes += 2*n*nb1;
-        });
+        for (int32_t s = 0; s < ub_n; ++s) {
+            const size_t  off = ring_off(ub_seq[s]);
+            const size_t  dof = (size_t) s*n_cell*nb1; // the ring of stream s in the tail buffer
+            const int64_t lo  = tb_lo[s].load();
+            const int64_t hi  = tb_hi[s].load();
+            kvq_cell_runs(n_cell, lo, hi, [&](int64_t c, int64_t n) {
+                ggml_backend_tensor_set_async(stream, tb.k, (const uint8_t *) l.k_cache->data + off + c*nb1, dof + c*nb1, n*nb1);
+                ggml_backend_tensor_set_async(stream, tb.v, (const uint8_t *) l.v_cache->data + off + c*nb1, dof + c*nb1, n*nb1);
+                bytes += 2*n*nb1;
+            });
+        }
     }
     ggml_backend_event_record(l.ev_tb.get(), stream);
     l.tb_rec = true;
@@ -1262,12 +1284,15 @@ void llama_kvq_store::read_ring(layer & l) {
     ggml_backend_event_wait(cp, l.ev_cpy.get());
     const tail_buf & tb = tbufs[l.tbuf];
     const size_t nb1 = (size_t) G*ROW;
-    const size_t off = ring_off(cur);
-    kvq_cell_runs(n_cell, ub_p0, ub_p1, [&](int64_t c, int64_t n) {
-        ggml_backend_tensor_get_async(cp, tb.k, (uint8_t *) l.k_cache->data + off + c*nb1, c*nb1, n*nb1);
-        ggml_backend_tensor_get_async(cp, tb.v, (uint8_t *) l.v_cache->data + off + c*nb1, c*nb1, n*nb1);
-        l.cnt.rb_bytes += 2*n*nb1;
-    });
+    for (int32_t s = 0; s < ub_n; ++s) {
+        const size_t off = ring_off(ub_seq[s]);
+        const size_t dof = (size_t) s*n_cell*nb1;
+        kvq_cell_runs(n_cell, ub_lo[s], ub_hi[s], [&](int64_t c, int64_t n) {
+            ggml_backend_tensor_get_async(cp, tb.k, (uint8_t *) l.k_cache->data + off + c*nb1, dof + c*nb1, n*nb1);
+            ggml_backend_tensor_get_async(cp, tb.v, (uint8_t *) l.v_cache->data + off + c*nb1, dof + c*nb1, n*nb1);
+            l.cnt.rb_bytes += 2*n*nb1;
+        });
+    }
     ggml_backend_event_record(l.ev_rb.get(), cp);
 }
 
@@ -1345,10 +1370,14 @@ void llama_kvq_store::order_rows() {
     ggml_backend_event_wait(backend_main, ev_ord.get());
 }
 
-ggml_tensor * llama_kvq_store::get_ring(ggml_context * ctx, int32_t il, bool is_v, int64_t n_kv) const {
-    GGML_ASSERT(n_kv <= n_cell);
+ggml_tensor * llama_kvq_store::get_ring(ggml_context * ctx, int32_t il, bool is_v, int64_t n_kv, int64_t S) const {
+    GGML_ASSERT(n_kv <= n_cell && S >= 1 && S <= n_str);
     const tail_buf & tb = tbufs[layers.at(layer_of_il.at(il)).tbuf];
     ggml_tensor * t = is_v ? tb.v : tb.k;
+    if (S > 1) {
+        // one ring per stream
+        return ggml_view_4d(ctx, t, D, n_kv, G, S, t->nb[1], ROW, t->nb[1]*n_cell, 0);
+    }
     return ggml_view_3d(ctx, t, D, n_kv, G, t->nb[1], ROW, 0);
 }
 
@@ -1374,16 +1403,17 @@ void llama_kvq_store::flush_ubatch() {
     ub_tokens = 0;
 }
 
-// the positions of the ubatch, one run
-static void kvq_ubatch_pos(const llama_ubatch & ub, int32_t & p0, int32_t & p1) {
-    p0 = ub.pos[0];
-    p1 = ub.pos[0];
-    for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+// the positions of the tokens [i0, i0 + n) of the ubatch, one run
+static void kvq_ubatch_pos(const llama_ubatch & ub, int32_t & p0, int32_t & p1, uint32_t i0 = 0, uint32_t n = 0) {
+    n = n > 0 ? n : ub.n_tokens;
+    p0 = ub.pos[i0];
+    p1 = ub.pos[i0];
+    for (uint32_t i = i0; i < i0 + n; ++i) {
         p0 = std::min(p0, ub.pos[i]);
         p1 = std::max(p1, ub.pos[i]);
     }
     p1++;
-    GGML_ASSERT(p1 - p0 == (int32_t) ub.n_tokens && "the two-tier cache needs a ubatch of consecutive positions");
+    GGML_ASSERT(p1 - p0 == (int32_t) n && "the two-tier cache needs a ubatch of consecutive positions");
 }
 
 // the sequence of a ubatch: one
@@ -1393,7 +1423,20 @@ static int32_t kvq_ubatch_seq(const llama_ubatch & ub, int32_t n_seq) {
 }
 
 void llama_kvq_store::use_seq(int32_t s) {
-    if (s == cur) {
+    use_streams(&s, 1);
+}
+
+// the streams of the ubatch: sequence ids[i] is stream i (slice i of the resident, tail and ridx buffers)
+void llama_kvq_store::use_streams(const int32_t * ids, int32_t n) {
+    GGML_ASSERT(n >= 1 && n <= n_str);
+    bool same = n == ub_n;
+    for (int32_t i = 0; i < n && same; ++i) {
+        same = ids[i] == ub_seq[i];
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        GGML_ASSERT(ids[i] >= 0 && ids[i] < n_seq());
+    }
+    if (same) {
         return;
     }
     // the prefetches, the base uploads and the mirror writes of the ubatch before work on its sequence
@@ -1406,7 +1449,11 @@ void llama_kvq_store::use_seq(int32_t s) {
             l.own_sinks = false;
         }
     }
-    cur = s;
+    cur = ids[0];
+    ub_n = n;
+    for (int32_t i = 0; i < n; ++i) {
+        ub_seq[i] = ids[i];
+    }
 }
 
 void llama_kvq_store::begin_ubatch(const llama_ubatch & ub) {
@@ -1419,18 +1466,30 @@ void llama_kvq_store::begin_ubatch(const llama_ubatch & ub) {
             drop(l);
         }
     }
-    use_seq(kvq_ubatch_seq(ub, n_seq()));
-    seq_state & q = seqs[cur];
+    // the sequences of the ubatch are its streams, in the order of the tokens (equal runs, ascending sequence ids)
+    const int32_t S = (int32_t) ub.n_seqs_unq;
+    GGML_ASSERT(S >= 1 && S <= n_str && n % S == 0 && "the two-tier cache: a packed ubatch of at most n_seq_max sequences of equal length");
+    int32_t ids[GGML_KVQ_MAX_STREAM];
+    for (int32_t s = 0; s < S; ++s) {
+        ids[s] = (int32_t) ub.seq_id_unq[s];
+        GGML_ASSERT(ub.n_seq_id[s*(n/S)] == 1 && ub.seq_id[s*(n/S)][0] == ub.seq_id_unq[s]);
+    }
+    use_streams(ids, S);
     flush_ubatch();
     ub_tokens = n;
     n_ubatch++;
 
-    kvq_ubatch_pos(ub, ub_p0, ub_p1);
-    sync_ring(cur, ub_p0);
-    q.rg_ok = ub_p1;
-    q.st_ok = std::min(q.st_ok, ub_p0);
-    tb_lo = q.n_host;
-    tb_hi = ub_p1;
+    for (int32_t s = 0; s < S; ++s) {
+        seq_state & q = seqs[ids[s]];
+        kvq_ubatch_pos(ub, ub_lo[s], ub_hi[s], s*(n/S), n/S);
+        sync_ring(ids[s], ub_lo[s]);
+        q.rg_ok = ub_hi[s];
+        q.st_ok = std::min(q.st_ok, ub_lo[s]);
+        tb_lo[s] = q.n_host;
+        tb_hi[s] = ub_hi[s];
+    }
+    ub_p0 = ub_lo[0];
+    ub_p1 = ub_hi[0];
     // the early query of the first layer comes before any join: its tail now, if the last join of the previous round did not wait for it
     layer & l0 = layers[0];
     if (!l0.tb_ready) {
@@ -1446,6 +1505,8 @@ void llama_kvq_store::begin_scr(const llama_ubatch & ub) {
     use_seq(kvq_ubatch_seq(ub, n_seq()));
     seq_state & q = seqs[cur];
     kvq_ubatch_pos(ub, ub_p0, ub_p1);
+    ub_lo[0] = ub_p0;
+    ub_hi[0] = ub_p1;
     sync_store(cur, ub_p0);
     q.st_ok = ub_p1;
     q.rg_ok = std::min(q.rg_ok, ub_p0);
@@ -1473,17 +1534,26 @@ static void kvq_build_scatter(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor 
     ggml_build_forward_expand(gf, scatter);
 }
 
-void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t seq, int32_t il, ggml_tensor * score, int64_t n_top) const {
+void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t n_coarse_min, int32_t il, ggml_tensor * score, int64_t n_top, ggml_tensor * bias_s) const {
     const kind k = KIND_PREFETCH;
     const layer_tensors & t = get_layer(il);
 
-    const int64_t n_coarse_ = seqs[seq].n_coarse;
+    // the largest coarse region of the streams
+    const int64_t n_coarse_ = score->ne[0];
     const int64_t L = score->ne[2];
-    GGML_ASSERT(score->ne[0] == n_coarse_ && score->ne[1] == G);
-    GGML_ASSERT(n_top <= n_coarse_ - n_sink);
+    const int64_t S = score->ne[3];
+    GGML_ASSERT(score->ne[1] == G && n_coarse_ <= n_rows_);
+    GGML_ASSERT(n_top <= n_coarse_min - n_sink);
 
-    // the sinks are never candidates
-    ggml_tensor * sc = ggml_add(ctx, ggml_reshape_2d(ctx, score, n_coarse_, G*L), ggml_view_1d(ctx, bias, n_coarse_, 0));
+    // the sinks are never candidates; streams: the rows of a stream at or after its n_coarse are 0 in the score, they are never
+    // candidates either (bias_s: f32 [n_coarse, 1, 1, S], -inf for the sinks and those rows)
+    ggml_tensor * sc = nullptr;
+    if (S > 1) {
+        GGML_ASSERT(bias_s != nullptr && bias_s->ne[0] == n_coarse_ && bias_s->ne[3] == S);
+        sc = ggml_reshape_2d(ctx, ggml_add(ctx, score, bias_s), n_coarse_, G*L*S);
+    } else {
+        sc = ggml_add(ctx, ggml_reshape_2d(ctx, score, n_coarse_, G*L), ggml_view_1d(ctx, bias, n_coarse_, 0));
+    }
 
     ggml_tensor * ids = ggml_top_k(ctx, sc, n_top); // [n_top, G*L]
     ggml_format_name(ids, "kvq_ids%d-%d", (int) k, il);
@@ -1491,7 +1561,7 @@ void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_bac
     ggml_set_output(ids);
 
     // the trigger reads a get_rows of the selection (anchor), so it runs after the selection
-    ggml_tensor * sc3    = ggml_reshape_3d(ctx, sc, 1, n_coarse_, G*L);
+    ggml_tensor * sc3    = ggml_reshape_3d(ctx, sc, 1, n_coarse_, G*L*S);
     ggml_tensor * anchor = nullptr;
     if (pf_scores(n_top, L)) {
         // the scores of the selected rows, to cut the union over the positions; read back from a copy stream, so an output
@@ -1511,7 +1581,7 @@ void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_bac
     ggml_build_forward_expand(gf, trig);
 }
 
-void llama_kvq_store::build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int64_t n_top, int64_t L) const {
+void llama_kvq_store::build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int64_t n_top, int64_t L, int64_t S) const {
     const layer_tensors & t = get_layer(il);
 
     ggml_tensor * trig = ggml_add(ctx, ggml_view_1d(ctx, bias, 1, 0), t.trig[KIND_JOIN]);
@@ -1519,7 +1589,7 @@ void llama_kvq_store::build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_back
     ggml_backend_sched_set_tensor_backend(sched, trig, kvq_backend(sched, dev));
     ggml_build_forward_expand(gf, trig);
 
-    kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(n_top, L), KIND_JOIN, il);
+    kvq_build_scatter(ctx, gf, t.rkv_h, t.stage, t.slots, 2*G*n_req(n_top, L)*S, KIND_JOIN, il);
 }
 
 static void kvq_build_trigger(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, ggml_backend_dev_t dev,
@@ -1576,8 +1646,8 @@ void llama_kvq_store::select(const layer & l, const ggml_tensor * dst, ggml_cgra
 }
 
 // more requested rows than slots: the n_u rows with the largest max score over the positions stay requested, ties by row
-void llama_kvq_store::cut_request(layer & l, int32_t g, int64_t n_u) {
-    uint64_t * rq = ls(l).req.data() + g*n_bmw;
+void llama_kvq_store::cut_request(layer & l, layer_seq & q, int32_t st, int32_t g, int64_t n_u) {
+    uint64_t * rq = q.req.data() + g*n_bmw;
     int64_t n = 0;
     for (int64_t w = 0; w < n_bmw; ++w) {
         n += kvq_popcount(rq[w]);
@@ -1590,7 +1660,7 @@ void llama_kvq_store::cut_request(layer & l, int32_t g, int64_t n_u) {
     std::vector<kvq_cand> & u = l.cand;
     u.clear();
     for (int64_t p = 0; p < L; ++p) {
-        const int64_t o = (g + G*p)*n_top;
+        const int64_t o = (g + G*(p + L*st))*n_top;
         for (int64_t i = 0; i < n_top; ++i) {
             u.push_back({ l.h_sel[o + i], l.h_val[o + i] });
         }
@@ -1614,7 +1684,7 @@ void llama_kvq_store::cut_request(layer & l, int32_t g, int64_t n_u) {
     }
     l.cnt.pf_cut++;
     for (int64_t p = 0; p < L; ++p) {
-        const int64_t o = (g + G*p)*n_top;
+        const int64_t o = (g + G*(p + L*st))*n_top;
         for (int64_t i = 0; i < n_top; ++i) {
             l.cnt.pf_lost += !kvq_bit(rq, l.h_sel[o + i]);
         }
@@ -1624,8 +1694,7 @@ void llama_kvq_store::cut_request(layer & l, int32_t g, int64_t n_u) {
 // the rows of l.miss (by row, not resident) go to free slots: a slot is free if its row is not in l.req
 // the free slots of the oldest requests first, then by slot, so the slot of a row does not depend on the order of the selection
 // the slots of the requested rows get the stamp now; l.req is cleared
-void llama_kvq_store::place(layer & l, int32_t g, uint32_t now) {
-    layer_seq & q = ls(l);
+void llama_kvq_store::place(layer & l, layer_seq & q, int32_t g, uint32_t now) {
     uint64_t * rq = q.req.data() + g*n_bmw;
     const size_t o = (size_t) g*cap_tot;
 
@@ -1680,17 +1749,27 @@ void llama_kvq_store::place(layer & l, int32_t g, uint32_t now) {
     }
 }
 
+// the plan of every stream of the ubatch, one after the other (the fetches of the streams follow each other in the list)
 void llama_kvq_store::plan_prefetch(layer & l) {
+    l.fetch.clear();
+    for (int32_t s = 0; s < ub_n; ++s) {
+        l.plan_s = s;
+        plan_stream(l, s);
+    }
+    l.plan_s = 0;
+}
+
+void llama_kvq_store::plan_stream(layer & l, int32_t st) {
     llama_kvq_counters & cnt = l.cnt;
-    layer_seq & q = ls(l);
-    const int32_t n_coarse_ = seqs[cur].n_coarse;
+    layer_seq & q = ls(ub_seq[st], l);
+    const int32_t n_coarse_ = seqs[ub_seq[st]].n_coarse;
 
     const int64_t n_top = l.n_top;
     const int64_t L     = l.n_pos;
     const bool    cut   = pf_scores(n_top, L);
 
     const uint32_t now = ++q.stamp;
-    l.fetch.clear();
+    const size_t   f0  = l.fetch.size();
 
     cnt.n_pf++;
     cnt.pf_sel += G*L*n_top;
@@ -1699,14 +1778,14 @@ void llama_kvq_store::plan_prefetch(layer & l) {
         // the union over the positions; the order of top_k on the device is not fixed (atomics), the bitmap does not keep it
         uint64_t * rq = q.req.data() + g*n_bmw;
         for (int64_t p = 0; p < L; ++p) {
-            const int32_t * sel = l.h_sel + (g + G*p)*n_top;
+            const int32_t * sel = l.h_sel + (g + G*(p + L*st))*n_top;
             for (int64_t i = 0; i < n_top; ++i) {
                 GGML_ASSERT(sel[i] >= n_sink && sel[i] < n_coarse_);
                 kvq_bit_set(rq, sel[i]);
             }
         }
         if (cut) {
-            cut_request(l, g, n_req(n_top, L));
+            cut_request(l, q, st, g, n_req(n_top, L));
         }
         const uint64_t * rb = q.res.data() + g*n_bmw;
         l.miss.clear();
@@ -1719,9 +1798,9 @@ void llama_kvq_store::plan_prefetch(layer & l) {
                 l.miss.push_back((int32_t) (64*w + ctz64(m)));
             }
         }
-        place(l, g, now);
+        place(l, q, g, now);
     }
-    cnt.pf_fetch += l.fetch.size();
+    cnt.pf_fetch += l.fetch.size() - f0;
 }
 
 // rows, slot list and ridx of the last plan to the pinned staging
@@ -1740,11 +1819,21 @@ void llama_kvq_store::gather(layer & l, int64_t n_rows) {
     // sorting the rows by address does not make the copy faster (measured)
     pool->run(l.fetch.data(), n, h_stage, this, cur, l.li);
 
+    // the slot of stream s: the slice s of the resident rows, K then V
     for (int64_t i = 0; i < n; ++i) {
-        h_slots[2*i]     = (int32_t) ((0*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
-        h_slots[2*i + 1] = (int32_t) ((1*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
+        const int64_t s = l.fetch[i].st;
+        h_slots[2*i]     = (int32_t) (((2*s + 0)*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
+        h_slots[2*i + 1] = (int32_t) (((2*s + 1)*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
     }
-    memcpy(h_ridx, ls(l).ridx.data(), ls(l).ridx.size()*sizeof(int32_t));
+    fill_ridx(l);
+}
+
+// the ridx of layer l of every stream of the ubatch to the pinned block
+void llama_kvq_store::fill_ridx(layer & l) {
+    for (int32_t s = 0; s < ub_n; ++s) {
+        const layer_seq & q = ls(ub_seq[s], l);
+        memcpy(h_ridx + (size_t) s*G*cap_tot, q.ridx.data(), q.ridx.size()*sizeof(int32_t));
+    }
 }
 
 // on the stream of backend, after the previous readers of stage, slots and ridx of the layer
@@ -1758,7 +1847,13 @@ void llama_kvq_store::upload(ggml_backend_t backend, layer & l) {
     // ridx, the whole slot list and the rows in one copy of the block
     slots_hi = 2*n;
     const size_t nb = off_stage + 2*n*ROW;
-    ggml_backend_tensor_set_async(backend, jblk, h_ridx, 0, nb);
+    if (ub_n == n_str) {
+        ggml_backend_tensor_set_async(backend, jblk, h_ridx, 0, nb);
+    } else {
+        // the ridx of the streams of the ubatch, then the slot list and the rows
+        ggml_backend_tensor_set_async(backend, jblk, h_ridx, 0, (size_t) ub_n*G*cap_tot*sizeof(int32_t));
+        ggml_backend_tensor_set_async(backend, jblk, (const uint8_t *) h_ridx + off_slots, off_slots, nb - off_slots);
+    }
     ggml_backend_event_record(l.ev_up.get(), backend);
     l.up_rec = true;
     l.cnt.bytes += nb;
@@ -1770,7 +1865,7 @@ void llama_kvq_store::run_prefetch(layer & l) {
     const double t0 = kvq_now();
     plan_prefetch(l);
     const double t1 = kvq_now();
-    gather(l, 2*G*n_req(l.n_top, l.n_pos));
+    gather(l, 2*G*n_req(l.n_top, l.n_pos)*ub_n);
     const double t2 = kvq_now();
     l.cnt.t_plan   += t1 - t0;
     l.cnt.t_gather += t2 - t1;
@@ -1788,7 +1883,7 @@ void llama_kvq_store::drop(layer & l) {
     work->mark_joined(l);
     work->wait_mirror(l);
     for (const auto & f : l.fetch) {
-        layer::forget(ls(l), f.g, f.slot, cap_tot, n_bmw);
+        layer::forget(ls(ub_seq[f.st], l), f.g, f.slot, cap_tot, n_bmw);
     }
     l.fetch.clear();
     ggml_backend_synchronize(backend_cp.get());
@@ -1861,7 +1956,7 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
             ggml_backend_event_wait(backend_cp.get(), l.ev_sel.get());
             // the staging is not ordered by a readback here
             ggml_backend_synchronize(backend_cp.get());
-            memcpy(h_ridx, ls(l).ridx.data(), ls(l).ridx.size()*sizeof(int32_t));
+            fill_ridx(l);
         }
         // a rotating layer without its base upload (no prefetch job before it queued one), an own buffer after a reset: now,
         // the main stream is after the attention of the layer before
@@ -1871,9 +1966,11 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
         } else if (l.own && l.own_sinks) {
             ggml_backend_event_record(l.ev_sel.get(), backend);
             ggml_backend_event_wait(backend_cp.get(), l.ev_sel.get());
-            for (int32_t m = 0; m < 2*G; ++m) {
-                const size_t off = (size_t) m*cap_tot*ROW;
-                ggml_backend_tensor_set_async(backend_cp.get(), l.t.rkv_h, ls(l).mirror + off, off, (size_t) n_sink*ROW);
+            for (int32_t s = 0; s < ub_n; ++s) {
+                for (int32_t m = 0; m < 2*G; ++m) {
+                    const size_t off = (size_t) m*cap_tot*ROW;
+                    ggml_backend_tensor_set_async(backend_cp.get(), l.t.rkv_h, ls(ub_seq[s], l).mirror + off, (size_t) s*2*G*cap_tot*ROW + off, (size_t) n_sink*ROW);
+                }
             }
         }
         l.own_stale = false;
@@ -1908,8 +2005,8 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
         select(l, dst, graph, &ids, &anchor);
 
         const int64_t n_top = ids->ne[0];
-        const int64_t L     = ids->ne[1]/G;
-        GGML_ASSERT(kind == KIND_PREFETCH);
+        const int64_t L     = ids->ne[1]/G/ub_n; // per stream
+        GGML_ASSERT(kind == KIND_PREFETCH && L*G*ub_n == ids->ne[1]);
         GGML_ASSERT(n_top*G*L <= (int64_t) params.prefetch_n*G*params.max_batch);
         GGML_ASSERT(!l.pending);
 

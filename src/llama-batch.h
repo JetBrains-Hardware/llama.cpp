@@ -201,6 +201,10 @@ public:
     // TODO: extend to support multiple _full_ sequences in the ubatch
     llama_ubatch split_seq(uint32_t n_ubatch);
 
+    // one ubatch of all unused tokens of the given sequences (each a single sequence, the same number of tokens in each), in the
+    // order of the sequence ids; empty ubatch if they are not equal (the two-tier cache: the decode / verify tokens of several sequences)
+    llama_ubatch split_seqs(const std::vector<llama_seq_id> & ids);
+
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);

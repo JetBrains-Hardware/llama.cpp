@@ -875,6 +875,42 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     return ubatch_add(idxs, 1, true);
 }
 
+llama_ubatch llama_batch_allocr::split_seqs(const std::vector<llama_seq_id> & ids) {
+    std::vector<llama_seq_id> srt = ids;
+    std::sort(srt.begin(), srt.end());
+
+    // all unused tokens of every sequence, one sequence after the other in the order of the sequence ids (the order of seq_id_unq)
+    std::vector<int32_t> idxs;
+    size_t n_per = 0;
+    for (size_t s = 0; s < srt.size(); ++s) {
+        seq_set_t set;
+        set.set(srt[s]);
+        const auto it = seq_set_map.find(set);
+        if (it == seq_set_map.end()) {
+            return {};
+        }
+        size_t n = 0;
+        for (const int32_t idx : it->second) {
+            if (!used[idx]) {
+                idxs.push_back(idx);
+                ++n;
+            }
+        }
+        if (n == 0 || (s > 0 && n != n_per)) {
+            return {};
+        }
+        n_per = n;
+    }
+    if (idxs.empty()) {
+        return {};
+    }
+    for (const int32_t idx : idxs) {
+        used[idx] = true;
+        ++n_used;
+    }
+    return ubatch_add(idxs, srt.size(), true);
+}
+
 void llama_batch_allocr::clear() {
     n_outputs = 0;
 

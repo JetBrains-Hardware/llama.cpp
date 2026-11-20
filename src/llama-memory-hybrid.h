@@ -96,7 +96,8 @@ protected:
                           bool   embd_all,
      std::vector<llama_ubatch> & ubatches,
                slot_info_vec_t & heads_attn,
-                      uint32_t   n_seqs_max = UINT32_MAX);
+                      uint32_t   n_seqs_max = UINT32_MAX,
+ const std::vector<std::vector<llama_seq_id>> * packed = nullptr);
 
 private:
     const llama_hparams & hparams;
