@@ -118,8 +118,8 @@ static server_role_type server_role_detect(const common_params & params, server_
     return has_model ? SERVER_ROLE_INSTANCE : SERVER_ROLE_ROUTER;
 }
 
-// --kvq: the two-tier KV cache holds one sequence and cannot copy or shift the K/V,
-// the settings it needs are forced with a warning, the others are an error
+// --kvq: the two-tier KV cache holds one sequence per slot and cannot copy or shift the K/V (no seq_cp, context
+// shift or cache reuse), the settings it needs are forced with a warning, the others are an error
 static bool server_kvq_prepare_params(common_params & params) {
     // ubatches of up to this many tokens use the packed attention (llama_kvq_params::max_batch)
     const int32_t kvq_max_batch = llama_kvq_params().max_batch;
@@ -132,13 +132,17 @@ static bool server_kvq_prepare_params(common_params & params) {
         SRV_ERR("%s", "--kvq: embeddings are not supported\n");
         return false;
     }
-    if (params.n_parallel != 1) {
-        SRV_WRN("--kvq: one slot only, setting n_parallel = 1 (was %d)\n", params.n_parallel);
-        params.n_parallel = 1;
+    if (params.n_parallel > 1 && params.kvq.prefill_free_codes) {
+        SRV_ERR("--kvq: --kvq-prefill-free-codes needs one slot (-np 1), n_parallel = %d\n", params.n_parallel);
+        return false;
     }
-    if (params.kv_unified) {
-        params.kv_unified = false;
+    if (params.n_parallel > 1 && !params.kv_unified) {
+        // every slot sees the whole context and the slots share the pool of pages, as with the unified KV cache
+        SRV_INF("--kvq: %d slots share one pool of pages, setting kv_unified = true\n", params.n_parallel);
+        params.kv_unified = true;
     }
+    // the idle slots are neither saved to the prompt cache nor cleared when a new task starts
+    // (one slot: nothing to clear; several: a full pool still purges idle slots, see try_clear_idle_slots)
     params.cache_idle_slots = false;
     if (params.ctx_shift) {
         SRV_WRN("%s", "--kvq: the K/V cannot be shifted, disabling the context shift\n");
