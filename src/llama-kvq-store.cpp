@@ -51,10 +51,7 @@ struct llama_kvq_store::layer {
 
     size_t li = 0; // index in layers, for the host pages
 
-    std::vector<int32_t>  ridx;       // [G][cap_tot], mirror of t.ridx
-    std::vector<uint64_t> res;        // [G][n_bmw], bitmap of the resident rows of the evictable slots
-    std::vector<uint64_t> req;        // [G][n_bmw], bitmap of the rows of the request being planned, 0 between plans
-    std::vector<uint32_t> slot_stamp; // [G][cap_tot], stamp of the last request that listed the row of the slot
+    // the resident set of the layer is per sequence (layer_seq, see ls)
 
     // plan scratch
     std::vector<int32_t> miss;     // requested rows that are not resident, by row
@@ -63,19 +60,15 @@ struct llama_kvq_store::layer {
     std::vector<int32_t> pick;     // the free slots that take the missing rows
     std::vector<kvq_cand> cand;    // cut: the union with the max score of each row
 
-    uint32_t stamp    = 0; // selection clock
-    uint32_t pf_stamp = 0; // stamp of the last prefetch
-
     // pinned host buffers
     int32_t * h_sel   = nullptr; // selection readback
     float   * h_val   = nullptr;
 
-    // resident rows: the device buffer (bufs), rotating or own, and the mirror [2][G][cap_tot][ROW] (pinned)
+    // resident rows: the device buffer (bufs), rotating or own; the mirror [2][G][cap_tot][ROW] (pinned) is per sequence
     int32_t   buf     = -1;
     bool      own     = false;
     bool      own_stale = true;  // own buffer: the scratch used its memory, the mirror goes back in (dec_alloc, or the next join)
     bool      own_sinks = false; // own buffer: the sink rows of the mirror changed (reset), the next join uploads them
-    uint8_t * mirror  = nullptr;
     std::vector<int32_t> base_next; // rotating: the layers whose base uploads the worker queues after the prefetch job of this layer
     bool      base_early = false;    // rotating: queued in the previous round, or at the first prefetch of the round when it is not
     bool      base_rec  = false; // the base upload for the next join of the layer is queued (ev_base), the join waits for it
@@ -114,29 +107,38 @@ struct llama_kvq_store::layer {
 
     llama_kvq_counters cnt;
 
-    void assign(int32_t g, int32_t s, int32_t row, int32_t cap_tot, int64_t n_bmw) {
+    // the slot s of kv head g takes the row, in the resident set q of the layer
+    void assign(layer_seq & q, int32_t g, int32_t s, int32_t row, int32_t cap_tot, int64_t n_bmw) {
         const size_t o = (size_t) g*cap_tot;
-        uint64_t * rb = res.data() + g*n_bmw;
-        const int32_t old = ridx[o + s];
+        uint64_t * rb = q.res.data() + g*n_bmw;
+        const int32_t old = q.ridx[o + s];
         if (old >= 0) {
             kvq_bit_clear(rb, old);
             cnt.evict++;
         }
-        ridx[o + s] = row;
+        q.ridx[o + s] = row;
         kvq_bit_set(rb, row);
-        slot_stamp[o + s] = stamp;
+        q.slot_stamp[o + s] = q.stamp;
         fetch.push_back({ g, s, row });
     }
 
     // the slot becomes empty
-    void forget(int32_t g, int32_t s, int32_t cap_tot, int64_t n_bmw) {
-        int32_t & row = ridx[(size_t) g*cap_tot + s];
+    static void forget(layer_seq & q, int32_t g, int32_t s, int32_t cap_tot, int64_t n_bmw) {
+        int32_t & row = q.ridx[(size_t) g*cap_tot + s];
         if (row >= 0) {
-            kvq_bit_clear(res.data() + g*n_bmw, row);
+            kvq_bit_clear(q.res.data() + g*n_bmw, row);
             row = -1;
         }
     }
 };
+
+llama_kvq_store::layer_seq & llama_kvq_store::ls(const layer & l) {
+    return seqs[cur].lay[l.li];
+}
+
+llama_kvq_store::layer_seq & llama_kvq_store::ls(int32_t s, const layer & l) {
+    return seqs[s].lay[l.li];
+}
 
 static double kvq_now() {
     return ggml_time_us()*1e-6;
@@ -176,6 +178,7 @@ struct llama_kvq_store::gather_pool {
     int64_t           n        = 0;
     uint8_t *         dst      = nullptr;
     const llama_kvq_store * st = nullptr;
+    int32_t           seq      = 0;
     size_t            li       = 0;
     const int         n_th;
 
@@ -183,7 +186,7 @@ struct llama_kvq_store::gather_pool {
         const int64_t i0 = n*ith/nth;
         const int64_t i1 = n*(ith + 1)/nth;
         for (int64_t i = i0; i < i1; ++i) {
-            memcpy(dst + 2*i*ROW, st->row_ptr(li, fetch[i].g, fetch[i].row), 2*ROW);
+            memcpy(dst + 2*i*ROW, st->row_ptr(seq, li, fetch[i].g, fetch[i].row), 2*ROW);
         }
     }
 
@@ -220,12 +223,13 @@ struct llama_kvq_store::gather_pool {
         }
     }
 
-    void run(const kvq_fetch * f, int64_t n_f, uint8_t * d, const llama_kvq_store * s, size_t l) {
+    void run(const kvq_fetch * f, int64_t n_f, uint8_t * d, const llama_kvq_store * s, int32_t sq, size_t l) {
         std::lock_guard<std::mutex> lr(m_run);
         fetch    = f;
         n        = n_f;
         dst      = d;
         st       = s;
+        seq      = sq;
         li       = l;
         // waking the helpers costs more than a small copy
         if (n_th == 1 || n < 256) {
@@ -359,7 +363,6 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
 
     this->n_sink = n_sink;
     n_chunk = (n_rows + n_chunk_rows - 1)/n_chunk_rows;
-    n_host_ = n_coarse_;
     nwk     = (bits_k*(int32_t) D + 31)/32;
     nwv     = (bits_v*(int32_t) D + 31)/32;
     cap     = resident_cap;
@@ -370,6 +373,10 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     GGML_ASSERT(!ids.empty());
 
     const auto & cells = kv.get_cells(0);
+
+    // one state per sequence of the memory (the page table, the boundaries, the resident set, the query sums)
+    const int32_t n_sq = (int32_t) std::max<uint32_t>(1, kv.get_n_seq_max());
+    seqs.resize(n_sq);
 
     layers.resize(ids.size());
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -459,7 +466,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         }
     }
 
-    ctx_dev   = init_ctx(layers.size()*8 + 5 + 2*N_TBUF);
+    ctx_dev   = init_ctx(layers.size()*8 + 5 + 2*N_TBUF + (size_t) n_sq*(2*layers.size() + 1));
     ctx_codes = init_ctx(layers.size()*4);
     ctx_alias = init_ctx(n_bufs);
     ctx_host  = init_ctx(layers.size()*KIND_COUNT);
@@ -493,11 +500,15 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         ggml_format_name(t.kc,    "kvq_kc-%d",    l.il);
         ggml_format_name(t.vc,    "kvq_vc-%d",    l.il);
         ggml_format_name(t.tab,   "kvq_tab-%d",   l.il);
-        t.qacc = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, D, D, G);
-        ggml_format_name(t.qacc, "kvq_qacc-%d", l.il);
-        if (n_gate > 0) {
-            t.gacc = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_gate);
-            ggml_format_name(t.gacc, "kvq_gacc-%d", l.il);
+        for (auto & q : seqs) {
+            q.qacc.resize(layers.size(), nullptr);
+            q.gacc.resize(layers.size(), nullptr);
+            q.qacc[l.li] = ggml_new_tensor_3d(ctx_dev.get(), GGML_TYPE_F32, D, D, G);
+            ggml_format_name(q.qacc[l.li], "kvq_qacc-%d", l.il);
+            if (n_gate > 0) {
+                q.gacc[l.li] = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_gate);
+                ggml_format_name(q.gacc[l.li], "kvq_gacc-%d", l.il);
+            }
         }
         for (int k = 0; k < KIND_COUNT; ++k) {
             t.trig[k] = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, 1);
@@ -507,8 +518,10 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
     bias    = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_rows);
     ggml_set_name(bias,    "kvq_bias");
-    pt      = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_I32, n_chunk);
-    ggml_set_name(pt,      "kvq_pt");
+    for (auto & q : seqs) {
+        q.pt = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_I32, n_chunk);
+        ggml_set_name(q.pt, "kvq_pt");
+    }
 
     // the scratch of the large ubatches, one row per position of the coarse region, then one per ring cell (see scr_alloc)
     n_scr   = n_rows + cells.size();
@@ -540,11 +553,14 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         pl.tab_slot  = layers[0].t.tab->nb[1];
         GGML_ASSERT(pl.tab_slot == TAB_SLOT && TAB_SLOT % sizeof(float) == 0);
         pages.reset(new llama_kvq_pool(buft_host, pl, n_chunk));
-        page_tab.resize(n_chunk);
-        for (int32_t c = 0; c < n_chunk; ++c) {
-            page_tab[c] = c;
+        // the pool has the pages of one sequence for now: sequence 0 owns them, the identity
+        for (auto & q : seqs) {
+            q.page_tab.assign(n_chunk, -1);
         }
-        ggml_backend_tensor_set(pt, page_tab.data(), 0, ggml_nbytes(pt));
+        for (int32_t c = 0; c < n_chunk; ++c) {
+            seqs[0].page_tab[c] = c;
+        }
+        ggml_backend_tensor_set(seqs[0].pt, seqs[0].page_tab.data(), 0, ggml_nbytes(seqs[0].pt));
     }
     // set_rows has no q8_0 to q8_0 copy, so the scatter writes the rows of rkv as groups of 4 bytes (f32, half the threads of f16)
     for (size_t b = 0; b < bufs.size(); ++b) {
@@ -559,14 +575,17 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     // the mirrors of the layers, zeroed: a slot that is not resident is skipped by the attention, but must not hold NaN
     {
         const size_t sz_mir = (size_t) 2*G*cap_tot*ROW;
-        buf_mir.reset(ggml_backend_buft_alloc_buffer(buft_host, sz_mir*n_att));
-        if (!buf_mir) {
-            throw std::runtime_error("failed to allocate the mirrors of the resident rows");
-        }
-        ggml_backend_buffer_clear(buf_mir.get(), 0);
-        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf_mir.get());
-        for (int32_t i = 0; i < n_att; ++i) {
-            layers[i].mirror = base + i*sz_mir;
+        for (auto & q : seqs) {
+            q.buf_mir.reset(ggml_backend_buft_alloc_buffer(buft_host, sz_mir*n_att));
+            if (!q.buf_mir) {
+                throw std::runtime_error("failed to allocate the mirrors of the resident rows");
+            }
+            ggml_backend_buffer_clear(q.buf_mir.get(), 0);
+            uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(q.buf_mir.get());
+            q.lay.resize(n_att);
+            for (int32_t i = 0; i < n_att; ++i) {
+                q.lay[i].mirror = base + i*sz_mir;
+            }
         }
     }
 
@@ -617,11 +636,15 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         ggml_backend_tensor_set(bias, b.data(), 0, ggml_nbytes(bias));
     }
 
+    for (auto & q : seqs) {
+        for (auto & s : q.lay) {
+            s.ridx.assign((size_t) G*cap_tot, -1);
+            s.res.assign((size_t) G*n_bmw, 0);
+            s.req.assign((size_t) G*n_bmw, 0);
+            s.slot_stamp.assign((size_t) G*cap_tot, 0);
+        }
+    }
     for (auto & l : layers) {
-        l.ridx.assign((size_t) G*cap_tot, -1);
-        l.res.assign((size_t) G*n_bmw, 0);
-        l.req.assign((size_t) G*n_bmw, 0);
-        l.slot_stamp.assign((size_t) G*cap_tot, 0);
         l.ev_sel.reset(ggml_backend_event_new(dev));
         l.ev_read.reset(ggml_backend_event_new(dev));
         l.ev_up.reset(ggml_backend_event_new(dev));
@@ -676,7 +699,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
 
     LLAMA_LOG_INFO("%s: n_coarse = %d of %d rows, %d chunks of %d rows, K %d / V %d bits (%d / %d words), resident slots %d + %d sinks\n", __func__,
-            n_coarse_, n_rows, n_chunk, n_crow, bits_k, bits_v, nwk, nwv, cap, n_sink);
+            seqs[0].n_coarse, n_rows, n_chunk, n_crow, bits_k, bits_v, nwk, nwv, cap, n_sink);
     LLAMA_LOG_INFO("%s: device: codes %.1f MiB, tables %.1f MiB (%s), resident %.1f MiB, ring %.1f MiB, scratch %.1f MiB (%s), other %.1f MiB; host: store %.1f MiB (%s), codes and tables %.1f MiB, ring %.1f MiB, other %.1f MiB\n", __func__,
             mi.codes/1048576.0, mi.tables/1048576.0, "freed in a prompt only with --kvq-prefill-free-codes", mi.resident/1048576.0, mi.ring/1048576.0, mi.scratch/1048576.0, scr_ok ? "used" : "not used", mi.other_dev/1048576.0,
             mi.host_store/1048576.0, mi.pinned ? "pinned" : "pageable", mi.host_codes/1048576.0, mi.host_ring/1048576.0, mi.host_other/1048576.0);
@@ -742,19 +765,19 @@ void llama_kvq_store::synchronize() {
     }
 }
 
-void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async) {
+void llama_kvq_store::set_chunk_table(int32_t seq, int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async) {
     GGML_ASSERT(c >= 0 && c < n_chunk && g >= 0 && g < G);
     GGML_ASSERT(!async || backend_main);
     const layer & l = layers.at(layer_of_il.at(il));
     const layer_tensors & t = l.t;
-    const int64_t m = (int64_t) page_tab[c]*2*G + 2*g + (is_v ? 1 : 0);
-    memcpy(htinv_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), inv, (size_t) D*D);
-    memcpy(htaux_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), aux, (size_t) D*3*sizeof(float));
+    const int64_t m = (int64_t) seqs[seq].page_tab[c]*2*G + 2*g + (is_v ? 1 : 0);
+    memcpy(htinv_ptr(seq, l.li, c, 2*g + (is_v ? 1 : 0)), inv, (size_t) D*D);
+    memcpy(htaux_ptr(seq, l.li, c, 2*g + (is_v ? 1 : 0)), aux, (size_t) D*3*sizeof(float));
     if (!codes_on_dev()) {
         return;
     }
     // one copy of the slot from the host copy; a queued upload of codes_alloc may read it now: this write comes after it on the main stream
-    const uint8_t * slot = htab_ptr(l.li, c, 2*g + (is_v ? 1 : 0));
+    const uint8_t * slot = htab_ptr(seq, l.li, c, 2*g + (is_v ? 1 : 0));
     if (async) {
         ggml_backend_tensor_set_async(backend_main, t.tab, slot, m*t.tab->nb[1], TAB_SLOT);
     } else {
@@ -762,57 +785,60 @@ void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t 
     }
 }
 
-void llama_kvq_store::set_n_host(int32_t n) {
-    GGML_ASSERT(n >= n_coarse_ && n <= n_rows_);
+void llama_kvq_store::set_n_host(int32_t seq, int32_t n) {
+    seq_state & q = seqs[seq];
+    GGML_ASSERT(n >= q.n_coarse && n <= n_rows_);
     // the queued tail uploads start at n_host; the host ring does not hold the rows before it
-    if (n != n_host_) {
+    if (n != q.n_host) {
         reset_base();
-        GGML_ASSERT(n < n_host_ || st_ok >= n);
-        if (n < n_host_) {
-            rg_ok = std::min(rg_ok, n);
+        GGML_ASSERT(n < q.n_host || q.st_ok >= n);
+        if (n < q.n_host) {
+            q.rg_ok = std::min(q.rg_ok, n);
         }
     }
     // the codes of a job are rows of the host store; the rows after n need no upload
-    hc_hi = std::min(hc_hi, n);
-    n_host_ = n;
+    q.hc_hi = std::min(q.hc_hi, n);
+    q.n_host = n;
 }
 
-void llama_kvq_store::set_n_coarse(int32_t n) {
-    GGML_ASSERT(n >= 0 && n <= n_rows_ && n <= std::max(n_host_, n_coarse_));
-    if (n == n_coarse_) {
+void llama_kvq_store::set_n_coarse(int32_t seq, int32_t n) {
+    seq_state & q = seqs[seq];
+    GGML_ASSERT(n >= 0 && n <= n_rows_ && n <= std::max(q.n_host, q.n_coarse));
+    if (n == q.n_coarse) {
         return;
     }
     drop_pending();
     reset_base();
     synchronize();
-    hc_hi = std::max(hc_hi, n);
-    if (n < n_coarse_) {
+    q.hc_hi = std::max(q.hc_hi, n);
+    if (n < q.n_coarse) {
         // the slots of the removed rows become empty, the sinks keep their slots
         // a layer gets its device ridx at every join
         for (auto & l : layers) {
+            layer_seq & s_l = ls(seq, l);
             for (int32_t g = 0; g < G; ++g) {
                 for (int32_t s = n_sink; s < cap_tot; ++s) {
-                    if (l.ridx[(size_t) g*cap_tot + s] >= n) {
-                        l.forget(g, s, cap_tot, n_bmw);
+                    if (s_l.ridx[(size_t) g*cap_tot + s] >= n) {
+                        layer::forget(s_l, g, s, cap_tot, n_bmw);
                     }
                 }
             }
         }
-    } else if (n_coarse_ == 0) {
+    } else if (q.n_coarse == 0) {
         // the rows of the sinks are in the host store now
         for (auto & l : layers) {
-            upload_pinned(l, n_sink);
+            upload_pinned(seq, l, n_sink);
         }
     }
-    n_coarse_ = n;
+    q.n_coarse = n;
 }
 
 // the table tensors go by their own type and slice size, so a change of the packed table format is a mismatch, not a misread
-void llama_kvq_store::state_write_meta(llama_io_write_i & io) const {
+void llama_kvq_store::state_write_meta(int32_t seq, llama_io_write_i & io) const {
     const layer_tensors & t = layers[0].t;
     const int32_t v[13] = {
-        (int32_t) layers.size(), G, (int32_t) D, (int32_t) ROW, n_crow, nwk, nwv, n_coarse_,
-        (int32_t) GGML_TYPE_I8, (int32_t) (D*D), (int32_t) GGML_TYPE_F32, (int32_t) (D*3*sizeof(float)), n_host_,
+        (int32_t) layers.size(), G, (int32_t) D, (int32_t) ROW, n_crow, nwk, nwv, seqs[seq].n_coarse,
+        (int32_t) GGML_TYPE_I8, (int32_t) (D*D), (int32_t) GGML_TYPE_F32, (int32_t) (D*3*sizeof(float)), seqs[seq].n_host,
     };
     io.write(v, sizeof(v));
     for (const auto & l : layers) {
@@ -820,7 +846,8 @@ void llama_kvq_store::state_write_meta(llama_io_write_i & io) const {
     }
 }
 
-void llama_kvq_store::state_read_meta(llama_io_read_i & io, int32_t & n_out, int32_t & n_host_out) const {
+void llama_kvq_store::state_read_meta(int32_t seq, llama_io_read_i & io, int32_t & n_out, int32_t & n_host_out) const {
+    GGML_ASSERT(seq >= 0 && seq < n_seq());
     int32_t v[13];
     io.read(v, sizeof(v));
     if (v[0] != (int32_t) layers.size() || v[1] != G || v[2] != (int32_t) D || v[3] != (int32_t) ROW) {
@@ -852,13 +879,13 @@ void llama_kvq_store::state_read_meta(llama_io_read_i & io, int32_t & n_out, int
 }
 
 // per layer: the host rows of each kv head, the codes of each kv head, the tables of the chunks
-void llama_kvq_store::state_write_data(llama_io_write_i & io) {
+void llama_kvq_store::state_write_data(int32_t seq, llama_io_write_i & io) {
     synchronize();
-    const int32_t n = n_coarse_;
+    const int32_t n = seqs[seq].n_coarse;
     for (auto & l : layers) {
         for (int32_t g = 0; g < G; ++g) {
-            chunk_runs(0, n_host_, [&](int32_t p, int32_t m) {
-                io.write(row_ptr(l.li, g, p), (size_t) m*2*ROW);
+            chunk_runs(0, seqs[seq].n_host, [&](int32_t p, int32_t m) {
+                io.write(row_ptr(seq, l.li, g, p), (size_t) m*2*ROW);
             });
         }
         if (n == 0) {
@@ -869,7 +896,7 @@ void llama_kvq_store::state_write_data(llama_io_write_i & io) {
             const ggml_tensor * rows = k ? l.t.vc : l.t.kc;
             for (int32_t g = 0; g < G; ++g) {
                 chunk_runs(0, n, [&](int32_t p, int32_t m) {
-                    io.write(hcode_ptr(l.li, k == 1, g, p), (size_t) m*rows->nb[1]);
+                    io.write(hcode_ptr(seq, l.li, k == 1, g, p), (size_t) m*rows->nb[1]);
                 });
             }
         }
@@ -877,22 +904,23 @@ void llama_kvq_store::state_write_data(llama_io_write_i & io) {
         for (int k = 2; k < 4; ++k) {
             for (int32_t c = 0; c < (n + n_crow - 1)/n_crow; ++c) {
                 for (int32_t m = 0; m < 2*G; ++m) {
-                    io.write(k == 3 ? htaux_ptr(l.li, c, m) : htinv_ptr(l.li, c, m), k == 3 ? (size_t) D*3*sizeof(float) : (size_t) D*D);
+                    io.write(k == 3 ? htaux_ptr(seq, l.li, c, m) : htinv_ptr(seq, l.li, c, m), k == 3 ? (size_t) D*3*sizeof(float) : (size_t) D*D);
                 }
             }
         }
     }
 }
 
-void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n, int32_t h) {
-    GGML_ASSERT(n_coarse_ == 0 && n <= h && h <= n_rows_);
+void llama_kvq_store::state_read_data(int32_t seq, llama_io_read_i & io, int32_t n, int32_t h) {
+    seq_state & q = seqs[seq];
+    GGML_ASSERT(q.n_coarse == 0 && n <= h && h <= n_rows_);
     drop_pending();
     reset_base();
     synchronize();
     for (auto & l : layers) {
         for (int32_t g = 0; g < G; ++g) {
             chunk_runs(0, h, [&](int32_t p, int32_t m) {
-                io.read(row_ptr(l.li, g, p), (size_t) m*2*ROW);
+                io.read(row_ptr(seq, l.li, g, p), (size_t) m*2*ROW);
             });
         }
         if (n == 0) {
@@ -902,24 +930,24 @@ void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n, int32_t h
             const ggml_tensor * rows = k ? l.t.vc : l.t.kc;
             for (int32_t g = 0; g < G; ++g) {
                 chunk_runs(0, n, [&](int32_t p, int32_t m) {
-                    io.read(hcode_ptr(l.li, k == 1, g, p), (size_t) m*rows->nb[1]);
+                    io.read(hcode_ptr(seq, l.li, k == 1, g, p), (size_t) m*rows->nb[1]);
                 });
             }
         }
         for (int k = 2; k < 4; ++k) {
             for (int32_t c = 0; c < (n + n_crow - 1)/n_crow; ++c) {
                 for (int32_t m = 0; m < 2*G; ++m) {
-                    io.read(k == 3 ? htaux_ptr(l.li, c, m) : htinv_ptr(l.li, c, m), k == 3 ? (size_t) D*3*sizeof(float) : (size_t) D*D);
+                    io.read(k == 3 ? htaux_ptr(seq, l.li, c, m) : htinv_ptr(seq, l.li, c, m), k == 3 ? (size_t) D*3*sizeof(float) : (size_t) D*D);
                 }
             }
         }
     }
     if (codes_on_dev()) {
-        codes_up(n, false);
+        codes_up(seq, n, false);
     }
     // the sink rows are read from the host store now
-    n_host_ = h;
-    set_n_coarse(n);
+    q.n_host = h;
+    set_n_coarse(seq, n);
 }
 
 bool llama_kvq_store::enable(const llama_kvq_params & p) {
@@ -1042,7 +1070,9 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
         }
     }
 
-    reset_resident();
+    for (int32_t s = 0; s < n_seq(); ++s) {
+        reset_resident(s);
+    }
     reset_counters();
 
     // the device copy of the codes and tables lives with the context, unless a prompt frees it (scr_alloc)
@@ -1054,49 +1084,50 @@ bool llama_kvq_store::enable(const llama_kvq_params & p) {
     LLAMA_LOG_INFO("%s: max_batch = %d, prefetch_n = %d, resident = %d, lead = %d\n", __func__, p.max_batch, p.prefetch_n, cap, p.lead);
     LLAMA_LOG_INFO("%s: staging: device %.1f MiB, pinned host %.1f MiB; mirrors: pinned host %.1f MiB\n", __func__,
             ggml_nbytes(jblk)/1048576.0, ggml_backend_buffer_get_size(buf_pin.get())/1048576.0,
-            buf_mir ? ggml_backend_buffer_get_size(buf_mir.get())/1048576.0 : 0.0);
+            seqs[0].buf_mir ? ggml_backend_buffer_get_size(seqs[0].buf_mir.get())*n_seq()/1048576.0 : 0.0);
     return true;
 }
 
-void llama_kvq_store::reset_resident() {
+void llama_kvq_store::reset_resident(int32_t seq) {
     drop_pending();
     reset_base();
     if (backend_cp) {
         ggml_backend_synchronize(backend_cp.get());
     }
     for (auto & l : layers) {
+        layer_seq & q = ls(seq, l);
         l.up_rec   = false;
-        std::fill(l.ridx.begin(), l.ridx.end(), -1);
-        std::fill(l.res.begin(), l.res.end(), 0);
-        std::fill(l.slot_stamp.begin(), l.slot_stamp.end(), 0);
-        l.stamp    = 0;
-        l.pf_stamp = 0;
+        std::fill(q.ridx.begin(), q.ridx.end(), -1);
+        std::fill(q.res.begin(), q.res.end(), 0);
+        std::fill(q.slot_stamp.begin(), q.slot_stamp.end(), 0);
+        q.stamp    = 0;
+        q.pf_stamp = 0;
         l.fetch.clear();
 
         // the sinks are pinned rows; they are never requested, so they are not in the bitmap
         for (int32_t g = 0; g < G; ++g) {
             for (int32_t s = 0; s < n_sink; ++s) {
-                l.ridx[(size_t) g*cap_tot + s] = s;
+                q.ridx[(size_t) g*cap_tot + s] = s;
             }
         }
 
         // the sink rows are uploaded with the first chunk
-        if (n_coarse_ > 0) {
-            upload_pinned(l, n_sink);
+        if (seqs[seq].n_coarse > 0) {
+            upload_pinned(seq, l, n_sink);
         }
     }
 }
 
 // rows [0, n_pin) of the host store to the slots [0, n_pin) of the mirror, which is [kv][g][slot][ROW]; an own buffer gets them at the next join
 // the caller has waited for the base uploads and the mirror writes
-void llama_kvq_store::upload_pinned(layer & l, int32_t n_pin) {
+void llama_kvq_store::upload_pinned(int32_t sq, layer & l, int32_t n_pin) {
     GGML_ASSERT(n_pin <= n_sink);
     l.own_sinks = true;
     for (int kv = 0; kv < 2; ++kv) {
         for (int32_t g = 0; g < G; ++g) {
-            uint8_t * dst = l.mirror + ((size_t) kv*G + g)*cap_tot*ROW;
+            uint8_t * dst = ls(sq, l).mirror + ((size_t) kv*G + g)*cap_tot*ROW;
             for (int32_t s = 0; s < n_pin; ++s) {
-                memcpy(dst + (size_t) s*ROW, row_ptr(l.li, g, s) + kv*ROW, ROW);
+                memcpy(dst + (size_t) s*ROW, row_ptr(sq, l.li, g, s) + kv*ROW, ROW);
             }
         }
     }
@@ -1142,7 +1173,7 @@ void llama_kvq_store::write_mirror(layer & l) {
     const size_t nb_kv = (size_t) G*cap_tot*ROW;
     for (size_t i = 0; i < l.fetch.size(); ++i) {
         const kvq_fetch & f = l.fetch[i];
-        uint8_t * dst = l.mirror + ((size_t) f.g*cap_tot + f.slot)*ROW;
+        uint8_t * dst = ls(l).mirror + ((size_t) f.g*cap_tot + f.slot)*ROW;
         memcpy(dst,         h_stage + 2*i*ROW,       ROW);
         memcpy(dst + nb_kv, h_stage + (2*i + 1)*ROW, ROW);
     }
@@ -1159,7 +1190,7 @@ void llama_kvq_store::issue_base(layer & l, ggml_backend_event_t ev, ggml_backen
     }
     const size_t n = (size_t) 2*G*cap_tot*ROW;
     for (int r = 0; r < up_rep; ++r) {
-        ggml_backend_tensor_set_async(bu, l.t.rkv_h, l.mirror, 0, n);
+        ggml_backend_tensor_set_async(bu, l.t.rkv_h, ls(l).mirror, 0, n);
     }
     ggml_backend_event_record(l.ev_base.get(), bu);
     l.base_rec = true;
@@ -1226,14 +1257,14 @@ void llama_kvq_store::read_scr(layer & l) {
     const size_t n = (size_t) (ub_p1 - ub_p0)*2*ROW;
     for (int32_t g = 0; g < G; ++g) {
         chunk_runs(ub_p0, ub_p1, [&](int32_t p, int32_t m) {
-            ggml_backend_tensor_get_async(backend_cp.get(), scr, row_ptr(l.li, g, p), g*scr->nb[3] + p*scr->nb[2], (size_t) m*2*ROW);
+            ggml_backend_tensor_get_async(backend_cp.get(), scr, row_ptr(cur, l.li, g, p), g*scr->nb[3] + p*scr->nb[2], (size_t) m*2*ROW);
         });
     }
     l.cnt.rb_bytes += (int64_t) G*n;
 }
 
 // host ring: the rows of the positions [p0, p1) of every layer between the host store [g][row][K, V] and the host ring [cell][g][ROW] (K, V)
-void llama_kvq_store::ring_copy(bool to_store, int32_t p0, int32_t p1) {
+void llama_kvq_store::ring_copy(int32_t sq, bool to_store, int32_t p0, int32_t p1) {
     if (p1 <= p0) {
         return;
     }
@@ -1244,7 +1275,7 @@ void llama_kvq_store::ring_copy(bool to_store, int32_t p0, int32_t p1) {
             uint8_t * rk = (uint8_t *) l.k_cache->data + (p % n_cell)*nb1;
             uint8_t * rv = (uint8_t *) l.v_cache->data + (p % n_cell)*nb1;
             for (int32_t g = 0; g < G; ++g) {
-                uint8_t * s = row_ptr(l.li, g, p);
+                uint8_t * s = row_ptr(sq, l.li, g, p);
                 if (to_store) {
                     memcpy(s,       rk + g*ROW, ROW);
                     memcpy(s + ROW, rv + g*ROW, ROW);
@@ -1258,32 +1289,34 @@ void llama_kvq_store::ring_copy(bool to_store, int32_t p0, int32_t p1) {
     LLAMA_LOG_DEBUG("%s: positions [%d, %d) %s in %.3f ms\n", __func__, p0, p1, to_store ? "to the host store" : "to the host ring", 1e3*(kvq_now() - t0));
 }
 
-void llama_kvq_store::sync_store(int32_t n) {
-    if (st_ok >= n) {
+void llama_kvq_store::sync_store(int32_t seq, int32_t n) {
+    seq_state & q = seqs[seq];
+    if (q.st_ok >= n) {
         return;
     }
     synchronize();
-    GGML_ASSERT(rg_ok >= n);
-    ring_copy(true, std::max(st_ok, n_host_), n);
-    st_ok = n;
+    GGML_ASSERT(q.rg_ok >= n);
+    ring_copy(seq, true, std::max(q.st_ok, q.n_host), n);
+    q.st_ok = n;
 }
 
-void llama_kvq_store::sync_ring(int32_t n) {
-    if (rg_ok >= n) {
+void llama_kvq_store::sync_ring(int32_t seq, int32_t n) {
+    seq_state & q = seqs[seq];
+    if (q.rg_ok >= n) {
         return;
     }
     // the queued tail uploads read the host ring
     reset_base();
     synchronize();
-    GGML_ASSERT(st_ok >= n);
-    ring_copy(false, std::max(rg_ok, n_host_), n);
-    rg_ok = n;
+    GGML_ASSERT(q.st_ok >= n);
+    ring_copy(seq, false, std::max(q.rg_ok, q.n_host), n);
+    q.rg_ok = n;
 }
 
-void llama_kvq_store::ring_loaded(int32_t n) {
+void llama_kvq_store::ring_loaded(int32_t seq, int32_t n) {
     reset_base();
-    st_ok = n_host_;
-    rg_ok = n;
+    seqs[seq].st_ok = seqs[seq].n_host;
+    seqs[seq].rg_ok = n;
 }
 
 void llama_kvq_store::order_rows() {
@@ -1332,6 +1365,22 @@ static void kvq_ubatch_pos(const llama_ubatch & ub, int32_t & p0, int32_t & p1) 
     GGML_ASSERT(p1 - p0 == (int32_t) ub.n_tokens && "the two-tier cache needs a ubatch of consecutive positions");
 }
 
+// the sequence of a ubatch: one
+static int32_t kvq_ubatch_seq(const llama_ubatch & ub, int32_t n_seq) {
+    GGML_ASSERT(ub.n_seqs_unq == 1 && ub.seq_id_unq[0] >= 0 && ub.seq_id_unq[0] < n_seq && "the two-tier cache needs a ubatch of one sequence");
+    return (int32_t) ub.seq_id_unq[0];
+}
+
+void llama_kvq_store::use_seq(int32_t s) {
+    if (s == cur) {
+        return;
+    }
+    // the prefetches, the base uploads and the mirror writes of the ubatch before work on its sequence
+    drop_pending();
+    reset_base();
+    cur = s;
+}
+
 void llama_kvq_store::begin_ubatch(const llama_ubatch & ub) {
     const int64_t n = ub.n_tokens;
     GGML_ASSERT(n <= 64);
@@ -1342,15 +1391,17 @@ void llama_kvq_store::begin_ubatch(const llama_ubatch & ub) {
             drop(l);
         }
     }
+    use_seq(kvq_ubatch_seq(ub, n_seq()));
+    seq_state & q = seqs[cur];
     flush_ubatch();
     ub_tokens = n;
     n_ubatch++;
 
     kvq_ubatch_pos(ub, ub_p0, ub_p1);
-    sync_ring(ub_p0);
-    rg_ok = ub_p1;
-    st_ok = std::min(st_ok, ub_p0);
-    tb_lo = n_host_;
+    sync_ring(cur, ub_p0);
+    q.rg_ok = ub_p1;
+    q.st_ok = std::min(q.st_ok, ub_p0);
+    tb_lo = q.n_host;
     tb_hi = ub_p1;
     // the early query of the first layer comes before any join: its tail now, if the last join of the previous round did not wait for it
     layer & l0 = layers[0];
@@ -1364,10 +1415,12 @@ void llama_kvq_store::begin_ubatch(const llama_ubatch & ub) {
 }
 
 void llama_kvq_store::begin_scr(const llama_ubatch & ub) {
+    use_seq(kvq_ubatch_seq(ub, n_seq()));
+    seq_state & q = seqs[cur];
     kvq_ubatch_pos(ub, ub_p0, ub_p1);
-    sync_store(ub_p0);
-    st_ok = ub_p1;
-    rg_ok = std::min(rg_ok, ub_p0);
+    sync_store(cur, ub_p0);
+    q.st_ok = ub_p1;
+    q.rg_ok = std::min(q.rg_ok, ub_p0);
 }
 
 static ggml_backend_t kvq_backend(ggml_backend_sched_t sched, ggml_backend_dev_t dev) {
@@ -1392,10 +1445,11 @@ static void kvq_build_scatter(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor 
     ggml_build_forward_expand(gf, scatter);
 }
 
-void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, ggml_tensor * score, int64_t n_top) const {
+void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t seq, int32_t il, ggml_tensor * score, int64_t n_top) const {
     const kind k = KIND_PREFETCH;
     const layer_tensors & t = get_layer(il);
 
+    const int64_t n_coarse_ = seqs[seq].n_coarse;
     const int64_t L = score->ne[2];
     GGML_ASSERT(score->ne[0] == n_coarse_ && score->ne[1] == G);
     GGML_ASSERT(n_top <= n_coarse_ - n_sink);
@@ -1495,7 +1549,7 @@ void llama_kvq_store::select(const layer & l, const ggml_tensor * dst, ggml_cgra
 
 // more requested rows than slots: the n_u rows with the largest max score over the positions stay requested, ties by row
 void llama_kvq_store::cut_request(layer & l, int32_t g, int64_t n_u) {
-    uint64_t * rq = l.req.data() + g*n_bmw;
+    uint64_t * rq = ls(l).req.data() + g*n_bmw;
     int64_t n = 0;
     for (int64_t w = 0; w < n_bmw; ++w) {
         n += kvq_popcount(rq[w]);
@@ -1543,7 +1597,8 @@ void llama_kvq_store::cut_request(layer & l, int32_t g, int64_t n_u) {
 // the free slots of the oldest requests first, then by slot, so the slot of a row does not depend on the order of the selection
 // the slots of the requested rows get the stamp now; l.req is cleared
 void llama_kvq_store::place(layer & l, int32_t g, uint32_t now) {
-    uint64_t * rq = l.req.data() + g*n_bmw;
+    layer_seq & q = ls(l);
+    uint64_t * rq = q.req.data() + g*n_bmw;
     const size_t o = (size_t) g*cap_tot;
 
     // without branches on the request: about 40% of the slots are requested, in no order
@@ -1551,10 +1606,10 @@ void llama_kvq_store::place(layer & l, int32_t g, uint32_t now) {
     l.free_age.resize(cap + 1);
     int32_t  * fs = l.free_s.data();
     uint8_t  * fa = l.free_age.data();
-    uint32_t * ss = l.slot_stamp.data() + o;
+    uint32_t * ss = q.slot_stamp.data() + o;
     int64_t    nf = 0;
     for (int32_t s = n_sink; s < n_sink + cap; ++s) {
-        const int32_t  row = l.ridx[o + s];
+        const int32_t  row = q.ridx[o + s];
         const bool     in  = (row >= 0) & kvq_bit(rq, std::max(row, 0));
         const uint32_t st  = ss[s];
         ss[s]  = in ? now : st;
@@ -1593,26 +1648,28 @@ void llama_kvq_store::place(layer & l, int32_t g, uint32_t now) {
     }
     GGML_ASSERT(np == n_miss);
     for (int64_t k = 0; k < n_miss; ++k) {
-        l.assign(g, pk[k], l.miss[k], cap_tot, n_bmw);
+        l.assign(q, g, pk[k], l.miss[k], cap_tot, n_bmw);
     }
 }
 
 void llama_kvq_store::plan_prefetch(layer & l) {
     llama_kvq_counters & cnt = l.cnt;
+    layer_seq & q = ls(l);
+    const int32_t n_coarse_ = seqs[cur].n_coarse;
 
     const int64_t n_top = l.n_top;
     const int64_t L     = l.n_pos;
     const bool    cut   = pf_scores(n_top, L);
 
-    const uint32_t now = ++l.stamp;
+    const uint32_t now = ++q.stamp;
     l.fetch.clear();
 
     cnt.n_pf++;
     cnt.pf_sel += G*L*n_top;
-    l.pf_stamp = now;
+    q.pf_stamp = now;
     for (int32_t g = 0; g < G; ++g) {
         // the union over the positions; the order of top_k on the device is not fixed (atomics), the bitmap does not keep it
-        uint64_t * rq = l.req.data() + g*n_bmw;
+        uint64_t * rq = q.req.data() + g*n_bmw;
         for (int64_t p = 0; p < L; ++p) {
             const int32_t * sel = l.h_sel + (g + G*p)*n_top;
             for (int64_t i = 0; i < n_top; ++i) {
@@ -1623,7 +1680,7 @@ void llama_kvq_store::plan_prefetch(layer & l) {
         if (cut) {
             cut_request(l, g, n_req(n_top, L));
         }
-        const uint64_t * rb = l.res.data() + g*n_bmw;
+        const uint64_t * rb = q.res.data() + g*n_bmw;
         l.miss.clear();
         for (int64_t w = 0; w < n_bmw; ++w) {
             if (rq[w] == 0) {
@@ -1653,13 +1710,13 @@ void llama_kvq_store::gather(layer & l, int64_t n_rows) {
     }
 
     // sorting the rows by address does not make the copy faster (measured)
-    pool->run(l.fetch.data(), n, h_stage, this, l.li);
+    pool->run(l.fetch.data(), n, h_stage, this, cur, l.li);
 
     for (int64_t i = 0; i < n; ++i) {
         h_slots[2*i]     = (int32_t) ((0*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
         h_slots[2*i + 1] = (int32_t) ((1*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
     }
-    memcpy(h_ridx, l.ridx.data(), l.ridx.size()*sizeof(int32_t));
+    memcpy(h_ridx, ls(l).ridx.data(), ls(l).ridx.size()*sizeof(int32_t));
 }
 
 // on the stream of backend, after the previous readers of stage, slots and ridx of the layer
@@ -1703,7 +1760,7 @@ void llama_kvq_store::drop(layer & l) {
     work->mark_joined(l);
     work->wait_mirror(l);
     for (const auto & f : l.fetch) {
-        l.forget(f.g, f.slot, cap_tot, n_bmw);
+        layer::forget(ls(l), f.g, f.slot, cap_tot, n_bmw);
     }
     l.fetch.clear();
     ggml_backend_synchronize(backend_cp.get());
@@ -1737,7 +1794,7 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
         const size_t n = (size_t) ub_p0*2*ROW;
         for (int32_t g = 0; g < G; ++g) {
             chunk_runs(0, ub_p0, [&](int32_t p, int32_t m) {
-                ggml_backend_tensor_set_async(cp, scr, row_ptr(l.li, g, p), g*scr->nb[3] + p*scr->nb[2], (size_t) m*2*ROW);
+                ggml_backend_tensor_set_async(cp, scr, row_ptr(cur, l.li, g, p), g*scr->nb[3] + p*scr->nb[2], (size_t) m*2*ROW);
             });
         }
         ggml_backend_event_record(l.ev_sd.get(), cp);
@@ -1776,7 +1833,7 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
             ggml_backend_event_wait(backend_cp.get(), l.ev_sel.get());
             // the staging is not ordered by a readback here
             ggml_backend_synchronize(backend_cp.get());
-            memcpy(h_ridx, l.ridx.data(), l.ridx.size()*sizeof(int32_t));
+            memcpy(h_ridx, ls(l).ridx.data(), ls(l).ridx.size()*sizeof(int32_t));
         }
         // a rotating layer without its base upload (no prefetch job before it queued one), an own buffer after a reset: now,
         // the main stream is after the attention of the layer before
@@ -1788,7 +1845,7 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
             ggml_backend_event_wait(backend_cp.get(), l.ev_sel.get());
             for (int32_t m = 0; m < 2*G; ++m) {
                 const size_t off = (size_t) m*cap_tot*ROW;
-                ggml_backend_tensor_set_async(backend_cp.get(), l.t.rkv_h, l.mirror + off, off, (size_t) n_sink*ROW);
+                ggml_backend_tensor_set_async(backend_cp.get(), l.t.rkv_h, ls(l).mirror + off, off, (size_t) n_sink*ROW);
             }
         }
         l.own_stale = false;
@@ -1949,12 +2006,13 @@ bool llama_kvq_store::dec_alloc() {
     return true;
 }
 
-void llama_kvq_store::codes_written(int32_t r1) {
-    hc_hi = std::max(hc_hi, r1);
+void llama_kvq_store::codes_written(int32_t seq, int32_t r1) {
+    seqs[seq].hc_hi = std::max(seqs[seq].hc_hi, r1);
 }
 
-// host copy -> device: the codes of the rows [0, n), the tables of their chunk slots; async: on the main stream (pinned host copy)
-void llama_kvq_store::codes_up(int32_t n, bool async) {
+// host copy -> device: the codes of the rows [0, n) of the sequence, the tables of their chunk slots; async: on the main stream (pinned host copy)
+void llama_kvq_store::codes_up(int32_t s, int32_t n, bool async) {
+    const std::vector<int32_t> & page_tab = seqs[s].page_tab;
     const int32_t n_tab = (n + n_crow - 1)/n_crow;
     for (auto & l : layers) {
         for (int k = 0; k < 2; ++k) {
@@ -1973,7 +2031,7 @@ void llama_kvq_store::codes_up(int32_t n, bool async) {
         // the tables: one copy per page (the slots [2G] of the host page are the device page)
         for (int32_t c = 0; c < n_tab; ++c) {
             ggml_tensor *   t   = l.t.tab;
-            const uint8_t * src = htab_ptr(l.li, c, 0);
+            const uint8_t * src = htab_ptr(s, l.li, c, 0);
             if (async) {
                 ggml_backend_tensor_set_async(backend_main, t, src, (size_t) page_tab[c]*t->nb[2], t->nb[2]);
             } else {
@@ -1998,10 +2056,15 @@ bool llama_kvq_store::codes_alloc() {
     ggml_backend_buffer_set_usage(buf_codes.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     codes_gen_++;
     // also the rows of the jobs whose codes are in the host copy and that have not joined the coarse region yet
-    const int32_t n = std::min(n_rows_, std::max(n_coarse_, hc_hi));
+    int32_t n = 0;
     const bool async = backend_main != nullptr;
     const int64_t t1 = ggml_time_us();
-    codes_up(n, async);
+    for (int32_t s = 0; s < n_seq(); ++s) {
+        // the pages of the sequences are different pages, the chunks of the largest one are the ones logged
+        const int32_t ns = std::min(n_rows_, std::max(seqs[s].n_coarse, seqs[s].hc_hi));
+        codes_up(s, ns, async);
+        n = std::max(n, ns);
+    }
     {
         const size_t sz_rows = (size_t) ((n + n_crow - 1)/n_crow)*(layers[0].t.kc->nb[3] + layers[0].t.vc->nb[3])*layers.size();
         const size_t sz_tabs = (size_t) ((n + n_crow - 1)/n_crow)*layers[0].t.tab->nb[2]*layers.size();
@@ -2035,8 +2098,14 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     for (const auto & l : layers) {
         mi.codes      += ggml_nbytes(l.t.kc) + ggml_nbytes(l.t.vc);
         mi.tables     += ggml_nbytes(l.t.tab);
-        mi.other_dev  += (l.t.qacc ? ggml_nbytes(l.t.qacc) : 0) + (l.t.gacc ? ggml_nbytes(l.t.gacc) : 0);
-        mi.host_other += (l.ridx.size() + l.slot_stamp.size())*sizeof(int32_t) + (l.res.size() + l.req.size())*sizeof(uint64_t);
+    }
+    for (const auto & q : seqs) {
+        for (size_t li = 0; li < layers.size(); ++li) {
+            mi.other_dev  += (q.qacc[li] ? ggml_nbytes(q.qacc[li]) : 0) + (q.gacc[li] ? ggml_nbytes(q.gacc[li]) : 0);
+            const layer_seq & s = q.lay[li];
+            mi.host_other += (s.ridx.size() + s.slot_stamp.size())*sizeof(int32_t) + (s.res.size() + s.req.size())*sizeof(uint64_t);
+        }
+        mi.host_other += q.buf_mir ? ggml_backend_buffer_get_size(q.buf_mir.get()) : 0;
     }
     for (const auto & b : bufs) {
         mi.resident += ggml_nbytes(b.rkv_h);
@@ -2047,7 +2116,7 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     mi.host_ring  = layers.size()*2*(size_t) n_cell*G*ROW;
     mi.other_dev += ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
     mi.scratch    = scr ? ggml_nbytes(scr) : 0;
-    mi.host_other += (buf_pin ? ggml_backend_buffer_get_size(buf_pin.get()) : 0) + (buf_mir ? ggml_backend_buffer_get_size(buf_mir.get()) : 0);
+    mi.host_other += buf_pin ? ggml_backend_buffer_get_size(buf_pin.get()) : 0;
     for (int32_t p = 0; p < pages->n_pages(); ++p) {
         mi.host_store += pages->bytes_rows(p);
         mi.host_codes += pages->bytes_codes(p);

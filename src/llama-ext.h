@@ -197,10 +197,11 @@ struct llama_kvq_counters_all {
     int64_t n_tokens   = 0;
 };
 
+// the counters are totals over the sequences (the callbacks and the worker count per layer, not per sequence)
 LLAMA_API bool llama_memory_kvq_get_counters(llama_memory_t mem, llama_kvq_counters_all & out);
 LLAMA_API void llama_memory_kvq_reset_counters(llama_memory_t mem);
 
-// device and host memory of the packed state, bytes
+// device and host memory of the packed state, bytes: totals, the per-sequence parts (resident sets, mirrors, query sums) of every sequence
 struct llama_kvq_memory_info {
     size_t codes      = 0; // packed coarse rows
     size_t tables     = 0;
@@ -305,11 +306,12 @@ struct llama_kvq_fit_progress {
     double  t_settle    = 0.0;  // decode thread seconds of these calls
 };
 
-LLAMA_API bool llama_memory_kvq_fit_get_progress(llama_memory_t mem, llama_kvq_fit_progress & out);
+// the progress of the fit of sequence seq_id (its coarse region, jobs, counters and times), false for a sequence the memory does not have
+LLAMA_API bool llama_memory_kvq_fit_get_progress(llama_memory_t mem, llama_seq_id seq_id, llama_kvq_fit_progress & out);
 
-// the end of a prompt: fits every chunk that is not fitted yet and the rows after the last complete chunk (see llama_kvq_rem),
-// waits for all of it; afterwards no fit work runs. Call it between decodes, from the decode thread
-LLAMA_API bool llama_memory_kvq_fit_wait(llama_memory_t mem);
+// the end of the prompt of sequence seq_id: fits every chunk of it that is not fitted yet and the rows after the last complete chunk
+// (see llama_kvq_rem), waits for all of it; afterwards no fit work of the sequence runs. Call it between decodes, from the decode thread
+LLAMA_API bool llama_memory_kvq_fit_wait(llama_memory_t mem, llama_seq_id seq_id);
 
 // debug: hold = true: finished chunks join the coarse region only in llama_memory_kvq_fit_wait
 LLAMA_API bool llama_memory_kvq_fit_set_hold(llama_memory_t mem, bool hold);

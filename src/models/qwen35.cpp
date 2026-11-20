@@ -200,7 +200,8 @@ public:
 
         if (res && params.enabled) {
             res &= store == mctx->get_store();
-            res &= store != nullptr && n_coarse == store->n_coarse() && n_host == store->n_host() && codes_gen == store->codes_gen();
+            res &= store != nullptr && gparams.ubatch.n_seqs_unq == 1 && seq == gparams.ubatch.seq_id_unq[0];
+            res &= n_coarse == store->n_coarse(seq) && n_host == store->n_host(seq) && codes_gen == store->codes_gen();
             res &= packed_small == llama_kvq_use_packed(p, gparams.ubatch.n_tokens, n_coarse, n_host);
             res &= scratch == kvq_use_scratch(p, store, packed_small);
             const int64_t n_mask = n_coarse + mctx->get_attn()->get_n_kv();
@@ -225,6 +226,9 @@ public:
     llm_attn_mask mask_early; // F16 [n_coarse + n_kv, n_tokens], without the cells of the ubatch (their K/V are not written yet)
 
     const llama_kvq_store * store = nullptr;
+
+    // the sequence of the ubatch: its page table and query sums are the inputs of the graph
+    int32_t seq = 0;
 
     // packed mode: the coarse region of the graph; fit mode: the graph sums the query statistics
     int32_t n_coarse = 0;
@@ -427,8 +431,9 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
         const int64_t n_kv = mctx_kvq->get_attn()->get_n_kv();
 
         inp->store        = mctx_kvq->get_store();
-        inp->n_coarse     = inp->store->n_coarse();
-        inp->n_host       = inp->store->n_host();
+        inp->seq          = ubatch.seq_id_unq[0];
+        inp->n_coarse     = inp->store->n_coarse(inp->seq);
+        inp->n_host       = inp->store->n_host(inp->seq);
         inp->fit          = true;
         inp->codes_gen    = inp->store->codes_gen();
         inp->packed_small = llama_kvq_use_packed(inp->params, n_tokens, inp->n_coarse, inp->n_host);
@@ -516,16 +521,16 @@ void llama_model_qwen35::graph::build_kvq_prefetch(
 
     ggml_tensor * k = store->get_ring(ctx0, il, false, inp->mctx->get_n_kv());
 
-    ggml_tensor * score = ggml_kvq_attn(ctx0, q, store->get_kc(ctx0, il), nullptr, t.tab, store->get_pt(), k, nullptr, nullptr, nullptr,
+    ggml_tensor * score = ggml_kvq_attn(ctx0, q, store->get_kc(ctx0, il), nullptr, t.tab, store->get_pt(inp_kvq->seq), k, nullptr, nullptr, nullptr,
             inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse, store->n_chunk_rows(), GGML_KVQ_SCORE);
     cb(score, "kvq_eq_score", il);
 
-    store->build_fetch(ctx0, gf, sched, il, score, inp_kvq->params.prefetch_n);
+    store->build_fetch(ctx0, gf, sched, inp_kvq->seq, il, score, inp_kvq->params.prefetch_n);
 }
 
 // fit mode: qacc[:, :, g] += sum of q q^T over the tokens and the query heads of kv head g
 void llama_model_qwen35::graph::build_kvq_qstat(llm_graph_input_kvq * inp_kvq, ggml_tensor * q, int il) {
-    ggml_tensor * acc = inp_kvq->store->get_layer(il).qacc;
+    ggml_tensor * acc = inp_kvq->store->get_qacc(inp_kvq->seq, il);
 
     const int64_t D = q->ne[0];
     const int64_t G = acc->ne[2];
@@ -544,7 +549,7 @@ void llama_model_qwen35::graph::build_kvq_qstat(llm_graph_input_kvq * inp_kvq, g
 
 // fit mode: gacc += sum of sigmoid(gate) over the tokens
 void llama_model_qwen35::graph::build_kvq_gstat(llm_graph_input_kvq * inp_kvq, ggml_tensor * gate_sigmoid, int il) {
-    ggml_tensor * acc = inp_kvq->store->get_layer(il).gacc;
+    ggml_tensor * acc = inp_kvq->store->get_gacc(inp_kvq->seq, il);
 
     // one token (decode): the add only
     ggml_tensor * sum = gate_sigmoid;
@@ -586,7 +591,7 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
     const int64_t n_coarse = inp_kvq->n_coarse;
     const int64_t n_crow   = store->n_chunk_rows();
 
-    GGML_ASSERT(n_coarse == store->n_coarse());
+    GGML_ASSERT(n_coarse == store->n_coarse(inp_kvq->seq));
 
     // the whole ring, its mask has the cells after the coarse rows
     ggml_tensor * k    = store->get_ring(ctx0, il, false, mctx_attn->get_n_kv());
@@ -601,7 +606,7 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_packed(
         store->build_join(ctx0, gf, sched, il, params.prefetch_n, n_tokens);
     }
 
-    ggml_tensor * out = ggml_kvq_attn(ctx0, q_cur, kc, vc, t.tab, store->get_pt(), k, v, t.rkv, ridx, mask, kq_scale, (int) n_coarse, (int) n_crow, GGML_KVQ_ATTN);
+    ggml_tensor * out = ggml_kvq_attn(ctx0, q_cur, kc, vc, t.tab, store->get_pt(inp_kvq->seq), k, v, t.rkv, ridx, mask, kq_scale, (int) n_coarse, (int) n_crow, GGML_KVQ_ATTN);
     cb(out, "kvq_attn", il);
 
     ggml_tensor * cur = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]);
@@ -636,7 +641,7 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
     // no host rows yet: the rows of the cells, in the order of the cells (no wrap)
     const int64_t n_host = inp_kvq->n_host;
     const int64_t n_rows = !inp_kvq->scr_cells ? inp_kvq->scr_rows : mctx_attn->get_n_kv();
-    GGML_ASSERT((n_host == store->n_host() || !inp_kvq->params.enabled) && n_rows > n_host);
+    GGML_ASSERT((n_host == store->n_host(inp_kvq->seq) || !inp_kvq->params.enabled) && n_rows > n_host);
 
     // after the readback of the rows of the layer before (the same scratch rows)
     store->build_scr_join(ctx0, gf, sched, il);
@@ -781,7 +786,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
 
-    if (inp_kvq && inp_kvq->fit && inp_kvq->store->get_layer(il).gacc) {
+    if (inp_kvq && inp_kvq->fit && inp_kvq->store->get_gacc(inp_kvq->seq, il)) {
         build_kvq_gstat(inp_kvq, gate_sigmoid, il);
     }
 

@@ -19,10 +19,16 @@ class llama_kv_cache;
 class llama_io_write_i;
 class llama_io_read_i;
 
-// packed two-tier state of the attention layers of one sequence (see llama_kvq_params::packed)
+// packed two-tier state of the attention layers (see llama_kvq_params::packed)
 //   device: packed coarse rows and tables of the coarse region, resident precise rows (rkv, ridx) of the layers in rotating buffers or one per layer, top-k bias
 //   host:   precise store (the q8_0 K/V rows of the coarse region), mirrors of the resident rows, slot state and row bitmaps of the resident slots
 // the tensors and host arrays are allocated for n_rows coarse rows, the coarse region is [0, n_coarse)
+//
+// per sequence (seq_state, one per n_seq_max of the memory): the page table, the boundaries n_coarse and n_host, the resident set of every layer
+// (slots, bitmaps, stamps, mirrors), the device query and gate sums, st_ok, rg_ok; a function that acts on one sequence takes its id, a ubatch
+// works on its own sequence (begin_ubatch, begin_scr)
+// shared by the sequences, used by one ubatch at a time: the page pool, the scratch / shared memory and its modes, the rotating resident and
+// tail buffers, the staging, the worker, the gather pool, the streams and events, the bias, the triggers
 //
 // resident slots of a (layer, kv head): [0, n_sink) hold the sinks, then cap evictable slots, then one unused slot (the trash slot of the scatter before the trash rows)
 // where the resident rows live: each attention layer keeps its rows in a pinned host mirror [2][G][cap_tot][ROW]
@@ -84,12 +90,11 @@ public:
         ggml_tensor * stage = nullptr; // f32 [ROW/4, n_stage], rows to scatter (set by enable, one for all layers)
         ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest trash rows (trash_row)
         ggml_tensor * trig[KIND_COUNT] = {}; // host f32 [1], per kind
-        ggml_tensor * qacc  = nullptr; // f32 [D, D, G], sum of q q^T over the query heads of each kv head (fit mode)
-        ggml_tensor * gacc  = nullptr; // f32 [n_gate], sum of sigmoid(gate) over the tokens (fit mode with n_gate > 0)
     };
 
     // the tensors hold n_rows coarse rows, table sets of n_chunk_rows rows (fit mode)
-    // the region starts empty and grows (set_n_coarse), the query statistics tensors are allocated
+    // the region of every sequence starts empty and grows (set_n_coarse), the query statistics tensors of every sequence are allocated
+    // (kv.get_n_seq_max() sequences; only sequence 0 owns pages for now)
     // n_gate > 0: also the gate statistics tensors, n_gate = n_head*D
     // layer_bufs: device buffers of the resident rows (llama_kvq_params::layer_bufs)
     // shared_min: the smallest shared memory (the fitter works in it, llama_kvq_fitter::shared_min)
@@ -100,15 +105,15 @@ public:
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
     // the decode thread, between graphs; a coarse chunk must get its new codes before the next graph
     // async: a copy on the main stream, the memory must stay valid until the next synchronize (pinned memory for a real async copy)
-    void set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async = false);
+    void set_chunk_table(int32_t seq, int32_t il, int32_t g, bool is_v, int32_t c, const int8_t * inv, const float * aux, bool async = false);
 
-    // fit mode: the coarse region becomes [0, n), n <= n_host; new rows must have codes and tables set
+    // fit mode: the coarse region of the sequence becomes [0, n), n <= n_host; new rows must have codes and tables set
     // the resident rows at or after n are dropped; the decode thread, between graphs
-    void set_n_coarse(int32_t n);
+    void set_n_coarse(int32_t seq, int32_t n);
 
-    // fit mode: the positions [0, n) have their q8_0 rows in the host store (or will have, by work queued on the main stream)
+    // fit mode: the positions [0, n) of the sequence have their q8_0 rows in the host store (or will have, by work queued on the main stream)
     // the scratch attention reads these rows from the host store, the later ones from the cache
-    void set_n_host(int32_t n);
+    void set_n_host(int32_t seq, int32_t n);
 
     // the main backend of the device (one of the backends of the context)
     void set_backend(const std::vector<ggml_backend_t> & backends);
@@ -116,14 +121,14 @@ public:
     // waits for the main stream and the copy stream
     void synchronize();
 
-    // fit mode, state save and load of the coarse region [0, n_coarse): host rows, codes and tables, the decode thread
+    // fit mode, state save and load of the coarse region [0, n_coarse) of one sequence: host rows, codes and tables, the decode thread
     // host rows [0, n_host), codes [0, n_coarse), tables of the chunks of the coarse region
     // meta: shapes and types, state_read_meta throws on a mismatch and returns n_coarse and n_host of the state
     // state_read_data: the coarse region must be empty, it becomes [0, n), the host rows [0, n_host)
-    void state_write_meta(llama_io_write_i & io) const;
-    void state_write_data(llama_io_write_i & io);
-    void state_read_meta (llama_io_read_i  & io, int32_t & n, int32_t & n_host) const;
-    void state_read_data (llama_io_read_i  & io, int32_t n, int32_t n_host);
+    void state_write_meta(int32_t seq, llama_io_write_i & io) const;
+    void state_write_data(int32_t seq, llama_io_write_i & io);
+    void state_read_meta (int32_t seq, llama_io_read_i  & io, int32_t & n, int32_t & n_host) const;
+    void state_read_data (int32_t seq, llama_io_read_i  & io, int32_t n, int32_t n_host);
 
     // the main backend (set_backend), the device and the buffer type of the device tensors
     ggml_backend_t             backend() const { return backend_main; }
@@ -131,8 +136,8 @@ public:
     ggml_backend_buffer_type_t dev_buft() const { return buft; }
 
     // host precise store: the K row then the V row (2*ROW bytes) of position pos of kv head g of layer il, in the page of its chunk
-    // the next rows of the chunk follow, a range that crosses a chunk boundary is split (chunk_runs)
-    uint8_t * host_row(int32_t il, int32_t g, int32_t pos) const { return row_ptr(layer_of_il.at(il), g, pos); }
+    // (in the page table of the sequence); the next rows of the chunk follow, a range that crosses a chunk boundary is split (chunk_runs)
+    uint8_t * host_row(int32_t seq, int32_t il, int32_t g, int32_t pos) const { return row_ptr(seq, layer_of_il.at(il), g, pos); }
 
     // the runs [p, p + n) of the range [p0, p1) that lie in one chunk: f(p, n)
     template <typename F>
@@ -150,21 +155,22 @@ public:
     // checks the parameters against the allocation and resets the resident slots and the counters
     bool enable(const llama_kvq_params & params);
 
-    // the resident slots start empty (the sinks stay), so the packed attention after this depends on the memory state only
-    void reset_resident();
+    // the resident slots of the sequence start empty (the sinks stay), so the packed attention after this depends on the memory state only
+    void reset_resident(int32_t seq);
 
-    // called once per ubatch of the packed path
+    // called once per ubatch of the packed path, the ubatch is one sequence: the later calls without a seq id (the callbacks, the
+    // worker) work on it
     void begin_ubatch(const llama_ubatch & ubatch);
 
     // called once per ubatch of the scratch path
     void begin_scr(const llama_ubatch & ubatch);
 
-    // the rows of the positions [n_host, n) in the host store, or in the host ring (the copy on the host at a switch, see the class comment)
-    void sync_store(int32_t n);
-    void sync_ring(int32_t n);
+    // the rows of the positions [n_host, n) of the sequence in the host store, or in the host ring (the copy on the host at a switch, see the class comment)
+    void sync_store(int32_t seq, int32_t n);
+    void sync_ring(int32_t seq, int32_t n);
 
     // after a state read, the host ring holds the positions [n_host, n)
-    void ring_loaded(int32_t n);
+    void ring_loaded(int32_t seq, int32_t n);
 
     // the main stream waits for the readbacks into the host store (before it uploads host rows)
     void order_rows();
@@ -185,7 +191,7 @@ public:
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
     // the graph of the selection of the prefetch trigger: score [n_coarse, G, L] -> top n_top per (kv head, position) -> trigger
-    void build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, ggml_tensor * score, int64_t n_top) const;
+    void build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t seq, int32_t il, ggml_tensor * score, int64_t n_top) const;
 
     // the join of the prefetch of layer il for L positions: trigger -> scatter, before the attention
     void build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int64_t n_top, int64_t L) const;
@@ -212,8 +218,8 @@ public:
     // path: scr_alloc frees it, codes_alloc (end of a prompt, or dec_alloc) allocates it and queues the upload of the host copy on
     // the main stream
     // the host copy of the codes of K or V of position pos of kv head g of layer il, in the row layout of kc / vc, contiguous to the end of the chunk
-    uint8_t * host_codes(int32_t il, bool is_v, int32_t g, int32_t pos) const { return hcode_ptr(layer_of_il.at(il), is_v, g, pos); }
-    void      codes_written(int32_t r1); // the fitter queued the codes of rows before r1 into the host copy
+    uint8_t * host_codes(int32_t seq, int32_t il, bool is_v, int32_t g, int32_t pos) const { return hcode_ptr(seq, layer_of_il.at(il), is_v, g, pos); }
+    void      codes_written(int32_t seq, int32_t r1); // the fitter queued the codes of rows of the sequence before r1 into the host copy
     bool      codes_alloc();
     void      codes_free();
     bool      codes_on_dev() const { return buf_codes != nullptr; }
@@ -233,12 +239,21 @@ public:
     ggml_tensor * get_kc(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_vc(ggml_context * ctx, int32_t il) const;
 
-    // i32 [n_chunk]: the page of each chunk (device), the page table input of ggml_kvq_attn
-    ggml_tensor * get_pt() const { return pt; }
-    int32_t page_of_chunk(int32_t c) const { return page_tab[c]; }
+    // i32 [n_chunk]: the page of each chunk of the sequence (device), the page table input of ggml_kvq_attn
+    ggml_tensor * get_pt(int32_t seq) const { return seqs[seq].pt; }
+    int32_t page_of_chunk(int32_t seq, int32_t c) const { return seqs[seq].page_tab[c]; }
 
-    int32_t n_coarse()     const { return n_coarse_; }
-    int32_t n_host()       const { return n_host_; }
+    // the sums of the sequence over the queries (qacc: f32 [D, D, G], q q^T over the query heads of each kv head; fit mode) and the
+    // gates (gacc: f32 [n_gate], sigmoid(gate) over the tokens, nullptr without n_gate) of layer il
+    ggml_tensor * get_qacc(int32_t seq, int32_t il) const { return seqs[seq].qacc[layer_of_il.at(il)]; }
+    ggml_tensor * get_gacc(int32_t seq, int32_t il) const { return seqs[seq].gacc[layer_of_il.at(il)]; }
+
+    // the pool of pages, the fitter keeps the sums of the complete chunks in it
+    llama_kvq_pool & get_pool() const { return *pages; }
+
+    int32_t n_seq()                 const { return (int32_t) seqs.size(); }
+    int32_t n_coarse(int32_t seq)   const { return seqs[seq].n_coarse; }
+    int32_t n_host  (int32_t seq)   const { return seqs[seq].n_host; }
     int32_t n_chunks()     const { return n_chunk; }
     int32_t n_rows()       const { return n_rows_; }
     int32_t n_chunk_rows() const { return n_crow; }
@@ -260,8 +275,34 @@ private:
     struct gather_pool;
     struct worker;
 
-    int32_t n_coarse_ = 0;
-    int32_t n_host_   = 0;
+    // the resident set of one attention layer of one sequence
+    struct layer_seq {
+        std::vector<int32_t>  ridx;       // [G][cap_tot], mirror of the device ridx
+        std::vector<uint64_t> res;        // [G][n_bmw], bitmap of the resident rows of the evictable slots
+        std::vector<uint64_t> req;        // [G][n_bmw], bitmap of the rows of the request being planned, 0 between plans
+        std::vector<uint32_t> slot_stamp; // [G][cap_tot], stamp of the last request that listed the row of the slot
+        uint32_t stamp    = 0;            // selection clock
+        uint32_t pf_stamp = 0;            // stamp of the last prefetch
+        uint8_t * mirror  = nullptr;      // pinned host mirror [2][G][cap_tot][ROW] of the resident rows, in buf_mir of the sequence
+    };
+
+    // the state of one sequence
+    struct seq_state {
+        int32_t n_coarse = 0;
+        int32_t n_host   = 0;
+        int32_t st_ok    = 0; // decode thread: the host store holds the rows of the positions [n_host, st_ok)
+        int32_t rg_ok    = 0; // decode thread: the host ring holds the rows of the positions [n_host, rg_ok)
+        int32_t hc_hi    = 0; // the host copy holds the codes of the rows that a later upload needs before this
+        std::vector<int32_t> page_tab; // chunk -> page, -1: none
+        ggml_tensor *        pt = nullptr; // its device copy
+        std::vector<ggml_tensor *> qacc;   // per layer: f32 [D, D, G], sum of q q^T over the query heads of each kv head (fit mode)
+        std::vector<ggml_tensor *> gacc;   // per layer: f32 [n_gate], sum of sigmoid(gate) over the tokens (fit mode with n_gate > 0)
+        ggml_backend_buffer_ptr buf_mir;   // pinned host mirrors of the resident rows
+        std::vector<layer_seq> lay;        // per layer
+    };
+    std::vector<seq_state> seqs;
+    int32_t                cur = 0; // the sequence of the current ubatch (begin_ubatch, begin_scr), the one the callbacks and the worker act on
+
     int32_t n_rows_   = 0; // allocated rows, the stride of the per-row host arrays
     int32_t n_crow    = 0;
     int32_t n_chunk   = 0;
@@ -292,9 +333,6 @@ private:
     ggml_context_ptr        ctx_codes; // kc, vc, tab
     ggml_backend_buffer_ptr buf_codes;
     std::unique_ptr<llama_kvq_pool> pages; // pinned host pages: rows, host copy of the codes and tables (see llama-kvq-pool.h)
-    std::vector<int32_t>    page_tab;  // chunk -> page, the identity
-    ggml_tensor *           pt = nullptr; // its device copy
-    int32_t                 hc_hi      = 0;     // the host copy holds the codes of the rows that a later upload needs before this
     uint32_t                codes_gen_ = 0;
     bool                    prefill_free_codes = false; // llama_kvq_params::prefill_free_codes
     ggml_context_ptr        ctx_alias;
@@ -302,7 +340,6 @@ private:
     ggml_backend_buffer_ptr buf_dev;
     ggml_backend_buffer_ptr buf_host; // triggers
     ggml_backend_buffer_ptr buf_pin;  // pinned host buffers (staging rows, ridx, slot list; readback per layer)
-    ggml_backend_buffer_ptr buf_mir;  // pinned host mirrors of the resident rows
     ggml_context_ptr        ctx_stage;
     ggml_backend_buffer_ptr buf_stage; // device staging rows and slot list
     ggml_backend_ptr        backend_cp; // copy stream
@@ -324,8 +361,6 @@ private:
     };
     std::vector<tail_buf> tbufs;
     int64_t n_cell = 0; // cells of the ring
-    int32_t st_ok  = 0; // decode thread: the host store holds the rows of the positions [n_host, st_ok)
-    int32_t rg_ok  = 0; // decode thread: the host ring holds the rows of the positions [n_host, rg_ok)
     int32_t ub_p0  = 0; // decode thread: positions [ub_p0, ub_p1) of the current ubatch (packed or scratch)
     int32_t ub_p1  = 0;
     std::atomic<int32_t> tb_lo{0}; // the worker uploads the cells of the positions [tb_lo, tb_hi)
@@ -368,22 +403,29 @@ private:
     std::unique_ptr<gather_pool> pool;
     std::unique_ptr<worker>      work;
 
-    // host side of the rows, codes and tables of the chunk of a position, through its page (layer index li)
-    uint8_t * row_ptr(size_t li, int32_t g, int32_t pos) const {
-        const int32_t pg = page_tab[pos/n_crow];
+    // host side of the rows, codes and tables of the chunk of a position, through its page in the page table of the sequence (layer index li)
+    uint8_t * row_ptr(int32_t s, size_t li, int32_t g, int32_t pos) const {
+        const int32_t pg = seqs[s].page_tab[pos/n_crow];
         return pages->rows_ptr(pg, (int32_t) li) + ((size_t) g*pages->rows(pg) + pos%n_crow)*2*ROW;
     }
-    uint8_t * hcode_ptr(size_t li, bool is_v, int32_t g, int32_t pos) const {
-        const int32_t pg = page_tab[pos/n_crow];
+    uint8_t * hcode_ptr(int32_t s, size_t li, bool is_v, int32_t g, int32_t pos) const {
+        const int32_t pg = seqs[s].page_tab[pos/n_crow];
         const size_t  nb = (size_t) (is_v ? nwv + 1 : nwk)*sizeof(int32_t);
         return (is_v ? pages->vc_ptr(pg, (int32_t) li) : pages->kc_ptr(pg, (int32_t) li)) + ((size_t) g*pages->rows(pg) + pos%n_crow)*nb;
     }
     // slot m = 2*g + (V ? 1 : 0) of the tables of chunk c
     // (a slot: the inverse table, D*D bytes, then the aux floats, 3*D)
     static constexpr size_t TAB_SLOT = (size_t) D*D + (size_t) 3*D*sizeof(float);
-    uint8_t * htab_ptr (size_t li, int32_t c, int32_t m) const { return pages->tab_ptr(page_tab[c], (int32_t) li) + (size_t) m*TAB_SLOT; }
-    uint8_t * htinv_ptr(size_t li, int32_t c, int32_t m) const { return htab_ptr(li, c, m); }
-    uint8_t * htaux_ptr(size_t li, int32_t c, int32_t m) const { return htab_ptr(li, c, m) + (size_t) D*D; }
+    uint8_t * htab_ptr (int32_t s, size_t li, int32_t c, int32_t m) const { return pages->tab_ptr(seqs[s].page_tab[c], (int32_t) li) + (size_t) m*TAB_SLOT; }
+    uint8_t * htinv_ptr(int32_t s, size_t li, int32_t c, int32_t m) const { return htab_ptr(s, li, c, m); }
+    uint8_t * htaux_ptr(int32_t s, size_t li, int32_t c, int32_t m) const { return htab_ptr(s, li, c, m) + (size_t) D*D; }
+
+    // the resident set of layer l of the sequence of the current ubatch, or of sequence s
+    layer_seq & ls(const layer & l);
+    layer_seq & ls(int32_t s, const layer & l);
+
+    // the ubatch works on this sequence from now on: the queued work of another sequence is dropped first
+    void use_seq(int32_t s);
 
     // rows per kv head of one request
     int64_t n_req(int64_t n_top, int64_t L) const;
@@ -406,14 +448,14 @@ private:
     void wait(layer & l);
     void drop(layer & l);
     void drop_pending();
-    void upload_pinned(layer & l, int32_t n_pin);
+    void upload_pinned(int32_t s, layer & l, int32_t n_pin);
     void write_mirror(layer & l);
     void issue_base(layer & l, ggml_backend_event_t ev, ggml_backend_t stream);
     void issue_tail(layer & l, ggml_backend_event_t ev, ggml_backend_t stream);
     void read_ring(layer & l);
     void read_scr(layer & l);
-    void ring_copy(bool to_store, int32_t p0, int32_t p1);
+    void ring_copy(int32_t s, bool to_store, int32_t p0, int32_t p1);
     void wait_mirrors();
     void reset_base();
-    void codes_up(int32_t n, bool async);
+    void codes_up(int32_t s, int32_t n, bool async);
 };
