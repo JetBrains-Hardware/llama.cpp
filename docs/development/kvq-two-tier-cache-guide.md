@@ -233,8 +233,8 @@ Consequences: block 16k is the default; a KL against a single-attention referenc
 Each of these is a documented limit (release blockers R1, R2 and R6 in `kvq-scratch/RELEASE-BLOCKERS.md` list what supporting them takes). The memory operations abort with a message that starts with `not supported by the two-tier KV cache (--kvq)`, then the reason and what to do; the server never calls them with its `--kvq` settings (one slot, no context shift, no cache reuse).
 
 - `seq_cp`, `seq_keep` of a sequence > 0, `seq_rm` of a sequence > 0, and more than one sequence: the store and the fitter hold sequence 0 only. Use `n_seq_max = 1` (server: `-np 1`).
-- `seq_add` and `seq_div`: the coarse codes hold rotated keys, so positions cannot be shifted or divided. Disable the context shift and `--cache-reuse`.
-- `seq_rm` of a middle range: only the end of the sequence can be removed, `[p0, -1)` with `p0 <= last position`.
+- `seq_add` and `seq_div`: qwen35 uses IMROPE, and no KV cache can shift its keys (`llama_memory_can_shift` is false without `--kvq` too, so the server already disables the context shift and `--cache-reuse` for this model). This is a limit of ggml-org's KV cache, not of the two-tier cache.
+- `seq_rm` of a middle range: only the end of the sequence can be removed, `[p0, -1)` with `p0 <= last position`. The plain hybrid memory accepts it (the attention cache keeps a gap); for the two-tier cache this needs a row mask in the coarse attention and in the blocked scratch attention (release blocker R1).
 - Multimodal input and embeddings: the memory serves text generation of the qwen35 target only.
 - `--fit`: it measures a plain q8_0 K/V cache and does not know the kvq memory (device codes, tables, scratch, resident sets, host store). Use `--fit off`, with `--ctx-size` and `-ngl` set (release blocker R2).
 - More than one kvq context per GPU per process: the CUDA attention uses one side stream and function-static fork / join events per device (release blocker R6).

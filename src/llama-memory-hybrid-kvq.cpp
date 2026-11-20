@@ -265,7 +265,7 @@ void llama_memory_hybrid_kvq::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid_kvq::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     if (params.enabled) {
-        GGML_ABORT("seq_add is not supported by the two-tier KV cache (--kvq): the coarse codes hold rotated keys, so positions cannot be shifted. Disable the context shift and --cache-reuse, or run without --kvq.");
+        GGML_ABORT("seq_add is not supported by the two-tier KV cache (--kvq): qwen35 uses IMROPE, its keys cannot be shifted in any KV cache (llama_memory_can_shift is false without --kvq too). Disable the context shift and --cache-reuse.");
     }
 
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
@@ -273,7 +273,7 @@ void llama_memory_hybrid_kvq::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 
 void llama_memory_hybrid_kvq::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     if (params.enabled) {
-        GGML_ABORT("seq_div is not supported by the two-tier KV cache (--kvq): the coarse codes hold rotated keys, so positions cannot be divided. Disable the context shift (self-extend), or run without --kvq.");
+        GGML_ABORT("seq_div is not supported by the two-tier KV cache (--kvq): qwen35 uses IMROPE, its keys cannot be shifted in any KV cache (llama_memory_can_shift is false without --kvq too). Disable the context shift (self-extend).");
     }
 
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
