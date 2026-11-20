@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <stdexcept>
 
-llama_kvq_pool::llama_kvq_pool(ggml_backend_buffer_type_t buft_host, const layout & lay, int32_t n_pages, bool prealloc, size_t max_bytes) :
-    lay(lay), buft(buft_host), max_b(max_bytes), bufs(n_pages), base(n_pages, nullptr), offs(n_pages), nrow(n_pages), kept(n_pages), hold(n_pages, 0),
-    st(new std::atomic<int>[n_pages > 0 ? n_pages : 1]) {
+llama_kvq_pool::llama_kvq_pool(ggml_backend_buffer_type_t buft_host, const layout & lay, int32_t n_pages, bool prealloc, size_t max_bytes, size_t keep_bytes) :
+    lay(lay), buft(buft_host), max_b(max_bytes), keep_b(prealloc ? SIZE_MAX : keep_bytes), bufs(n_pages), base(n_pages, nullptr), offs(n_pages), nrow(n_pages), kept(n_pages), hold(n_pages, 0),
+    st(new std::atomic<int>[n_pages > 0 ? n_pages : 1]), want(n_pages > 0 ? n_pages : 0, 0), drop(n_pages > 0 ? n_pages : 0, 0) {
     if (lay.C <= 0 || n_pages <= 0 || (int64_t) n_pages*lay.C < lay.n_rows) {
         throw std::runtime_error("kvq pool: bad page layout");
     }
@@ -64,10 +64,19 @@ int32_t llama_kvq_pool::n_free() const {
 }
 
 bool llama_kvq_pool::pick(int32_t n, int32_t * out) const {
+    // free pages that have host memory first, then those queued for it, then those without, last those that are being freed (the lowest ids
+    // within each: with no host memory kept, a page that is just freed is not waited for)
     int32_t k = 0;
-    for (int32_t p = 0; p < n_pages() && k < n; ++p) {
-        if (hold[p] == 0) {
-            out[k++] = p;
+    for (int cls = 0; cls < 4 && k < n; ++cls) {
+        for (int32_t p = 0; p < n_pages() && k < n; ++p) {
+            if (hold[p] != 0) {
+                continue;
+            }
+            const int s = st[p].load();
+            const int c = s == ST_READY ? 0 : s == ST_QUEUED ? 1 : s == ST_RELEASING ? 3 : 2;
+            if (c == cls) {
+                out[k++] = p;
+            }
         }
     }
     return k == n;
@@ -101,12 +110,70 @@ void llama_kvq_pool::give(int32_t page) {
     }
 }
 
+int32_t llama_kvq_pool::trim() {
+    if (keep_b == SIZE_MAX) {
+        return 0;
+    }
+    size_t kept_b = 0;
+    int32_t n_rel = 0;
+    std::lock_guard<std::mutex> lk(m);
+    for (int32_t p = 0; p < n_pages(); ++p) {
+        const int s = st[p].load();
+        if (hold[p] != 0 || (s != ST_READY && s != ST_QUEUED)) {
+            continue;
+        }
+        if (kept_b + bytes(p) <= keep_b) {
+            kept_b += bytes(p);
+            continue;
+        }
+        if (s == ST_QUEUED) {
+            // queued ahead, nobody took it: the thread drops it
+            drop[p] = 1;
+            continue;
+        }
+        // the caller synchronized the streams: nothing reads or writes the page any more
+        st[p].store(ST_RELEASING);
+        want[p] = 0;
+        todo_free.push_back(p);
+        n_rel++;
+    }
+    if (n_rel > 0) {
+        if (!thr.joinable()) {
+            thr = std::thread([this]() { run(); });
+        }
+        cv_work.notify_one();
+    }
+    return n_rel;
+}
+
+void llama_kvq_pool::wait_frees() {
+    std::unique_lock<std::mutex> lk(m);
+    cv_done.wait(lk, [&]() {
+        for (int32_t p = 0; p < n_pages(); ++p) {
+            if (st[p].load() == ST_RELEASING) {
+                return false;
+            }
+        }
+        return true;
+    });
+}
+
 void llama_kvq_pool::queue(int32_t page) {
     std::lock_guard<std::mutex> lk(m);
     const int s = st[page].load();
+    if (s == ST_QUEUED) {
+        drop[page] = 0;
+        return;
+    }
+    if (s == ST_RELEASING) {
+        // the thread allocates it again when the free is done
+        want[page] = 1;
+        return;
+    }
     if (s != ST_NONE && s != ST_FAILED) {
         return;
     }
+    drop[page] = 0;
     st[page].store(ST_QUEUED);
     n_commit++;
     todo.push_back(page);
@@ -123,20 +190,19 @@ bool llama_kvq_pool::wait(int32_t page) {
     queue(page);
     const int64_t t0 = ggml_time_us();
     std::unique_lock<std::mutex> lk(m);
-    cv_done.wait(lk, [&]() { return st[page].load() >= ST_READY; });
+    cv_done.wait(lk, [&]() { const int s = st[page].load(); return s == ST_READY || s == ST_FAILED; });
     stat.n_wait++;
     stat.t_wait += (ggml_time_us() - t0)*1e-6;
     return st[page].load() == ST_READY;
 }
 
 void llama_kvq_pool::queue_ahead() {
-    for (int32_t p = 0; p < n_pages(); ++p) {
-        if (hold[p] == 0 && st[p].load() == ST_NONE) {
-            if (host_fits(&p, 1)) {
-                queue(p);
-            }
-            return;
-        }
+    int32_t p = -1;
+    if (!pick(1, &p) || st[p].load() != ST_NONE) {
+        return; // none free, or the page the next reservation takes has its host memory or is on its way
+    }
+    if (host_fits(&p, 1)) {
+        queue(p);
     }
 }
 
@@ -158,15 +224,50 @@ bool llama_kvq_pool::alloc_now(int32_t page) {
     return true;
 }
 
+void llama_kvq_pool::free_now(int32_t page) {
+    bufs[page].reset();
+    base[page] = nullptr;
+}
+
 void llama_kvq_pool::run() {
     std::unique_lock<std::mutex> lk(m);
     while (true) {
-        cv_work.wait(lk, [&]() { return stop || !todo.empty(); });
+        cv_work.wait(lk, [&]() { return stop || !todo.empty() || !todo_free.empty(); });
         if (stop) {
             return;
         }
-        const int32_t p = todo.front();
-        todo.pop_front();
+        // allocations go before frees: a sequence may wait for a page
+        std::deque<int32_t> & q = todo.empty() ? todo_free : todo;
+        const int32_t p = q.front();
+        q.pop_front();
+        if (st[p].load() == ST_RELEASING) {
+            // cudaFreeHost synchronizes the device: here, not on the thread that decodes
+            lk.unlock();
+            const int64_t t0 = ggml_time_us();
+            free_now(p);
+            const double dt = (ggml_time_us() - t0)*1e-6;
+            lk.lock();
+            stat.n_free++;
+            stat.t_free += dt;
+            n_commit--;
+            if (want[p]) {
+                want[p] = 0;
+                st[p].store(ST_QUEUED);
+                n_commit++;
+                todo.push_back(p);
+            } else {
+                st[p].store(ST_NONE);
+            }
+            cv_done.notify_all();
+            continue;
+        }
+        if (drop[p]) {
+            drop[p] = 0;
+            n_commit--;
+            st[p].store(ST_NONE);
+            cv_done.notify_all();
+            continue;
+        }
         lk.unlock();
         const int64_t t0 = ggml_time_us();
         const bool ok = alloc_now(p);
@@ -174,6 +275,21 @@ void llama_kvq_pool::run() {
         lk.lock();
         stat.n_alloc++;
         stat.t_alloc += dt;
+        if (ok && drop[p]) {
+            // taken by nobody while it was allocated
+            drop[p] = 0;
+            lk.unlock();
+            const int64_t t1 = ggml_time_us();
+            free_now(p);
+            const double df = (ggml_time_us() - t1)*1e-6;
+            lk.lock();
+            stat.n_free++;
+            stat.t_free += df;
+            n_commit--;
+            st[p].store(ST_NONE);
+            cv_done.notify_all();
+            continue;
+        }
         if (!ok) {
             n_commit--;
         }

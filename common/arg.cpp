@@ -2525,8 +2525,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KVQ_PREFILL_FREE_CODES").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kvq-host-prealloc"},
-        "two-tier KV cache: allocate the pinned host memory of every page of the pool at load (default: a page gets its host memory in the background "
-        "when a sequence first needs it, and keeps it)",
+        "two-tier KV cache: allocate the pinned host memory of every page of the pool at load and keep it for the life of the context, pages are never freed (default: a page gets its host memory in the background "
+        "when a sequence first needs it and gives it back to the OS when no sequence holds the page any more, see --kvq-host-keep-mib)",
         [](common_params & params) {
             params.kvq.host_prealloc = true;
         }
@@ -2541,6 +2541,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kvq.host_max_mib = value;
         }
     ).set_env("LLAMA_ARG_KVQ_HOST_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-host-keep-mib"}, "N",
+        string_format("two-tier KV cache: when no sequence holds a page of the pool any more (slot cleared or evicted, rollback) its pinned host memory goes back to the OS, in a background thread; keep up to N MiB of released pages for reuse, 0 = give everything back (default: %d); --kvq-host-prealloc keeps everything", params.kvq.host_keep_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.host_keep_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_HOST_KEEP_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kvq-tail"}, "N",
         "two-tier KV cache: cells of the ring of q8_0 rows that are not coded yet, in pinned host memory (default: max(batch size, 4096) + 256)",

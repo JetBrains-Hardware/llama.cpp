@@ -622,7 +622,7 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
         const int32_t G      = (int32_t) model.hparams.n_head_kv(kv->get_layer_ids()[0]);
         const size_t  sh_min = llama_kvq_fitter::shared_min(G, llama_kvq_fitter::stage_rows(n_rows, fp), fp.bits_k, fp.bits_v);
         store = std::make_unique<llama_kvq_store>(*kv, n_rows, fp.chunk, fp.bits_k, fp.bits_v, llama_kvq_resident_slots(p), p.n_sink, p.layer_bufs, n_gate, sh_min,
-                p.host_prealloc, (size_t) std::max(0, p.host_max_mib)*1024*1024);
+                p.host_prealloc, (size_t) std::max(0, p.host_max_mib)*1024*1024, (size_t) std::max(0, p.host_keep_mib)*1024*1024);
         store->set_backend(backends);
         if (!store->scratch_ok()) {
             throw std::runtime_error("the two-tier cache needs the scratch attention (pinned host memory, LLAMA_KVQ_SCRATCH not 0)");

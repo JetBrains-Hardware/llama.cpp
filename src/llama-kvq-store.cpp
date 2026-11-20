@@ -346,7 +346,7 @@ static int kvq_popcount(uint64_t x) {
 }
 
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-        int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min, bool host_prealloc, size_t host_max_bytes) :
+        int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min, bool host_prealloc, size_t host_max_bytes, size_t host_keep_bytes) :
     n_rows_(n_rows), n_crow(n_chunk_rows) {
     if (kv.get_n_stream() != 1 && kv.get_n_stream() != kv.get_n_seq_max()) {
         throw std::runtime_error("packed two-tier mode needs one KV stream or one per sequence");
@@ -564,7 +564,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
             LLAMA_LOG_WARN("%s: --kvq-host-prealloc allocates every page at load, --kvq-host-max-mib is ignored\n", __func__);
             host_max_bytes = 0;
         }
-        pages.reset(new llama_kvq_pool(buft_host, pl, n_pg, host_prealloc, host_max_bytes));
+        pages.reset(new llama_kvq_pool(buft_host, pl, n_pg, host_prealloc, host_max_bytes, host_keep_bytes));
         // no sequence has a page yet: the device page tables are zero (buf_dev is cleared)
         for (auto & q : seqs) {
             q.page_tab.assign(n_chunk, -1);
@@ -715,9 +715,10 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
             mi.host_store/1048576.0, mi.pinned ? "pinned" : "pageable", mi.host_codes/1048576.0, mi.host_ring/1048576.0, mi.host_other/1048576.0);
     {
         const size_t pb = pages->bytes(0);
-        LLAMA_LOG_INFO("%s: pool of %d pages (%d chunks + %d), device reserved for all of them: codes %.1f MiB + tables %.1f MiB; host: one page is %.1f MiB, %s%s\n", __func__,
+        LLAMA_LOG_INFO("%s: pool of %d pages (%d chunks + %d), device reserved for all of them: codes %.1f MiB + tables %.1f MiB; host: one page is %.1f MiB, %s%s%s\n", __func__,
                 pages->n_pages(), n_chunk, n_sq - 1, mi.codes/1048576.0, mi.tables/1048576.0, pb/1048576.0,
-                host_prealloc ? "all pages allocated at load" : "pages allocated on demand (--kvq-host-prealloc: at load)",
+                host_prealloc ? "all pages allocated at load and kept" : "pages allocated on demand and given back to the OS when released (--kvq-host-prealloc: at load, kept)",
+                !host_prealloc && pages->keep_host_bytes() > 0 ? format(", up to %.1f MiB of free pages kept (--kvq-host-keep-mib)", pages->keep_host_bytes()/1048576.0).c_str() : "",
                 pages->max_host_bytes() > 0 ? format(", capped at %.1f MiB", pages->max_host_bytes()/1048576.0).c_str() : "");
     }
 }
@@ -2158,6 +2159,8 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     mi.t_page_wait = ps.t_wait;
     mi.n_page_alloc = ps.n_alloc;
     mi.t_page_alloc = ps.t_alloc;
+    mi.n_page_free  = ps.n_free;
+    mi.t_page_free  = ps.t_free;
     mi.pinned = pages->pinned();
     return mi;
 }
@@ -2174,7 +2177,13 @@ bool llama_kvq_store::reserve(int32_t seq, int32_t n_pos) {
         return false;
     }
     const int32_t add = n_c - q.n_page;
+    // the next page is allocated ahead (while this batch runs) once the sequence is in the last quarter of its last page: no idle page is left behind
+    // when a request ends early (the host memory of a free page is only given back at the next release)
+    const bool near_end = n_pos > (n_c - 1)*n_crow + 3*(n_crow/4);
     if (add <= 0) {
+        if (near_end) {
+            pages->queue_ahead();
+        }
         return true;
     }
     std::vector<int32_t> pg(add);
@@ -2182,6 +2191,10 @@ bool llama_kvq_store::reserve(int32_t seq, int32_t n_pos) {
         LLAMA_LOG_ERROR("%s: the kvq page pool is full: sequence %d needs %d more pages (%d positions, pages of %d rows), %d of %d are free\n", __func__,
                 seq, add, n_pos, n_crow, pages->n_free(), pages->n_pages());
         return false;
+    }
+    if (!pages->host_fits(pg.data(), add)) {
+        // the memory of released pages may still be on its way back
+        pages->wait_frees();
     }
     if (!pages->host_fits(pg.data(), add)) {
         LLAMA_LOG_ERROR("%s: the kvq host memory cap is reached: sequence %d needs %d more pages of %.1f MiB, %.1f of %.1f MiB are allocated or queued (--kvq-host-max-mib)\n", __func__,
@@ -2204,8 +2217,10 @@ bool llama_kvq_store::reserve(int32_t seq, int32_t n_pos) {
     }
     q.n_page = n_c;
     pt_up(seq);
-    // the next page of a sequence is allocated while this batch runs
-    pages->queue_ahead();
+    // the page after these is allocated while this batch runs (if the sequence is not near its last page, see above)
+    if (near_end) {
+        pages->queue_ahead();
+    }
     return true;
 }
 
@@ -2222,6 +2237,12 @@ void llama_kvq_store::release_from(int32_t seq, int32_t c0) {
         q.page_tab[c] = -1;
     }
     q.n_page = c0;
+    // the host memory of the pages nobody holds goes back to the OS, on the pool thread (the streams are synchronized above)
+    const int32_t n_rel = pages->trim();
+    if (n_rel > 0) {
+        LLAMA_LOG_INFO("%s: sequence %d let its pages from chunk %d go: the pinned host memory of %d pages (%.1f MiB) goes back to the OS, %d pages with %.1f MiB stay\n", __func__,
+                seq, c0, n_rel, n_rel*pages->bytes(0)/1048576.0, pages->n_alloc(), pages->host_bytes()/1048576.0);
+    }
     pt_up(seq);
 }
 
