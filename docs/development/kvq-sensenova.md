@@ -31,7 +31,16 @@ llama-server --fit off -m SenseNova-Loop-9B-Q5_K_M.gguf --alias SenseNova-Loop-9
   --spec-type draft-mtp --spec-draft-n-max 1 -ctkd f16 -ctvd f16
 ```
 
-- MTP draft of one token (the model's own MTP layer, blk.56). Greedy decode, 4 generic prompts of up to 400 tokens, short context, RTX 5090: plain 116 t/s, plain + MTP n_max 1 144 - 169 t/s, `--kvq` 106 t/s, `--kvq` + MTP n_max 1 105 - 122 t/s; draft acceptance 0.70 - 0.91. n_max 1 is the best: every further draft token costs about 6.5 ms per step and is accepted less often (plain + MTP n_max 3: 143 t/s, acceptance 0.48).
+- MTP draft of one token (the model's own MTP layer, blk.56). Greedy decode t/s, RTX 5090 (short: 4 generic prompts of up to 400 tokens; 24k / 100k: prompts of 24,183 / 99,395 tokens, 300 tokens each, `--verbose`); draft acceptance 0.70 - 0.95:
+
+  | config | short | 24k | 100k |
+  |---|---|---|---|
+  | plain | 116 | 107 | 84 |
+  | plain + MTP n_max 1 | 160 | 141 | 108 |
+  | `--kvq` | 106 | 91 | 80 |
+  | `--kvq` + MTP n_max 1 | 135 - 157 | 132 | 120 |
+
+- The MTP draft context has no compute buffers per phase: it alternates 1- and 2-token ubatches, and with the per-phase buffers it switched the phase at every step (about 7 ms per step, `--kvq` + MTP 88 / 85 / 80 t/s). n_max 1 is the best: every further draft token costs about 6.5 ms per step and is accepted less often (plain + MTP n_max 3: 143 t/s, acceptance 0.48).
 - This needs the commit that adds `sensenova_loop` to `llm_arch_supports_rs_rollback` (PR 32588 does not have it). Without it the server checkpoints the whole recurrent state (88 MiB) every step and restores it and decodes again after a rejected draft, and MTP makes the decode slower (plain + MTP n_max 3: 71 t/s). With it, the greedy output of MTP n_max 1 is byte-identical to the greedy output without MTP, with and without `--kvq`.
 - Sampling of the model card: temperature 1.0, top_p 0.95.
 - Memory at 256k: VRAM holds the weights (6.7 GB) and the coarse codes (K 2 bit, V 1 bit plus a gain: about 5.6 KB per token, 1.4 GB at 256k) instead of a q8_0 KV cache of about 30 KB per token (7.4 GB). The q8_0 rows of all positions are in pinned host RAM (about 7.4 GB at 256k).
