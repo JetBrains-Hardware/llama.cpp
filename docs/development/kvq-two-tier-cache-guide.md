@@ -38,21 +38,23 @@ llama-server --fit off -m Qwen3.8-27B-UD-IQ3_S.gguf -md Qwen3.8-27B-DFlash2-Q4_K
   --ctx-size 256000 --n-gpu-layers all -ngld all --parallel 1 ^
   --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --jinja ^
   --spec-type draft-dflash --spec-draft-n-max 7 -ctkd f16 -ctvd f16 ^
-  --batch-size 4096 --ubatch-size 1024 --kvq
+  --batch-size 4096 --ubatch-size 1024 --kvq --kvq-prefill-free-codes
 ```
+
+`--kvq-prefill-free-codes` is part of the 250k recipe: without it the codes and tables (1.8 GB at 250k) stay on the device during the prompt and the 15.5 GiB budget is exceeded. At short contexts leave it off (the default).
 
 The two configurations that fit 15,872 MiB at 250k:
 
 | | flags | largest VRAM sample at 250k | 250k prompt | why |
 |---|---|---|---|---|
-| A, default | `--ubatch-size 1024 --kvq` | 15,271 MiB (decode phase) | 139 s | smallest footprint |
-| B, large ubatch | `--ubatch-size 4096 --spec-draft-n-ubatch 1024 --kvq` | 15,372 MiB (prompt phase) | 136 s | 2% faster prompt |
+| A, default | `--ubatch-size 1024 --kvq --kvq-prefill-free-codes` | 15,271 MiB (decode phase) | 139 s | smallest footprint |
+| B, large ubatch | `--ubatch-size 4096 --spec-draft-n-ubatch 1024 --kvq --kvq-prefill-free-codes` | 15,372 MiB (prompt phase) | 136 s | 2% faster prompt |
 
 B without `--spec-draft-n-ubatch 1024` is 15,876 MiB (4 MiB over). Since the blocked attention, ubatch 4096 gains only about 2% over 1024, so A is the recommendation; B is a speed knob.
 
 What `--kvq` forces, with a warning in the log: one slot (`--parallel 1`), context shift and cache reuse off, flash attention on, q8_0 K and V, draft n_max at most 7, recurrent rollback by replay (context param `rs_replay`; `LLAMA_RS_REPLAY=0` keeps the snapshots). It refuses to start for a model that is not `qwen35`, with `--mmproj`, or with embeddings. `--fit` does not know the kvq memory, so use `--fit off`.
 
-What to expect in the log: the memory line of the store at load (`llama_kvq_store: device: codes ... (decode phase only) ...; host: store ... (pinned), codes and tables ...`), per prompt `scr_alloc` / `codes_free` at the start and `codes_alloc` / the fit wait at the end (`kvq: waited ... at the end of the prompt, coarse region N rows`), and the phase switches of the compute buffers (`sched_reserve: ... compute buffer size of the tg phase`).
+What to expect in the log: the memory line of the store at load (`llama_kvq_store: device: codes ... (freed in a prompt only with `--kvq-prefill-free-codes`) ...; host: store ... (pinned), codes and tables ...`), per prompt, with `--kvq-prefill-free-codes`, `scr_alloc` / `codes_free` at the start and `codes_alloc` / the fit wait at the end (without the flag the codes are allocated once at load and neither appears per prompt) (`kvq: waited ... at the end of the prompt, coarse region N rows`), and the phase switches of the compute buffers (`sched_reserve: ... compute buffer size of the tg phase`).
 
 Slot save and restore and the RAM prompt cache work with the default settings (a kvq state is about 29% larger than a plain one, about 1.77 GB at 24k; a plain snapshot cannot be loaded into a kvq context and the other way round).
 
@@ -71,6 +73,7 @@ Server flags of the two-tier cache (`common/arg.cpp`); defaults are the measured
 | `--kvq-prefetch-n N` | 1024 | rows per (kv head, position) selected by the early query |
 | `--kvq-resident-cap N` | 0 = 8192 | resident slots per (layer, kv head); 0 = max_batch x prefetch_n; 6144 is as good at 8 per batch and saves 71 MB of pinned memory |
 | `--kvq-lead N` | 2 | how many layers ahead the early query runs |
+| `--kvq-prefill-free-codes` | off | free the device copy of the codes and tables (kc, vc, tinv, taux) while a prompt is processed and allocate it again at the end of the prompt; the pinned host copy holds them meanwhile. Saves their size in the prompt phase (734 MiB at ctx 102400, 1,831 MiB at 250k), costs one allocation and an upload of the host copy per prompt. Needed for the 250k-in-15.5-GiB recipe. Refused with more than one sequence. Same output with and without. Env `LLAMA_ARG_KVQ_PREFILL_FREE_CODES` |
 | `--kvq-layer-bufs N\|all` | all | device buffers of the resident rows. `all`: one per attention layer, the rows stay on the device and a verify batch uploads only the fetched rows. N >= 2: the layers rotate through N buffers and every verify batch re-uploads each layer's resident set from its pinned mirror (272 MiB at cap 8192); slower on a slow bus, 110 MiB less VRAM below 250k, same output (section 6.1) |
 
 Flags of the rest of the stack that matter for the budget:
@@ -129,7 +132,7 @@ Headroom = 15,872 minus the largest sample of the session. In A the decode phase
 | drafter weights (Q4_K_M) | 1,080 | 1,080 | |
 | drafter KV cache (f16) | 60 | 60 | |
 | recurrent state (GDN, replay) | 177 | 177 | 1,197 with snapshot rows |
-| kvq codes + tables | 0 | 1,831 | pinned host copy during the prompt |
+| kvq codes + tables | 0 | 1,831 | pinned host copy during the prompt, with `--kvq-prefill-free-codes`; without it the codes stay on the device in the prompt phase too (+1,831 MiB there) |
 | kvq scratch, shared with resident / tail / staging | 540 | 540 | one layer of exact rows; decode uses about 330 of it (88 with `--kvq-layer-bufs 2`) |
 | kvq other | 17 | 17 | slot lists, counters |
 | kvq fitter | 1 | 1 | since the GPU table fit (2026-11-20) it works in the kvq scratch memory between the ubatches; was 86 in the prompt phase (session 250k: load 14,039 -> 13,951, run max 15,269 unchanged; 24k: -88 everywhere) |

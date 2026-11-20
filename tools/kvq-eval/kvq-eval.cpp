@@ -12,6 +12,7 @@
 //   chunks of --kvq-fit-chunk (default 8192); waits for the fitter after the prefill
 //   --kvq-pf-n 1024, --kvq-cap 0 (max_batch x pf-n), --kvq-lead 2: the prefetch of the resident rows (llama_kvq_params)
 //   --kvq-scr-block N: the scratch attention of a large ubatch in key blocks of N rows, 0: one attention with a mask (llama_kvq_params::scr_block)
+//   --kvq-prefill-free-codes: free the device copy of the codes and tables during a prompt (llama_kvq_params::prefill_free_codes)
 //   the ring has max(batch, 4096) + 256 cells (--kvq-tail of the server), or --kvq-ring N cells
 //   --kvq-rem own|merge, --kvq-min-rows N: the rows after the last complete chunk (llama_kvq_rem)
 //   --kvq-rm-test: functional check of clear and seq_rm on the first chunk, no scoring
@@ -61,6 +62,7 @@ struct kvq_args {
     int32_t     pk_cap       = 0;
     int32_t     pk_lead      = 2;
     int32_t     pk_scr_block = 16384;
+    bool        pk_free_codes = false;
 
     bool        no_rot = false;
     bool        perf   = false;
@@ -120,6 +122,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.pk_lead = std::stoi(argv[++i]);
         } else if (a == "--kvq-scr-block" && has_val) {
             args.pk_scr_block = std::stoi(argv[++i]);
+        } else if (a == "--kvq-prefill-free-codes") {
+            args.pk_free_codes = true;
         } else if (a == "--kvq-no-rot") {
             args.no_rot = true;
         } else if (a == "--kvq-perf") {
@@ -755,6 +759,7 @@ int main(int argc, char ** argv) {
         params.kvq.resident_cap = args.pk_cap;
         params.kvq.lead         = args.pk_lead;
         params.kvq.scr_block    = args.pk_scr_block;
+        params.kvq.prefill_free_codes = args.pk_free_codes;
     }
     if (args.rm_test || args.rb_test) {
         // recurrent snapshots for a seq_rm into the last ubatch
