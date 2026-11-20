@@ -67,6 +67,15 @@ public:
     static int32_t stage_rows(int32_t n_rows, const llama_kvq_fit_params & fparams);
 
     bool has_jobs(int32_t seq) const { return !jobs_empty(seq); }
+    bool has_failed(int32_t seq) const { return seqs[seq].failed; }
+
+    // shared prefix (seq_cp): the number of leading chunks of the sequence that no job writes any more: the chunk is complete, fitted as a
+    // whole (coarse up to its end, its statistics kept) and has no job in flight; its page can be shared by reference
+    int32_t n_shared(int32_t seq) const;
+
+    // the empty sequence dst continues from src (no job in flight in src; the store has forked the pages, store.fork): the fit state of src
+    // (fitted ranges, number of complete chunks, sums of the open chunk, the failed flag) and the device sums of the open chunk
+    void fork(int32_t src, int32_t dst);
 
     // the state and progress of the sequence (the jobs, the counters and times of its fits)
     void get_progress(int32_t seq, llama_kvq_fit_progress & out) const;

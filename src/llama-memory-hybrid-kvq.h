@@ -77,7 +77,7 @@ public:
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
     // fit mode: seq_rm of the end per sequence (seq_id -1: every sequence), seq_keep empties the other sequences
-    // seq_cp, seq_add and seq_div abort in two-tier mode (seq_cp: the sequences do not share rows yet)
+    // seq_cp copies a whole sequence (complete chunk pages shared by reference, the last page copied; a range aborts), seq_add and seq_div abort in two-tier mode
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id) override;
     void seq_add (llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;

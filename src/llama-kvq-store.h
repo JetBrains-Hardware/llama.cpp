@@ -269,6 +269,18 @@ public:
     void    release_all();
     int32_t n_page_chunks(int32_t seq) const { return seqs[seq].n_page; }
 
+    // shared prefix (seq_cp): the empty sequence dst takes the first n_share pages of src by reference (holder count + 1) and a copy of each
+    // later page of src (the rows up to n_host, the codes and tables up to n_coarse, the kept sums), then its boundaries are those of
+    // src; the caller made sure src has no job in flight and its host ring is complete (sync_ring), the shared pages are complete chunks
+    // that no sequence writes any more. The host ring cells [p0, p1) of src are copied to dst (ring_fork). False (nothing taken) if the
+    // pool has no pages or host memory for the copies; the resident set of dst is empty (reset_resident, the caller)
+    bool    fork(int32_t src, int32_t dst, int32_t n_share);
+    void    ring_fork(int32_t src, int32_t dst, int32_t p0, int32_t p1);
+    // copy on write: if the page of chunk c of the sequence has other holders, the sequence takes a private copy of it (the rows up to n_host,
+    // the codes and tables up to n_coarse; not the kept sums); false if there is no page
+    bool    make_private(int32_t seq, int32_t c);
+    int32_t n_page_holders(int32_t seq, int32_t c) const { return pages->holders(seqs[seq].page_tab[c]); }
+
     // the sums of the sequence over the queries (qacc: f32 [D, D, G], q q^T over the query heads of each kv head; fit mode) and the
     // gates (gacc: f32 [n_gate], sigmoid(gate) over the tokens, nullptr without n_gate) of layer il
     ggml_tensor * get_qacc(int32_t seq, int32_t il) const { return seqs[seq].qacc[layer_of_il.at(il)]; }
@@ -474,6 +486,13 @@ private:
 
     // the page table of the sequence to the device (-1 as page 0, the op reads the chunks of the coarse region only)
     void pt_up(int32_t seq);
+
+    // n free pages for the sequence (not taken), their host memory is ready; false (one log line) if there are none or the cap is reached
+    bool acquire_pages(int32_t seq, int32_t n, int32_t * pg);
+    // page to: the rows [0, n_rows) of every kv head of page from, the codes and tables of the rows [0, n_code), the kept sums
+    void copy_page_data(int32_t from, int32_t to, int32_t n_rows, int32_t n_code, bool sums);
+    // host copy -> device of the codes and tables of the page (main stream order, no async)
+    void page_up(int32_t page);
 
     // rows per kv head of one request
     int64_t n_req(int64_t n_top, int64_t L) const;

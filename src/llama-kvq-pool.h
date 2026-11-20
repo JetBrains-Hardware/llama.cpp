@@ -21,7 +21,8 @@
 // and, in pageable host memory, the kept sums of the chunk (struct sums): they are a part of the fitted chunk, so a page carries them
 // every page has C rows (the last page of n_rows is not shortened)
 //
-// a page has a holder count (the sequences whose page table has it; 0 or 1 until pages are shared): a page is free at 0
+// a page has a holder count (the sequences whose page table has it; more than 1 for a complete chunk after seq_cp): a page is free at 0;
+// the kept sums are reset at the first take and the last give, not at the others
 // the host memory of a page is allocated on demand, by a background thread: queue() at the reservation of a page (and for the
 // next free page, ahead), wait() before the page is used; when the last holder gives a page back its host memory goes back to the OS
 // (also on the background thread: freeing pinned memory synchronizes the device), except up to keep_bytes of free pages that keep it
@@ -53,6 +54,8 @@ public:
     // holders
     int32_t holders(int32_t page) const { return hold[page]; }
     int32_t n_free() const;
+    // pages with more than one holder (shared by sequences, seq_cp)
+    int32_t n_shared() const;
 
     // the n free pages with the lowest ids into out, false if there are fewer
     bool    pick(int32_t n, int32_t * out) const;

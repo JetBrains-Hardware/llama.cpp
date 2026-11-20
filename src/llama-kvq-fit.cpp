@@ -754,10 +754,46 @@ void llama_kvq_fitter::snapshots(int32_t seq, llama_pos n_pos) {
 }
 
 // the kept sums of the chunks [c0, n_snap) of the sequence are dropped (n_snap is set by the caller)
+// a page that other sequences hold keeps its sums (they are theirs too: the caller lets the page go or copies it)
 void llama_kvq_fitter::drop_sums(int32_t seq, int32_t c0) {
     for (int32_t c = c0; c < seqs[seq].n_snap; ++c) {
-        llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(store.page_of_chunk(seq, c));
+        const int32_t pg = store.page_of_chunk(seq, c);
+        if (store.get_pool().holders(pg) > 1) {
+            continue;
+        }
+        llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(pg);
         ks = llama_kvq_pool::sums();
+    }
+}
+
+int32_t llama_kvq_fitter::n_shared(int32_t seq) const {
+    const seq_fit & sq = seqs[seq];
+    const int32_t   C  = store.n_chunk_rows();
+    int32_t n = 0;
+    while (n < store.n_page_chunks(seq) && n < sq.n_snap && (int64_t) (n + 1)*C <= store.n_coarse(seq) &&
+            sq.slot_fit[n] == range{ n*C, (n + 1)*C } && !in_flight(seq, range{ n*C, (n + 1)*C })) {
+        n++;
+    }
+    return n;
+}
+
+void llama_kvq_fitter::fork(int32_t src, int32_t dst) {
+    GGML_ASSERT(src != dst && jobs_empty(src) && jobs_empty(dst));
+    const seq_fit & s = seqs[src];
+    seq_fit       & d = seqs[dst];
+    d.n_snap   = s.n_snap;
+    d.slot_fit = s.slot_fit;
+    d.acc_pos  = s.acc_pos;
+    d.acc_gram = s.acc_gram;
+    d.acc_gsum = s.acc_gsum;
+    d.failed   = s.failed;
+    // the device sums of the open chunk (the statistics of the queries of its rows so far)
+    store.synchronize();
+    for (int32_t il : layer_ids) {
+        ggml_backend_tensor_copy(store.get_qacc(src, il), store.get_qacc(dst, il));
+        if (store.get_gacc(src, il)) {
+            ggml_backend_tensor_copy(store.get_gacc(src, il), store.get_gacc(dst, il));
+        }
     }
 }
 

@@ -63,6 +63,14 @@ int32_t llama_kvq_pool::n_free() const {
     return n;
 }
 
+int32_t llama_kvq_pool::n_shared() const {
+    int32_t n = 0;
+    for (int32_t h : hold) {
+        n += h > 1;
+    }
+    return n;
+}
+
 bool llama_kvq_pool::pick(int32_t n, int32_t * out) const {
     // free pages that have host memory first, then those queued for it, then those without, last those that are being freed (the lowest ids
     // within each: with no host memory kept, a page that is just freed is not waited for)
