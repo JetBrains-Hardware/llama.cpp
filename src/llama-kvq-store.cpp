@@ -982,6 +982,19 @@ void llama_kvq_store::state_read_data(int32_t seq, llama_io_read_i & io, int32_t
     set_n_coarse(seq, n);
 }
 
+size_t llama_kvq_store::stream_device_bytes() const {
+    size_t n = 0;
+    for (const auto & b : bufs) {
+        n += (size_t) 2*G*cap_tot*ROW;
+        (void) b;
+    }
+    n += (size_t) N_TBUF*2*ggml_row_size(GGML_TYPE_Q8_0, D*G)*n_cell;
+    if (jblk) {
+        n += ggml_nbytes(jblk)/n_str;
+    }
+    return n;
+}
+
 bool llama_kvq_store::enable(const llama_kvq_params & p) {
     const bool own_p = p.layer_bufs < 0 || p.layer_bufs >= (int32_t) layers.size();
     if (p.n_sink != n_sink || llama_kvq_resident_slots(p) != cap || own_p != (n_rot == 0) || (!own_p && p.layer_bufs != n_buf)) {

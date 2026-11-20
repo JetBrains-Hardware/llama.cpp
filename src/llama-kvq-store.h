@@ -245,6 +245,9 @@ public:
 
     // streams of a packed ubatch at most (n_seq_max, GGML_KVQ_MAX_STREAM)
     int32_t n_streams() const { return n_str; }
+    // device bytes of the slices of ONE stream of the packed path (resident rows of every device buffer, the rotating tail buffers,
+    // the ridx / slot list / staging block); all of them exist for n_streams() streams from the load on, in the shared memory
+    size_t  stream_device_bytes() const;
     // rkv of layer il for S streams: q8_0 [D, cap_tot, G, 2*S]
     ggml_tensor * get_rkv(ggml_context * ctx, int32_t il, int64_t S) const;
 

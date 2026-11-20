@@ -61,6 +61,11 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // the reserve of the packed decode graph: n_streams() sequences of max_batch tokens each, every coarse region at its largest
+    // (0 if the packed path has one stream only, or no store)
+    llama_memory_context_ptr init_full_packed();
+    uint32_t                 n_packed_streams() const;
+
     // the packed rows cannot be shifted
     bool get_can_shift() const override;
 
@@ -187,6 +192,9 @@ public:
     // used to create a full-cache context, two-tier mode is off (fit mode: the store is set, for the statistics nodes of the reserve)
     explicit llama_memory_hybrid_kvq_context(llama_memory_hybrid_kvq * mem);
 
+    // used to create the full-cache context of the packed decode reserve (two-tier mode is on, see init_full_packed)
+    llama_memory_hybrid_kvq_context(llama_memory_hybrid_kvq * mem, bool packed_reserve);
+
     // used to create a batch processing context from a batch
     llama_memory_hybrid_kvq_context(
             llama_memory_hybrid_kvq * mem,
@@ -203,6 +211,9 @@ public:
     //
 
     const llama_kvq_params & get_params() const { return params; }
+
+    // the packed decode reserve: the graph is built for the largest coarse region of every stream, nothing is executed
+    bool packed_reserve() const { return is_packed_reserve; }
 
     // nullptr if not enabled
     llama_kvq_store * get_store() const { return store; }
@@ -228,6 +239,8 @@ private:
     llama_memory_hybrid_kvq * mem_kvq = nullptr;
 
     const llama_kvq_params params;
+
+    bool is_packed_reserve = false;
 
     llama_kvq_store * store = nullptr;
 
