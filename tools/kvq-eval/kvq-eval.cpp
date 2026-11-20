@@ -96,6 +96,7 @@ struct kvq_args {
     bool        multi_ex   = false; // the script of the sequences: rollback, empty, state round trip, then seq_keep
     int32_t     multi_short = 0;    // the first sequences only prefill one batch (debugging: the others get later pages)
     bool        multi_full = false; // the pool is too small for all sequences: a decode that fails ends that sequence, it is run again alone at the end
+    bool        multi_pack = false; // the score steps of several sequences with the same number of tokens are one decode (one packed ubatch)
 
     bool lib() const { return lib_on; }
 };
@@ -203,6 +204,8 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
             args.multi_short = std::stoi(argv[++i]);
         } else if (a == "--kvq-multi-full") {
             args.multi_full = true;
+        } else if (a == "--kvq-multi-pack") {
+            args.multi_pack = true;
         } else if (a.rfind("--kvq-", 0) == 0) {
             LOG_ERR("%s: unknown or incomplete argument '%s'\n", __func__, a.c_str());
             return false;
@@ -955,8 +958,55 @@ static bool kvq_multi(llama_context * ctx, const llama_vocab * vocab, const std:
     const int64_t t0 = ggml_time_us();
     for (bool any = true; any; ) {
         any = false;
-        for (auto & r : runs) {
-            if (r.failed || r.next >= r.steps.size()) {
+        std::vector<bool> packed(runs.size(), false);
+        if (args.multi_pack) {
+            // the sequences whose next step is a score step of the same length: one decode of all their tokens, the sequences in order
+            // (one ubatch of several sequences when they are all on the packed path)
+            std::vector<kvq_seq_run *> grp;
+            int32_t n_tok = 0;
+            for (size_t k = 0; k < runs.size(); ++k) {
+                kvq_seq_run & r = runs[k];
+                if (r.failed || r.next >= r.steps.size() || r.steps[r.next].kind != ST_SCORE) {
+                    continue;
+                }
+                if (grp.empty()) {
+                    n_tok = r.steps[r.next].b;
+                }
+                if (r.steps[r.next].b == n_tok) {
+                    grp.push_back(&r);
+                    packed[k] = true;
+                }
+            }
+            if (grp.size() >= 2) {
+                any = true;
+                common_batch batch(ctx);
+                for (kvq_seq_run * r : grp) {
+                    const kvq_step & st = r->steps[r->next];
+                    for (int32_t j = 0; j < st.b; ++j) {
+                        batch.add(r->ids[st.a + j], st.a + j, r->seq, true);
+                    }
+                }
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                    LOG_ERR("%s: the packed decode of %zu sequences failed\n", __func__, grp.size());
+                    return false;
+                }
+                int32_t i0 = 0;
+                for (kvq_seq_run * r : grp) {
+                    const kvq_step st = r->steps[r->next++];
+                    for (int32_t j = 0; j < st.b; ++j) {
+                        if (st.a + j - r->s >= kvq_n_skip) {
+                            write_lp(*r, llama_get_logits_ith(ctx, i0 + j));
+                        }
+                    }
+                    i0 += st.b;
+                }
+            } else {
+                std::fill(packed.begin(), packed.end(), false);
+            }
+        }
+        for (size_t k = 0; k < runs.size(); ++k) {
+            kvq_seq_run & r = runs[k];
+            if (packed[k] || r.failed || r.next >= r.steps.size()) {
                 continue;
             }
             any = true;
@@ -979,7 +1029,7 @@ static bool kvq_multi(llama_context * ctx, const llama_vocab * vocab, const std:
         }
     }
     llama_synchronize(ctx);
-    LOG("kvq: multi: %d sequences, %.2f s\n", N, (ggml_time_us() - t0)/1e6);
+    LOG("kvq: multi: %d sequences, %.2f s%s\n", N, (ggml_time_us() - t0)/1e6, args.multi_pack ? " (score steps packed)" : "");
 
     // seq_keep: only sequence 0 stays, and goes on
     if (args.multi_ex) {

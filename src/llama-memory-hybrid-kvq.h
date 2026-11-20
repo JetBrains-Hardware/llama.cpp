@@ -209,7 +209,8 @@ public:
 
     // tail: mask F16 [n_coarse + n_kv, n_tokens] over the coarse rows (kept) and the ring cells (causal by position)
     // early (if not null): the same without the positions of the ubatch and later
-    void set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, int32_t n_coarse) const;
+    // the ubatch is S sequences of L tokens (equal split): mask F16 [n_coarse_max + n_kv, L, 1, S], n_coarse_s the coarse rows of each
+    void set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, const std::vector<int32_t> & n_coarse_s) const;
 
     // tail: mask F16 [n_rows - r0, n_tokens] over the scratch rows [r0, n_rows), row r = position r: the rows of the host store [0, n_host) kept, the others causal if the ring has them
     void set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_host, int64_t r0) const;

@@ -88,9 +88,22 @@ bool llama_memory_hybrid::prepare_batch(
                       bool   embd_all,
  std::vector<llama_ubatch> & ubatches,
            slot_info_vec_t & heads_attn,
-                  uint32_t   n_seqs_max) {
+                  uint32_t   n_seqs_max,
+ const std::vector<std::vector<llama_seq_id>> * packed) {
     do {
         balloc.split_reset();
+
+        // the two-tier cache: the first ubatches hold the tokens of the sequences of a packed group, one ubatch per group
+        if (packed) {
+            for (const auto & group : *packed) {
+                llama_ubatch ubatch = balloc.split_seqs(group);
+                if (ubatch.n_tokens == 0) {
+                    LLAMA_LOG_ERROR("%s: failed to make a ubatch of %zu sequences\n", __func__, group.size());
+                    return false;
+                }
+                ubatches.push_back(std::move(ubatch)); // NOLINT
+            }
+        }
 
         // follow the recurrent pattern for creating the ubatch splits
 

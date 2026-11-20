@@ -163,8 +163,9 @@ public:
     // the resident slots of the sequence start empty (the sinks stay), so the packed attention after this depends on the memory state only
     void reset_resident(int32_t seq);
 
-    // called once per ubatch of the packed path, the ubatch is one sequence: the later calls without a seq id (the callbacks, the
-    // worker) work on it
+    // called once per ubatch of the packed path, the ubatch is one or more sequences of equal length (equal split, ascending ids):
+    // each is a stream of the ubatch (slice s of the resident rows, ridx and the tail buffers); the later calls without a seq id
+    // (the callbacks, the worker) work on them
     void begin_ubatch(const llama_ubatch & ubatch);
 
     // called once per ubatch of the scratch path
@@ -180,8 +181,8 @@ public:
     // the main stream waits for the readbacks into the host store (before it uploads host rows)
     void order_rows();
 
-    // K or V of the tail cells [0, n_kv) of layer il, like a view of the cache: [D, n_kv, G]
-    ggml_tensor * get_ring(ggml_context * ctx, int32_t il, bool is_v, int64_t n_kv) const;
+    // K or V of the tail cells [0, n_kv) of layer il, like a view of the cache: [D, n_kv, G] ([D, n_kv, G, S]: the rings of S streams)
+    ggml_tensor * get_ring(ggml_context * ctx, int32_t il, bool is_v, int64_t n_kv, int64_t S = 1) const;
 
     // the K or V of the ubatch [D, G, n_tokens] into the tail buffer of layer il (cells idxs), like llama_kv_cache::cpy_k
     ggml_tensor * build_ring_cpy(ggml_context * ctx, int32_t il, bool is_v, ggml_tensor * cur, ggml_tensor * idxs) const;
@@ -195,11 +196,13 @@ public:
     // ggml_backend_sched copy callback, false if src is not a trigger
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
 
-    // the graph of the selection of the prefetch trigger: score [n_coarse, G, L] -> top n_top per (kv head, position) -> trigger
-    void build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t seq, int32_t il, ggml_tensor * score, int64_t n_top) const;
+    // the graph of the selection of the prefetch trigger: score [n_coarse, G, L, S] -> top n_top per (stream, kv head, position) -> trigger
+    // S > 1: n_coarse is the largest of the streams, bias_s f32 [n_coarse, 1, 1, S] is -inf for the sinks and the rows at or after the
+    // n_coarse of the stream (a graph input); n_coarse_min the smallest n_coarse of the streams
+    void build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t n_coarse_min, int32_t il, ggml_tensor * score, int64_t n_top, ggml_tensor * bias_s = nullptr) const;
 
-    // the join of the prefetch of layer il for L positions: trigger -> scatter, before the attention
-    void build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int64_t n_top, int64_t L) const;
+    // the join of the prefetch of layer il for L positions of each of S streams: trigger -> scatter, before the attention
+    void build_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int64_t n_top, int64_t L, int64_t S = 1) const;
 
     const layer_tensors & get_layer(int32_t il) const;
 
@@ -237,8 +240,13 @@ public:
     // K or V of scratch rows [r0, r0 + n): [D, G, n, 1], like a cache view
     ggml_tensor * get_scr(ggml_context * ctx, bool is_v, int64_t n, int64_t r0 = 0) const;
 
-    // ridx without the flag column
-    ggml_tensor * get_ridx(ggml_context * ctx, int32_t il) const;
+    // ridx without the flag column, [cap_tot, G] ([cap_tot, G, S] for S streams)
+    ggml_tensor * get_ridx(ggml_context * ctx, int32_t il, int64_t S = 1) const;
+
+    // streams of a packed ubatch at most (n_seq_max, GGML_KVQ_MAX_STREAM)
+    int32_t n_streams() const { return n_str; }
+    // rkv of layer il for S streams: q8_0 [D, cap_tot, G, 2*S]
+    ggml_tensor * get_rkv(ggml_context * ctx, int32_t il, int64_t S) const;
 
     // kc and vc of the pages (the op reads the first n_coarse rows through the page table)
     ggml_tensor * get_kc(ggml_context * ctx, int32_t il) const;
@@ -382,16 +390,22 @@ private:
     int32_t n_ring_strm = 1;        // streams of the cache
     // byte offset of the stream of sequence s in K and V of a layer of the ring (nb[2] of the cache tensor)
     size_t ring_off(int32_t s) const { return (size_t) ring_strm[s]*(size_t) n_cell*(size_t) G*ROW; }
-    int32_t ub_p0  = 0; // decode thread: positions [ub_p0, ub_p1) of the current ubatch (packed or scratch)
+    int32_t n_str  = 1; // streams of a packed ubatch at most
+    int32_t ub_n   = 1; // streams of the current ubatch, stream s is the sequence ub_seq[s]
+    int32_t ub_seq[GGML_KVQ_MAX_STREAM] = { 0 };
+    int32_t ub_lo[GGML_KVQ_MAX_STREAM]  = { 0 }; // decode thread: positions [ub_lo[s], ub_hi[s]) of stream s of the current ubatch
+    int32_t ub_hi[GGML_KVQ_MAX_STREAM]  = { 0 };
+    int32_t ub_p0  = 0; // decode thread: positions [ub_p0, ub_p1) of the current ubatch (the scratch path, one sequence)
     int32_t ub_p1  = 0;
-    std::atomic<int32_t> tb_lo{0}; // the worker uploads the cells of the positions [tb_lo, tb_hi)
-    std::atomic<int32_t> tb_hi{0};
+    std::atomic<int32_t> tb_lo[GGML_KVQ_MAX_STREAM] = {}; // the worker uploads the cells of the positions [tb_lo[s], tb_hi[s]) of stream s
+    std::atomic<int32_t> tb_hi[GGML_KVQ_MAX_STREAM] = {};
     ggml_backend_event_ptr ev_ord; // copy stream, for order_rows
 
     ggml_tensor * bias    = nullptr; // f32 [n_coarse], -inf for the sinks
     int64_t       n_stage = 0;       // rows of the staging tensors
     ggml_tensor * jblk    = nullptr; // i8, the device block [ridx | slot list | staging rows] of the rotating layers, one copy per join
     size_t      off_stage = 0;       // byte offset of the staging rows in jblk and in the pinned block at h_ridx
+    size_t      off_slots = 0;       // byte offset of the slot list (after the ridx of n_str streams)
     size_t      off_jblk  = 0;       // shared memory: byte offset of jblk in the scratch buffer
 
     // pinned staging [h_ridx | h_slots | h_stage] with the layout of jblk, shared by the layers (see gather)
@@ -452,6 +466,8 @@ private:
 
     // the ubatch works on this sequence from now on: the queued work of another sequence is dropped first
     void use_seq(int32_t s);
+    // the same for the streams of a packed ubatch (stream i is the sequence ids[i])
+    void use_streams(const int32_t * ids, int32_t n);
 
     // the page table of the sequence to the device (-1 as page 0, the op reads the chunks of the coarse region only)
     void pt_up(int32_t seq);
@@ -461,16 +477,18 @@ private:
 
     // the entries of the slot list after the fetched rows write to trash rows after rkv in rkv_h, spread so that the writes do not wait on one row
     static constexpr int64_t N_TRASH = 1024;
-    int32_t trash_row(int64_t j) const { return (int32_t) (2*G*cap_tot + j % N_TRASH); }
+    int32_t trash_row(int64_t j) const { return (int32_t) (2*G*cap_tot*n_str + j % N_TRASH); }
 
     // the prefetch of L positions needs the scores of the selection: the union can have more rows than the slots
     bool pf_scores(int64_t n_top, int64_t L) const { return n_top*L > cap; }
 
     void flush_ubatch();
     void select(const layer & l, const ggml_tensor * dst, ggml_cgraph * graph, const ggml_tensor ** ids, const ggml_tensor ** anchor) const;
-    void cut_request(layer & l, int32_t g, int64_t n_u);
-    void place(layer & l, int32_t g, uint32_t now);
+    void cut_request(layer & l, layer_seq & q, int32_t st, int32_t g, int64_t n_u);
+    void place(layer & l, layer_seq & q, int32_t g, uint32_t now);
     void plan_prefetch(layer & l);
+    void plan_stream(layer & l, int32_t st);
+    void fill_ridx(layer & l);
     void gather(layer & l, int64_t n_rows);
     void upload(ggml_backend_t backend, layer & l);
     void run_prefetch(layer & l);
