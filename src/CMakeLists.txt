@@ -30,6 +30,7 @@ set(LLAMA_CORE_SOURCES
     llama-kvq-codec.cpp
     llama-kvq-fit.cpp
     llama-kvq-pack.cpp
+    llama-kvq-pool.cpp
     llama-kvq-store.cpp
     llama-memory.cpp
     llama-moe-cache.cpp

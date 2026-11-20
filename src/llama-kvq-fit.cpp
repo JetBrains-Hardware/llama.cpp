@@ -620,8 +620,9 @@ void llama_kvq_fitter::upload_rows(int32_t il, int32_t r0, int32_t r1) {
     }
     const int64_t G = store.n_head_kv();
     for (int64_t g = 0; g < G; ++g) {
-        const uint8_t * src = store.host_rows(il) + ((size_t) g*store.n_rows() + r0)*2*KVQ_ROW;
-        ggml_backend_tensor_set_async(store.backend(), stage, src, g*stage->nb[3], (size_t) (r1 - r0)*2*KVQ_ROW);
+        store.chunk_runs(r0, r1, [&](int32_t p, int32_t n) {
+            ggml_backend_tensor_set_async(store.backend(), stage, store.host_row(il, g, p), g*stage->nb[3] + (size_t) (p - r0)*2*KVQ_ROW, (size_t) n*2*KVQ_ROW);
+        });
     }
 }
 
@@ -684,10 +685,11 @@ void llama_kvq_fitter::queue_job(job & jb) {
             for (int kv = 0; kv < 2; ++kv) {
                 const ggml_tensor * rows = kv ? store.get_layer(il).vc : store.get_layer(il).kc;
                 ggml_tensor       * src  = dev ? const_cast<ggml_tensor *>(rows) : cst[kv];
-                uint8_t           * dst  = store.host_codes(il, kv == 1);
                 for (int64_t g = 0; g < G; ++g) {
-                    ggml_backend_tensor_get_async(backend, src, dst + g*rows->nb[2] + (size_t) jb.r0*rows->nb[1],
-                            g*src->nb[2] + (dev ? (size_t) jb.r0*rows->nb[1] : 0), (size_t) jb.n()*rows->nb[1]);
+                    store.chunk_runs(jb.r0, jb.r1, [&](int32_t p, int32_t n) {
+                        ggml_backend_tensor_get_async(backend, src, store.host_codes(il, kv == 1, g, p),
+                                g*src->nb[2] + (size_t) (dev ? p : p - jb.r0)*rows->nb[1], (size_t) n*rows->nb[1]);
+                    });
                 }
             }
         }

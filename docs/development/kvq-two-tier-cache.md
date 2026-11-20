@@ -96,6 +96,7 @@ A plain state starts with the stream count of the attention cache, so a plain co
 | Flash attention with the log-sum-exp (prompt scratch in key blocks) | `ggml_flash_attn_ext_lse`, `ggml_flash_attn_ext_get_lse` in `ggml/include/ggml.h`, `ggml/src/ggml.c`; CPU in `ggml/src/ggml-cpu/ops.cpp`; CUDA MMA kernel and stream-k fixup in `ggml/src/ggml-cuda/fattn-mma-f16.cuh`, `fattn-common.cuh`, dispatch (GQA variants without a mask) in `fattn.cu`; the blocks and the merge in `build_attn_kvq_scratch` in `src/models/qwen35.cpp`, the mask of the rest in `set_input_kvq_scr` in `src/llama-memory-hybrid-kvq.cpp` |
 | Fit op (mean, covariance, rotation, V gain statistics, code and pack), CPU reference and CUDA | `ggml_kvq_fit` in `ggml/include/ggml.h`, `ggml_compute_forward_kvq_fit` in `ggml/src/ggml-cpu/ops.cpp`, `ggml/src/ggml-cuda/kvq-fit.{cu,cuh}` |
 | Host store, resident cache, prefetch worker, scratch uploads | `src/llama-kvq-store.{h,cpp}` |
+| Host pages (rows, host codes and tables of one chunk, pinned) | `src/llama-kvq-pool.{h,cpp}`, `row_ptr` / `hcode_ptr` / `chunk_runs` in `src/llama-kvq-store.h` |
 | Fitter (device phases, CPU tasks) | `src/llama-kvq-fit.{h,cpp}` |
 | Memory (hybrid subclass), ring-shaped device cache | `src/llama-memory-hybrid-kvq.{h,cpp}`, `src/llama-kv-cache.{h,cpp}` |
 | Graph | `src/models/qwen35.cpp` |
