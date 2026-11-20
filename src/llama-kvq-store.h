@@ -1,10 +1,12 @@
 #pragma once
 
 #include "llama-ext.h"
+#include "llama-kvq-pool.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -129,8 +131,19 @@ public:
     ggml_backend_dev_t         device()  const { return dev; }
     ggml_backend_buffer_type_t dev_buft() const { return buft; }
 
-    // host precise store of layer il: [G][n_rows][2*ROW], K row then V row
-    uint8_t * host_rows(int32_t il) const;
+    // host precise store: the K row then the V row (2*ROW bytes) of position pos of kv head g of layer il, in the page of its chunk
+    // the next rows of the chunk follow, a range that crosses a chunk boundary is split (chunk_runs)
+    uint8_t * host_row(int32_t il, int32_t g, int32_t pos) const { return row_ptr(layer_of_il.at(il), g, pos); }
+
+    // the runs [p, p + n) of the range [p0, p1) that lie in one chunk: f(p, n)
+    template <typename F>
+    void chunk_runs(int32_t p0, int32_t p1, F && f) const {
+        for (int32_t p = p0; p < p1; ) {
+            const int32_t n = std::min(p1, (p/n_crow + 1)*n_crow) - p;
+            f(p, n);
+            p += n;
+        }
+    }
 
     // pinned host memory of the device, or the CPU buffer type
     ggml_backend_buffer_type_t host_buft() const { return buft_host; }
@@ -199,7 +212,8 @@ public:
     // allocated by enable and stays (writes update both). With llama_kvq_params::prefill_free_codes it exists only for the packed
     // path: scr_alloc frees it, codes_alloc (end of a prompt, or dec_alloc) allocates it and queues the upload of the host copy on
     // the main stream
-    uint8_t * host_codes(int32_t il, bool is_v) const;
+    // the host copy of the codes of K or V of position pos of kv head g of layer il, in the row layout of kc / vc, contiguous to the end of the chunk
+    uint8_t * host_codes(int32_t il, bool is_v, int32_t g, int32_t pos) const { return hcode_ptr(layer_of_il.at(il), is_v, g, pos); }
     void      codes_written(int32_t r1); // the fitter queued the codes of rows before r1 into the host copy
     bool      codes_alloc();
     void      codes_free();
@@ -274,7 +288,8 @@ private:
     ggml_context_ptr        ctx_dev;
     ggml_context_ptr        ctx_codes; // kc, vc, tinv, taux
     ggml_backend_buffer_ptr buf_codes;
-    std::vector<ggml_backend_buffer_ptr> buf_hcodes; // host copy, one per layer
+    std::unique_ptr<llama_kvq_pool> pages; // pinned host pages: rows, host copy of the codes and tables (see llama-kvq-pool.h)
+    std::vector<int32_t>    page_tab;  // chunk -> page, the identity
     int32_t                 hc_hi      = 0;     // the host copy holds the codes of the rows that a later upload needs before this
     uint32_t                codes_gen_ = 0;
     bool                    prefill_free_codes = false; // llama_kvq_params::prefill_free_codes
@@ -289,7 +304,6 @@ private:
     ggml_backend_ptr        backend_cp; // copy stream
     ggml_backend_ptr        backend_bu; // base upload stream
     ggml_backend_t          backend_main = nullptr;
-    std::vector<ggml_backend_buffer_ptr> buf_store; // precise store, one per layer
 
     // the device buffers of the resident rows, n_buf rotating ones or one per layer (their ridx is the one in jblk)
     struct res_buf {
@@ -349,6 +363,20 @@ private:
 
     std::unique_ptr<gather_pool> pool;
     std::unique_ptr<worker>      work;
+
+    // host side of the rows, codes and tables of the chunk of a position, through its page (layer index li)
+    uint8_t * row_ptr(size_t li, int32_t g, int32_t pos) const {
+        const int32_t pg = page_tab[pos/n_crow];
+        return pages->rows_ptr(pg, (int32_t) li) + ((size_t) g*pages->rows(pg) + pos%n_crow)*2*ROW;
+    }
+    uint8_t * hcode_ptr(size_t li, bool is_v, int32_t g, int32_t pos) const {
+        const int32_t pg = page_tab[pos/n_crow];
+        const size_t  nb = (size_t) (is_v ? nwv + 1 : nwk)*sizeof(int32_t);
+        return (is_v ? pages->vc_ptr(pg, (int32_t) li) : pages->kc_ptr(pg, (int32_t) li)) + ((size_t) g*pages->rows(pg) + pos%n_crow)*nb;
+    }
+    // slot m = 2*g + (V ? 1 : 0) of the tables of chunk c
+    uint8_t * htinv_ptr(size_t li, int32_t c, int32_t m) const { return pages->tinv_ptr(page_tab[c], (int32_t) li) + (size_t) m*D*D; }
+    uint8_t * htaux_ptr(size_t li, int32_t c, int32_t m) const { return pages->taux_ptr(page_tab[c], (int32_t) li) + (size_t) m*D*3*sizeof(float); }
 
     // rows per kv head of one request
     int64_t n_req(int64_t n_top, int64_t L) const;

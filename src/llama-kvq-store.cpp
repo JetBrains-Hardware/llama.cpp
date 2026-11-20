@@ -49,9 +49,7 @@ struct llama_kvq_store::layer {
 
     layer_tensors t;
 
-    uint8_t * store = nullptr; // [G][n_rows][2*ROW], K row then V row
-
-    uint8_t * hc[4] = {}; // fit mode: host copy of kc, vc, tinv, taux (the bytes of the device tensors)
+    size_t li = 0; // index in layers, for the host pages
 
     std::vector<int32_t>  ridx;       // [G][cap_tot], mirror of t.ridx
     std::vector<uint64_t> res;        // [G][n_bmw], bitmap of the resident rows of the evictable slots
@@ -177,15 +175,15 @@ struct llama_kvq_store::gather_pool {
     const kvq_fetch * fetch    = nullptr;
     int64_t           n        = 0;
     uint8_t *         dst      = nullptr;
-    const uint8_t *   store    = nullptr;
-    int64_t           n_rows   = 0;
+    const llama_kvq_store * st = nullptr;
+    size_t            li       = 0;
     const int         n_th;
 
     void part(int ith, int nth) const {
         const int64_t i0 = n*ith/nth;
         const int64_t i1 = n*(ith + 1)/nth;
         for (int64_t i = i0; i < i1; ++i) {
-            memcpy(dst + 2*i*ROW, store + ((size_t) fetch[i].g*n_rows + fetch[i].row)*2*ROW, 2*ROW);
+            memcpy(dst + 2*i*ROW, st->row_ptr(li, fetch[i].g, fetch[i].row), 2*ROW);
         }
     }
 
@@ -222,13 +220,13 @@ struct llama_kvq_store::gather_pool {
         }
     }
 
-    void run(const kvq_fetch * f, int64_t n_f, uint8_t * d, const uint8_t * st, int64_t n_r) {
+    void run(const kvq_fetch * f, int64_t n_f, uint8_t * d, const llama_kvq_store * s, size_t l) {
         std::lock_guard<std::mutex> lr(m_run);
         fetch    = f;
         n        = n_f;
         dst      = d;
-        store    = st;
-        n_rows   = n_r;
+        st       = s;
+        li       = l;
         // waking the helpers costs more than a small copy
         if (n_th == 1 || n < 256) {
             part(0, 1);
@@ -380,6 +378,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         l.k_cache = kv.get_k_storage(l.il);
         l.v_cache = kv.get_v_storage(l.il);
         l.cnt.il  = l.il;
+        l.li      = i;
         if (l.k_cache->type != GGML_TYPE_Q8_0 || l.v_cache->type != GGML_TYPE_Q8_0 || l.k_cache->ne[0] % D != 0 || l.v_cache->ne[0] != l.k_cache->ne[0]) {
             throw std::runtime_error("packed two-tier mode needs a q8_0 K and V cache with head size 256");
         }
@@ -528,26 +527,23 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
 
     // every write of the codes and tables goes to a pinned host copy; the device copy exists only in the decode phase with
     // prefill_free_codes (codes_alloc, codes_free), otherwise from enable on
+    // the host copy and the precise store are the pages of the pool, one per chunk
     {
-        for (auto & l : layers) {
-            const ggml_tensor * ts[4] = { l.t.kc, l.t.vc, l.t.tinv, l.t.taux };
-            size_t sz = 0;
-            for (const ggml_tensor * t : ts) {
-                sz += ggml_nbytes(t);
-            }
-            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft_host, sz);
-            if (b == nullptr) {
-                b = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), sz);
-            }
-            if (b == nullptr) {
-                throw std::runtime_error("failed to allocate the host copy of the codes");
-            }
-            buf_hcodes.emplace_back(b);
-            uint8_t * p = (uint8_t *) ggml_backend_buffer_get_base(b);
-            for (int k = 0; k < 4; ++k) {
-                l.hc[k] = p;
-                p += ggml_nbytes(ts[k]);
-            }
+        llama_kvq_pool::layout pl;
+        pl.n_layers  = (int32_t) layers.size();
+        pl.G         = G;
+        pl.C         = n_crow;
+        pl.n_rows    = n_rows;
+        pl.row_b     = 2*ROW;
+        pl.kc_row    = layers[0].t.kc->nb[1];
+        pl.vc_row    = layers[0].t.vc->nb[1];
+        pl.tinv_slot = layers[0].t.tinv->nb[2];
+        pl.taux_slot = layers[0].t.taux->nb[2];
+        GGML_ASSERT(pl.tinv_slot == (size_t) D*D && pl.taux_slot == (size_t) D*3*sizeof(float));
+        pages.reset(new llama_kvq_pool(buft_host, pl, n_chunk));
+        page_tab.resize(n_chunk);
+        for (int32_t c = 0; c < n_chunk; ++c) {
+            page_tab[c] = c;
         }
     }
     // set_rows has no q8_0 to q8_0 copy, so the scatter writes the rows of rkv as groups of 4 bytes (f32, half the threads of f16)
@@ -610,23 +606,6 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     }
     ggml_backend_buffer_clear(buf_host.get(), 0);
     ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    // precise store, one buffer per layer (a single pinned CUDA buffer is limited to 4 GB)
-    const size_t store_size = (size_t) G*n_rows*2*ROW;
-    for (auto & l : layers) {
-        ggml_backend_buffer_t b = nullptr;
-        if (store_size <= ggml_backend_buft_get_max_size(buft_host)) {
-            b = ggml_backend_buft_alloc_buffer(buft_host, store_size);
-        }
-        if (b == nullptr) {
-            b = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), store_size);
-        }
-        if (b == nullptr) {
-            throw std::runtime_error("failed to allocate the precise store");
-        }
-        buf_store.emplace_back(b);
-        l.store = (uint8_t *) ggml_backend_buffer_get_base(b);
-    }
 
     for (auto & l : layers) {
         GGML_ASSERT(l.k_cache->nb[1] == G*ROW && l.v_cache->nb[1] == G*ROW);
@@ -742,10 +721,6 @@ std::vector<int32_t> llama_kvq_store::layer_ids() const {
     return res;
 }
 
-uint8_t * llama_kvq_store::host_rows(int32_t il) const {
-    return layers.at(layer_of_il.at(il)).store;
-}
-
 void llama_kvq_store::set_backend(const std::vector<ggml_backend_t> & backends) {
     backend_main = nullptr;
     for (ggml_backend_t b : backends) {
@@ -773,8 +748,8 @@ void llama_kvq_store::set_chunk_table(int32_t il, int32_t g, bool is_v, int32_t 
     const layer & l = layers.at(layer_of_il.at(il));
     const layer_tensors & t = l.t;
     const int64_t m = (int64_t) c*2*G + 2*g + (is_v ? 1 : 0);
-    memcpy(l.hc[2] + m*t.tinv->nb[2], inv, t.tinv->nb[2]);
-    memcpy(l.hc[3] + m*t.taux->nb[2], aux, t.taux->nb[2]);
+    memcpy(htinv_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), inv, t.tinv->nb[2]);
+    memcpy(htaux_ptr(l.li, c, 2*g + (is_v ? 1 : 0)), aux, t.taux->nb[2]);
     if (!codes_on_dev()) {
         return;
     }
@@ -883,8 +858,10 @@ void llama_kvq_store::state_write_data(llama_io_write_i & io) {
     synchronize();
     const int32_t n = n_coarse_;
     for (auto & l : layers) {
-        for (int32_t g = 0; g < G && n_host_ > 0; ++g) {
-            io.write(l.store + (size_t) g*n_rows_*2*ROW, (size_t) n_host_*2*ROW);
+        for (int32_t g = 0; g < G; ++g) {
+            chunk_runs(0, n_host_, [&](int32_t p, int32_t m) {
+                io.write(row_ptr(l.li, g, p), (size_t) m*2*ROW);
+            });
         }
         if (n == 0) {
             continue;
@@ -893,12 +870,16 @@ void llama_kvq_store::state_write_data(llama_io_write_i & io) {
         for (int k = 0; k < 2; ++k) {
             const ggml_tensor * rows = k ? l.t.vc : l.t.kc;
             for (int32_t g = 0; g < G; ++g) {
-                io.write(l.hc[k] + g*rows->nb[2], (size_t) n*rows->nb[1]);
+                chunk_runs(0, n, [&](int32_t p, int32_t m) {
+                    io.write(hcode_ptr(l.li, k == 1, g, p), (size_t) m*rows->nb[1]);
+                });
             }
         }
         for (int k = 2; k < 4; ++k) {
             const ggml_tensor * tab = k == 3 ? l.t.taux : l.t.tinv;
-            io.write(l.hc[k], (size_t) ((n + n_crow - 1)/n_crow)*tab->nb[3]);
+            for (int32_t c = 0; c < (n + n_crow - 1)/n_crow; ++c) {
+                io.write(k == 3 ? htaux_ptr(l.li, c, 0) : htinv_ptr(l.li, c, 0), tab->nb[3]);
+            }
         }
     }
 }
@@ -909,8 +890,10 @@ void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n, int32_t h
     reset_base();
     synchronize();
     for (auto & l : layers) {
-        for (int32_t g = 0; g < G && h > 0; ++g) {
-            io.read(l.store + (size_t) g*n_rows_*2*ROW, (size_t) h*2*ROW);
+        for (int32_t g = 0; g < G; ++g) {
+            chunk_runs(0, h, [&](int32_t p, int32_t m) {
+                io.read(row_ptr(l.li, g, p), (size_t) m*2*ROW);
+            });
         }
         if (n == 0) {
             continue;
@@ -918,12 +901,16 @@ void llama_kvq_store::state_read_data(llama_io_read_i & io, int32_t n, int32_t h
         for (int k = 0; k < 2; ++k) {
             const ggml_tensor * rows = k ? l.t.vc : l.t.kc;
             for (int32_t g = 0; g < G; ++g) {
-                io.read(l.hc[k] + g*rows->nb[2], (size_t) n*rows->nb[1]);
+                chunk_runs(0, n, [&](int32_t p, int32_t m) {
+                    io.read(hcode_ptr(l.li, k == 1, g, p), (size_t) m*rows->nb[1]);
+                });
             }
         }
         for (int k = 2; k < 4; ++k) {
             const ggml_tensor * tab = k == 3 ? l.t.taux : l.t.tinv;
-            io.read(l.hc[k], (size_t) ((n + n_crow - 1)/n_crow)*tab->nb[3]);
+            for (int32_t c = 0; c < (n + n_crow - 1)/n_crow; ++c) {
+                io.read(k == 3 ? htaux_ptr(l.li, c, 0) : htinv_ptr(l.li, c, 0), tab->nb[3]);
+            }
         }
     }
     if (codes_on_dev()) {
@@ -1108,7 +1095,7 @@ void llama_kvq_store::upload_pinned(layer & l, int32_t n_pin) {
         for (int32_t g = 0; g < G; ++g) {
             uint8_t * dst = l.mirror + ((size_t) kv*G + g)*cap_tot*ROW;
             for (int32_t s = 0; s < n_pin; ++s) {
-                memcpy(dst + (size_t) s*ROW, l.store + ((size_t) g*n_rows_ + s)*2*ROW + kv*ROW, ROW);
+                memcpy(dst + (size_t) s*ROW, row_ptr(l.li, g, s) + kv*ROW, ROW);
             }
         }
     }
@@ -1236,8 +1223,10 @@ void llama_kvq_store::read_ring(layer & l) {
 // passed the attention of the layer (the same layout, one copy per kv head)
 void llama_kvq_store::read_scr(layer & l) {
     const size_t n = (size_t) (ub_p1 - ub_p0)*2*ROW;
-    for (int32_t g = 0; g < G && n > 0; ++g) {
-        ggml_backend_tensor_get_async(backend_cp.get(), scr, l.store + ((size_t) g*n_rows_ + ub_p0)*2*ROW, g*scr->nb[3] + ub_p0*scr->nb[2], n);
+    for (int32_t g = 0; g < G; ++g) {
+        chunk_runs(ub_p0, ub_p1, [&](int32_t p, int32_t m) {
+            ggml_backend_tensor_get_async(backend_cp.get(), scr, row_ptr(l.li, g, p), g*scr->nb[3] + p*scr->nb[2], (size_t) m*2*ROW);
+        });
     }
     l.cnt.rb_bytes += (int64_t) G*n;
 }
@@ -1254,7 +1243,7 @@ void llama_kvq_store::ring_copy(bool to_store, int32_t p0, int32_t p1) {
             uint8_t * rk = (uint8_t *) l.k_cache->data + (p % n_cell)*nb1;
             uint8_t * rv = (uint8_t *) l.v_cache->data + (p % n_cell)*nb1;
             for (int32_t g = 0; g < G; ++g) {
-                uint8_t * s = l.store + ((size_t) g*n_rows_ + p)*2*ROW;
+                uint8_t * s = row_ptr(l.li, g, p);
                 if (to_store) {
                     memcpy(s,       rk + g*ROW, ROW);
                     memcpy(s + ROW, rv + g*ROW, ROW);
@@ -1663,7 +1652,7 @@ void llama_kvq_store::gather(layer & l, int64_t n_rows) {
     }
 
     // sorting the rows by address does not make the copy faster (measured)
-    pool->run(l.fetch.data(), n, h_stage, l.store, n_rows_);
+    pool->run(l.fetch.data(), n, h_stage, this, l.li);
 
     for (int64_t i = 0; i < n; ++i) {
         h_slots[2*i]     = (int32_t) ((0*G + l.fetch[i].g)*cap_tot + l.fetch[i].slot);
@@ -1745,8 +1734,10 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
             read_scr(layers[it->second.first - 1]);
         }
         const size_t n = (size_t) ub_p0*2*ROW;
-        for (int32_t g = 0; g < G && n > 0; ++g) {
-            ggml_backend_tensor_set_async(cp, scr, l.store + (size_t) g*n_rows_*2*ROW, g*scr->nb[3], n);
+        for (int32_t g = 0; g < G; ++g) {
+            chunk_runs(0, ub_p0, [&](int32_t p, int32_t m) {
+                ggml_backend_tensor_set_async(cp, scr, row_ptr(l.li, g, p), g*scr->nb[3] + p*scr->nb[2], (size_t) m*2*ROW);
+            });
         }
         ggml_backend_event_record(l.ev_sd.get(), cp);
         cnt.n_scr++;
@@ -1957,10 +1948,6 @@ bool llama_kvq_store::dec_alloc() {
     return true;
 }
 
-uint8_t * llama_kvq_store::host_codes(int32_t il, bool is_v) const {
-    return layers.at(layer_of_il.at(il)).hc[is_v ? 1 : 0];
-}
-
 void llama_kvq_store::codes_written(int32_t r1) {
     hc_hi = std::max(hc_hi, r1);
 }
@@ -1969,17 +1956,28 @@ void llama_kvq_store::codes_written(int32_t r1) {
 void llama_kvq_store::codes_up(int32_t n, bool async) {
     const int32_t n_tab = (n + n_crow - 1)/n_crow;
     for (auto & l : layers) {
-        ggml_tensor * ts[4] = { l.t.kc, l.t.vc, l.t.tinv, l.t.taux };
-        for (int k = 0; k < 4; ++k) {
-            ggml_tensor * t = ts[k];
-            const int64_t n_part = k < 2 ? G : 1;
-            const size_t  sz     = k < 2 ? (size_t) n*t->nb[1] : (size_t) n_tab*t->nb[3];
-            for (int64_t g = 0; g < n_part && sz > 0; ++g) {
-                const size_t off = k < 2 ? g*t->nb[2] : 0;
+        for (int k = 0; k < 2; ++k) {
+            ggml_tensor * t = k ? l.t.vc : l.t.kc;
+            for (int32_t g = 0; g < G; ++g) {
+                chunk_runs(0, n, [&](int32_t p, int32_t m) {
+                    const size_t off = g*t->nb[2] + (size_t) p*t->nb[1];
+                    const uint8_t * src = hcode_ptr(l.li, k == 1, g, p);
+                    if (async) {
+                        ggml_backend_tensor_set_async(backend_main, t, src, off, (size_t) m*t->nb[1]);
+                    } else {
+                        ggml_backend_tensor_set(t, src, off, (size_t) m*t->nb[1]);
+                    }
+                });
+            }
+        }
+        for (int k = 2; k < 4; ++k) {
+            ggml_tensor * t = k == 3 ? l.t.taux : l.t.tinv;
+            for (int32_t c = 0; c < n_tab; ++c) {
+                const uint8_t * src = k == 3 ? htaux_ptr(l.li, c, 0) : htinv_ptr(l.li, c, 0);
                 if (async) {
-                    ggml_backend_tensor_set_async(backend_main, t, l.hc[k] + off, off, sz);
+                    ggml_backend_tensor_set_async(backend_main, t, src, (size_t) c*t->nb[3], t->nb[3]);
                 } else {
-                    ggml_backend_tensor_set(t, l.hc[k] + off, off, sz);
+                    ggml_backend_tensor_set(t, src, (size_t) c*t->nb[3], t->nb[3]);
                 }
             }
         }
@@ -2038,7 +2036,6 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     for (const auto & l : layers) {
         mi.codes      += ggml_nbytes(l.t.kc) + ggml_nbytes(l.t.vc);
         mi.tables     += ggml_nbytes(l.t.tinv) + ggml_nbytes(l.t.taux);
-        mi.host_store += (size_t) G*n_rows_*2*ROW;
         mi.other_dev  += (l.t.qacc ? ggml_nbytes(l.t.qacc) : 0) + (l.t.gacc ? ggml_nbytes(l.t.gacc) : 0);
         mi.host_other += (l.ridx.size() + l.slot_stamp.size())*sizeof(int32_t) + (l.res.size() + l.req.size())*sizeof(uint64_t);
     }
@@ -2052,10 +2049,11 @@ llama_kvq_memory_info llama_kvq_store::memory_info() const {
     mi.other_dev += ggml_nbytes(bias) + (buf_stage ? ggml_backend_buffer_get_size(buf_stage.get()) : 0);
     mi.scratch    = scr ? ggml_nbytes(scr) : 0;
     mi.host_other += (buf_pin ? ggml_backend_buffer_get_size(buf_pin.get()) : 0) + (buf_mir ? ggml_backend_buffer_get_size(buf_mir.get()) : 0);
-    for (const auto & b : buf_hcodes) {
-        mi.host_codes += ggml_backend_buffer_get_size(b.get());
+    for (int32_t p = 0; p < pages->n_pages(); ++p) {
+        mi.host_store += pages->bytes_rows(p);
+        mi.host_codes += pages->bytes_codes(p);
     }
-    mi.pinned = !buf_store.empty() && ggml_backend_buffer_get_type(buf_store[0].get()) != ggml_backend_cpu_buffer_type();
+    mi.pinned = pages->pinned();
     return mi;
 }
 
@@ -2070,11 +2068,8 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kvq_store::memory_breakdown()
     if (buf_codes) {
         res[ggml_backend_buffer_get_type(buf_codes.get())] += ggml_backend_buffer_get_size(buf_codes.get());
     }
-    for (const auto & b : buf_hcodes) {
-        res[ggml_backend_buffer_get_type(b.get())] += ggml_backend_buffer_get_size(b.get());
-    }
-    for (const auto & b : buf_store) {
-        res[ggml_backend_buffer_get_type(b.get())] += ggml_backend_buffer_get_size(b.get());
+    for (int32_t p = 0; p < pages->n_pages(); ++p) {
+        res[ggml_backend_buffer_get_type(pages->buffer(p).get())] += ggml_backend_buffer_get_size(pages->buffer(p).get());
     }
     return res;
 }
