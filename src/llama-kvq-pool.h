@@ -23,8 +23,10 @@
 //
 // a page has a holder count (the sequences whose page table has it; 0 or 1 until pages are shared): a page is free at 0
 // the host memory of a page is allocated on demand, by a background thread: queue() at the reservation of a page (and for the
-// next free page, ahead), wait() before the page is used; a free page keeps its host memory (the free list is the free pages
-// that have it), so the host memory only grows to the high-water mark of the pages in use
+// next free page, ahead), wait() before the page is used; when the last holder gives a page back its host memory goes back to the OS
+// (also on the background thread: freeing pinned memory synchronizes the device), except up to keep_bytes of free pages that keep it
+// for reuse (all of it with prealloc); a page that is being freed is not handed out before the free finished (queue() after it
+// allocates again), a page that was queued ahead and is free by then is dropped as soon as it is allocated
 // max_bytes: cap of the host memory of the pages (allocated and queued), 0: none
 class llama_kvq_pool {
 public:
@@ -40,7 +42,7 @@ public:
     };
 
     // prealloc: allocates every page here, throws if one fails
-    llama_kvq_pool(ggml_backend_buffer_type_t buft_host, const layout & lay, int32_t n_pages, bool prealloc, size_t max_bytes);
+    llama_kvq_pool(ggml_backend_buffer_type_t buft_host, const layout & lay, int32_t n_pages, bool prealloc, size_t max_bytes, size_t keep_bytes = 0);
     ~llama_kvq_pool();
 
     int32_t n_pages() const { return (int32_t) bufs.size(); }
@@ -58,15 +60,21 @@ public:
     // the host memory the n pages need, new: those that have no host memory yet; false if it would pass max_bytes
     bool    host_fits(const int32_t * pg, int32_t n) const;
 
-    // a holder takes the page (its kept sums are reset) / gives it back (at 0 the kept sums are reset, the host memory stays)
+    // a holder takes the page (its kept sums are reset) / gives it back (at 0 the kept sums are reset; the caller made sure no copy
+    // into or out of the page is in flight; call trim() after the gives)
     void    take(int32_t page);
     void    give(int32_t page);
+    // frees (in the background) the host memory of the free pages beyond keep_bytes, highest page ids first, and drops the queued free ones;
+    // returns the number of pages whose host memory goes back
+    int32_t trim();
+    // waits until the pending frees are done
+    void    wait_frees();
 
     // the host memory of the page: queues the allocation, if it has none
     void    queue(int32_t page);
     // waits for the allocation (counted when it blocks), false if it failed
     bool    wait(int32_t page);
-    // queues the free page with the lowest id that has no host memory (the next one a sequence takes), if the cap allows
+    // queues the free page with the lowest id (the next one a sequence takes) if it has no host memory, if the cap allows
     void    queue_ahead();
 
     // bytes of a page, and of its rows and of its codes and tables
@@ -78,6 +86,7 @@ public:
     int32_t n_alloc() const;
     size_t  host_bytes() const;
     size_t  max_host_bytes() const { return max_b; }
+    size_t  keep_host_bytes() const { return keep_b; }
 
     // the host memory of every allocated page is pinned
     bool pinned() const;
@@ -88,6 +97,8 @@ public:
         double  t_alloc  = 0.0; // s in them (the thread's time)
         int32_t n_wait   = 0;   // wait() calls that blocked
         double  t_wait   = 0.0; // s blocked
+        int32_t n_free   = 0;   // host buffers freed
+        double  t_free   = 0.0; // s in them (the thread's time)
     };
     stats get_stats() const;
     void  reset_wait_stats();
@@ -114,11 +125,12 @@ public:
     const layout & get_layout() const { return lay; }
 
 private:
-    enum { ST_NONE = 0, ST_QUEUED = 1, ST_READY = 2, ST_FAILED = 3 };
+    enum { ST_NONE = 0, ST_QUEUED = 1, ST_READY = 2, ST_FAILED = 3, ST_RELEASING = 4 };
 
     layout lay;
     ggml_backend_buffer_type_t buft = nullptr;
     size_t max_b = 0;
+    size_t keep_b = 0;
     std::vector<ggml_backend_buffer_ptr> bufs; // one per page, set when the page is ready
     std::vector<uint8_t *>               base; // their base addresses
     std::vector<std::array<size_t, 5>>   offs; // per page: the offsets of the sections in the block of a layer, then its size
@@ -126,17 +138,21 @@ private:
     std::vector<sums>                    kept; // per page: the kept sums of its chunk
     std::vector<int32_t>                 hold; // per page: holders
     std::unique_ptr<std::atomic<int>[]>  st;   // per page: ST_*
+    std::vector<char>                    want; // per page, under m: allocate again once the free is done (ST_RELEASING)
+    std::vector<char>                    drop; // per page, under m: free it once allocated (ST_QUEUED, nobody took it)
 
     mutable std::mutex      m;
     std::condition_variable cv_work;
     std::condition_variable cv_done;
-    std::deque<int32_t>     todo;
+    std::deque<int32_t>     todo;              // pages to allocate (or to drop)
+    std::deque<int32_t>     todo_free;         // pages to free, after the allocations
     bool                    stop = false;
-    int32_t                 n_commit = 0;      // pages that are queued or ready
+    int32_t                 n_commit = 0;      // pages that are queued, ready or being freed
     stats                   stat;
     std::thread             thr;
 
     bool alloc_now(int32_t page);
+    void free_now(int32_t page);
     void run();
 
     uint8_t * sec(int32_t page, int32_t li, int k) const {

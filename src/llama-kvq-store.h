@@ -97,13 +97,14 @@ public:
     // (kv.get_n_seq_max() sequences)
     // the pool has ceil(n_rows / n_chunk_rows) + n_seq_max - 1 pages, the device codes and tables of all of them are allocated here;
     // a sequence takes the pages of its chunks when a batch needs them (reserve), the host memory of a page is allocated on demand
-    // (llama_kvq_pool); host_prealloc: all of it here; host_max_bytes: cap of the host memory of the pages, 0: none
+    // (llama_kvq_pool); host_prealloc: all of it here; host_max_bytes: cap of the host memory of the pages, 0: none;
+    // host_keep_bytes: free pages keep up to this much host memory, the rest goes back to the OS when the last holder lets a page go
     // n_gate > 0: also the gate statistics tensors, n_gate = n_head*D
     // layer_bufs: device buffers of the resident rows (llama_kvq_params::layer_bufs)
     // shared_min: the smallest shared memory (the fitter works in it, llama_kvq_fitter::shared_min)
     llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
             int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate = 0, size_t shared_min = 0,
-            bool host_prealloc = false, size_t host_max_bytes = 0);
+            bool host_prealloc = false, size_t host_max_bytes = 0, size_t host_keep_bytes = 0);
     ~llama_kvq_store();
 
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)

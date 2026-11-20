@@ -154,6 +154,8 @@ struct llama_kvq_params {
                                         // false: a page gets its host memory when a sequence first takes it and keeps it (RAM stays at the high-water mark)
     int32_t host_max_mib  = 0;          // fit mode: cap of the pinned host memory of the pages, MiB; a batch that needs pages beyond it fails like a full
                                         // cache (llama_decode returns 1); 0: none; ignored with host_prealloc
+    int32_t host_keep_mib = 0;          // fit mode: when the last holder lets a page go (slot cleared, sequence removed) its pinned host memory goes back to the OS;
+                                        // up to this many MiB of free pages keep it for reuse; 0: give everything back; ignored with host_prealloc (it keeps all)
 };
 
 // the evictable resident slots of the parameters; the default holds the whole prefetch request of every packed ubatch,
@@ -226,6 +228,8 @@ struct llama_kvq_memory_info {
     double  t_page_alloc = 0.0;
     int32_t n_page_wait  = 0; // waits for an allocation that blocked (the batch of a sequence needed a page whose host memory was not ready), and their time
     double  t_page_wait  = 0.0;
+    int32_t n_page_free  = 0; // host buffers given back to the OS after the last holder let a page go, and the time in them (the thread's)
+    double  t_page_free  = 0.0;
 };
 
 // the memory info of the store (fit mode), false without it

@@ -1406,6 +1406,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         kvq_cfg.params.prefill_free_codes = params.kvq.prefill_free_codes;
         kvq_cfg.params.host_prealloc      = params.kvq.host_prealloc;
         kvq_cfg.params.host_max_mib       = params.kvq.host_max_mib;
+        kvq_cfg.params.host_keep_mib      = params.kvq.host_keep_mib;
     }
 
     llama_context * lctx = params.kvq.enabled ? llama_init_from_model_kvq(model, cparams, kvq_cfg) : llama_init_from_model(model, cparams);

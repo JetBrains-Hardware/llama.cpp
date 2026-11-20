@@ -634,6 +634,7 @@ struct common_params {
         bool        prefill_free_codes = false; // free the device copy of the codes and tables while a prompt is processed
         bool        host_prealloc = false; // allocate the pinned host memory of every page of the pool at load (default: on demand)
         int32_t     host_max_mib  = 0;     // cap of the pinned host memory of the pages, MiB, 0: none
+        int32_t     host_keep_mib = 0;     // free pages keep up to this many MiB of pinned host memory, the rest goes back to the OS (0: all of it), ignored with host_prealloc
     } kvq;
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
