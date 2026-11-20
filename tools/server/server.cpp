@@ -117,7 +117,7 @@ static server_role_type server_role_detect(const common_params & params, server_
     return has_model ? SERVER_ROLE_INSTANCE : SERVER_ROLE_ROUTER;
 }
 
-// --kvq: the two-tier KV cache holds one sequence per slot and cannot copy or shift the K/V (no seq_cp, context
+// --kvq: the two-tier KV cache keeps the state of each slot's sequence in a pool of pages shared by all the slots, and cannot copy or shift the K/V (no seq_cp, context
 // shift or cache reuse), the settings it needs are forced with a warning, the others are an error
 static bool server_kvq_prepare_params(common_params & params) {
     // ubatches of up to this many tokens use the packed attention (llama_kvq_params::max_batch)

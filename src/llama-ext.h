@@ -141,7 +141,7 @@ struct llama_kvq_params {
 
     int32_t max_batch     = 8;
     int32_t prefetch_n    = 1024; // rows per (kv head, position) requested by the early query
-    int32_t resident_cap  = 0;    // evictable resident slots per (layer, kv head), the sinks have their own; 0: max_batch*prefetch_n (llama_kvq_resident_slots); more slots cost attention time
+    int32_t resident_cap  = 0;    // evictable resident slots per (layer, kv head) and per packed stream (device memory for min(n_seq_max, 8) streams is allocated at load), the sinks have their own; 0: max_batch*prefetch_n (llama_kvq_resident_slots); more slots cost attention time
     int32_t lead          = 2;    // the early query of layer il runs at the input of layer il - lead, 0: no prefetch (packed mode needs 1 - 3)
     int32_t layer_bufs    = -1;   // device buffers of the resident rows, the attention layers rotate through them (each round uploads every layer's
                                   // resident set); < 0 or at least the attention layer count: one buffer per layer, its rows stay on the device
@@ -151,7 +151,8 @@ struct llama_kvq_params {
                                         // prompt is processed and allocate it again at its end (saves their size in the prompt phase, 1.8 GB at 250k);
                                         // false: allocated once, for the life of the context. Needs n_seq_max 1
     bool    host_prealloc = false;      // fit mode: allocate the pinned host memory of every page of the pool at load (the old behaviour);
-                                        // false: a page gets its host memory when a sequence first takes it and keeps it (RAM stays at the high-water mark)
+                                        // false: a page gets its host memory when a sequence first takes it and gives it back to the OS when released (see host_keep_mib)
+                                        // true: every page is allocated at load and never given back (the ring and the staging buffers are allocated at load in both cases)
     int32_t host_max_mib  = 0;          // fit mode: cap of the pinned host memory of the pages, MiB; a batch that needs pages beyond it fails like a full
                                         // cache (llama_decode returns 1); 0: none; ignored with host_prealloc
     int32_t host_keep_mib = 0;          // fit mode: when the last holder lets a page go (slot cleared, sequence removed) its pinned host memory goes back to the OS;

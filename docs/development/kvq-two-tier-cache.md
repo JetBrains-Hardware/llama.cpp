@@ -1,8 +1,6 @@
 # Two-tier KV cache for qwen35 (kvq): implementation notes, knobs, measurements, gaps
 
-State: branch `erokhins/kvq` of ours (the JetBrains-Hardware fork of ggml-org/llama.cpp), HEAD d7887c1ad, 2026-11-20. The branch is ggml-org/llama.cpp master plus the GDN replay of ggml-org PR 31669 (merged locally at 4218b5b9f) plus the kvq series. This file is the single document of the feature: what it is and how the code works (sections 1 - 4), every setting (section 5), how to build and run (section 6), all measurements with their build and date (section 7), the decisions and the history behind them (section 8), and what is not implemented, with the status of each item against the code (section 9). It replaces the former `kvq-two-tier-cache.md` (prototype state) and `kvq-two-tier-cache-guide.md` (user guide).
-
-Open item while this was written: step 3c of the multi-sequence work (the device memory for packed decoding reserved at load) is being implemented in parallel and is not in HEAD; section 3.7 describes it from its specification and carries a TODO for its numbers.
+State: branch `erokhins/kvq` of ours (the JetBrains-Hardware fork of ggml-org/llama.cpp), HEAD 99f888b74 (step 3c), 2026-11-20. The branch is ggml-org/llama.cpp master plus the GDN replay of ggml-org PR 31669 (merged locally at 4218b5b9f) plus the kvq series. This file is the single document of the feature: what it is and how the code works (sections 1 - 4), every setting (section 5), how to build and run (section 6), all measurements with their build and date (section 7), the decisions and the history behind them (section 8), and what is not implemented, with the status of each item against the code (section 9). It replaces the former `kvq-two-tier-cache.md` (prototype state) and `kvq-two-tier-cache-guide.md` (user guide).
 
 Contents: 1 What it is. 2 How it works (one sequence). 3 Several sequences. 4 Code map. 5 Settings. 6 Build and run. 7 Measurements. 8 Decisions and history. 9 Not implemented, known gaps, ideas. 10 Material outside the repository.
 
@@ -94,7 +92,7 @@ Codes in host memory during the prompt (only with `--kvq-prefill-free-codes`): e
 
 ## 3. Several sequences
 
-Commits 811195375 .. d7887c1ad (2026-11-20, design in the owner's design note of the same day; steps 1 - 3b of its four steps). The memory takes `n_seq_max` sequences; the server runs `-np N`.
+Commits 811195375 .. 99f888b74 (2026-11-20, design in the owner's design note of the same day; steps 1 - 3c of its four steps). The memory takes `n_seq_max` sequences; the server runs `-np N`.
 
 ### 3.1 Pool of chunk pages
 
@@ -128,11 +126,25 @@ Op stream dimension (5032d4c33): one call serves S = q->ne[3] <= GGML_KVQ_MAX_ST
 
 Store and graph (d7887c1ad): resident buffers (`rkv_h`), the ridx / staging block, `h_sel` and the tail buffers have one slice per stream (n_str = min(n_seq_max, 8)); per stream the prefetch plan, request cut, fetch list, mirror write, base upload, tail upload and readback, join scatter; a block upload copies only the ridx slices of the ubatch streams. The mask fillers work per stream (rows beyond a stream's n_coarse are -inf). qwen35 builds q / out with the stream dimension, per-stream masks, the page table input [n_chunk, S] and the selection bias [n_coarse, 1, 1, S] as graph inputs, and per-sequence query / gate sums. The matmuls see another batch size than a solo run, so the logits of a packed run differ from a solo run in rounding; two runs of the same schedule are identical, and the output of a sequence depends only on its own state, not on thread timing.
 
-### 3.7 Reserve for packed decoding (step 3c, in progress, not in HEAD)
+### 3.7 Reserve for packed decoding (step 3c, 99f888b74)
 
-Specification of the owner's choice: predictability over optimality, a server must never grow VRAM mid-run. At load the context reserves the device memory for packed decoding: resident rows per stream for min(n_seq_max, 8) streams (capped at 8192 rows), plus the packed compute graph in the reserve (`llama_memory_hybrid_kvq::init_full_packed`: n_streams() sequences of max_batch tokens each, every coarse region at its largest, nothing executed). In HEAD the resident and tail buffers are already sized per stream at load, but the packed graph of several sequences is not part of the reserve, so the compute buffer can still grow at the first packed decode of several slots.
+The owner's choice: predictability over optimality. At load the context reserves the worst case for packed decoding and the per-stream cap stays 8192 rows; there is no tuning. Two parts.
 
-TODO (fill in after step 3c reports): VRAM reserved per stream (resident rows, tail buffer, packed compute graph) at -np 1 / 2 / 4 / 8; max `-c` per `-np` that fits 15,872 MiB with the reserve; whether the load-time number now equals the run maximum (no growth after the first packed decode); prompt and decode speed against d7887c1ad (section 7.9).
+Device memory per packed stream: 325.7 MiB (resident rows 273 MiB at cap 8192, the tail buffers, the staging / ridx block). It is allocated at load (store construction / enable, since 3b) for S_max = min(n_seq_max, 8) streams: 325.7 MiB at `-np 1`, 1,302.7 MiB at `-np 4`. Host side: one pinned mirror buffer of the resident rows per sequence (1,088.7 MiB at `-np 4`); the ring and `buf_pin` are allocated at load too, only the pages of the pool are on demand (3.4).
+
+The packed decode graph (S_max streams x 8 tokens, n_coarse = every row, `llama_memory_hybrid_kvq::init_full_packed`, nothing executed) is part of the scheduler reserve of the context, before the final pp reserve. It costs +0.0 MiB of compute buffer at `-c 65536` and +2.5 MiB at `-c 900000` (the prompt graph dominates the compute buffer). At `-np 1` there is no packed reserve and the graph set is unchanged. Load log line: `sched_reserve: packed decoding reserved at load: 4 streams (--parallel 4, at most 8 tokens per stream), device memory 325.7 MiB per stream (resident rows, tail buffers, staging), 1302.7 MiB for all, plus 0.0 MiB of compute buffer`. If the reserve fails the context is not created: `failed to reserve the compute buffers of the packed decode graph (N sequences x L tokens, --kvq with --parallel P): lower --parallel or the context size` (this path is untested). With n_seq_max > 1 a WARN "compute buffer grew from X to Y" fires if a compute buffer outgrows the reserve; it never fired in the s3c runs.
+
+What the reserve does not cover: growth at run time that is not in any reserve (the CUDA VMM pool of ggml, CUDA graph capture, unattributed). Idle after load -> peak in packed decode, `-c 65536`, DFlash2 (MiB, `kvq-scratch/ms/s3c`, `vram.sh`):
+
+| config | idle | peak | growth |
+|---|---|---|---|
+| np1 d7 | 14,197 | 14,367 | 170 |
+| np2 d7 | 14,925 | 15,099 | 174 |
+| np2 d3 | 14,899 | 15,041 | 142 |
+| np4 d7 | 16,159 | 16,427 | 268 |
+| np4 d3 | 16,105 | 16,307 | 202 |
+
+At np4 d7 about 162 MiB is the ggml CUDA VMM pool growing (it scales with the streams, 64 MiB at np1), about 58 MiB is CUDA graph capture and about 50 MiB is unattributed. The same kind of growth exists at `-np 1` and with ggml-org's plain cache. So the load-time number does not equal the run maximum: the compute buffers and the per-stream memory no longer grow (the 3b figures 14,635 / 14,927 / 15,219 at np 1 / 2 / 4 were before 3c, see 7.9), the CUDA pool and graphs still add 140 - 270 MiB (section 9.2). Max `-c` per `-np` that fits 15,872 MiB, and speed: 7.9.
 
 ### 3.8 Server with `-np N`
 
@@ -393,11 +405,15 @@ With own buffers the time no longer depends on the bus (k = 3 costs at most +0.4
 
 ### 7.9 Multi-sequence
 
-Machine and builds as above. Memory: `-np` 1 to 4 at `-c 65536`, DFlash2, 512-token prompt, VRAM max (MiB), `kvq-scratch/ms/s2e`, build 405c751da (one sequence per ubatch, resident buffers per stream already allocated at load): 14,197 / 14,635 / 14,927 / 15,219 (np 1 / 2 / 3 / 4), +438 MiB for the second slot and +292 MiB for each one after; before 405c751da (the drafter pp reserve was a 1,100 MiB token graph when the phase buffers were off): 14,197 / 15,579 / 15,913 / 16,207. `-np 1 --no-phase-buffers` 14,637 (was 15,579).
+Machine and builds as above. Memory, historical (step 2e, build 405c751da, BEFORE packed decoding and the step 3c reserve; the current numbers are further down): `-np` 1 to 4 at `-c 65536`, DFlash2, 512-token prompt, VRAM max (MiB), `kvq-scratch/ms/s2e` (one sequence per ubatch, resident buffers per stream already allocated at load): 14,197 / 14,635 / 14,927 / 15,219 (np 1 / 2 / 3 / 4), +438 MiB for the second slot and +292 MiB for each one after; before 405c751da (the drafter pp reserve was a 1,100 MiB token graph when the phase buffers were off): 14,197 / 15,579 / 15,913 / 16,207. `-np 1 --no-phase-buffers` 14,637 (was 15,579).
 
-Maximum context at `-np 2` in 15,872 MiB (build 405c751da, load VRAM, 512-token prompt): -c 131072 15,103; 163,840 15,353; 196,608 15,655; 212,992 15,807 (fits); 217,088 15,873 (4 over, 1 MiB). Before that commit about 82k. With mixed traffic (a prompt of slot A while slot B decodes; codes stay on the device with `-np` > 1; s2c, build 5d3a52126, before the drafter fix): -c 65,536 15,697; 81,920 15,815; 86,016 15,873.
+Maximum context at `-np 2` in 15,872 MiB, historical (step 2e, build 405c751da, before packed decoding and the reserve of 3c; superseded by the table below; load VRAM, 512-token prompt): -c 131072 15,103; 163,840 15,353; 196,608 15,655; 212,992 15,807 (fit then); 217,088 15,873 (4 over, 1 MiB). Before that commit about 82k. With mixed traffic (a prompt of slot A while slot B decodes; codes stay on the device with `-np` > 1; s2c, build 5d3a52126, before the drafter fix): -c 65,536 15,697; 81,920 15,815; 86,016 15,873.
 
-Packed decoding (d7887c1ad): VRAM at `-c 65536`: `-np 2` 15,099, `-np 4` 16,427 MiB (the resident rows are per stream in the shared device memory, about 270 MiB per extra stream at the default cap; max `-c` per `-np` and the reserve of step 3c: TODO, section 3.7).
+Packed decoding, current (3b d7887c1ad, the same peaks with the 3c reserve 99f888b74): VRAM peak at `-c 65536` with draft 7: `-np 1` 14,367, `-np 2` 15,099, `-np 4` 16,427 MiB (idle after load 14,197 / 14,925 / 16,159; the growth at run time is in 3.7). The resident rows are per stream in the shared device memory, 325.7 MiB per stream with tail buffers and staging (3.7).
+
+Maximum `-c` per `-np` whose measured peak in packed decoding is at most 15,872 MiB (step 3c, 99f888b74, draft 7, 6,000-token prompts, 600 generated, grid of 4096, `kvq-scratch/ms/s3c/maxc.txt`): `-np 1` 245,760 (peak 15,845), `-np 2` 172,032 (15,825), `-np 4` 16,384 (15,789); `-np 4` at 4,096 fails to load. The prompts are short, so the CUDA pool at the full context is understated. Because the worst case is reserved at load and the per-stream cap stays 8192 (owner's decision), `-np 4` at the default cap leaves only `-c 16384` in 15.5 GiB.
+
+Speed with the reserve (20k prompts, draft 7): `-np 2` 424.8 t/s, `-np 4` 492.0 t/s total (3b: 418 / 465).
 
 Throughput (`kvq-scratch/ms/s3b`, server, DFlash2, IQ3_S target, `-c 102400`, ub 1024, 20k-token prompts of different traces, 2000-token replies per slot with `ignore_eos` (400 at `-np 1`), all slots at once; total tokens per second over the generation window; "before" = s2e (405c751da, one sequence per ubatch), "now" = d7887c1ad):
 
@@ -407,7 +423,7 @@ Throughput (`kvq-scratch/ms/s3b`, server, DFlash2, IQ3_S target, `-c 102400`, ub
 | 2 | 162.3 -> 417.8 | 96.3 -> 271.4 | 33.1 -> 124.8 | 15,407 / 15,339 / 13,417 |
 | 4 | 158.2 -> 465.0 | 96.4 -> 350.1 | 33.3 -> 165.2 | 16,743 / 16,611 / 14,541 |
 
-`-np 4` at n_max 7 exceeds 15,872 MiB at `-c 102400` (16,743). Per-slot rates at `-np 4` n_max 7 before: 35 - 43 tok/s each. Before packed decoding, concurrency gave no throughput over queuing (one forward pass per slot per step); the packed ubatch does one pass over the weights for all slots. Op timing (5032d4c33, 150k rows, cap 1024): L4 attention 0.167 ms and score 0.119 ms, L8 0.315 / 0.247, unchanged against the single-stream op.
+`-np 4` at n_max 7 exceeds 15,872 MiB at `-c 102400` (16,743; source `kvq-scratch/ms/s3b/q.txt` and `tp-new-np4-d7/vram.txt`, build d7887c1ad, i.e. before 3c; the 3c max per `-np` is above). Per-slot rates at `-np 4` n_max 7 before: 35 - 43 tok/s each. Before packed decoding, concurrency gave no throughput over queuing (one forward pass per slot per step); the packed ubatch does one pass over the weights for all slots. Op timing (5032d4c33, 150k rows, cap 1024): L4 attention 0.167 ms and score 0.119 ms, L8 0.315 / 0.247, unchanged against the single-stream op.
 
 Host RAM shrink (523876fcc, 24k request then a 300-token one in the slot): pinned pool 1,321.5 -> 330.4 MiB (one page of the short prompt); process private bytes 18,436 -> 17,693 MiB at `-np 1` (short prompt alone 17,322) and 20,994 -> 19,748 at `-np 2` (alone 19,417). Cost of freeing: 13 - 15 ms per 330.4 MiB page on the pool thread; with `-np 2`, slot 1 decoding 800 tokens while slot 0 is replaced (4 pages freed) the largest gap between streamed chunks was 163 ms with one page kept, 133 ms with nothing freed, 210 ms with all freed (the new request also waits about 50 ms for its page allocation). Pinned host memory after a 250k prompt 10.5 GiB; the on-demand pool costs a 250k prompt +0.5% (140.67 against 139.98 s).
 
@@ -475,7 +491,9 @@ Status key: done, partly done, stale (no longer true, with the reason), open. Or
 | Item | Status | Now |
 |---|---|---|
 | G1 `-np N` served at once; pool of pages; per-sequence state; host RAM on demand and given back; ring streams; `fit_wait(seq)`; server `-np N`; packed decode of several sequences; op stream dimension | done | 3.1 - 3.8, 7.9 |
-| Reserve of the packed decode memory and graph at load (step 3c) | in progress | 3.7, TODO |
+| Reserve of the packed decode memory and graph at load (step 3c) | done | 99f888b74, 3.7, 7.9 |
+| CUDA pool / graph growth after load (~140 - 270 MiB at `-c 65536`) is not reserved | open | 3.7. Options: pre-reserve the CUDA pool with a worst-case estimate, or a warm-up decode at load |
+| Smaller per-stream resident cap for `-np` > 1 | idea | Memory against quality, unmeasured; deliberately not done now (owner: predictability over optimality, cap 8192 unchanged) |
 | Step 4: shared prefix: `seq_cp`, `seq_keep(seq > 0)` with sharing, refcounts (holder count is 0 / 1 today), copy-on-write of one partial page (a `seq_cp` up to p1 inside a chunk: copy, then roll dst back to p1 so the copy happens in one place), server `n > 1` completions (refused today with an invalid request error), full-context state with shared pages (sharing survives a save) | open | Gates planned: fork at the end and in the middle of a chunk equal to the same sequence processed alone, pool accounting returns to empty. `--kvq-rem merge` must then be refused with N > 1 (a merged group rewrites the tables of the last complete chunk and complete pages must never change); today it is accepted |
 | State format version 4 (per-sequence pages in logical order, full state with page tables) | stale | The format stayed at version 3 and is written per sequence from the pages (the host bytes are the same); a full-context state with several sequences and shared pages has no design yet because nothing is shared |
 | Drafter (draft model) cache full aborts all slots of the batch | open | The drafter context is a plain cache of `-c` positions in total, not the pool: when it is full the slots of the batch stop. The pool-full path only covers the target |

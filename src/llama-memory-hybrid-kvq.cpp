@@ -661,7 +661,7 @@ bool llama_memory_hybrid_kvq::fit_enable(const llama_kvq_fit_params & fp, const 
                 p.host_prealloc, (size_t) std::max(0, p.host_max_mib)*1024*1024, (size_t) std::max(0, p.host_keep_mib)*1024*1024);
         store->set_backend(backends);
         if (!store->scratch_ok()) {
-            throw std::runtime_error("the two-tier cache needs the scratch attention (pinned host memory, LLAMA_KVQ_SCRATCH not 0)");
+            throw std::runtime_error("the two-tier cache needs the scratch attention, which reads the host store with async copies, so the host store must be pinned memory (it is not)");
         }
         fitter = std::make_unique<llama_kvq_fitter>(*store, fp, wo, n_head, min_first);
         // the graph does not read the ring cells, see llama_kvq_store (host ring)
