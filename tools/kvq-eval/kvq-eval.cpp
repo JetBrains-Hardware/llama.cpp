@@ -72,6 +72,8 @@ struct kvq_args {
     bool        lib_hold     = false;
     int32_t     lib_rem      = LLAMA_KVQ_REM_OWN;
     int32_t     lib_min_rows = 256;
+    int32_t     bits_k       = 2;
+    int32_t     bits_v       = 1;
     int32_t     lib_ring     = 0; // 0: max(batch, 4096) + 256
     std::vector<int32_t> turns;
     int32_t     turn_gen     = 0;
@@ -141,6 +143,10 @@ static bool kvq_parse_args(int & argc, char ** argv, kvq_args & args) {
                 return false;
             }
             args.lib_rem = v == "merge" ? LLAMA_KVQ_REM_MERGE : LLAMA_KVQ_REM_OWN;
+        } else if (a == "--kvq-bits-k" && has_val) {
+            args.bits_k = std::stoi(argv[++i]);
+        } else if (a == "--kvq-bits-v" && has_val) {
+            args.bits_v = std::stoi(argv[++i]);
         } else if (a == "--kvq-min-rows" && has_val) {
             args.lib_min_rows = std::stoi(argv[++i]);
         } else if (a == "--kvq-ring" && has_val) {
@@ -750,6 +756,8 @@ int main(int argc, char ** argv) {
         params.kvq.chunk        = args.fit_chunk;
         params.kvq.rem          = args.lib_rem;
         params.kvq.min_rows     = args.lib_min_rows;
+        params.kvq.bits_k       = args.bits_k;
+        params.kvq.bits_v       = args.bits_v;
         params.kvq.tail         = args.lib_ring;
         params.kvq.prefetch_n   = args.pk_pf_n;
         params.kvq.resident_cap = args.pk_cap;

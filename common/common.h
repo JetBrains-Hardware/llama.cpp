@@ -628,6 +628,8 @@ struct common_params {
         int32_t     layer_bufs   = -1;   // device buffers of the resident rows: -1 one per attention layer, N >= 2 rotating
         int32_t     tail         = -1;   // cells of the ring of the rows that are not coded yet (pinned host memory), -1: max(n_batch, 4096) + 256
         int32_t     chunk        = 8192; // rows per chunk (one table set)
+        int32_t     bits_k       = 2;
+        int32_t     bits_v       = 1;
         int32_t     rem          = 0;    // llama_kvq_rem: the rows after the last complete chunk, 0 own chunk, 1 merged into the last complete chunk
         int32_t     min_rows     = 256;  // own: the smallest chunk of these rows, fewer stay precise
         int32_t     scr_block    = 16384; // rows per key block of the scratch attention of a prompt, 0: one attention with a mask

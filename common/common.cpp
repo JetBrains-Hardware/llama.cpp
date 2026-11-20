@@ -1395,6 +1395,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         kvq_cfg.tail = params.kvq.tail;
 
         kvq_cfg.fit.chunk     = params.kvq.chunk;
+        kvq_cfg.fit.bits_k    = params.kvq.bits_k;
+        kvq_cfg.fit.bits_v    = params.kvq.bits_v;
         kvq_cfg.fit.rem       = params.kvq.rem;
         kvq_cfg.fit.min_rows  = params.kvq.min_rows;
 
