@@ -150,6 +150,10 @@ struct llama_kvq_params {
     bool    prefill_free_codes = false; // fit mode: free the device copy of the codes and tables (kc, vc, tinv, taux; the pinned host copy holds them) while a
                                         // prompt is processed and allocate it again at its end (saves their size in the prompt phase, 1.8 GB at 250k);
                                         // false: allocated once, for the life of the context. Needs n_seq_max 1
+    bool    host_prealloc = false;      // fit mode: allocate the pinned host memory of every page of the pool at load (the old behaviour);
+                                        // false: a page gets its host memory when a sequence first takes it and keeps it (RAM stays at the high-water mark)
+    int32_t host_max_mib  = 0;          // fit mode: cap of the pinned host memory of the pages, MiB; a batch that needs pages beyond it fails like a full
+                                        // cache (llama_decode returns 1); 0: none; ignored with host_prealloc
 };
 
 // the evictable resident slots of the parameters; the default holds the whole prefetch request of every packed ubatch,
@@ -214,7 +218,18 @@ struct llama_kvq_memory_info {
     size_t host_store = 0;
     size_t host_other = 0;
     bool   pinned     = false;
+    // the page pool of the host store (host_store and host_codes count the pages whose host memory is allocated)
+    int32_t pages      = 0; // pages of the pool
+    int32_t pages_free = 0; // not held by a sequence
+    int32_t pages_host = 0; // with host memory
+    int32_t n_page_alloc = 0; // allocations of host memory by the background thread, and the time in them
+    double  t_page_alloc = 0.0;
+    int32_t n_page_wait  = 0; // waits for an allocation that blocked (the batch of a sequence needed a page whose host memory was not ready), and their time
+    double  t_page_wait  = 0.0;
 };
+
+// the memory info of the store (fit mode), false without it
+LLAMA_API bool llama_memory_kvq_get_memory_info(llama_memory_t mem, llama_kvq_memory_info & out);
 
 // packed mode, the library fits the codec tables (single sequence 0, positions from 0 without gaps):
 //   the graph sums q q^T of the queries (after q_norm and RoPE) per (attention layer, kv head) on the device;

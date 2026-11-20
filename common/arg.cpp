@@ -2524,6 +2524,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KVQ_PREFILL_FREE_CODES").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kvq-host-prealloc"},
+        "two-tier KV cache: allocate the pinned host memory of every page of the pool at load (default: a page gets its host memory in the background "
+        "when a sequence first needs it, and keeps it)",
+        [](common_params & params) {
+            params.kvq.host_prealloc = true;
+        }
+    ).set_env("LLAMA_ARG_KVQ_HOST_PREALLOC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kvq-host-max-mib"}, "N",
+        string_format("two-tier KV cache: cap of the pinned host memory of the pages of the pool in MiB; a batch that needs pages over the cap fails like a full cache, 0 = no cap (default: %d)", params.kvq.host_max_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kvq.host_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KVQ_HOST_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--kvq-tail"}, "N",
         "two-tier KV cache: cells of the ring of q8_0 rows that are not coded yet, in pinned host memory (default: max(batch size, 4096) + 256)",
         [](common_params & params, int value) {
