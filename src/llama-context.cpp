@@ -918,7 +918,8 @@ void llama_context::sched_reserve() {
     }
 
     // a DFlash draft: the large ubatches are the injection batches, the token batches are tg ubatches
-    const bool pp_embd = phase_on && model.arch == LLM_ARCH_DFLASH;
+    // (independent of the phase buffers: the pp graph computes no logits, the token graphs are reserved apart below)
+    const bool pp_embd = model.arch == LLM_ARCH_DFLASH;
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1010,6 +1011,15 @@ void llama_context::sched_reserve() {
                 phase_size_tg[i] = tg_grow ? 0 : sizes[i];
             }
         }
+    }
+
+    // a DFlash draft without phase buffers: the pp reserve is the injection graph, the largest token graph (one block per
+    // sequence, one output per token) is reserved apart so that decoding does not grow the buffers
+    if (pp_embd && !phase_on && !cparams.training && n_tokens_tg >= 1) {
+        if (!graph_reserve(n_tokens_tg, n_seqs, n_tokens_tg, mctx.get(), model.no_alloc())) {
+            throw std::runtime_error("failed to allocate compute tg buffers");
+        }
+        graph_has_logits = true;
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
