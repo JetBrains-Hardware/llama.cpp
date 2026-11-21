@@ -195,6 +195,10 @@ cmake -B build -DGGML_CUDA=ON
 cmake --build build --config Release
 ```
 
+For experimental compact-weight prefill on GB10, set `GGML_CUDA_COMPACT_NVFP4=1` and use large prompt microbatches (for example, `-b 4096 -ub 4096`). Eligible dense projections stage IQ2_S, IQ3_S, IQ3_XXS, IQ4_XS, Q3_K or Q4_K weights into temporary block-scaled FP4 buffers. Activations are also rounded to FP4. Eligible partial batches write directly into the final output buffer when cuBLASLt supports the shape. Decode uses the original weights and existing kernels. This path is off by default because the additional rounding can affect model outputs.
+
+The Qwen 27B prefill measurements also enable `GGML_CUDA_COMPACT_PREFILL_FATTN=1` for a wider 256-dimensional grouped-query attention tile and `GGML_CUDA_COMPACT_SPLIT_CONV=1` for separate convolution history. To verify dispatch, set `GGML_CUDA_COMPACT_NVFP4_TRACE=1`. To compare direct output against padded output with the same arithmetic, set `GGML_CUDA_COMPACT_NVFP4_PAD_OUTPUT=1`.
+
 To use a specific CCCL version instead of the one bundled with the installed CUDA Toolkit, add `-DGGML_CUDA_CCCL_VERSION=vMAJOR.MINOR.PATCH`. CUB DeviceTopK requires CCCL 3.4.3 or newer; older versions use the sort fallback.
 
 Note that this also builds the CPU backend by default. On Windows on ARM, MSVC's

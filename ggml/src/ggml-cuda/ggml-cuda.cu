@@ -147,11 +147,6 @@ int ggml_cuda_get_device() {
     return id;
 }
 
-static bool ggml_cuda_env_flag(const char * name) {
-    const char * env = getenv(name);
-    return env != nullptr && std::atoi(env) != 0;
-}
-
 static int ggml_cuda_env_int(const char * name, int default_value) {
     const char * env = getenv(name);
     return env != nullptr ? std::atoi(env) : default_value;
@@ -4457,6 +4452,70 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    static const bool compact_prefill = ggml_cuda_env_flag("GGML_CUDA_COMPACT_NVFP4");
+
+    if (compact_prefill && node->op == GGML_OP_MUL_MAT && node->ne[1] >= 1792 && i + 2 < cgraph->n_nodes &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_tensor * second = cgraph->nodes[i + 1];
+        const ggml_tensor * glu = cgraph->nodes[i + 2];
+        const bool gate_up = (glu->src[0] == node && glu->src[1] == second) ||
+                             (glu->src[1] == node && glu->src[0] == second);
+        const int outputs[] = { i, i + 1 };
+        const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+        if (second->op == GGML_OP_MUL_MAT && glu->op == GGML_OP_GLU && gate_up && node->src[1] == second->src[1] &&
+                ggml_get_op_params_i32(node, 1) == GGML_HINT_NONE && ggml_get_op_params_i32(second, 1) == GGML_HINT_NONE &&
+                ggml_can_fuse_subgraph(cgraph, i, 2, ops, outputs, 2) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, outputs, 2) &&
+                ggml_cuda_try_compact_nvfp4_pair(*cuda_ctx, node, second)) {
+            return 1;
+        }
+    }
+
+    if (compact_prefill && node->op == GGML_OP_MUL_MAT && node->ne[1] > 2048 &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && j <= i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        if (j < cgraph->n_nodes && j <= i + 4) {
+            ggml_tensor * second = cgraph->nodes[j];
+            const int outputs[] = { i, j };
+            const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+            if (second->op == GGML_OP_MUL_MAT && node->src[1] == second->src[1] &&
+                    ggml_get_op_params_i32(node, 1) == GGML_HINT_NONE &&
+                    ggml_get_op_params_i32(second, 1) == GGML_HINT_NONE &&
+                    ggml_can_fuse_subgraph_ext(cgraph, outputs, 2, ops, outputs, 2) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, j-i+1, outputs, 2) &&
+                    ggml_cuda_try_compact_nvfp4_pair(*cuda_ctx, node, second)) {
+                if (ggml_cuda_env_flag("GGML_CUDA_COMPACT_NVFP4_TRACE")) {
+                    fprintf(stderr, "PREFILL_SHARED_PACK %s %s %lld\n", node->src[0]->name,
+                            second->src[0]->name, (long long) node->ne[1]);
+                }
+                return j-i;
+            }
+        }
+    }
+
+    if (compact_prefill && node->op == GGML_OP_GLU && node->ne[1] >= 1792 && i + 1 < cgraph->n_nodes &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_tensor * down = cgraph->nodes[i + 1];
+        const ggml_tensor * gate = node->src[0];
+        const ggml_tensor * up = node->src[1];
+        const int output = i + 1;
+        const ggml_op ops[] = { GGML_OP_GLU, GGML_OP_MUL_MAT };
+        if (down->op == GGML_OP_MUL_MAT && down->src[1] == node && ggml_get_op_params_i32(down, 1) == GGML_HINT_NONE &&
+                ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && !ggml_get_op_params_i32(node, 1) &&
+                up && up->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(up) && ggml_are_same_shape(up, gate) && ggml_are_same_shape(node, gate) &&
+                ggml_can_fuse_subgraph(cgraph, i, 2, ops, &output, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &output, 1) &&
+                ggml_cuda_try_compact_nvfp4_swiglu(*cuda_ctx, node, down)) {
+            return 1;
+        }
+    }
+#endif
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

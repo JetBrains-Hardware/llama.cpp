@@ -241,6 +241,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 256 && DV == 256) {
+        static const bool compact_prefill_tile = ggml_cuda_env_flag("GGML_CUDA_COMPACT_PREFILL_FATTN");
+        if (compact_prefill_tile && use_gqa_opt && gqa_ratio % 2 == 0 && Q->ne[1] >= 128 &&
+                Q->ne[1] % 64 == 0 && ampere_mma_available(cc)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 64, 2>(ctx, dst);
+            return;
+        }
+    }
+#endif
+
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {

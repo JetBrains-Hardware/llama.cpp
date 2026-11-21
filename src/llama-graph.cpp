@@ -4178,9 +4178,20 @@ void llm_graph_context::build_conv_state_store(
         ggml_tensor * conv_x,
             int64_t   n_cols,
              size_t   offs) const {
+    build_conv_state_store_impl(inp, s, conv_x, n_cols, offs, false);
+}
+
+void llm_graph_context::build_conv_state_store_impl(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+        ggml_tensor * conv_x,
+            int64_t   n_cols,
+             size_t   offs,
+                 bool     channel_first) const {
     const auto * mctx_cur = inp->mctx;
 
-    const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
+    const int64_t last_start = conv_x->ne[0] - n_cols;
+    const int64_t n        = channel_first ? conv_x->ne[0] : last_start;
     const int64_t channels = conv_x->ne[1];
     const int64_t n_seqs   = conv_x->ne[2];
 
@@ -4188,10 +4199,15 @@ void llm_graph_context::build_conv_state_store(
     const size_t cell_offs = mctx_cur->get_head()*row_size + offs;
 
     if (cparams.n_rs_seq == 0) {
-        ggml_tensor * last = ggml_view_3d(ctx0, conv_x,
-                n_cols, channels, n_seqs,
-                conv_x->nb[1], conv_x->nb[2],
-                ggml_row_size(conv_x->type, n));
+        ggml_tensor * last;
+        if (channel_first) {
+            last = ggml_view_3d(ctx0, ggml_transpose(ctx0, conv_x), channels, n_cols, n_seqs,
+                    conv_x->nb[0], conv_x->nb[2], last_start*conv_x->nb[0]);
+            last = ggml_transpose(ctx0, last);
+        } else {
+            last = ggml_view_3d(ctx0, conv_x, n_cols, channels, n_seqs,
+                    conv_x->nb[1], conv_x->nb[2], ggml_row_size(conv_x->type, n));
+        }
 
         ggml_tensor * cell = ggml_view_2d(ctx0, s,
                 n_cols*channels, n_seqs,
@@ -4219,10 +4235,17 @@ void llm_graph_context::build_conv_state_store(
 
     // window w starts at column n - (Kw - 1) + w (ascending time) and is rollback slot Kw - 1 - w,
     // consecutive windows start one element apart, so they overlap
-    ggml_tensor * windows = ggml_view_4d(ctx0, conv_x,
-            n_cols, Kw, channels, n_seqs,
-            ggml_element_size(conv_x), conv_x->nb[1], conv_x->nb[2],
-            ggml_row_size(conv_x->type, n - (Kw - 1)));
+    ggml_tensor * windows;
+    if (channel_first) {
+        const size_t offset = (last_start - (Kw - 1))*conv_x->nb[0];
+        windows = ggml_view_4d(ctx0, ggml_transpose(ctx0, conv_x), channels, n_cols, Kw, n_seqs,
+                conv_x->nb[0], conv_x->nb[0], conv_x->nb[2], offset);
+        windows = ggml_cont(ctx0, ggml_permute(ctx0, windows, 2, 0, 1, 3));
+    } else {
+        windows = ggml_view_4d(ctx0, conv_x, n_cols, Kw, channels, n_seqs,
+                ggml_element_size(conv_x), conv_x->nb[1], conv_x->nb[2],
+                ggml_row_size(conv_x->type, n - (Kw - 1)));
+    }
 
     // [n_cols, slot, channel, seq] view of the cells of this ubatch
     ggml_tensor * slots = ggml_view_4d(ctx0, s,
