@@ -60,6 +60,12 @@
 // https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_functionality.html#blackwell-sm120-gemms
 #define GGML_CUDA_CC_BLACKWELL       1200
 #define GGML_CUDA_CC_GB10            1210
+
+inline bool ggml_cuda_env_flag(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && std::atoi(env) != 0;
+}
+
 #define GGML_CUDA_CC_RUBIN           1300
 #define GGML_CUDA_CC_OFFSET_AMD      0x1000000
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000

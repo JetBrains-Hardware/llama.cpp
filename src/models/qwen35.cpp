@@ -1,6 +1,9 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+#include <cstring>
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -377,6 +380,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    static const bool share_prefill_activations = [] {
+        const char * value = std::getenv("GGML_CUDA_COMPACT_NVFP4");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (share_prefill_activations && ubatch.n_seq_tokens > 2048 && !model.layers[il].wqkv_z) {
+        const auto device = model.dev_layer(il);
+        if (device && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "CUDA") == 0) {
+            ggml_build_forward_expand(gf, qkv_mixed);
+            ggml_build_forward_expand(gf, z);
+        }
+    }
+
     ggml_tensor * beta  = nullptr;
     ggml_tensor * alpha = nullptr;
     if (model.layers[il].ssm_beta_alpha_cat) {
@@ -416,13 +431,45 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    static const bool split_conv = [] {
+        const char * value = std::getenv("GGML_CUDA_COMPACT_SPLIT_CONV");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const auto device = model.dev_layer(il);
+    const bool use_split = split_conv && device &&
+            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "CUDA") == 0 &&
+            conv_kernel_size == 4 && conv_channels % 128 == 0 &&
+            n_seq_tokens >= std::max<int64_t>(512, int64_t(cparams.n_rs_seq) + conv_kernel_size);
+
+    ggml_tensor * history = nullptr;
+    ggml_tensor * conv_input;
+    if (use_split) {
+        ggml_tensor * previous = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+        previous = ggml_reshape_3d(ctx0, previous, conv_kernel_size - 1, conv_channels, n_seqs);
+        history = ggml_dup(ctx0, previous);
+        // Keep the old history alive across updates to its recurrent cache cell.
+        ggml_build_forward_expand(gf, history);
+        conv_input = ggml_transpose(ctx0, qkv_mixed);
+        cb(conv_input, "conv_input", il);
+        build_conv_state_store_impl(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0, true);
+    } else {
+        conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    }
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_output_proper;
+    if (history) {
+        conv_output_proper = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, conv_channels, n_seq_tokens, n_seqs);
+        conv_output_proper->op = GGML_OP_SSM_CONV;
+        conv_output_proper->src[0] = conv_input;
+        conv_output_proper->src[1] = conv_kernel;
+        conv_output_proper->src[2] = history;
+    } else {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    }
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

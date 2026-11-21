@@ -2,8 +2,19 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "unary.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <optional>
+#include <tuple>
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#include <cuda_fp4.h>
+#include <cuda_fp8.h>
+#endif
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -161,12 +172,67 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+
+#include "dequantize.cuh"
+#include "mmq-compact-nvfp4.cuh"
+#include "native-prefill.cuh"
+
+static bool ggml_cuda_supports_compact_nvfp4(
+        const ggml_backend_cuda_context & ctx, const ggml_tensor * weight, const ggml_tensor * input, const ggml_tensor * dst) {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_COMPACT_NVFP4");
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    if (!enabled || device.cc != GGML_CUDA_CC_GB10 || !blackwell_mma_available(device.cc) ||
+            !native_prefill::supported_type(weight->type)) {
+        return false;
+    }
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const auto prec = ggml_prec_get_src(dst, 1);
+    return (prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8) &&
+        input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && input->ne[0] == k &&
+        dst->ne[0] == n && dst->ne[1] == m && ggml_is_matrix(dst) &&
+        weight->buffer && ggml_backend_buffer_get_type(weight->buffer) == ggml_backend_cuda_buffer_type(ctx.device) &&
+        ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        !weight->view_src && !(weight->flags & GGML_TENSOR_FLAG_PARAM) &&
+        ggml_is_matrix(weight) && ggml_is_matrix(input) &&
+        ggml_is_contiguous(weight) && ggml_is_contiguous(input) && ggml_is_contiguous(dst) &&
+        k > 0 && k <= 32768 && k % MMQ_ITER_K_FP4 == 0 && n > 0 && n <= 65536 && n % 128 == 0 &&
+        m >= 1792 && m <= 8192;
+}
+
+static bool ggml_cuda_try_compact_nvfp4(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst,
+        const ggml_tensor * swiglu_up = nullptr, const ggml_tensor * second_weight = nullptr, ggml_tensor * second_dst = nullptr) {
+    return ggml_cuda_supports_compact_nvfp4(ctx, weight, input, dst) &&
+        (!second_weight || ggml_cuda_supports_compact_nvfp4(ctx, second_weight, input, second_dst)) &&
+        native_prefill::run(ctx, weight, input, dst, swiglu_up, second_weight, second_dst);
+}
+
+bool ggml_cuda_try_compact_nvfp4_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second) {
+    return ggml_cuda_try_compact_nvfp4(ctx, first->src[0], first->src[1], first, nullptr, second->src[0], second);
+}
+
+bool ggml_cuda_try_compact_nvfp4_swiglu(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * down) {
+    return ggml_cuda_try_compact_nvfp4(ctx, down->src[0], glu->src[0], down, glu->src[1]);
+}
+
+#endif
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    if (!ids && !fusion && ggml_cuda_try_compact_nvfp4(ctx, src0, src1, dst)) {
+        return;
+    }
+#endif
 
     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
     // Fused scale (no gate): dst is the MUL that applies the weight scale to the MUL_MAT.
