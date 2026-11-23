@@ -852,3 +852,53 @@ Fixes from the list in 14.5, each measured alone. 32k and 76k requests, K=7, req
 - Tried and dropped: scoring the Markov steps only on the top 512 candidates of the base logits (Strata `K_cand`). Draft 1.75 ms, but acceptance falls from position 2 on (32k mean acc len 2.55 against 3.01), decode 94.3 (32k) and 86 t/s (76k). Patch kept in `tmp/inkling/patches/dspark-f1f2f5.diff`.
 - Not done: F3 (reuse of the two draft-context graphs, about 0.3 ms per round): `gf_res_prev` already has two slots, but one scheduler serves both graphs, and allocating one invalidates the other; real reuse needs a second scheduler in `llama_context`. Cheaper option: merge the injection into the block decode as one mixed batch. F4 (`f_rnn` on the device, about 0.15 ms): needs a mixed state input in `llama-graph.cpp`.
 - Against Strata (121.9 / 114.4 t/s): 32k -12%, 76k -6% at fixed K=7. Next: windowed K (plan step 4).
+
+## 16. Windowed draft length (plan step 4), 2026-11-24: implemented, loses, removed
+
+Design: plan step 4, "windowed K". Per sequence a window of 64 rounds, `a = n_acc / (n_acc + n_rej)`, `K = argmax E(K) / c(K)`, switch only above +3%, the draft block is K + 1 tokens. Env `LLAMA_SPEC_DRAFT_COST`, `LLAMA_SPEC_DRAFT_WINDOW`; unset = off. About 100 lines in `common_speculative_impl_draft_dspark` (uses the existing `accept()` callback). Patch: `tmp/inkling/patches/dspark-windowed-k.diff`. Not in the tree. Logs: `tmp/inkling/logs/dspark-s9/`.
+
+Cost table from synthetic acceptance (`--spec-synth-len K+1`, 32k request, tools stripped, `ignore_eos`, w2q8 drafter, text not valid output; single-token decode 80.76 t/s = 12.38 ms):
+
+| K | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|
+| round ms | 18.4 | 20.5 | 25.2 | 26.7 | 29.4 | 30.4 | 33.1 |
+| draft ms | 1.29 | 1.49 | 1.70 | 1.83 | 2.03 | 2.09 | 2.33 |
+| c (synthetic) | 1.48 | 1.66 | 2.03 | 2.16 | 2.37 | 2.46 | 2.68 |
+| c (real acceptance, verify of 13.5 + draft above) | 1.47 | 1.62 | 1.88 | - | 2.15 | - | 2.25 |
+
+Gate: teacher forcing step 2 run 1 with the rule on (window 16): 300 of 300. Speed, `--spec-draft-n-max 7`, w2q8 drafter, request sampling:
+
+| Config | 32k t/s | 76k t/s | Mean acc len (32k / 76k) |
+|---|---|---|---|
+| fixed K=7 (section 15) | 107.7 | 107.2 | 3.01 / 3.38 |
+| fixed K=2 | 114.0 | not run | 2.30 / - |
+| windowed K | 108.0 | 96.2 | 2.48 / 2.39 |
+
+K sequence, the same in both requests and reps: 3 -> 2 -> 6 -> 2 -> 6 -> 2.
+
+Why it loses.
+- The synthetic table makes long drafts look too expensive: c(7) is 2.68 synthetic against 2.25 with real acceptance. A synthetic round commits 8 tokens, a real one about 3, so each committed token costs about 1 ms more than a verified one ((33.1 - 27.8) ms / 5 tokens). The rule therefore goes to small K too often (76k: 96 against 107 t/s).
+- Even with the real costs the choice at 32k is a tie: a = 0.68 gives E/c = 1.32 for both K = 2 and K = 7. A window of 64 rounds measures a to about +-0.05, so the rule flips between K = 2 and K = 6; the 3% hysteresis is far below that noise.
+- Upper bound of any length rule on these two requests: +6% on 32k (fixed K = 2 against K = 7), about 0 on 76k (K = 7 is best). A fixed K gets most of it.
+
+Open finding: about 1 ms per committed token outside the verify graph. Not measured directly. Candidate: the server samples every verified position on the host (copy of 200k logits per position, softmax and sampling over the full vocabulary on the CPU). With about 3 committed tokens per round that is about 3 ms of a 28 ms round, and plain decode pays it once per token. If confirmed, backend sampling for the target (the drafter already samples on the device) would remove most of it. Revisit the rule after that, with costs from real rounds.
+
+## 17. Where a target pass spends its GPU time (nsys, 2026-11-24)
+
+Trace `tmp/inkling/logs/dspark-s6/nsys-k7.sqlite` (32k request, K=7, before the drafter fixes; target unchanged since). Verify passes of 8 tokens, median of 76 passes. Kernel times under nsys, which inflates very short kernels, so the small-kernel total is an upper bound. Busy time (25.1 ms) is above the span (22.6 ms) because some graph nodes overlap.
+
+| Group | ms per pass | Kernels per pass | Note |
+|---|---|---|---|
+| expert matmuls (`mul_mat_vec_q_moe`, IQ3_XXS / IQ4_NL, q8_1 activations, int8 dot products) | 5.0 | 96 | 52 us each, close to the bandwidth |
+| attention (`flash_attn_ext_f16`, 8 global + 40 SWA visits) | 3.1 | 48 | the global layers read about 1 GiB, 0.6 ms at peak bandwidth: about 5x above the floor |
+| small F32 / BF16 matmuls (`mul_mat_f`, `mul_mat_vec_f`: router, loop control, small projections) | 4.5 | 544 | 6 to 10 us each, too small to fill the GPU |
+| Q6_K projections, lm head, other quantized matmuls | about 1.6 | about 275 | |
+| elementwise and glue (`k_bin_bcast` 1492, `scale_f32` 819, `rms_norm_f32` 514, `unary_op_kernel` 577, concat 548, `quantize_q8_1` 293, `k_set_rows` 292, `ssm_conv_f32` 192, ...) | about 9 | about 6300 | 1.2 to 2 us each, almost all fixed cost |
+| total | 22.6 (span) | 7583 | |
+
+The arithmetic is not the limit: a token needs about 4.8 G multiply-adds (about 90 M weights per visit x 48 visits + lm head), an 8-token verify about 77 GFLOP, well below 1 ms on this GPU. The memory bandwidth is the limit only in the expert matmuls. Most of the pass is a chain of about 7600 dependent, mostly tiny kernels with a fixed cost of about 1.5 us each on the GPU (CUDA graphs remove the CPU launch cost, not this). The same chain at batch 1 is the "about 11 ms fixed" part of plain decode in 13.13 (21% of peak bandwidth). Strata (11.2 ms per token without the drafter) fuses each stage into hand-written kernels; it is also well above the bandwidth floor.
+
+Levers, all ggml / kernel work (not in the plan so far):
+- Fuse the glue chains (norm + scale + mul + add, gates, sigmoid chains) in ggml-cuda: several ms per pass, for decode and verify. A comment in ggml-org PR #32773 mentions a branch "realugbun/inkling2-speed" with fused CUDA glue ops for Inkling2: look at it first.
+- BF16 instead of F32 for the router and loop control weights: fewer bytes, but these kernels are latency bound, so small.
+- Flash attention with 8 queries over 32k positions is about 5x above its bandwidth floor: split the global layers across more blocks, check the positional mask and rel-bias paths.
