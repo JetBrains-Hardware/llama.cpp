@@ -357,3 +357,133 @@ Runs (all `--swa-full`):
 | S2: pos vs baseline | 90de4a52 | yes |
 
 No finding. Caveat: S1 proves only that reuse with forced re-processing is stable. S2 is the position-moving test.
+
+## 11. Strata engine comparison (SQ-15 vs our pos-mask build)
+
+Goal: measure the real Strata engine (not just read its source) on the same two requests, to see how much of the
+prefill/decode gap to Strata our pos-mask work (section 10, step 3) actually closed.
+
+### Setup
+
+- Strata source checkout `..\Strata` (commit `6a6db7f`, terminal/engine build 0.2.20/0.1.66; the installed app was 0.2.9
+  and does not know the Inkling family, so the source checkout was used directly: `terminal/.venv` created, Strata's own
+  `terminal/requirements.txt` installed into it).
+- Model: `strata-engine/Inkling-2-Mini-Strata` build **SQ-15** (14.3 GB, downloaded this session to
+  `C:\Users\erokh\AppData\Local\Strata\Strata-data\models\inkling-2-mini\Inkling-2-Mini-SQ-15.strata`), engine package
+  `0.1.66-windows-x86_64-cuda-cuda13` (417 MB, downloaded alongside it).
+- Launch (`terminal/setup.py`, what `strata launch`/`START-HERE.bat` call): `--family inkling-2-mini --model SQ-15
+  --context 98304 --kv int8 --vision no --mtp off --drafter off --parallel 1 --host 127.0.0.1 --port 8096 --no-browser
+  --yes --output jsonl`. `--mtp off --drafter off` deliberately turn off Strata's speculative decoding stack (MTP /
+  DSpark) so the comparison is attention/compute-buffer against attention/compute-buffer, not drafting against no
+  drafting. `--kv int8` is Strata's default and was left as-is: our side runs F16 KV, so **the VRAM numbers below are
+  not apples-to-apples on KV format**, only the compute-buffer/attention part is the thing this branch changed.
+- llama.cpp side: this worktree's `build-cuda/bin/llama-server.exe` (commit fc73aaa58, i.e. 3692ecb40 pos-mask + later
+  docs-only commits), `-m Inkling-2-Mini-UD-Q3_K_XL.gguf -ngl 99 -fa on -c 98304 -ub 512 -np 1 --port 8765 --jinja`,
+  same convention as step 3.
+- Both engines were given the exact same two captured requests (`replays/test2/req_32k.json`, `req_76k.json`), one
+  server session per (engine, request), GPU lock held for the whole session (`gpurun.sh`, `GPU_OWNER=strata-bench`).
+  Reps: 3 for the 32k request, 2 for the 76k request, `max_tokens` cap 4000, same as the established convention.
+
+**Anti-cache nonce.** Strata has a prompt/prefix cache (`MESSAGE_BOUNDARY_CACHE.md`, `PROMPT_CACHE_TAIL.md`) and no
+documented per-request "force full prefill" flag was found. Resending the identical captured body would hit this cache
+on reps after the first and give a meaningless near-zero prefill. Fix: before sending, a short unique nonce comment
+(`<!-- bench <12 hex chars> -->\n`) is prepended to the system message of every rep, on **both** engines, so the two
+engines see literally the same input tokens and no rep can reuse another rep's KV. llama.cpp's own `cache_prompt:false`
+already forces full reprocessing regardless, so the nonce is harmless there; it changes `prompt_tokens` by about 10-16
+tokens out of 32k/76k, negligible.
+
+**`model` field bug (found and fixed during this run).** The captured requests carry
+`"model": "Inkling-2-Mini-UD-Q3_K_XL"` (the Junie-side alias). llama-server ignores this field. Strata's OpenAI endpoint
+does not: it 404'd on every real (non-sanity) request until the field was dropped from the body before sending. The
+first attempt at this measurement lost both the 32k and the 76k Strata runs to this (`HTTP Error 404: Not Found`,
+`bench_client.py`), and because the failure happened inside a `set -e` script before the stop/cleanup lines ran, it
+also left two orphaned `strata-inkling.exe` + `server.py` + `setup.py` process chains running (not cleaned by
+`strata launch --stop`, since they were started by `setup.py` directly, not tracked by `launch`); they were found with
+`Get-CimInstance Win32_Process` and ended with `taskkill //PID <pid> //F //T`. The session script was changed to always
+tree-kill its server chain via a `trap ... EXIT`, but the trap itself had a second bug: it tree-killed `$SP`, the PID
+Git Bash's `$!` gives for a backgrounded native `.exe` — on this MSYS setup that is **not** the real Windows PID
+`taskkill` needs (`ps`'s own `WINPID` column has the real one), so every automated cleanup in this session silently
+no-opped (`taskkill` against a nonexistent PID, swallowed by `|| true`) and left one orphaned
+`setup.py -> setup.py -> server.py -> server.py -> strata-inkling.exe` chain per Strata session. All of them (one
+after the first crash, one after the final 76kB run) were found by matching `CommandLine` in
+`Get-CimInstance Win32_Process` (port `8096` / the model's run-config name) and tree-killed from the real PID. A
+correct fix would resolve the real PID from `$SP`'s `WINPID` (or from the command-line match) before trapping, not
+implemented here since the runs were already done by the time this was found; flagging it so the next session's
+scripts don't repeat it.
+
+Strata's chat completion response does carry the same non-standard `timings` object as llama.cpp
+(`prompt_per_second`, `predicted_per_second`, `prompt_ms`, `predicted_ms`) plus a standard OpenAI `usage` block — its
+engine really is llama.cpp-derived under the hood (`engine/third_party/strata-llama`) — so the existing
+`replay.py`-style parsing applies unchanged once the `model` field is dropped.
+
+**Host RAM caveat.** The plan called for an idle-before / after-load / after-gen triple per session; only
+after-load/after-gen were actually captured (whole-system `TotalVisibleMemorySize - FreePhysicalMemory` via
+PowerShell, not a per-process number), and the llama.cpp and Strata sessions ran at different points in the overall
+session with different ambient processes (venv setup, downloads). The absolute RAM numbers below are reported as
+measured but should be read as rough/qualitative, not a controlled delta; only the within-session after-load-to-after-gen
+growth is reasonably trustworthy.
+
+### Results
+
+Prefill/decode are the mean of the per-rep `timings.prompt_per_second` / `timings.predicted_per_second`; VRAM is
+`nvidia-smi` read right after each response.
+
+32k request (prompt ~32,138-32,160 tokens after the nonce):
+
+| engine | rep | prompt tok | completion tok | prefill t/s | decode t/s | VRAM after response MiB |
+|---|---|---|---|---|---|---|
+| llama.cpp (pos-mask) | 0 | 32160 | 1618 | 2673.90 | 80.80 | 17116 |
+| llama.cpp (pos-mask) | 1 | 32158 | 1939 | 2753.80 | 80.72 | 17110 |
+| llama.cpp (pos-mask) | 2 | 32157 | 364 | 2750.75 | 79.65 | 17110 |
+| Strata SQ-15 | 0 | 32141 | 1725 | 4951.5 | 90.8 | 17364 |
+| Strata SQ-15 | 1 | 32138 | 1354 | 5008.1 | 91.6 | 17371 |
+| Strata SQ-15 | 2 | 32139 | 1594 | 4961.3 | 85.6 | 18230 |
+
+76k request (prompt ~75,967-75,999 tokens after the nonce):
+
+| engine | rep | prompt tok | completion tok | prefill t/s | decode t/s | VRAM after response MiB |
+|---|---|---|---|---|---|---|
+| llama.cpp (pos-mask) | 0 | 75999 | 3739 | 2482.04 | 73.48 | 17117 |
+| llama.cpp (pos-mask) | 1 | 75998 | 3533 | 2499.03 | 73.94 | 17117 |
+| Strata SQ-15 | 0 | 75967 | 3283 | 3676.9 | 75.6 | 18784 |
+| Strata SQ-15 | 1 | 75968 | 100 | 3907.5 | 77.1 | 18783 |
+
+Summary (mean over reps; VRAM after load is the nvidia-smi reading right after the model finished loading, before any request):
+
+| request | engine | prefill t/s (mean) | decode t/s (mean) | VRAM after load MiB | VRAM after last rep MiB | RAM after load | RAM after last rep |
+|---|---|---|---|---|---|---|---|
+| 32k | llama.cpp pos-mask | 2726.2 | 80.4 | 17080 | 17110 | 45.88 GiB | 49.90 GiB |
+| 32k | Strata SQ-15 | 4973.6 | 89.3 | 17394 | 18230 | 34.79 GiB | 35.93 GiB |
+| 76k | llama.cpp pos-mask | 2490.5 | 73.7 | 17074 | 17117 | 45.37 GiB | 50.30 GiB |
+| 76k | Strata SQ-15 | 3792.2 | 76.4 | 17650 | 18784 | 35.99 GiB | 35.80 GiB |
+
+Strata/llama.cpp speedup: 32k prefill **1.82x**, 32k decode **1.11x**; 76k prefill **1.52x**, 76k decode **1.04x**.
+
+### Reading the numbers
+
+- **Prefill**: Strata is still 1.5-1.8x faster than our pos-mask build on both requests. Section 6 already said the
+  pos-mask closes the *buffer* gap (no more `O(n_ctx)` mask), not necessarily the *compute* gap; this measurement
+  confirms a real prefill throughput gap remains, likely Strata's tiled cuBLAS prefill path (section 3) and/or other
+  engine-level differences (int8 KV means less data to move, different batching/thread tuning, etc.) — not isolated
+  further here.
+- **Decode**: much closer, 4-11% in Strata's favor, inside the kind of run-to-run noise seen in section 10 (step 3
+  noted "noise between runs is about 3%"), so decode speed is roughly at parity with drafting off on both sides.
+- **VRAM after load** is close (within a few hundred MiB) despite Strata's KV being int8 against our F16 — expected,
+  since this is not an apples-to-apples KV-format comparison (see setup notes) and Strata reserves a fixed
+  `vram-experts-gb` workspace (12.28 GB in the run config) independent of KV format.
+  **VRAM after generation grows noticeably more for Strata** across reps of the same session (32k: 17394 -> 18230 MiB,
+  +836 MiB over 3 distinct nonce'd prompts; 76k: 17650 -> 18784 MiB, +1134 MiB over 2) while llama.cpp stays flat
+  (within normal noise, 17080 -> 17110-17117 MiB). Plausible explanation: Strata's prompt/message-boundary cache keeps
+  more than one distinct conversation's KV resident (each nonce'd request looks like a brand new conversation to it),
+  while our pos-mask build's one `-np 1` slot simply overwrites. Not confirmed further; worth a follow-up if VRAM
+  headroom at long sessions matters.
+- 76k Strata rep1 generated only 100 tokens against rep0's 3283 (and llama.cpp's 3533-3739); this kind of generated-length
+  difference between runs/engines was already seen and is not a correctness signal by itself (section 10, step 0 item 9) —
+  temperature/seed reproduce the request but not across different engines or even across FP-nondeterministic reruns.
+
+Logs and scripts (git-ignored, not committed): `C:\Users\erokh\junie-local-project\kvq-scratch\strata-bench\` —
+`bench_client.py` (shared nonce'd client, both engines), `llama_session_32k.sh`/`llama_session_76k.sh`,
+`strata_session.sh`, and the `*_session.log` / `*_results.log` / `*_server.log` files per run.
+
+This section and its results are uncommitted (working-tree change only, per `AGENTS.md`: no agent commit without
+explicit human approval).
