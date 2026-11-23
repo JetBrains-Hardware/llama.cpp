@@ -8981,6 +8981,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * rel_table = dst->src[6];
+    const ggml_tensor * rel_kpos  = dst->src[7];
+    const ggml_tensor * rel_qpos  = dst->src[8];
+    const int64_t rel_extent = rel_table ? rel_table->ne[0] - 1 : 0;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9075,6 +9079,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
+        const float   * rb = rel_table ? (const float *) ((const char *) rel_table->data + iq2*rel_table->nb[1] + iq1*rel_table->nb[2] + iq3*rel_table->nb[3]) : nullptr;
+        const int32_t * kp = rel_table ? (const int32_t *) ((const char *) rel_kpos->data + iq3*rel_kpos->nb[1]) : nullptr;
+        const int32_t   qp = rel_table ? *(const int32_t *) ((const char *) rel_qpos->data + iq1*rel_qpos->nb[0] + iq3*rel_qpos->nb[1]) : 0;
+
         // k indices
         const int ik3 = iq3 / rk3;
         const int ik2 = iq2 / rk2;
@@ -9093,9 +9101,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
+            }
+            if (rb) {
+                const int64_t d = int64_t(qp) - kp[ic];
+                mv += rb[d >= 0 && d < rel_extent ? d : rel_extent];
             }
 
             const int64_t ik1 = rows ? rows[ic] : ic;
@@ -9616,7 +9628,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int nth = params->nth;
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
-    const bool use_ref = params->use_ref;
+    const bool use_ref = params->use_ref || dst->src[6] != nullptr;
 
     // with kv_rows the loops run over the mask columns, the split KV path does not support it
     const ggml_tensor * kv_rows = dst->src[5];

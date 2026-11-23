@@ -28,21 +28,26 @@ UD-Q4_K_M 16.61, UD-Q4_K_XL 17.63, UD-Q8_K_XL 22.87. Other sources: bartowski (i
 llama-bench, UD-Q3_K_XL (12.68 GiB): pp512 3184 t/s, pp2048 2521 t/s, tg128 92 t/s.
 
 VRAM (`-np 1`, includes ~0.4 GB idle): 14.6 GB at 4k context, 18.2 GB at 32k, 30.8 GB at 131k, i.e. 0.128 MiB per context token.
-KV looks large for a model where only 1 layer in 6 is global attention (hypothesis, not yet checked: sliding-window layers
-may get full-context cache slots).
+SWA layers are properly capped to a fixed 1,536-cell window (~240 MiB total); the ~96 KiB/tok compute scaling came from
+materializing the dense per-head relative-position bias (`kq_b` + `ggml_cont(ggml_permute(...))`, F32) before FlashAttention.
 
 ### Real Junie requests (replayed)
 
 Two requests captured from Junie CLI (profile `local-inkling-2-mini-q3kxl`, through mitmproxy) are replayed with
-`cache_prompt=false` (full prefill each time) and the original sampling and seed. Server: `-c 98304 -np 1`.
+`cache_prompt=false` (full prefill each time) and the original sampling and seed. Server: `-c 98304 -np 1 -fa on`.
 
-| Request | Prompt tokens | Prefill | Decode | Generated |
+Baseline (`8f2537201`) vs fused relative-position bias in FlashAttention (`hridaya423/llama.cpp` `68cd7533a`, `ggml_flash_attn_ext_add_rel_bias`):
+
+| Request | Mode | VRAM | Prefill | Generation |
 |---|---|---|---|---|
-| flow 144 (32k) | 32,144 | 1,400-1,460 t/s (22.0-23.0 s) | 78.5 t/s | 1,939 (3 reps, identical) |
-| flow 197 (76k) | 75,985 | 916 t/s (82.9 s) | 66.9 t/s | 802 (2 reps, identical) |
+| flow 144 (32k, 32,144 tok, 3 reps) | original (`8f2537201`) | 27,110-27,390 MiB (26.5-26.7 GiB) | 1,400-1,432 t/s (22.4-23.0 s) | 77.9-78.8 t/s (1,939 tok) |
+| flow 144 (32k, 32,144 tok, 3 reps) | + hridaya423 (`68cd7533a`) | 17,387-17,394 MiB (17.0 GiB) | 2,703-2,739 t/s (11.7-11.9 s) | 81.3-81.4 t/s (1,727 tok) |
+| flow 197 (76k, 75,985 tok, 2 reps) | original (`8f2537201`) | 26,984-27,006 MiB (26.4 GiB) | 916-917 t/s (82.9 s) | 66.7-67.1 t/s (802 tok) |
+| flow 197 (76k, 75,985 tok, 2 reps) | + hridaya423 (`68cd7533a`) | 17,386-17,530 MiB (17.0-17.1 GiB) | 2,401-2,492 t/s (30.5-31.7 s) | 71.6-73.6 t/s (2,832 tok) |
 
-Server VRAM with `-c 98304` is about 27 GB in both cases. The generated length differs from the original run (1,489 and 3,174)
-because the original had cached prefixes; speeds, not lengths, are the comparison.
+Server VRAM after load drops from ~27.0 GiB to 17,358 MiB (16.95 GiB) with `-c 98304`, with `0` graph reallocations.
+Generated lengths differ from baseline (and from the original cached-prefix run: 1,489 and 3,174) because relative bias is
+accumulated in FP32 inside FlashAttention instead of cast through an FP16 mask; repeats remain deterministic.
 Real Junie traffic rarely generates much: of 190 requests only a handful produced more than 600 tokens.
 
 ## Local tools (not committed)

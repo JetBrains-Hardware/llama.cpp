@@ -154,7 +154,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) && dst->src[5] == nullptr &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
-        mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+        mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 && dst->src[6] == nullptr &&
         K->ne[1] >= std::max<int64_t>(4096, GGML_CUDA_CC_IS_NVIDIA(cc) ? 2*n_gather : 2LL*n_kv_max);
 #endif // !defined(GGML_USE_MUSA)
 }
@@ -217,7 +217,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     //     are put into the template specialization without GQA optimizations.
     // a mask with a head dimension is not shared by the Q heads of a K/V head
     // without a mask the GQA kernels run only for the log-sum-exp (key blocks of a merged attention)
-    bool use_gqa_opt = (mask ? mask->ne[2] == 1 : ggml_flash_attn_ext_get_lse(KQV)) && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = (mask ? mask->ne[2] == 1 : ggml_flash_attn_ext_get_lse(KQV)) && dst->src[6] == nullptr && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -602,7 +602,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, if the mask has a head dimension,
     //     or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && dst->src[6] == nullptr && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -670,6 +670,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    if (dst->src[6] && !(GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc))) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     if (mask && mask->ne[2] != 1) {
         // the kv_rows mask is compacted per sequence, it has no head dimension
         if (kv_rows) {
@@ -725,7 +729,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
     int gqa_ratio_eff = 1;
-    while (max_bias == 0.0f && (!mask || mask->ne[2] == 1) && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
+    while (max_bias == 0.0f && (!mask || mask->ne[2] == 1 && dst->src[6] == nullptr) && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
         gqa_ratio_eff *= 2;
     }
 

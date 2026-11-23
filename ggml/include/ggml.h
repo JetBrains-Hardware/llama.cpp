@@ -2311,6 +2311,18 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // per-head relative-position bias gathered by the query-key distance, added to the masked KQ logits:
+    //   kq[k, q, h] += table[d < E ? d : E, h, q], d = qpos[q] - kpos[k] (d < 0 counts as E), E = table->ne[0] - 1
+    // table: [E + 1, n_head, n_batch, ne3] F32
+    // kpos:  [n_kv,  ne3]                  I32, positions of the K/V cells
+    // qpos:  [n_batch, ne3]                I32, positions of the queries
+    // the mask must not have a head dimension
+    GGML_API void ggml_flash_attn_ext_add_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * kpos,
+            struct ggml_tensor * qpos);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
