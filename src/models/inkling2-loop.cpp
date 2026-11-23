@@ -105,10 +105,15 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     std::vector<ggml_tensor *> blocks;
     const uint32_t block_sz = hparams.attn_res_block_size;
     const int lead = kvq_lead();
+
+    // DSpark target features are indexed by layer visit, not by cache slot
+    int visit = 0;
+
     for (int il = 0; il < start; ++il) {
         if (lead > 0 && il + lead < start && !hparams.is_swa(il + lead) && il / block_sz == (il + lead) / block_sz) {
             build_kvq_prefetch(il + lead, cur, blocks);
         }
+        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
 
@@ -133,6 +138,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 build_kvq_prefetch(il_tgt, cur, blocks, pass > 0 ? &bank : nullptr, bank_out,
                         pass > 0 ? &m.loop_layers[ip_tgt - start] : nullptr);
             }
+            res->t_layer_inp[visit++] = cur;
             if (pass == 0) {
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
@@ -146,7 +152,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         if (lead > 0 && il + lead < m.n_phys && !hparams.is_swa(il + lead) && il / block_sz == (il + lead) / block_sz) {
             build_kvq_prefetch(il + lead, cur, blocks);
         }
+        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
+    GGML_ASSERT(visit == n_layer);
     build_output(cur, blocks);
 }
