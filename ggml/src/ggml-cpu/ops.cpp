@@ -11960,18 +11960,20 @@ void ggml_compute_forward_kvq_attn(
     const int32_t n_crow = ggml_get_op_params_i32(dst, 1);
     const int32_t mode   = ggml_get_op_params_i32(dst, 2);
 
-    const bool do_attn  = mode == GGML_KVQ_ATTN;
+    const bool do_lse   = mode == GGML_KVQ_ATTN_LSE;
+    const bool do_attn  = mode == GGML_KVQ_ATTN || do_lse;
     const bool do_score = mode == GGML_KVQ_SCORE;
 
     const int64_t D        = q->ne[0];
     const int64_t n_head   = q->ne[1];
     const int64_t L        = q->ne[2];
     const int64_t S        = q->ne[3];
-    const int64_t G        = k->ne[2];
+    const int64_t G        = k ? k->ne[2] : kc->ne[2];
     const int64_t n_rep    = n_head/G;
-    const int64_t n_tail   = k->ne[1];
+    const int64_t n_tail   = k ? k->ne[1] : 0;
     const int64_t n_coarse_max = kc ? ggml_get_op_params_i32(dst, 3) : 0;
     const int64_t cap      = rkv ? rkv->ne[1] : 0;
+    const int64_t dst_s3   = do_attn ? (int64_t) (dst->nb[3]/sizeof(float)) : 0;
 
     // the stream of the current task: its coarse rows and chunks, its row of the page table
     int64_t s_cur    = 0;
@@ -12142,9 +12144,13 @@ void ggml_compute_forward_kvq_attn(
                 mx = std::max(mx, lp[s]);
             }
 
-            float * oh = out_attn + D*(h + n_head*(l + L*st));
+            float * oh = out_attn + st*dst_s3 + D*(h + n_head*l);
+            float * lh = do_lse ? out_attn + st*dst_s3 + D*n_head*L + h + n_head*l : nullptr;
             if (!(mx > -INFINITY)) {
                 std::fill(oh, oh + D, 0.0f);
+                if (lh) {
+                    *lh = -INFINITY;
+                }
                 continue;
             }
 
@@ -12212,6 +12218,9 @@ void ggml_compute_forward_kvq_attn(
 
             for (int64_t i = 0; i < D; i++) {
                 oh[i] = (float) (acc[i]/z);
+            }
+            if (lh) {
+                *lh = z > 0.0 ? (float) (mx + std::log(z)) : -INFINITY;
             }
         }
     }

@@ -3524,7 +3524,31 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (params.kvq_tail > 0 && llama_model_supports_kvq(this)) {
+                        // the two-tier KV cache (with optional SWA cache for hybrid-iswa architectures)
+                        res = new llama_memory_hybrid_kvq(
+                            /* model             */ *this,
+                            /* no_alloc          */ params.no_alloc,
+                            /* attn_type_k       */ params.type_k,
+                            /* attn_type_v       */ params.type_v,
+                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_swa_type     */ hparams.swa_type,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* rs_replay         */ cparams.rs_replay,
+                            /* offload           */ cparams.offload_kqv,
+                            /* unified           */ cparams.kv_unified,
+                            /* filter_attn       */ std::move(filter_attn),
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* tail              */ params.kvq_tail,
+                            /* attn_swa_full     */ params.swa_full,
+                            /* attn_n_ubatch     */ cparams.n_ubatch);
+                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
@@ -3566,28 +3590,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
-                    } else if (params.kvq_tail > 0 && llama_model_supports_kvq(this)) {
-                        // the two-tier KV cache
-                        res = new llama_memory_hybrid_kvq(
-                            /* model             */ *this,
-                            /* no_alloc          */ params.no_alloc,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
-                            /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                            /* n_seq_max         */ cparams.n_seq_max,
-                            /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* rs_replay         */ cparams.rs_replay,
-                            /* offload           */ cparams.offload_kqv,
-                            /* unified           */ cparams.kv_unified,
-                            /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr),
-                            /* tail              */ params.kvq_tail);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -4260,13 +4262,16 @@ bool llama_model_supports_kvq(const struct llama_model * model, std::string * re
 
     uint32_t n_head    = 0;
     uint32_t n_head_kv = 0;
+    uint32_t head_dim  = 0;
     for (uint32_t il = 0; il < hp.n_layer(); ++il) {
         if (hp.is_recr(il)) {
             continue;
         }
-        if (hp.n_embd_head_k(il) != 256 || hp.n_embd_head_v(il) != 256) {
-            return fail("the attention head size must be 256 for K and V (layer " + std::to_string(il) + " has " +
-                    std::to_string(hp.n_embd_head_k(il)) + " and " + std::to_string(hp.n_embd_head_v(il)) + ")");
+        const uint32_t dk = hp.n_embd_head_k(il);
+        const uint32_t dv = hp.n_embd_head_v(il);
+        if ((dk != 128 && dk != 256) || dk != dv) {
+            return fail("the attention head size must be 128 or 256 for K and V (layer " + std::to_string(il) + " has " +
+                    std::to_string(dk) + " and " + std::to_string(dv) + ")");
         }
         if (hp.n_head_kv(il) == 0 || hp.n_head(il) % hp.n_head_kv(il) != 0) {
             return fail("layer " + std::to_string(il) + " needs a whole number of query heads per kv head");
@@ -4274,8 +4279,9 @@ bool llama_model_supports_kvq(const struct llama_model * model, std::string * re
         if (n_head == 0) {
             n_head    = hp.n_head(il);
             n_head_kv = hp.n_head_kv(il);
-        } else if (hp.n_head(il) != n_head || hp.n_head_kv(il) != n_head_kv) {
-            return fail("all attention layers must have the same number of heads and kv heads");
+            head_dim  = dk;
+        } else if (hp.n_head(il) != n_head || hp.n_head_kv(il) != n_head_kv || dk != head_dim) {
+            return fail("all full-attention layers must have the same head size and number of heads and kv heads");
         }
     }
     if (n_head == 0) {

@@ -2624,19 +2624,21 @@ extern "C" {
     // logits: s = scale*(q . k) + mask[row, l], for a coarse row with the decoded K row
     // a resident slot overrides its coarse row for the attention of its kv head; slots of a kv head must hold distinct rows
     //
-    // CUDA (Ampere or newer): D == 256, L <= 8, (n_head/G)*L <= 48, nwk <= 32, nwv <= 32, k/v/rkv row strides multiple of 16 bytes
+    // CUDA (Ampere or newer): D in {128, 256}, L <= 8, (n_head/G)*L <= 48, nwk <= 32, nwv <= 32, k/v/rkv row strides multiple of 16 bytes (8 for D=128)
     //
-    // mode GGML_KVQ_ATTN:  res [D, n_head, L, S] f32 = sum_j w_j v_j, w = softmax over the non-resident coarse rows (coarse K/V),
-    //                      the resident slots (precise K/V) and the tail rows (precise K/V)
-    // mode GGML_KVQ_SCORE: res [n_coarse_max, G, L, S] f32, sum over the query heads of kv head g of softmax over all coarse rows
-    //                      (coarse K, resident or not) and the tail rows (precise K), at the coarse rows; needs kc,
-    //                      vc, v, rkv, ridx are unused; the rows of a stream at or after its n_coarse are 0
+    // mode GGML_KVQ_ATTN:     res [D, n_head, L, S] f32 = sum_j w_j v_j, w = softmax over the non-resident coarse rows (coarse K/V),
+    //                         the resident slots (precise K/V) and the tail rows (precise K/V)
+    // mode GGML_KVQ_SCORE:    res [n_coarse_max, G, L, S] f32, sum over the query heads of kv head g of softmax over all coarse rows
+    //                         (coarse K, resident or not) and the tail rows (precise K), at the coarse rows; needs kc,
+    //                         vc, v, rkv, ridx are unused; the rows of a stream at or after its n_coarse are 0
+    // mode GGML_KVQ_ATTN_LSE: same as GGML_KVQ_ATTN, with ne[2] = L + ceil(L/D); log-sum-exp [n_head, L] f32 per stream starts at L*nb[2]
     //
     // an all -inf row of weights gives 0
     //
     enum ggml_kvq_mode {
-        GGML_KVQ_ATTN  = 1,
-        GGML_KVQ_SCORE = 2,
+        GGML_KVQ_ATTN     = 1,
+        GGML_KVQ_SCORE    = 2,
+        GGML_KVQ_ATTN_LSE = 3,
     };
 
     #define GGML_KVQ_MAX_STREAM 8

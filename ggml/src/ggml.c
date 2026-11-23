@@ -6752,10 +6752,12 @@ struct ggml_tensor * ggml_kvq_attn_streams(
         const int           * n_coarse_s,
         int                   n_chunk_rows,
         int                   mode) {
-    GGML_ASSERT(mode == GGML_KVQ_ATTN || mode == GGML_KVQ_SCORE);
-    const bool attn  = mode == GGML_KVQ_ATTN;
+    GGML_ASSERT(mode == GGML_KVQ_ATTN || mode == GGML_KVQ_SCORE || mode == GGML_KVQ_ATTN_LSE);
+    const bool lse   = mode == GGML_KVQ_ATTN_LSE;
+    const bool attn  = mode == GGML_KVQ_ATTN || lse;
     const bool score = mode == GGML_KVQ_SCORE;
     GGML_ASSERT(!score || kc);
+    GGML_ASSERT(k || kc);
 
     const int64_t D      = q->ne[0];
     const int64_t n_head = q->ne[1];
@@ -6764,13 +6766,15 @@ struct ggml_tensor * ggml_kvq_attn_streams(
     GGML_ASSERT(q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float));
     GGML_ASSERT(S >= 1 && S <= GGML_KVQ_MAX_STREAM);
 
-    GGML_ASSERT(k->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(k->ne[0] == D && k->ne[1] >= 1 && k->ne[3] == S);
-    const int64_t G      = k->ne[2];
-    const int64_t n_tail = k->ne[1];
+    if (k) {
+        GGML_ASSERT(k->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(k->ne[0] == D && k->ne[1] >= 1 && k->ne[3] == S);
+    }
+    const int64_t G      = k ? k->ne[2] : kc->ne[2];
+    const int64_t n_tail = k ? k->ne[1] : 0;
     GGML_ASSERT(n_head % G == 0);
 
-    if (attn) {
+    if (attn && k) {
         GGML_ASSERT(v && v->type == k->type);
         GGML_ASSERT(v->ne[0] == D && v->ne[1] == n_tail && v->ne[2] == G && v->ne[3] == S);
     }
@@ -6815,7 +6819,8 @@ struct ggml_tensor * ggml_kvq_attn_streams(
         }
     }
 
-    struct ggml_tensor * result = attn ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head, L, S) : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_coarse, G, L, S);
+    const int64_t n_lse = lse ? (L + D - 1)/D : 0;
+    struct ggml_tensor * result = attn ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head, L + n_lse, S) : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_coarse, G, L, S);
 
     int32_t params[5 + GGML_KVQ_MAX_STREAM] = { 0, n_chunk_rows, mode, n_coarse, (int32_t) S };
     for (int64_t s = 0; s < S; s++) {

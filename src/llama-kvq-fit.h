@@ -61,7 +61,7 @@ public:
     void remove(int32_t seq, llama_pos p0);
 
     // the smallest shared memory of the store for a fit of one layer per group, n_stage rows per job
-    static size_t shared_min(int32_t n_head_kv, int32_t n_stage, int32_t bits_k, int32_t bits_v);
+    static size_t shared_min(int64_t head_dim, int32_t n_head_kv, int32_t n_stage, int32_t bits_k, int32_t bits_v);
 
     // the rows of the largest job
     static int32_t stage_rows(int32_t n_rows, const llama_kvq_fit_params & fparams);
@@ -101,6 +101,9 @@ private:
     };
 
     llama_kvq_store & store;
+
+    const int64_t KVQ_D;
+    const size_t  KVQ_ROW;
 
     const llama_kvq_fit_params fparams;
 

@@ -187,8 +187,9 @@ struct llama_kvq_store::gather_pool {
     void part(int ith, int nth) const {
         const int64_t i0 = n*ith/nth;
         const int64_t i1 = n*(ith + 1)/nth;
+        const size_t row = st->ROW;
         for (int64_t i = i0; i < i1; ++i) {
-            memcpy(dst + 2*i*ROW, st->row_ptr(st->ub_seq[fetch[i].st], li, fetch[i].g, fetch[i].row), 2*ROW);
+            memcpy(dst + 2*i*row, st->row_ptr(st->ub_seq[fetch[i].st], li, fetch[i].g, fetch[i].row), 2*row);
         }
     }
 
@@ -347,9 +348,14 @@ static int kvq_popcount(uint64_t x) {
     return (int) ((x*0x0101010101010101ull) >> 56);
 }
 
-llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
-        int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min, bool host_prealloc, size_t host_max_bytes, size_t host_keep_bytes) :
-    n_rows_(n_rows), n_crow(n_chunk_rows) {
+llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
+        int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min, bool host_prealloc, size_t host_max_bytes, size_t host_keep_bytes,
+        const std::vector<int32_t> & layer_order) :
+    n_rows_(n_rows), n_crow(n_chunk_rows),
+    D(head_dim), ROW((size_t) (head_dim/32)*34), TAB_SLOT((size_t) head_dim*head_dim + (size_t) 3*head_dim*sizeof(float)) {
+    if (D != 128 && D != 256) {
+        throw std::runtime_error("packed two-tier mode supports head size 128 or 256 only");
+    }
     if (kv.get_n_stream() != 1 && kv.get_n_stream() != kv.get_n_seq_max()) {
         throw std::runtime_error("packed two-tier mode needs one KV stream or one per sequence");
     }
@@ -371,7 +377,13 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
     cap_tot = n_sink + cap + 1;
     n_bmw   = (n_rows + 63)/64;
 
-    const auto ids = kv.get_layer_ids();
+    std::vector<int32_t> ids;
+    if (!layer_order.empty()) {
+        ids = layer_order;
+    } else {
+        const auto kv_ids = kv.get_layer_ids();
+        ids.assign(kv_ids.begin(), kv_ids.end());
+    }
     GGML_ASSERT(!ids.empty());
 
     const auto & cells = kv.get_cells(0);
@@ -397,7 +409,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int3
         l.cnt.il  = l.il;
         l.li      = i;
         if (l.k_cache->type != GGML_TYPE_Q8_0 || l.v_cache->type != GGML_TYPE_Q8_0 || l.k_cache->ne[0] % D != 0 || l.v_cache->ne[0] != l.k_cache->ne[0]) {
-            throw std::runtime_error("packed two-tier mode needs a q8_0 K and V cache with head size 256");
+            throw std::runtime_error("packed two-tier mode needs a q8_0 K and V cache matching head size");
         }
         const ggml_backend_buffer_type_t b = ggml_backend_buffer_get_type(l.k_cache->buffer);
         if (buft != nullptr && b != buft) {

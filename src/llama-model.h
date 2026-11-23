@@ -1062,6 +1062,9 @@ struct llama_model {
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
+    // execution order of full-attention slots for KVQ (empty = default ascending layer id order)
+    virtual std::vector<int32_t> kvq_layer_order() const { return {}; }
+
     // graph size budget: max graph nodes per model tensor
     virtual uint32_t graph_nodes_per_tensor() const { return 8; }
 

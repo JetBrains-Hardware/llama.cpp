@@ -46,7 +46,9 @@ public:
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-                 uint32_t   n_tail);
+                 uint32_t   n_tail,
+                     bool   swa_full = false,
+                 uint32_t   n_ubatch = 0);
 
     ~llama_memory_hybrid_kvq() = default;
 
@@ -60,6 +62,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     // the reserve of the packed decode graph: n_streams() sequences of max_batch tokens each, every coarse region at its largest
     // (0 if the packed path has one stream only, or no store)
@@ -112,6 +115,9 @@ public:
     bool fit_get_progress(llama_seq_id seq, llama_kvq_fit_progress & out) const;
     bool fit_set_hold(bool hold);
 
+    // nullptr if the model has no SWA layers
+    llama_kv_cache * get_mem_swa() const { return mem_swa.get(); }
+
     // nullptr before fit_enable
     llama_kvq_store * get_store() const { return store.get(); }
 
@@ -138,7 +144,9 @@ private:
 
     const llama_model & model;
 
-    const uint32_t n_ctx_max; // positions of the context
+    const uint32_t  n_ctx_max; // positions of the context
+    const llama_pos rel_keep;  // trailing positions kept precise in the ring for relative-position bias (0 if none)
+    std::unique_ptr<llama_kv_cache> mem_swa;
 
     // the state of one sequence (one per sequence of the memory, sized in fit_enable)
     struct seq_state {
@@ -200,10 +208,17 @@ public:
     // used to create the full-cache context of the packed decode reserve (two-tier mode is on, see init_full_packed)
     llama_memory_hybrid_kvq_context(llama_memory_hybrid_kvq * mem, bool packed_reserve);
 
+    // used to create an update context
+    llama_memory_hybrid_kvq_context(
+            llama_memory_hybrid_kvq * mem,
+                      llama_context * lctx,
+                               bool   optimize);
+
     // used to create a batch processing context from a batch
     llama_memory_hybrid_kvq_context(
             llama_memory_hybrid_kvq * mem,
                     slot_info_vec_t   sinfos_attn,
+                    slot_info_vec_t   sinfos_swa,
           std::vector<llama_ubatch>   ubatches);
 
     bool next()  override;
@@ -220,6 +235,9 @@ public:
     // the packed decode reserve: the graph is built for the largest coarse region of every stream, nothing is executed
     bool packed_reserve() const { return is_packed_reserve; }
 
+    // nullptr if the model has no SWA layers
+    const llama_kv_cache_context * get_swa() const;
+
     // nullptr if not enabled
     llama_kvq_store * get_store() const { return store; }
 
@@ -227,6 +245,9 @@ public:
     // early (if not null): the same without the positions of the ubatch and later
     // the ubatch is S sequences of L tokens (equal split): mask F16 [n_coarse_max + n_kv, L, 1, S], n_coarse_s the coarse rows of each
     void set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, const std::vector<int32_t> & n_coarse_s) const;
+
+    // tail-only mask [n_kv, L, 1, S] (F16) and cell positions [n_kv, S] (I32) for relative-position bias ring attention
+    void set_input_kvq_ring_tail(ggml_tensor * mask, ggml_tensor * kpos, const llama_ubatch * ubatch, const std::vector<int32_t> & n_coarse_s) const;
 
     // tail: mask F16 [n_rows - r0, n_tokens] over the scratch rows [r0, n_rows), row r = position r: the rows of the host store [0, n_host) kept, the others causal if the ring has them
     void set_input_kvq_scr(ggml_tensor * mask, const llama_ubatch * ubatch, int32_t n_host, int64_t r0) const;
@@ -239,6 +260,8 @@ public:
 
 private:
     const llama_kv_cache * kv_attn = nullptr;
+
+    llama_memory_context_ptr ctx_swa;
 
     // batch processing context only
     llama_memory_hybrid_kvq * mem_kvq = nullptr;

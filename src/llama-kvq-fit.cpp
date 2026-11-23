@@ -14,9 +14,6 @@
 #include <unordered_map>
 #include <stdexcept>
 
-static constexpr int64_t KVQ_D   = llama_kvq_store::D;
-static constexpr size_t  KVQ_ROW = llama_kvq_store::ROW;
-
 static double kvq_fit_now() {
     return ggml_time_us()*1e-6;
 }
@@ -55,20 +52,22 @@ int32_t llama_kvq_fitter::stage_rows(int32_t n_rows, const llama_kvq_fit_params 
     return std::min<int32_t>(n_rows, fparams.rem == LLAMA_KVQ_REM_MERGE ? 2*fparams.chunk - 1 : fparams.chunk);
 }
 
-size_t llama_kvq_fitter::shared_min(int32_t n_head_kv, int32_t n_stage, int32_t bits_k, int32_t bits_v) {
+size_t llama_kvq_fitter::shared_min(int64_t head_dim, int32_t n_head_kv, int32_t n_stage, int32_t bits_k, int32_t bits_v) {
+    const int64_t D    = head_dim;
+    const size_t  ROW  = (size_t) (D/32)*34;
     const size_t G     = n_head_kv;
     const size_t rows  = (size_t) n_stage*G;
-    const size_t words = (size_t) (bits_k*KVQ_D + 31)/32 + (bits_v*KVQ_D + 31)/32 + 1;
-    const size_t fixed = rows*2*KVQ_ROW + rows*words*sizeof(int32_t);
-    const size_t tab1  = 2*G*(2*KVQ_D + 3)*KVQ_D*sizeof(float);
+    const size_t words = (size_t) (bits_k*D + 31)/32 + (bits_v*D + 31)/32 + 1;
+    const size_t fixed = rows*2*ROW + rows*words*sizeof(int32_t);
+    const size_t tab1  = 2*G*(2*D + 3)*D*sizeof(float);
     // a graph of one layer holds at most three f32 copies of the rows of one of K and V
-    const size_t inter = 3*rows*KVQ_D*sizeof(float);
-    return fixed + tab1 + std::max(inter, ggml_kvq_fit_table_work_size(KVQ_D, 2*G)) + (8u << 20);
+    const size_t inter = 3*rows*D*sizeof(float);
+    return fixed + tab1 + std::max(inter, ggml_kvq_fit_table_work_size(D, 2*G)) + (8u << 20);
 }
 
 llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_params & fparams,
         const std::vector<const ggml_tensor *> & wo, int32_t n_head, int32_t min_first) :
-    store(store), fparams(fparams), min_first(min_first), layer_ids(store.layer_ids()), n_head(n_head), wo(wo) {
+    store(store), KVQ_D(store.head_dim()), KVQ_ROW(store.row_bytes()), fparams(fparams), min_first(min_first), layer_ids(store.layer_ids()), n_head(n_head), wo(wo) {
     const int32_t G     = store.n_head_kv();
     const int32_t C     = store.n_chunk_rows();
     const int32_t n_chk = store.n_chunks();
@@ -102,7 +101,7 @@ llama_kvq_fitter::llama_kvq_fitter(llama_kvq_store & store, const llama_kvq_fit_
         const ggml_tensor * ga = store.get_gacc(0, layer_ids[li]);
         if (w == nullptr || ga == nullptr || ggml_n_dims(w) != 2 || w->ne[0] != (int64_t) n_head*KVQ_D || ga->ne[0] != w->ne[0] ||
                 (w->type != GGML_TYPE_F32 && ggml_get_type_traits(w->type)->to_float == nullptr) ||
-                (n_rep*KVQ_D) % ggml_blck_size(w->type) != 0) {
+                w->ne[0] % ggml_blck_size(w->type) != 0) {
             throw std::runtime_error(format("per-chunk V: unsupported o_proj weight or no gate statistics in layer %d", layer_ids[li]));
         }
     }
@@ -396,24 +395,27 @@ void llama_kvq_fitter::compute_wo_gram(int32_t p) {
     const int32_t       g = p % G;
     const ggml_tensor * w = wo[p / G];
 
+    const int64_t n_in  = w->ne[0];
     const int64_t n_out = w->ne[1];
     const int64_t nc    = (int64_t) n_rep*KVQ_D; // the columns of kv head g
-    const size_t  off   = ggml_row_size(w->type, g*nc);
+    const bool    full_row = nc % ggml_blck_size(w->type) != 0;
+    const size_t  off   = full_row ? 0 : ggml_row_size(w->type, g*nc);
 
     std::vector<uint8_t> raw(ggml_nbytes(w));
     ggml_backend_tensor_get(w, raw.data(), 0, raw.size());
 
     std::vector<double> gram((size_t) n_rep*KVQ_D*KVQ_D, 0.0);
-    std::vector<float>  x(nc);
+    std::vector<float>  x(full_row ? n_in : nc);
     for (int64_t o = 0; o < n_out; ++o) {
         const uint8_t * src = raw.data() + o*w->nb[1] + off;
         if (w->type == GGML_TYPE_F32) {
-            memcpy(x.data(), src, nc*sizeof(float));
+            memcpy(x.data(), src, x.size()*sizeof(float));
         } else {
-            ggml_get_type_traits(w->type)->to_float(src, x.data(), nc);
+            ggml_get_type_traits(w->type)->to_float(src, x.data(), x.size());
         }
+        const float * xg = full_row ? x.data() + g*nc : x.data();
         for (int32_t r = 0; r < n_rep; ++r) {
-            const float * xr = x.data() + r*KVQ_D;
+            const float * xr = xg + r*KVQ_D;
             double      * gr = gram.data() + (size_t) r*KVQ_D*KVQ_D;
             for (int64_t i = 0; i < KVQ_D; ++i) {
                 for (int64_t j = 0; j < KVQ_D; ++j) {
@@ -458,7 +460,8 @@ void llama_kvq_fitter::compute_wo_gram_dev(std::vector<char> & on_dev) {
     int n_dev = 0;
     for (int32_t p = 0; p < (int32_t) on_dev.size(); ++p) {
         ggml_tensor * w = const_cast<ggml_tensor *>(wo[p / G]);
-        if (w->buffer == nullptr || ggml_backend_buffer_get_type(w->buffer) != store.dev_buft()) {
+        if (w->buffer == nullptr || ggml_backend_buffer_get_type(w->buffer) != store.dev_buft() ||
+                KVQ_D % ggml_blck_size(w->type) != 0) {
             continue;
         }
         ggml_init_params gp = { graph_meta.size(), graph_meta.data(), true };
@@ -1211,7 +1214,7 @@ void llama_kvq_fitter::state_read_meta(llama_io_read_i & io) const {
 }
 
 static size_t kvq_fit_n_gram(const llama_kvq_store & store) {
-    return (size_t) KVQ_D*KVQ_D*store.n_head_kv()*store.layer_ids().size();
+    return (size_t) store.head_dim()*store.head_dim()*store.n_head_kv()*store.layer_ids().size();
 }
 
 // the fitted range of each chunk slot of the coarse region, the statistics of the complete chunks, the device sums of the open chunk

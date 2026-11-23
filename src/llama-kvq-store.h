@@ -67,8 +67,9 @@ class llama_io_read_i;
 //   scratch join: before the attention of layer il, the main stream waits for the uploads
 class llama_kvq_store {
 public:
-    static constexpr int64_t D   = 256;
-    static constexpr size_t  ROW = 272; // q8_0 row of D values
+    int64_t head_dim()  const { return D; }
+    size_t  row_bytes() const { return ROW; }
+    size_t  tab_slot()  const { return TAB_SLOT; }
 
     enum kind {
         KIND_PREFETCH = 0,
@@ -102,9 +103,10 @@ public:
     // n_gate > 0: also the gate statistics tensors, n_gate = n_head*D
     // layer_bufs: device buffers of the resident rows (llama_kvq_params::layer_bufs)
     // shared_min: the smallest shared memory (the fitter works in it, llama_kvq_fitter::shared_min)
-    llama_kvq_store(const llama_kv_cache & kv, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
+    llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
             int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate = 0, size_t shared_min = 0,
-            bool host_prealloc = false, size_t host_max_bytes = 0, size_t host_keep_bytes = 0);
+            bool host_prealloc = false, size_t host_max_bytes = 0, size_t host_keep_bytes = 0,
+            const std::vector<int32_t> & layer_order = {});
     ~llama_kvq_store();
 
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
@@ -465,9 +467,9 @@ private:
         const size_t  nb = (size_t) (is_v ? nwv + 1 : nwk)*sizeof(int32_t);
         return (is_v ? pages->vc_ptr(pg, (int32_t) li) : pages->kc_ptr(pg, (int32_t) li)) + ((size_t) g*pages->rows(pg) + pos%n_crow)*nb;
     }
-    // slot m = 2*g + (V ? 1 : 0) of the tables of chunk c
-    // (a slot: the inverse table, D*D bytes, then the aux floats, 3*D)
-    static constexpr size_t TAB_SLOT = (size_t) D*D + (size_t) 3*D*sizeof(float);
+    const int64_t D;
+    const size_t  ROW;      // q8_0 row of D values
+    const size_t  TAB_SLOT; // inverse table (D*D bytes) + aux floats (3*D)
     uint8_t * htab_ptr (int32_t s, size_t li, int32_t c, int32_t m) const {
         GGML_ASSERT(seqs[s].page_tab[c] >= 0 && "kvq: the tables of a chunk without a page");
         return pages->tab_ptr(seqs[s].page_tab[c], (int32_t) li) + (size_t) m*TAB_SLOT;
