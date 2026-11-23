@@ -4466,6 +4466,127 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// Gather positional-bias rows into their final [key, query, head, stream] layout.
+template <bool fuse_mask>
+static __global__ void gather_attention_bias(
+        const float * __restrict__ table, const int32_t * __restrict__ distances,
+        const half * __restrict__ mask, void * __restrict__ output,
+        int keys, int positions, int heads, int queries) {
+    constexpr int tile_keys = 128;
+    __shared__ int32_t selected[tile_keys];
+
+    const int start = blockIdx.x * tile_keys;
+    const int flat_query = blockIdx.y;
+    const int stream = flat_query / queries;
+    const int query = flat_query % queries;
+    const int64_t qi = int64_t(flat_query) * keys;
+    const float * table_query = table + int64_t(flat_query) * heads * positions;
+    ggml_cuda_pdl_sync();
+
+    for (int i=threadIdx.y*32+threadIdx.x; i<tile_keys; i+=blockDim.x*blockDim.y) {
+        if (start+i < keys) {
+            selected[i] = distances[qi+start+i];
+        }
+    }
+    __syncthreads();
+
+    for (int head=threadIdx.y; head<heads; head+=blockDim.y) {
+        const int64_t row = (int64_t(stream)*heads+head)*queries+query;
+#pragma unroll
+        for (int step=0;step<tile_keys/32;++step) {
+            const int local = threadIdx.x+step*32;
+            const int key = start+local;
+            if (key < keys) {
+                const float val = table_query[int64_t(selected[local])*heads+head];
+                if constexpr (fuse_mask) {
+                    static_cast<half *>(output)[row*keys+key] = __float2half_rn(val+__half2float(mask[qi+key]));
+                } else {
+                    static_cast<float *>(output)[row*keys+key] = val;
+                }
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+
+static int ggml_cuda_try_fuse_gather_attention_bias(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    const auto * gather = graph->nodes[i];
+    if (gather->op != GGML_OP_GET_ROWS || gather->type != GGML_TYPE_F32 || i+3 >= graph->n_nodes) {
+        return 0;
+    }
+    const auto * table = gather->src[0];
+    const auto * distances = gather->src[1];
+    const auto * reshape = graph->nodes[i+1];
+    const auto * permute = graph->nodes[i+2];
+    const auto * cont = graph->nodes[i+3];
+    const int keys = cont->ne[0];
+    const int queries = cont->ne[1];
+    const int heads = cont->ne[2];
+    const int streams = cont->ne[3];
+    if (reshape->op != GGML_OP_RESHAPE || permute->op != GGML_OP_PERMUTE || cont->op != GGML_OP_CONT ||
+            reshape->src[0] != gather || permute->src[0] != reshape || cont->src[0] != permute ||
+            !ggml_are_same_shape(permute,cont) ||
+            reshape->ne[0] != heads || reshape->ne[1] != keys || reshape->ne[2] != queries || reshape->ne[3] != streams ||
+            permute->nb[0] != reshape->nb[1] || permute->nb[1] != reshape->nb[2] ||
+            permute->nb[2] != reshape->nb[0] || permute->nb[3] != reshape->nb[3] ||
+            keys < 256 || queries < 32 || int64_t(queries)*streams > 65535 || heads < 2 ||
+            table->type != GGML_TYPE_F32 || distances->type != GGML_TYPE_I32 || cont->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(table) || !ggml_is_contiguous(gather) ||
+            !ggml_is_contiguous(distances) || !ggml_is_contiguous(cont) ||
+            table->ne[0] != heads || table->ne[2] != int64_t(queries)*streams || table->ne[3] != 1 ||
+            distances->ne[0] != keys || distances->ne[1] != int64_t(queries)*streams ||
+            distances->ne[2] != 1 || distances->ne[3] != 1 ||
+            gather->ne[0] != heads || gather->ne[1] != keys ||
+            gather->ne[2] != int64_t(queries)*streams || gather->ne[3] != 1) {
+        return 0;
+    }
+
+    const ggml_op ops[] = { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT,
+                           GGML_OP_CPY, GGML_OP_ADD, GGML_OP_CPY };
+    const ggml_tensor * output = cont;
+    const ggml_tensor * mask = nullptr;
+    int count = 4;
+    int output_index = i+3;
+
+    if (i+6 < graph->n_nodes) {
+        const auto * cast_in = graph->nodes[i+4];
+        const auto * sum = graph->nodes[i+5];
+        const auto * cast_out = graph->nodes[i+6];
+        const auto * raw_mask = cast_in->src[0];
+        const int last = i+6;
+        if (cast_in->op == GGML_OP_CPY && sum->op == GGML_OP_ADD && cast_out->op == GGML_OP_CPY &&
+                cast_in->src[1] == cast_in && cast_out->src[1] == cast_out &&
+                ((sum->src[0] == cont && sum->src[1] == cast_in) || (sum->src[0] == cast_in && sum->src[1] == cont)) &&
+                cast_out->src[0] == sum && ggml_are_same_shape(cast_out,cont) &&
+                cast_in->type == GGML_TYPE_F32 && sum->type == GGML_TYPE_F32 && cast_out->type == GGML_TYPE_F16 &&
+                raw_mask && raw_mask->type == GGML_TYPE_F16 && ggml_is_contiguous(raw_mask) &&
+                raw_mask->ne[0] == keys && raw_mask->ne[1] == queries && raw_mask->ne[2] == 1 &&
+                raw_mask->ne[3] == streams && ggml_is_contiguous(cast_out) &&
+                ggml_can_fuse_subgraph(graph,i,7,ops,&last,1) &&
+                ggml_cuda_check_fusion_memory_ranges(graph,i,7,&last,1)) {
+            output = cast_out;
+            mask = raw_mask;
+            count = 7;
+            output_index = last;
+        }
+    }
+    if (count==4 && (!ggml_can_fuse_subgraph(graph,i,4,ops,&output_index,1) ||
+                      !ggml_cuda_check_fusion_memory_ranges(graph,i,4,&output_index,1))) {
+        return 0;
+    }
+    const dim3 grid((keys+127)/128,queries*streams);
+    const dim3 block(32,8);
+    const ggml_cuda_kernel_launch_params launch(grid,block,0,ctx.stream());
+    const auto kernel = mask ? gather_attention_bias<true> : gather_attention_bias<false>;
+    ggml_cuda_kernel_launch(kernel,launch,(const float *) table->data,(const int32_t *) distances->data,
+                            mask ? (const half *) mask->data : nullptr,output->data,keys,int(table->ne[1]),heads,queries);
+    CUDA_CHECK(cudaGetLastError());
+    if (getenv("GGML_CUDA_INKLING_TRACE_BIAS")) {
+        fprintf(stderr,"INKLING_BIAS_FUSED %d %d %d %d %d\n",count,keys,queries,heads,streams);
+    }
+    return count-1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4473,6 +4594,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    static const bool fuse_gather_bias = getenv("GGML_CUDA_INKLING_FUSE_BIAS") != nullptr;
+    if (fuse_gather_bias && node->op == GGML_OP_GET_ROWS && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int elided = ggml_cuda_try_fuse_gather_attention_bias(*cuda_ctx,cgraph,i);
+        if (elided) {
+            return elided;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
