@@ -130,10 +130,13 @@ Feature comparison (J, verified at the PR/commit level by Junie):
 
 So the only `O(n_ctx)` item left in our HEAD is the F16 `self_attn_mask`: `n_kv * n_ubatch * 2 B` = 1 KiB/tok at
 `-ub 512` (128 MiB at 131k, 1 GiB at 1M, 4 KiB/tok = 4 GiB at 1M with `-ub 2048`). Real gain of the "ultimate" step is
-therefore small for typical Junie contexts (<= 128k) and grows with `-ub` and context. TODO: confirm with
-`llama-server` compute-buffer log lines at 32k/131k/262k and `-ub 512/2048` before investing.
+therefore small for typical Junie contexts (<= 128k) and grows with `-ub` and context. Confirmed in step 0 (section 10):
+the slope at HEAD was 1.004 KiB/tok at `-ub 512` on both CUDA0 and host. After 3692ecb40 (pos mask) the gap is closed except
+for `kpos` (4 B/tok) and the dense fallback for a unified cache with several sequences in one ubatch.
 
-## 7. Candidate designs for this branch (to decide, not decided)
+## 7. Candidate designs for this branch
+
+Decision: A, implemented in 3692ecb40 as in `inkling-strata-plan.md` (window in op_params slot 5, mask by position inside the existing bias lookup, `kpos = INT32_MAX` for hidden cells, dense mask as fallback, switch `LLAMA_ATTN_POS_MASK_DISABLE`). Tile skipping from positions (plan step 4) was not needed: no loss at `-ub 2048`. `fattn-tile.cuh` is not reached with a bias and was not changed.
 
 A. Mask-free causal/SWA FA path: pass `mask = nullptr` plus `qpos`/`kpos` (already available, `llm_graph_rel_bias`
    in `src/llama-graph.h:779`, `kpos [n_kv, n_stream]`, `qpos [n_tokens]`) and apply `kpos <= qpos` and the SWA window
@@ -164,9 +167,11 @@ mask-present case and be checked with `teacher_force.py` and `test-backend-ops`.
 
 ## 9. Open questions
 
-- What is the actual compute buffer at HEAD (log lines), and how much is the mask vs table vs activations?
-- Does mask-free FA matter for the Junie workload, or is 17 GiB at 76k already good enough for the 16/24 GB target?
-- Do we need `-np > 1`? (Strata and unsloth both fall back or skip.)
+- Answered: compute buffer at HEAD, see section 10 step 0 (mask = 1 KiB/tok at `-ub 512`, fixed part about 130 MiB CUDA0).
+- Answered: `-np 2` works in both modes and gives the same text as the baseline (section 10, step 3 correctness).
+- Open: context shift and `--cache-reuse` with the pos mask are not tested (plan step 3.6).
+- Open: other backends (Vulkan, Metal, ...) do not refuse `src[6]` of FLASH_ATTN_EXT (plan step 5); this fork stays CUDA and CPU only for now.
+- Open: K/V types other than F16 make the mma kernel convert K/V in a temporary that scales with `n_kv` (not measured).
 - Upstream direction: #32740 contract (indexed bias + F16 mask) differs from hridaya423's `kpos`/`qpos` API. Rebase cost
   if upstream merges first.
 
@@ -253,3 +258,76 @@ Gate 2 items 2-5, teacher = baseline binary f929fd85c, both `-fa on`:
 | 5 | sweep 7..2100 vs `-fa off`, with and without the switch | 12/12 both | output identical line by line |
 
 All exact. Step 3 (milestone measurements) is not done yet.
+
+### Step 3 speed and VRAM
+
+New = 3692ecb40 (pos mask), base = f929fd85c. Logs: `tmp/inkling/logs/strata-s3` (`all.sh`, `sess.sh`, `*.out`).
+Server `-ngl 99 -fa on -np 1 --jinja`, one session per request and binary, GPU lock held for the whole session.
+Values are means over the reps. VRAM is nvidia-smi after load; it also moves by 100-250 MiB between sessions of the same binary (other processes), so use the compute buffer numbers below for the exact delta.
+
+Replay, `-c 98304`, `-ub 512`:
+
+| request | binary | prefill t/s | decode t/s | VRAM after load MiB |
+|---|---|---|---|---|
+| 32k (3 reps) | base | 2615 (2586, 2573, 2687) | 78.5 | 17496 |
+| 32k (3 reps) | new | 2673 (2699, 2725, 2596) | 77.8 | 17261 |
+| 32k | diff | +2.2% | -0.9% | -235 |
+| 76k (2 reps) | base | 2416 (2404, 2428) | 71.7 | 18049 |
+| 76k (2 reps) | new | 2491 (2475, 2506) | 72.9 | 17577 |
+| 76k | diff | +3.1% | +1.6% | -472 |
+
+Step 0 baseline 32k was 2690/2730/2721 t/s and 17266 MiB; the re-run of the baseline today is slower (noise between runs is about 3%).
+Prefill is equal or faster, decode is equal inside noise.
+
+`-ub 2048`, `-c 98304`, replay 32k (3 reps, 1863 tokens generated):
+
+| binary | prefill t/s | decode t/s | VRAM after load MiB |
+|---|---|---|---|
+| base | 3301 (3249, 3324, 3331) | 79.8 | 18257 |
+| new | 3332 (3306, 3350, 3341) | 79.3 | 17994 |
+| diff | +0.9% | -0.6% | -263 |
+
+No loss at `-ub 2048`, so decision D8 does not need step 4 from this measurement.
+
+Compute buffers (`sched_reserve`, `-lv 4`, MiB CUDA0 / host), new binary vs step 0:
+
+| ctx | ub | step 0 | new | diff |
+|---|---|---|---|---|
+| 262144 | 512 | 387.75 / 267.53 | 130.25 / 10.03 | -257.50 / -257.50 |
+| 131072 | 2048 | 1041.23 / 560.60 | 517.23 / 36.60 | -524.00 / -524.00 |
+| 262144 | 2048 | not measured | 517.73 / 37.10 | |
+
+At ctx 98304, ub 512 the step 0 slope gives about 227 MiB on CUDA0 against about 129.6 MiB with the pos mask: about 97 MiB lower, as expected.
+The ctx growth of the new buffers is 0.5 MiB per 131072 tokens (4 B per token).
+GPU memory after load (nvidia-smi): 22330 MiB at 262144/512 (step 0: 22545), 22956 MiB at 262144/2048, 18860 MiB at 131072/2048 (step 0: 19345).
+
+### Step 3 correctness
+
+Items 4 and 5 of step 3. Logs: `tmp/inkling/logs/strata-s3c`. Prompts A (C linked list reversal) and B (why the sky is blue), `/v1/chat/completions`, temperature 0, seed 1, max_tokens 200, `cache_prompt` false, `-fa on -ngl 99 -c 16384`.
+Compared field: the whole message (content and reasoning_content), byte for byte.
+The log of the new binary shows `n_slots = 2, kv_unified = 'false'` for `--no-kv-unified` and `kv_unified = 'true'` for `--kv-unified`.
+
+Item 4, parallel slots:
+
+| comparison | A | B |
+|---|---|---|
+| baseline -np 1 alone vs baseline -np 2 (both modes) alone | identical | identical |
+| baseline -np 1 alone vs new -np 2 (both modes) alone | identical | identical |
+| baseline -np 1 alone vs any concurrent run (baseline or new) | differs | differs |
+| baseline --no-kv-unified concurrent, round 1 vs round 2 | identical | identical |
+| baseline --kv-unified concurrent, round 1 vs round 2 | identical | identical |
+| new --no-kv-unified concurrent vs baseline --no-kv-unified concurrent (3 rounds) | identical | identical |
+| new --kv-unified concurrent vs baseline --kv-unified concurrent (2 rounds) | identical | identical |
+
+Concurrent output differs from alone output already at baseline (batched decoding of 2 sequences changes float results). So the valid comparison is new concurrent against baseline concurrent: identical in both modes.
+The concurrent output of baseline is deterministic across rounds. Both modes of the new binary are identical to the baseline of the same mode.
+The new_ns session run with the buggy script lost round 2 (empty files, session killed by timeout); two later rounds with the fixed script were taken.
+
+Item 5, CPU reference end to end (`teacher_force.py --ngl 0 --n-tokens 20`, prompt "Write a C function that reverses a linked list.", student new binary, teacher baseline, both `-fa on`):
+
+| run | top-1 | max \|d_logprob\| | mean NLL |
+|---|---|---|---|
+| pos mask | 20/20 | 0.00000 | 0.28323 |
+| `LLAMA_ATTN_POS_MASK_DISABLE=1` | 20/20 | 0.00000 | 0.28323 |
+
+Both runs are identical to each other and an exact match vs the teacher.
