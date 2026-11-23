@@ -224,6 +224,31 @@ ggml_tensor * llama_model_dflash::build_dspark_inp_block(const llm_graph_context
     return ggml_reshape_2d(ctx0, cur, n_embd, n_tokens);
 }
 
+// true when a block draws its tokens: 1/temp > 0 in the state of its first draft row, else the graph keeps the argmax chain
+static bool dspark_draws(const llama_ubatch & ubatch, int64_t n_embd, int64_t i_draft_beg) {
+    if (!ubatch.embd_state || ubatch.n_seqs_unq == 0) {
+        return false;
+    }
+    const int64_t block_drafts = ubatch.n_tokens / ubatch.n_seqs_unq;
+    for (int64_t b = 0; b < ubatch.n_seqs_unq && block_drafts > i_draft_beg; ++b) {
+        if (ubatch.embd_state[(b*block_drafts + i_draft_beg)*n_embd + 1] > 0.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// a reused block graph must keep its draw mode
+struct llm_graph_input_dspark_draw : public llm_graph_input_i {
+    bool draws;
+    int64_t i_draft_beg;
+    llm_graph_input_dspark_draw(bool draws, int64_t i_draft_beg) : draws(draws), i_draft_beg(i_draft_beg) {}
+    void set_input(const llama_ubatch *) override {}
+    bool can_reuse(const llm_graph_params & params) override {
+        return draws == dspark_draws(params.ubatch, params.model->hparams.n_embd, i_draft_beg);
+    }
+};
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
 // rnn_state: [n_embd, n_tokens] per-token state of the Inkling2 rnn head (see llama_batch_ext_select_n_embd_state)
 //   anchor row: f_rnn, an extra rnn input; draft row i: [uniform | 1/temp | 0...] of its draw
@@ -295,6 +320,13 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
     }
 
+    // greedy blocks need no draw: the chain is the argmax of each step, and the tokens come back in h_nextn instead of the logits
+    const bool draws = rnn_state && dspark_draws(g.ubatch, n_embd, i_draft_beg);
+    const bool chain = rnn_state && !draws;
+    if (rnn_state) {
+        res->add_input(std::make_unique<llm_graph_input_dspark_draw>(draws, i_draft_beg));
+    }
+
     // the draws keep the top n_cand candidates, q of the verifier is their distribution
     const int64_t n_cand = std::min<int64_t>(64, n_vocab);
     GGML_ASSERT(!rnn_state || 2 + 2*n_cand <= n_embd);
@@ -337,7 +369,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     if (!sample_from_anchor) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
-        cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        if (!chain) {
+            cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
+        }
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
         }
@@ -400,7 +434,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
         }
 
-        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        if (!chain) {
+            cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        }
 
         if (has_conf) {
             // confidence head input: predicts per-position acceptance
@@ -418,11 +454,16 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (rnn_state) {
+        if (draws) {
             ggml_tensor * packed = draw(col, i, prev);
             cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
-        } else if (i + 1 < block_drafts) {
+        } else if (chain || i + 1 < block_drafts) {
             prev = ggml_argmax(ctx0, col);
+            if (chain) {
+                ggml_tensor * tok    = ggml_reshape_2d(ctx0, ggml_cast(ctx0, prev, GGML_TYPE_F32), 1, n_blocks);
+                ggml_tensor * packed = ggml_pad(ctx0, tok, n_embd - 1, 0, 0, 0);
+                cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
+            }
         }
     }
 
@@ -432,6 +473,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         draws = ggml_cont(ctx0, ggml_permute(ctx0, draws, 0, 2, 1, 3));
         res->t_h_nextn = ggml_reshape_2d(ctx0, draws, n_embd, n_tok);
         ggml_build_forward_expand(g.gf, res->t_h_nextn);
+    }
+
+    if (chain) {
+        res->t_logits = nullptr;
+        return;
     }
 
     // cat is position-major; restore ubatch block-major order

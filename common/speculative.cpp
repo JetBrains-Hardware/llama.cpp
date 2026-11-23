@@ -1555,6 +1555,12 @@ public:
             return;
         }
 
+        // the graph of a block batch without draws returns the argmax chain of the rnn head in h_nextn, no logits
+        bool chain = has_markov_context;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            chain = chain && !(i_block_beg[seq_id] >= 0 && sampled[seq_id]);
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1570,6 +1576,18 @@ public:
 
             // bonus-anchor drafts read the mask positions only, like DFlash
             const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
+
+            if (chain) {
+                const float * toks = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(toks && "DSpark chain missing from h_nextn");
+                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                    result.push_back((llama_token) toks[(size_t) (beg + i) * n_embd_dec]);
+                }
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+                continue;
+            }
 
             if (sampled[seq_id]) {
                 // the tokens the graph drew, and the distribution q each one was drawn from
