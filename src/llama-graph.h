@@ -787,12 +787,13 @@ public:
 };
 
 // hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling)
-// the KQ masks are always dense (rows == nullptr) and are filled from the same cells as the distances, so that the bias
-// gathered by distance lines up with the mask
+// the KQ masks are dense (rows == nullptr) and are filled from the same cells as the distances, so that the bias
+// gathered by distance lines up with the mask, unless pos_mask is set: then FlashAttention masks by the positions
 struct llm_graph_rel_bias {
     ggml_tensor * table; // [extent + 1, n_head_q, n_tokens]
     ggml_tensor * kpos;  // [n_kv, n_stream]
     ggml_tensor * qpos;  // [n_tokens]
+    int32_t       n_window; // > 0: mask by position, no KQ mask
 };
 
 class llm_graph_input_mem_hybrid_iswa_rel : public llm_graph_input_i {
@@ -832,6 +833,8 @@ public:
 
     const uint32_t extent;
     const uint32_t extent_swa;
+
+    bool pos_mask = false; // the masks follow from the positions, the mask tensors are not built
 
     const llama_cparams cparams;
 

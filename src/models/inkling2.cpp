@@ -79,7 +79,7 @@ public:
                 mctx_swa->set_input_attn_mask(swa_mask, ubatch, cparams.causal_attn);
             }
             if (swa_kv_pos) {
-                mctx_swa->set_input_kv_pos(swa_kv_pos, ubatch);
+                mctx_swa->set_input_kv_pos(swa_kv_pos, ubatch, false);
             }
         }
         if (q_pos && q_pos->buffer) {
@@ -124,7 +124,7 @@ public:
             }
             if (kpos_scr && kpos_scr->buffer) {
                 if (scr_cells) {
-                    mctx->get_attn()->set_input_kv_pos(kpos_scr, ubatch);
+                    mctx->get_attn()->set_input_kv_pos(kpos_scr, ubatch, false);
                 } else {
                     const int64_t n = kpos_scr->ne[0];
                     std::vector<int32_t> pos(n);

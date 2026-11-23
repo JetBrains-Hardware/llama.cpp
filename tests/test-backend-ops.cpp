@@ -9309,9 +9309,11 @@ struct test_flash_attn_ext_rel_bias : public test_case {
     const int64_t nb;
     const int64_t extent;
     const ggml_type type_KV;
+    const int32_t window; // 0: mask tensor, > 0: no mask tensor, mask by position
+    const int64_t ns;     // streams
 
     std::string vars() override {
-        return VARS_TO_STR7(hs, nh, gqa, kv, nb, extent, type_KV);
+        return VARS_TO_STR9(hs, nh, gqa, kv, nb, extent, type_KV, window, ns);
     }
 
     double max_nmse_err() override {
@@ -9319,53 +9321,65 @@ struct test_flash_attn_ext_rel_bias : public test_case {
     }
 
     test_flash_attn_ext_rel_bias(int64_t hs = 128, int64_t nh = 8, int64_t gqa = 3, int64_t kv = 512, int64_t nb = 8,
-                                 int64_t extent = 16, ggml_type type_KV = GGML_TYPE_F16)
-        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), extent(extent), type_KV(type_KV) {}
+                                 int64_t extent = 16, ggml_type type_KV = GGML_TYPE_F16, int32_t window = 0, int64_t ns = 1)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), extent(extent), type_KV(type_KV), window(window), ns(ns) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, 1);
-        ggml_tensor * k  = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
-        ggml_tensor * v  = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
-        ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
-        ggml_tensor * rt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, extent + 1, nh*gqa, nb, 1);
-        ggml_tensor * kp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
-        ggml_tensor * qp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, 1);
+        ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, ns);
+        ggml_tensor * k  = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, ns);
+        ggml_tensor * v  = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, ns);
+        ggml_tensor * m  = window == 0 ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns) : nullptr;
+        ggml_tensor * rt = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, extent + 1, nh*gqa, nb, ns);
+        ggml_tensor * kp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, ns);
+        ggml_tensor * qp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nb, ns);
         ggml_set_name(q, "q");
         ggml_set_name(k, "k");
         ggml_set_name(v, "v");
-        ggml_set_name(m, "m");
+        if (m) {
+            ggml_set_name(m, "m");
+        }
         ggml_set_name(rt, "rt");
         ggml_set_name(kp, "kp");
         ggml_set_name(qp, "qp");
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_add_rel_bias(out, rt, kp, qp);
+        if (window > 0) {
+            ggml_flash_attn_ext_set_pos_window(out, window);
+        }
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        const int64_t q0 = kv - nb - 3;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "kp") == 0) {
-                std::vector<int32_t> data(kv);
-                for (int64_t i = 0; i < kv; ++i) {
-                    data[i] = i % 97 == 5 ? INT32_MAX : int32_t(i);
+                std::vector<int32_t> data(kv*ns);
+                for (int64_t s = 0; s < ns; ++s) {
+                    for (int64_t i = 0; i < kv; ++i) {
+                        data[s*kv + i] = i % 97 == 5 ? INT32_MAX : int32_t(i);
+                    }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "qp") == 0) {
-                std::vector<int32_t> data(nb);
-                for (int64_t i = 0; i < nb; ++i) {
-                    data[i] = int32_t(q0 + i);
+                std::vector<int32_t> data(nb*ns);
+                for (int64_t s = 0; s < ns; ++s) {
+                    const int64_t q0 = kv - nb - 3 - 7*s;
+                    for (int64_t i = 0; i < nb; ++i) {
+                        data[s*nb + i] = int32_t(q0 + i);
+                    }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (strcmp(t->name, "m") == 0) {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
-                for (int64_t iq = 0; iq < nb; ++iq) {
-                    for (int64_t ik = 0; ik < kv; ++ik) {
-                        const bool visible = ik % 97 != 5 && ik <= q0 + iq;
-                        data[iq*kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                for (int64_t s = 0; s < ns; ++s) {
+                    const int64_t q0 = kv - nb - 3 - 7*s;
+                    for (int64_t iq = 0; iq < nb; ++iq) {
+                        for (int64_t ik = 0; ik < kv; ++ik) {
+                            const bool visible = ik % 97 != 5 && ik <= q0 + iq;
+                            data[(s*nb + iq)*kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                        }
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
@@ -14210,9 +14224,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
         for (int64_t kv : { 512, 2048, }) {
-            for (int64_t nb : { 1, 2, 7, 64, 333, }) {
+            for (int64_t nb : { 1, 2, 7, 20, 64, 333, }) {
                 for (int64_t extent : { 16, 1024, }) {
-                    test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 8, 3, kv, nb, extent, type_KV));
+                    for (int32_t window : { 0, INT32_MAX, 100, }) {
+                        for (int64_t ns : { 1, 2, }) {
+                            test_cases.emplace_back(new test_flash_attn_ext_rel_bias(128, 8, 3, kv, nb, extent, type_KV, window, ns));
+                        }
+                    }
                 }
             }
         }

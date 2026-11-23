@@ -5585,7 +5585,7 @@ void ggml_flash_attn_ext_add_rel_bias(
     const struct ggml_tensor * k    = a->src[1];
     const struct ggml_tensor * mask = a->src[3];
 
-    GGML_ASSERT(mask && mask->ne[2] == 1);
+    GGML_ASSERT(!mask || mask->ne[2] == 1);
     GGML_ASSERT(table->type == GGML_TYPE_F32 && kpos->type == GGML_TYPE_I32 && qpos->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(table) && ggml_is_contiguous(kpos) && ggml_is_contiguous(qpos));
     GGML_ASSERT(table->ne[0] >= 1 && table->ne[1] == q->ne[2] && table->ne[2] == q->ne[1] && table->ne[3] == q->ne[3]);
@@ -5595,6 +5595,16 @@ void ggml_flash_attn_ext_add_rel_bias(
     a->src[6] = table;
     a->src[7] = kpos;
     a->src[8] = qpos;
+}
+
+void ggml_flash_attn_ext_set_pos_window(
+        struct ggml_tensor * a,
+        int32_t              n_window) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[6] != NULL);
+    GGML_ASSERT(n_window > 0);
+
+    ggml_set_op_params_i32(a, 6, n_window);
 }
 
 // ggml_flash_attn_back

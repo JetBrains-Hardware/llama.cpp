@@ -8985,6 +8985,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * rel_kpos  = dst->src[7];
     const ggml_tensor * rel_qpos  = dst->src[8];
     const int64_t rel_extent = rel_table ? rel_table->ne[0] - 1 : 0;
+    const int32_t rel_window = rel_table ? ggml_get_op_params_i32(dst, 6) : 0;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9107,6 +9108,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
             if (rb) {
                 const int64_t d = int64_t(qp) - kp[ic];
+                if (rel_window > 0 && (d < 0 || d >= rel_window)) {
+                    continue;
+                }
                 mv += rb[d >= 0 && d < rel_extent ? d : rel_extent];
             }
 

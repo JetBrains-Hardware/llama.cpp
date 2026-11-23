@@ -2316,12 +2316,19 @@ extern "C" {
     // table: [E + 1, n_head, n_batch, ne3] F32
     // kpos:  [n_kv,  ne3]                  I32, positions of the K/V cells
     // qpos:  [n_batch, ne3]                I32, positions of the queries
-    // the mask must not have a head dimension
+    // the mask is optional with ggml_flash_attn_ext_set_pos_window(), it must not have a head dimension
     GGML_API void ggml_flash_attn_ext_add_rel_bias(
             struct ggml_tensor * a,
             struct ggml_tensor * table,
             struct ggml_tensor * kpos,
             struct ggml_tensor * qpos);
+
+    // mask by position, needs ggml_flash_attn_ext_add_rel_bias(): cell k is visible to query q only if
+    //   0 <= qpos[q] - kpos[k] < n_window
+    // set kpos to INT32_MAX for the cells that no query may see. the mask is optional then
+    GGML_API void ggml_flash_attn_ext_set_pos_window(
+            struct ggml_tensor * a,
+            int32_t              n_window);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

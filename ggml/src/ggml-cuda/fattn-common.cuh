@@ -23,11 +23,15 @@ struct fattn_rel_bias {
     const int   * kpos;
     const int   * qpos;
     int           extent;
+    int           window; // > 0: mask by position
 };
 
 static __device__ __forceinline__ float fattn_rel_bias_get(
         const fattn_rel_bias & rb, const int sequence, const int head, const int n_head, const int q, const int n_q, const int k, const int n_kv) {
     const int d = rb.qpos[sequence*n_q + q] - rb.kpos[sequence*n_kv + k];
+    if (rb.window > 0 && (d < 0 || d >= rb.window)) {
+        return -INFINITY;
+    }
     return rb.table[((int64_t(sequence)*n_q + q)*n_head + head)*(rb.extent + 1) + (d >= 0 && d < rb.extent ? d : rb.extent)];
 }
 
@@ -39,11 +43,12 @@ struct fattn_rel_bias_tile {
     int           stride_q;
     int           n_q;
     int           n_kv;
+    int           window;
 };
 
 static __device__ __forceinline__ fattn_rel_bias_tile fattn_rel_bias_tile_make(
         const fattn_rel_bias & rb, const int sequence, const int head, const int n_head, const int n_q, const int n_kv) {
-    fattn_rel_bias_tile t = { nullptr, nullptr, nullptr, rb.extent, n_head*(rb.extent + 1), n_q, n_kv };
+    fattn_rel_bias_tile t = { nullptr, nullptr, nullptr, rb.extent, n_head*(rb.extent + 1), n_q, n_kv, rb.window };
     if (rb.table) {
         t.table = rb.table + (int64_t(sequence)*n_q*n_head + head)*(rb.extent + 1);
         t.kpos  = rb.kpos  + int64_t(sequence)*n_kv;
@@ -58,6 +63,9 @@ static __device__ __forceinline__ float fattn_rel_bias_tile_get(const fattn_rel_
     }
     q = q < t.n_q ? q : t.n_q - 1;
     const int d = t.qpos[q] - t.kpos[k];
+    if (t.window > 0 && (d < 0 || d >= t.window)) {
+        return -INFINITY;
+    }
     return t.table[int64_t(q)*t.stride_q + (d >= 0 && d < t.extent ? d : t.extent)];
 }
 
@@ -1107,6 +1115,7 @@ void launch_fattn(
         rel_table ? (const int   *) dst->src[7]->data  : nullptr,
         rel_table ? (const int   *) dst->src[8]->data  : nullptr,
         rel_table ? int(rel_table->ne[0] - 1)          : 0,
+        rel_table ? ggml_get_op_params_i32(dst, 6)     : 0,
     };
 
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows

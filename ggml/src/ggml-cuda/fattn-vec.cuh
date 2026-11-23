@@ -303,8 +303,10 @@ static __global__ void flash_attn_ext_vec(
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    if (mask) {
+                        sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    }
                     if (rel_bias.table) {
                         sum += fattn_rel_bias_get(rel_bias, sequence, head, ne02, ic0 + j, int(ne01.z), k_VKQ_0 + i_KQ, ne11);
                     }
