@@ -1,6 +1,6 @@
 # Inkling-2-Mini on llama.cpp (16/24 GB card work)
 
-Branch `erokhins/inkling` (ours): the fork CI commits on top of ggml-org/master, which already supports the model.
+Branch `erokhins/inkling` (rebased on `erokhins/kvq-rebase`): the fork CI and `--kvq` commits on top of ggml-org/master, which already supports the model.
 No loader changes were needed for the Unsloth `UD-Q3_K_XL` file.
 
 ## Support in ggml-org/llama.cpp
@@ -36,16 +36,18 @@ materializing the dense per-head relative-position bias (`kq_b` + `ggml_cont(ggm
 Two requests captured from Junie CLI (profile `local-inkling-2-mini-q3kxl`, through mitmproxy) are replayed with
 `cache_prompt=false` (full prefill each time) and the original sampling and seed. Server: `-c 98304 -np 1 -fa on`.
 
-Baseline (`8f2537201`) vs fused relative-position bias in FlashAttention (`hridaya423/llama.cpp` `68cd7533a`, `ggml_flash_attn_ext_add_rel_bias`):
+Baseline (`8f2537201`) vs fused relative-position bias in FlashAttention (`hridaya423/llama.cpp` `68cd7533a`, `ggml_flash_attn_ext_add_rel_bias`) vs two-tier KV cache (`--kvq`):
 
 | Request | Mode | VRAM | Prefill | Generation |
 |---|---|---|---|---|
 | flow 144 (32k, 32,144 tok, 3 reps) | original (`8f2537201`) | 27,110-27,390 MiB (26.5-26.7 GiB) | 1,400-1,432 t/s (22.4-23.0 s) | 77.9-78.8 t/s (1,939 tok) |
 | flow 144 (32k, 32,144 tok, 3 reps) | + hridaya423 (`68cd7533a`) | 17,387-17,394 MiB (17.0 GiB) | 2,703-2,739 t/s (11.7-11.9 s) | 81.3-81.4 t/s (1,727 tok) |
+| flow 144 (32k, 32,144 tok, 3 reps) | + kvq (`--kvq`) | 14,473-14,480 MiB (14.1 GiB) | 2,609-2,653 t/s (12.1-12.3 s) | 70.1-70.2 t/s (1,799 tok) |
 | flow 197 (76k, 75,985 tok, 2 reps) | original (`8f2537201`) | 26,984-27,006 MiB (26.4 GiB) | 916-917 t/s (82.9 s) | 66.7-67.1 t/s (802 tok) |
 | flow 197 (76k, 75,985 tok, 2 reps) | + hridaya423 (`68cd7533a`) | 17,386-17,530 MiB (17.0-17.1 GiB) | 2,401-2,492 t/s (30.5-31.7 s) | 71.6-73.6 t/s (2,832 tok) |
+| flow 197 (76k, 75,985 tok, 2 reps) | + kvq (`--kvq`) | 14,486 MiB (14.1 GiB) | 2,523-2,538 t/s (29.9-30.1 s) | 66.4 t/s (210-225 tok) |
 
-Server VRAM after load drops from ~27.0 GiB to 17,358 MiB (16.95 GiB) with `-c 98304`, with `0` graph reallocations.
+Server VRAM after load drops from ~27.0 GiB to 17,358 MiB (16.95 GiB) with `+ hridaya423` and to ~14.1 GiB flat with `--kvq` at `-c 98304` (fits comfortably on a 16 GB card), with `0` graph reallocations.
 Generated lengths differ from baseline (and from the original cached-prefix run: 1,489 and 3,174) because relative bias is
 accumulated in FP32 inside FlashAttention instead of cast through an FP16 mask; repeats remain deterministic.
 Real Junie traffic rarely generates much: of 190 requests only a handful produced more than 600 tokens.
@@ -86,6 +88,24 @@ Architectural notes for implementing `--kvq` on Inkling-2-Mini:
 - **Smaller footprint:** `head_dim = 128` makes KLT tables 4x smaller and coarse `K2/V1` only ~`3 KiB/tok` (~`384 MiB` at 131k).
 - **Caveat for end-to-end KL tuning:** Inkling-2-Mini's attention tail is slightly broader than Qwen3.8-27B (~250-263 prompt tokens `>1e-3`/step vs 80-95, and coda slot `23` has the highest NMSE at `0.0008-0.0009`), so `prefetch_n = 1024` vs `2048` should be checked on token-level KL at 76k-131k+.
 
+### KVQ implementation and verification
+
+Implemented `--kvq` for `inkling2` and `inkling2_loop` on top of `erokhins/kvq-rebase` in two layers:
+
+- **Generic KVQ refactoring (`f8c9f8a4a`):**
+  - Generalized `ggml_kvq_attn` (CPU + CUDA `kvq-attn.cu`), `llama_kvq_store`, `llama_kvq_fitter`, and `llama_memory_hybrid_kvq` from fixed `D = 256` to `D in {128, 256}` (using 8-byte `cp.async` for 136-byte `q8_0` rows at `D = 128`).
+  - Added `GGML_KVQ_ATTN_LSE` mode (returns `[D, n_head, L + ceil(L/D), S]` with per-head log-sum-exp) and allowed null tail (`k == nullptr`) so coarse+resident attention can be merged with a separate relative-bias tail attention.
+  - Added optional SWA KV cache inside `llama_memory_hybrid_kvq` (for hybrid-ISWA models), `rel_keep` (keeps the trailing `n_relative_extent` tokens precise in the ring), `llama_model::kvq_layer_order()` (execution-order slot list for looped models), and full-row `o_proj` dequantization when `n_rep * D` is not a multiple of the quant block size (`Q6_K`).
+- **Inkling-2 integration (`767d84ef0`):**
+  - Wired KVQ graph inputs, SWA attention, query/gate stats, and early-Q prefetch (`lead = 2`) in `src/models/inkling2.cpp` and `src/models/inkling2-loop.cpp`.
+  - Prefill uses scratch attention with `r0 = max(0, n_host - 1024)/256*256` so all tokens within `rel_extent = 1024` stay in the precise ring.
+  - Packed decode splits coarse+resident rows (`GGML_KVQ_ATTN_LSE`, constant `-sink` bias per head) from the precise ring tail (`ggml_flash_attn_ext_lse` with relative-position bias table), merges `(o_c, l_c)` and `(o_t, l_t)` in log-sum-exp space, and folds the virtual attention sink.
+- **Verification:**
+  - `test-kvq-attn` (CPU + CUDA0): passed all single-stream and multi-stream cases (GPU-vs-CPU NMSE `< 8e-7`).
+  - `test-backend-ops -b CUDA0 -o FLASH_ATTN_EXT -p extent=`: 40/40 passed (`f16` and `q8_0`).
+  - Replays at `-c 98304 -np 1 -fa on --kvq`: `14.1 GiB` VRAM across both 32k (`2,609-2,653 t/s` prefill, `70.1-70.2 t/s` decode, deterministic `1,799` tok, `0.00 ms` prefetch join, `0` failed fits) and 76k (`2,523-2,538 t/s` prefill, `66.4 t/s` decode).
+  - Teacher forcing on `flow 144` (`23,709` prompt tokens, 100 greedy steps, `--kvq` vs exact `-ctk q8_0 -ctv q8_0 -fa on`): **96/100** top-1 match, **100/100** top-5 match, median `|d_logprob| = 0.00456`, `ppl_ratio = 1.0075`, exact prefill/decode agreement at step 50.
+
 ## Local tools (not committed)
 
 Everything lives in the git-ignored `tmp/inkling/` of this worktree (`/tmp/` is in `.gitignore`):
@@ -100,5 +120,5 @@ Junie setup: profile `~/.junie/models/local-inkling-2-mini-q3kxl.json` points at
 mitmproxy-utils (`windows-support` branch, local) routes `localhost:8091/inkling` to `localhost:8765` (plain http, no CA needed).
 Select with `junie --model custom:local-inkling-2-mini-q3kxl`; `--slow-model` is accepted but undocumented.
 
-Reproduce: `build-inkling.bat llama-server`, start `llama-server -m <gguf> -ngl 99 -fa on -c 98304 -np 1 --port 8765 --jinja`,
+Reproduce: `build-inkling.bat llama-server`, start `llama-server -m <gguf> -ngl 99 -fa on -c 98304 -np 1 --kvq --port 8765 --jinja` (omit `--kvq` for standard full-attention KV cache),
 then `python tmp/inkling/tools/replay.py tmp/inkling/replays/test2/req_32k.json 4000 3`.
