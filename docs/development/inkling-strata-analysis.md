@@ -737,3 +737,101 @@ Findings.
 - The plain decode runs 4 to 5 times above its bandwidth floor. From 32k to 76k the KV read grows by 1.4 GB and the time by 1.1 ms, so attention runs close to the bandwidth; the rest (about 11 ms for 3.5 GB of weights, about 330 GB/s) looks bound by latency and launches (48 visits of small matrices, n_embd 2304). Not profiled yet.
 - Strata without the drafter is at the same level (89.3 t/s at 32k = 11.2 ms per token). Its advantage is the drafter and the draft policy, not the target pass.
 - The verify cost per extra token is small (c in 13.5 is at or below the Strata model). The draft is the cheapest part to fix: 4.0 ms of a 29.5 ms round at K=7, about 9 times the 0.45 ms that Strata claims. A rough floor for this drafter (3 BF16 layers, 7 Markov steps over the full vocabulary) is about 1.5 ms (estimate, not checked).
+
+## 14. Drafter cost: llama.cpp against Strata (plan step 6 diagnosis, 2026-11-24)
+
+Diagnosis only, no code change kept. Setup as in section 13: 32k request, K=7 and K=3, BF16 drafter, `-lv 4`.
+llama.cpp side: nsys (`--trace=cuda,nvtx`, osrt does not exist on Windows) with temporary NVTX ranges and stderr timers in `common/speculative.cpp` and `src/llama-context.cpp`, reverted afterwards.
+Strata side: nsys of the real engine (SQ-15, `--drafter dspark`, same request). The trace shows the greedy beam-tree draft, 33 drafts, always the full block 8, so its cost does not depend on K.
+nsys captured the whole session. Kernel durations are reliable. Host times come from the runs without nsys.
+
+### 14.1 One llama.cpp draft (K=7, K=3 in brackets)
+
+| Stage | ms | Detail |
+|---|---|---|
+| Host batch build | 0.006 | f_rnn row from the host ring, 8 rows x 2304 f32 = 73,728 B H2D |
+| llama_decode glue | about 0.25 | remainder of decode_call |
+| ggml graph build | 0.100 (0.063) | rebuilt every draft, 647 nodes (355) |
+| sched_alloc_graph | 0.172 (0.105) | re-allocated every draft |
+| set_inputs | 0.078 | 18 small H2D copies, most followed by a stream sync |
+| compute call (2 cudaGraphLaunch) | 0.46 (0.31) | 2 splits |
+| Host before the first kernel | about 1.05 (decode_call 1.07, K=3 0.74) | GPU idles meanwhile |
+| GPU backbone, 3 layers | 0.557 | L0 0.17, L1 0.23 (global flash-attn 0.088), L2 0.16 |
+| GPU lm head Q5_K, 8 rows | 0.200 | 319 MB, 1.5 TB/s |
+| GPU 7 Markov steps | 2.081 | 0.297 per step |
+| - w2 matmul, BF16 [256 x 200058], ncols=1 | 1.274 | 0.182 per step, 0.56 TB/s |
+| - argmax over 200058 | 0.212 | 0.030 per step |
+| - draw (top_k 64, argsort, softmax, cumsum) | about 0.24 | built in greedy mode too, nothing reads it |
+| - joint_proj | 0.047 | |
+| - about 45 tiny dependent kernels per step | 0.316 | about 1 us each |
+| GPU backend top-10 sampler, 8 rows | 0.27 | 8 x 33 us, serial top_k_radix, anchor row unused |
+| GPU total | 3.13 (K=3 1.81) | 512 kernels, gaps 0.1 |
+| D2H | 17 small copies | 73,728 B (h_nextn) + 16 x 40 B. The 8 x 200058 logits stay on the GPU |
+| Syncs | 93 per draft | one long wait of 3.09 ms at the end |
+| Measured draft | 4.1 (K=3 2.5) | host 1.07 + wait 3.10 (0.74 + 1.80) |
+
+Per round, outside dur(g): the injection decode on the draft context. K+1 rows, 53 nodes, rebuilt every time (build 0.025, alloc 0.029, call 0.105 ms), then 73,728 B D2H and a sync of about 0.13 ms. About 0.3 ms per round, counted in verify_ms of 13.5.
+
+### 14.2 Graph reuse and CUDA graphs per context
+
+- Target context: the 12,622-node graph is reused every round (140 of 146 ubatches). The 6 rebuilds are at session start and end. One rebuild costs 1.9 ms build and 3.3 ms alloc on CUDA, and the first compute takes 55 to 60 ms.
+- Draft context: 2 llama_decode calls per round (draft block and injection), 0 reuse out of about 290. The two graphs alternate in the single `gf_res_prev` slot, so `can_reuse` never matches. Cost per round: about 0.33 ms of build and alloc.
+- CUDA graph capture is active on both contexts. Per draft there are 2 cudaGraphLaunch (1 for the injection) and about 0 cudaGraphInstantiate: ggml-cuda sees identical node properties after each rebuild and relaunches the same CUDA graph. The launch of about 650 nodes costs about 0.4 ms of CPU.
+- `GGML_CUDA_GRAPH_DEBUG` printed nothing at `-lv 4`. The evidence is the launch and instantiate counts in the trace.
+
+### 14.3 Strata draft (nsys, 32k, beam tree)
+
+| Stage | ms | Detail |
+|---|---|---|
+| Host | about 0.1 | 3 pinned H2D (4, 4, 32 B), 1 cudaGraphLaunch (0.12 ms CPU), 5 tiny D2H, 1 sync. GPU idle 0.084 before, 0.148 after. No graph build, f_rnn ring on the device |
+| GEMMs (cuBLAS BF16, fused QKV and gate/up) | 0.478 | |
+| Block attention layers 0 and 2 (window 1025) | 0.125 each | |
+| Block attention layer 1 (global, 32k) | 3.272 | `k_dspark_block_attn`, 24 x 8 CTAs each re-read the whole K/V |
+| int8 dp4a screen of the 7 slots (230 MB) | 0.316 | 0.73 TB/s |
+| Top-512 candidates | 0.024 | |
+| 7 Markov steps over 512 candidates (W=4 beam) | about 0.32 | expand 0.129, int8 score 0.044, prep 0.031 |
+| Draft total | 4.67 | 1.13 without the block attention. Draft to draft period 27.9 ms median, so about 17% of a round |
+
+The Strata claim of below 0.45 ms is not reproduced. At 32k the draft is 4.67 ms, and 1.13 ms without its attention. The claim is also below the floor of its own parts: the GEMMs alone are 0.48 ms and the screen 0.32 ms.
+
+### 14.4 Side by side (32k, block 8 or K=7)
+
+| Stage | llama.cpp ms | Strata ms | Bytes read, llama.cpp / Strata | Floor at 1.79 TB/s, llama.cpp / Strata |
+|---|---|---|---|---|
+| Host before GPU | 1.05 | about 0.1 | - | - |
+| Backbone weights | 0.38 | 0.58 | 496 MB BF16 / 496 MB BF16 | 0.28 / 0.28 |
+| Attention over the context | 0.09 | 3.56 | 142 MB / 142 MB | 0.08 / 0.08 |
+| lm head or base logits | 0.200 | 0.34 | 319 MB Q5_K / 230 MB int8 | 0.18 / 0.13 |
+| Markov chain, 7 steps | 2.08 | 0.32 | 717 MB w2 + 55 MB / about 1 MB per step (candidates, L2) | 0.43 / 0.02 |
+| Draw and argmax over 200k | 0.45 (inside the 2.08) | 0 | - | - |
+| Backend top-10 on 8 rows | 0.27 | 0 | - | - |
+| GPU total | 3.13 | 4.67 (1.13 without attention) | 1.73 GB / 0.9 GB | 0.98 / 0.50 |
+
+Differences: Strata scores only the top-512 candidates (approximate), draws nothing, takes the drafted ids from the chain, keeps one persistent CUDA graph and keeps f_rnn on the device. Its attention kernel is 37 times slower than ours on the global layer, so there is nothing to copy there.
+
+### 14.5 Ranked fix candidates (ms per draft at K=7, K=3 is about 40 to 50 percent; estimates, not measured)
+
+Correction to the first report: the Q8_0 drafter file does NOT quantize `markov_w2`. `ginfo.py` shows `markov_w2.weight`, `markov_w1.weight` and `joint_proj.weight` as BF16 in the Q8_0 file, only the 3 layers are Q8_0. That is why 13.9 saw only 3.88 against 4.00 ms: it saves only the backbone bytes.
+
+| # | Fix | Saves | Where | Touches ggml |
+|---|---|---|---|---|
+| 1 | Top-512 candidate scoring in the Markov head (`ggml_top_k`, `get_rows` on w2 rows and bias, small `mul_mat`, argmax over 512). Approximate drafts, remeasure acceptance | about 1.3 net | `src/models/dspark.cpp` | no |
+| 2 | Skip `draw` unless drafting is probabilistic (flag from the driver) | about 0.40 | `src/models/dspark.cpp`, `common/speculative.cpp` | no |
+| 3 | Read the drafted chain tokens the graph already has, drop the backend top-10 on 8 rows | about 0.33 | `common/speculative.cpp`, `src/models/dspark.cpp` | no |
+| 4 | Reuse the draft-context graph: two result slots (draft block, injection) in llama_context | about 0.33 per round | `src/llama-context.cpp` | no |
+| 5 | Keep f_rnn on the device (existing h_nextn_dev path), no 73,728 B D2H and H2D | about 0.15 to 0.2 per round | `src/llama-context.cpp`, `common/speculative.cpp` | no |
+| 6 | Quantize `markov_w2` to Q8_0 in the drafter GGUF (converter or quantize override; the BF16 file folds w2 in fp64, requantizing may cost acceptance). ncols=1 `mul_mat_vec_q` should reach about 1.2 TB/s. Alternative to 1 | about 0.9 | converter, no graph change | no |
+| 7 | Q8_0 backbone (already in the Q8_0 file) | 0.1 to 0.3 (measured 0.12 in 13.9) | none | no |
+| 8 | Fuse the tiny Markov kernels | about 0.2 to 0.3 | ggml-cuda | yes |
+| 9 | Faster BF16 `mul_mat_vec_f` for ncols=1 (0.56 to about 1.4 TB/s) | about 0.75 if w2 stays BF16 | ggml-cuda | yes |
+| 10 | Async set_inputs without a sync per tensor | about 0.05 | backend input path | yes |
+
+Fixes 1 to 4 together should bring the draft from about 4.1 to about 1.6 to 1.8 ms. Fixes 1 and 6 overlap, take one. Proposed measurement, not run: a K=7 and K=3 session after fix 6 (or 1) for time and acceptance.
+
+### 14.6 Files
+
+All under `tmp/inkling/` (git-ignored).
+- `logs/dspark-s6/prof-k7.server.log`, `prof-k3.server.log`: timing runs with UB lines (build, alloc, set_inputs, compute call per decode) and DSPARK_PROF lines.
+- `logs/dspark-s6/nsys-k7.nsys-rep` and `.sqlite`, `nsys-k3.nsys-rep` and `.sqlite`, `strata-nsys.nsys-rep` and `.sqlite`: traces.
+- `logs/dspark-s6/draft-kernel-seq.txt`, `strata-draft-kernel-seq.txt`: ordered kernels of one draft.
+- `tools/dspark_s6_nsys.sh`, `dspark_s6_strata.sh`, `dspark_s6_an.py`: session scripts and trace analysis (its host-window lines are labelled ms but are us).

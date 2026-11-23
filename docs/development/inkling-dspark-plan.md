@@ -268,7 +268,15 @@ File: `common/speculative.cpp`, `common_speculative_impl_draft_dspark` only. Two
 
 4a. Let `--spec-draft-p-min` work without a confidence head. The base DFlash driver already cuts on the top-1 probability of the sampler (`cur_p->data[0].p < params.p_min`, `speculative.cpp:1352`). Do the same in the DSpark loop when the draft has no confidence head, and throw only if it has neither a confidence head nor a Markov context.
 
-4b. Strata rule. In the read loop keep `p_k` = top-1 probability of position k. After the loop:
+**Decision (2026-11-23, user, replaces the per-round rule below): windowed K.** Reasons: ggml-org PR #32773 measured that every change of the verify batch size rebuilds and re-allocates the target graph (14 to 20 ms on Vulkan; their per-round 1..4 rule ran 47 t/s against 80 for fixed 4), and section 13.6 shows that acceptance is close to geometric (conditional rate 0.66 to 0.72 at positions 1..6 on 32k, 0.70 to 0.80 on 76k), so one number per window is enough.
+- Load with `--spec-draft-n-max 7` (sizes `n_rs_seq`); the rule picks the K actually drafted, 1..7.
+- Per sequence, over a window of W rounds (about 50 to 100): `a = accepted / (accepted + rejected rounds)` (MLE of a geometric acceptance; it is measurable at any K, so no exploration rounds).
+- At the window end: `K = argmax_K E(K) / c(K)` with `E(K) = 1 + a + ... + a^K` and `c` from `LLAMA_SPEC_DRAFT_COST` (unset = rule off). Change K only if the predicted gain is above a few percent (hysteresis).
+- K changes once per window, so a graph rebuild is rare.
+- Check on 13.6 data: 32k a = 0.68 gives K = 2 (measured best 2), 76k a = 0.74 gives K = 5..7, flat (measured best 7).
+- Do it after the drafter speed work (step 6), because `c` depends on the draft time; measure `c` once after that, then run the two traces only.
+
+4b (superseded, kept for reference). Strata rule. In the read loop keep `p_k` = top-1 probability of position k. After the loop:
 
 ```cpp
 // cost[k]: time of a round with k draft tokens, in single-token decodes
