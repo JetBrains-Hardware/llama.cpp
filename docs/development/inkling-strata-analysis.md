@@ -334,22 +334,6 @@ Both runs are identical to each other and an exact match vs the teacher.
 
 ### Step 3.6 position shifts
 
-Logs: `tmp/inkling/logs/strata-s36` (`all.sh`, `sess.sh`, `<tag>.server.log`, `<tag>.p*.txt`). Three configs: baseline f929fd85c, new (pos mask), new with `LLAMA_ATTN_POS_MASK_DISABLE=1` (dense). `/completion`, temperature 0, fixed seed.
-
-What the model supports:
-- Without `--swa-full` the server says "cache_reuse is not supported by this context, it will be disabled". `llama_kv_cache_iswa::get_can_shift()` needs the base and SWA caches to have the same size (8192 vs 1536 by default). With `--swa-full` shifts are allowed (cache reuse and context shift).
-- `--cache-reuse` does shift (`reusing chunk with size 1127, shifting KV cache [2210, 3337) -> [1544, 2671)`), but right after it the server logs "forcing full prompt re-processing due to lack of cache data" and recomputes the prompt. Likely cause: the recurrent state of the hybrid memory cannot follow a shift. So cache reuse gives no real test of shifted cells for this model (and no speed gain).
-- `--context-shift` works: two "slot context shift, n_keep = 0, n_left = 4095, n_discard = 2047" events per run, generation continues over cells with moved positions.
-
-| scenario | args | base vs pos vs dense |
-|---|---|---|
-| cache reuse, request A+B+C then A+C | `-c 8192 --cache-reuse 256 --swa-full` | identical (also identical to a fresh server, because of the full re-processing) |
-| context shift, 2669 token prompt, long generation | `-c 4096 --context-shift --swa-full`, 2 shifts | identical |
-
-The pos mask gives the same text as the dense mask and the baseline after real context shifts.
-
-### Step 3.6 position shifts
-
 Logs and scripts: `tmp/inkling/logs/strata-s36`. Model Inkling-2-Mini UD-Q3_K_XL, `-ngl 99 -fa on -np 1 --jinja`, `/completion` raw prompt, temperature 0, seed 1. Configs: baseline `f929fd85c`, new pos mask, new with `LLAMA_ATTN_POS_MASK_DISABLE=1` (dense).
 
 What is supported:
