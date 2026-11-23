@@ -2542,6 +2542,9 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
     };
 
+    // two-tier attention inputs on top of the hybrid input, see llama_memory_hybrid_kvq
+    class llm_graph_input_kvq;
+
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
@@ -2568,10 +2571,24 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
 
-        llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
-        llm_graph_input_attn_kv_iswa        * attn = nullptr;
-        llm_graph_input_rs                  * recr = nullptr;
+        llm_graph_input_kvq * build_inp_kvq() const;
+        int kvq_lead() const;
+        void build_kvq_prefetch(int il_tgt, ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks,
+                const std::vector<ggml_tensor *> * bank = nullptr, ggml_tensor * bank_out = nullptr, const loop_layer * loop_tgt = nullptr);
+        void build_kvq_qstat(ggml_tensor * q, int il);
+        void build_kvq_gstat(ggml_tensor * gate_sigmoid, int il);
+        ggml_tensor * build_attn_kvq_packed(ggml_tensor * q_cur, ggml_tensor * k_cur, ggml_tensor * v_cur,
+                ggml_tensor * raw_table, ggml_tensor * sinks_raw, float kq_scale, int il);
+        ggml_tensor * build_attn_kvq_scratch(ggml_tensor * q_cur, ggml_tensor * k_cur, ggml_tensor * v_cur,
+                ggml_tensor * raw_table, ggml_tensor * sinks_raw, float kq_scale, int il);
 
+        llm_graph_input_mem_hybrid_iswa_rel * inp         = nullptr;
+        llm_graph_input_attn_kv_iswa        * attn        = nullptr;
+        llm_graph_input_mem_hybrid          * inp_hyb     = nullptr;
+        llm_graph_input_kvq                 * inp_kvq     = nullptr;
+        llm_graph_input_rs                  * recr        = nullptr;
+
+        ggml_tensor * inp_pos     = nullptr;
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
     };
@@ -2588,6 +2605,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;
+    std::vector<int32_t> kvq_layer_order() const override;
 
     int      n_phys     = 0;
     uint32_t core_start = 0;

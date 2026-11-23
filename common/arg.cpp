@@ -2453,7 +2453,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--kvq"},
-        "two-tier KV cache (qwen35 only): small batches attend through packed K/V codes and a resident set of q8_0 rows\n"
+        "two-tier KV cache (qwen35, inkling2): small batches attend through packed K/V codes and a resident set of q8_0 rows\n"
         "from pinned host memory, the K and V tables are fitted per 8k chunk in the background; forces 1 slot, q8_0 K/V,\n"
         "flash attention, no context shift, no cache reuse; slot save / restore and the RAM prompt cache work (default: disabled)",
         [](common_params & params) {

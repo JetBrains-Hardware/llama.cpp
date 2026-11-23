@@ -4254,17 +4254,21 @@ bool llama_model_supports_kvq(const struct llama_model * model, std::string * re
         return false;
     };
 
-    if (model->arch != LLM_ARCH_QWEN35) {
-        return fail(std::string("the architecture is '") + llm_arch_name(model->arch) + "', only qwen35 is supported");
+    if (model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_INKLING2 && model->arch != LLM_ARCH_INKLING2_LOOP) {
+        return fail(std::string("the architecture is '") + llm_arch_name(model->arch) + "', only qwen35 and inkling2 are supported");
     }
 
     const auto & hp = model->hparams;
+    const bool is_inkling = model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP;
 
     uint32_t n_head    = 0;
     uint32_t n_head_kv = 0;
     uint32_t head_dim  = 0;
     for (uint32_t il = 0; il < hp.n_layer(); ++il) {
-        if (hp.is_recr(il)) {
+        if (!is_inkling && hp.is_recr(il)) {
+            continue;
+        }
+        if (is_inkling && hp.is_swa(il)) {
             continue;
         }
         const uint32_t dk = hp.n_embd_head_k(il);

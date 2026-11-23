@@ -4,6 +4,29 @@ int llama_model_inkling2_loop::layer_phys(int il) const {
     return il < n_phys ? il : core_start + (il - n_phys) % (core_end - core_start);
 }
 
+std::vector<int32_t> llama_model_inkling2_loop::kvq_layer_order() const {
+    std::vector<int32_t> order;
+    for (int il = 0; il < (int) core_start; ++il) {
+        if (!hparams.is_swa(il)) {
+            order.push_back(il);
+        }
+    }
+    for (uint32_t pass = 0; pass < n_passes; ++pass) {
+        for (int ip = (int) core_start; ip < (int) core_end; ++ip) {
+            const int il = pass == 0 ? ip : n_phys + (int) (pass - 1)*((int) core_end - (int) core_start) + (ip - (int) core_start);
+            if (!hparams.is_swa(il)) {
+                order.push_back(il);
+            }
+        }
+    }
+    for (int il = (int) core_end; il < n_phys; ++il) {
+        if (!hparams.is_swa(il)) {
+            order.push_back(il);
+        }
+    }
+    return order;
+}
+
 void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
     llama_model_inkling2::load_arch_hparams(ml);
 
@@ -80,7 +103,12 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
 
     auto * cur = build_inputs();
     std::vector<ggml_tensor *> blocks;
+    const uint32_t block_sz = hparams.attn_res_block_size;
+    const int lead = kvq_lead();
     for (int il = 0; il < start; ++il) {
+        if (lead > 0 && il + lead < start && !hparams.is_swa(il + lead) && il / block_sz == (il + lead) / block_sz) {
+            build_kvq_prefetch(il + lead, cur, blocks);
+        }
         cur = build_layer(il, il, cur, blocks);
     }
 
@@ -99,6 +127,12 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         }
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
+            const int ip_tgt = ip + lead;
+            if (lead > 0 && ip_tgt < end && !hparams.is_swa(ip_tgt) && ip / block_sz == ip_tgt / block_sz) {
+                const int il_tgt = pass == 0 ? ip_tgt : m.n_phys + (pass - 1)*(end - start) + (ip_tgt - start);
+                build_kvq_prefetch(il_tgt, cur, blocks, pass > 0 ? &bank : nullptr, bank_out,
+                        pass > 0 ? &m.loop_layers[ip_tgt - start] : nullptr);
+            }
             if (pass == 0) {
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
@@ -109,6 +143,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     }
 
     for (int il = end; il < m.n_phys; ++il) {
+        if (lead > 0 && il + lead < m.n_phys && !hparams.is_swa(il + lead) && il / block_sz == (il + lead) / block_sz) {
+            build_kvq_prefetch(il + lead, cur, blocks);
+        }
         cur = build_layer(il, il, cur, blocks);
     }
     build_output(cur, blocks);
