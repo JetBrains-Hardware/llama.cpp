@@ -2852,6 +2852,7 @@ struct llama_model_sensenova_loop : public llama_model_qwen35 {
             ggml_tensor * input;
             ggml_tensor * post;
             ggml_tensor * mix;
+            ggml_tensor * packed;
         };
 
         ggml_tensor * mhc_scale = nullptr;

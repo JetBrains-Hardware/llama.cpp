@@ -4722,6 +4722,60 @@ struct test_snake_fuse : public test_case {
 };
 
 
+
+struct test_mhc_route : public test_case {
+    const int64_t d, n_tok;
+    const int32_t iterations;
+    const float pre_scale;
+    const bool fixed_identity;
+
+    std::string vars() override {
+        return VARS_TO_STR5(d, n_tok, iterations, pre_scale, fixed_identity);
+    }
+
+    test_mhc_route(int64_t d = 4096, int64_t n_tok = 1, int32_t iterations = 20, float pre_scale = 1.0f, bool fixed_identity = false)
+        : d(d), n_tok(n_tok), iterations(iterations), pre_scale(pre_scale), fixed_identity(fixed_identity) {}
+
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_route = fixed_identity ? 4 : 8;
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 2, n_tok);
+        ggml_tensor * weight   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*d, n_route);
+        ggml_tensor * bias     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_route);
+        return ggml_mhc_route(ctx, residual, weight, bias, iterations, pre_scale, fixed_identity);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->ne[0] == 2*d) {
+                init_tensor_uniform(t, -0.02f, 0.02f);
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+struct test_mhc_merge : public test_case {
+    const int64_t d, n_tok;
+
+    std::string vars() override {
+        return VARS_TO_STR2(d, n_tok);
+    }
+
+    test_mhc_merge(int64_t d = 4096, int64_t n_tok = 1) : d(d), n_tok(n_tok) {}
+
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 2, n_tok);
+        ggml_tensor * branch   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, n_tok);
+        ggml_tensor * packed   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d + 8, n_tok);
+        return ggml_mhc_merge(ctx, residual, branch, packed);
+    }
+};
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -11744,6 +11798,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : {1, 17}) {
         for (bool identity : {false, true}) {
             test_cases.emplace_back(new test_dsv4_hc_post(4096, n_tokens, identity, true, 2, !identity));
+        }
+    }
+    for (int64_t d : {4096, 1002}) {
+        for (int64_t n_tok : {1, 7, 128}) {
+            test_cases.emplace_back(new test_mhc_route(d, n_tok, 20, 1.0f, false));
+            test_cases.emplace_back(new test_mhc_route(d, n_tok, 20, 0.5f, true));
+            test_cases.emplace_back(new test_mhc_merge(d, n_tok));
         }
     }
     for (int64_t n_tokens : {1, 17, 512}) {

@@ -1096,6 +1096,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "MHC_ROUTE",
+    "MHC_MERGE",
     "TOP_K_MASK",
     "KVQ_ATTN",
     "KVQ_FIT",
@@ -1116,7 +1118,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1211,6 +1213,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "mhc_route(residual, w, b)",
+    "mhc_merge(residual, x, packed)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "kvq_attn(q, kc, vc, tab_inv, tab_aux, k, v, rkv, ridx, mask)",
     "kvq_fit(x, par, rows)",
@@ -1231,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6552,6 +6556,62 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_mhc_route
+
+struct ggml_tensor * ggml_mhc_route(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * bias,
+        int32_t               iterations,
+        float                 pre_scale,
+        bool                  fixed_identity) {
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(weight->type   == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type     == GGML_TYPE_F32);
+    GGML_ASSERT(residual->ne[1] == 2);
+    const int64_t d = residual->ne[0];
+    const int64_t nt = residual->ne[2];
+    const int64_t n_route = fixed_identity ? 4 : 8;
+    GGML_ASSERT(weight->ne[0] == 2*d && weight->ne[1] == n_route);
+    GGML_ASSERT(bias->ne[0] == n_route);
+
+    // Pack [input(d), post(2), mix(4), pad(2)] so row stride stays 16-byte aligned when d % 4 == 0.
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d + 8, nt);
+    result->op     = GGML_OP_MHC_ROUTE;
+    result->src[0] = residual;
+    result->src[1] = weight;
+    result->src[2] = bias;
+    ggml_set_op_params_i32(result, 0, iterations);
+    ggml_set_op_params_i32(result, 1, fixed_identity ? 1 : 0);
+    ggml_set_op_params_f32(result, 2, pre_scale);
+    return result;
+}
+
+// ggml_mhc_merge
+
+struct ggml_tensor * ggml_mhc_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * branch,
+        struct ggml_tensor  * packed) {
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(branch->type   == GGML_TYPE_F32);
+    GGML_ASSERT(packed->type   == GGML_TYPE_F32);
+    GGML_ASSERT(residual->ne[1] == 2);
+    const int64_t d  = residual->ne[0];
+    const int64_t nt = residual->ne[2];
+    GGML_ASSERT(branch->ne[0] == d && branch->ne[1] == nt);
+    GGML_ASSERT(packed->ne[0] == d + 8 && packed->ne[1] == nt);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 2, nt);
+    result->op     = GGML_OP_MHC_MERGE;
+    result->src[0] = residual;
+    result->src[1] = branch;
+    result->src[2] = packed;
+    return result;
 }
 
 // ggml_dsv4_hc_post

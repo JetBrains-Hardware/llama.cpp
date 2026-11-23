@@ -412,6 +412,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_MHC_ROUTE,
+        GGML_OP_MHC_MERGE,
         GGML_OP_TOP_K_MASK,
         GGML_OP_KVQ_ATTN,
         GGML_OP_KVQ_FIT,
@@ -2525,6 +2527,21 @@ extern "C" {
     //                       + sum_src residual[i, src, t]*comb[dst, src, t]
     //   comb == NULL uses the identity: result[i, dst, t] = x[i, t]*post[dst, t] + residual[i, dst, t]
     //
+    GGML_API struct ggml_tensor * ggml_mhc_route(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * bias,
+            int32_t               iterations,
+            float                 pre_scale,
+            bool                  fixed_identity);
+
+    GGML_API struct ggml_tensor * ggml_mhc_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * branch,
+            struct ggml_tensor  * packed);
+
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,

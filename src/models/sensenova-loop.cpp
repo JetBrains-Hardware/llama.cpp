@@ -105,85 +105,18 @@ std::unique_ptr<llm_graph_context> llama_model_sensenova_loop::build_arch_graph(
 llama_model_sensenova_loop::graph::routing llama_model_sensenova_loop::graph::build_route(
         ggml_tensor * residual, ggml_tensor * weight, ggml_tensor * bias, int il) {
     const int64_t nt = residual->ne[2];
-    ggml_tensor * flat = ggml_reshape_2d(ctx0, residual, 2*n_embd, nt);
-    flat = ggml_rms_norm(ctx0, flat, 1e-6f);
-    ggml_tensor * logits = build_lora_mm(weight, flat);
-    if (logits->op == GGML_OP_MUL_MAT) {
-        ggml_prec_set_acc(logits, GGML_PREC_F32);
-        ggml_prec_set_src(logits, GGML_PREC_F32, 1);
-    }
-    ggml_tensor * projection = logits;
-    logits = ggml_add(ctx0, logits, bias);
-    auto row = [&](int i) {
-        return ggml_view_2d(ctx0, logits, 1, nt, logits->nb[1], i*logits->nb[0]);
-    };
-
     routing result{};
-    if (cparams.fused_dsv4_hc_pre) {
-        ggml_tensor * pre = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, logits, 2, nt, logits->nb[1], 0));
-        result.input = ggml_dsv4_hc_pre(ctx0, residual, pre);
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, result.input, il});
-    } else {
-        ggml_tensor * a = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], 0);
-        ggml_tensor * b = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], residual->nb[1]);
-        result.input = ggml_add(ctx0, ggml_mul(ctx0, a, ggml_sigmoid(ctx0, row(0))), ggml_mul(ctx0, b, ggml_sigmoid(ctx0, row(1))));
-    }
-    if (hparams.mhc_pre_scale != 1.0f) {
-        result.input = ggml_scale(ctx0, result.input, hparams.mhc_pre_scale);
-    }
-    result.post = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_view_2d(ctx0, logits, 2, nt, logits->nb[1], 2*sizeof(float))), 2.0f);
-    ggml_tensor * comb = nullptr;
-    if (!hparams.mhc_fixed_identity) {
-        if (cparams.fused_dsv4_hc_comb) {
-            if (!mhc_scale) {
-                mhc_scale = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 3), 1.0f);
-                ggml_build_forward_expand(gf, mhc_scale);
-            }
-            comb = ggml_dsv4_hc_comb(ctx0, projection, mhc_scale, bias, 0.0f, hparams.mhc_iterations);
-            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, comb, il});
-            result.mix = ggml_reshape_2d(ctx0, comb, 4, nt);
-        } else {
-            ggml_tensor * mix[4];
-            for (int i = 0; i < 4; ++i) {
-                mix[i] = row(4 + i);
-            }
-            build_sinkhorn(ctx0, mix, hparams.mhc_iterations);
-            result.mix = ggml_concat(ctx0, ggml_concat(ctx0, mix[0], mix[1], 0), ggml_concat(ctx0, mix[2], mix[3], 0), 0);
-        }
-    }
-    if (comb && cparams.fused_dsv4_hc_pre) {
-        ggml_build_forward_expand(gf, result.post);
-        ggml_build_forward_expand(gf, comb);
-        ggml_build_forward_expand(gf, result.input);
-    }
+    result.packed = ggml_mhc_route(ctx0, residual, weight, bias,
+            (int32_t) hparams.mhc_iterations, hparams.mhc_pre_scale, hparams.mhc_fixed_identity);
+    result.input = ggml_view_2d(ctx0, result.packed, n_embd, nt, result.packed->nb[1], 0);
     cb(result.input, "mhc_input", il);
     return result;
 }
 
 ggml_tensor * llama_model_sensenova_loop::graph::build_merge(
         ggml_tensor * residual, ggml_tensor * branch, const routing & route, int il) {
-    const int64_t nt = branch->ne[1];
-    if (cparams.fused_dsv4_hc_post) {
-        // Loop stores comb as [output stream][input stream]; HC post takes [dst, src, token].
-        ggml_tensor * comb = route.mix ? ggml_permute(ctx0, ggml_reshape_3d(ctx0, route.mix, 2, 2, nt), 1, 0, 2, 3) : nullptr;
-        ggml_tensor * result = ggml_dsv4_hc_post(ctx0, branch, residual, route.post, comb);
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, result, il});
-        return result;
-    }
-    ggml_tensor * a = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], 0);
-    ggml_tensor * b = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], residual->nb[1]);
-    ggml_tensor * next_a = a;
-    ggml_tensor * next_b = b;
-    if (route.mix) {
-        auto mix = [&](int i) { return ggml_view_2d(ctx0, route.mix, 1, nt, route.mix->nb[1], i*sizeof(float)); };
-        next_a = ggml_add(ctx0, ggml_mul(ctx0, a, mix(0)), ggml_mul(ctx0, b, mix(1)));
-        next_b = ggml_add(ctx0, ggml_mul(ctx0, a, mix(2)), ggml_mul(ctx0, b, mix(3)));
-    }
-    ggml_tensor * post_a = ggml_view_2d(ctx0, route.post, 1, nt, route.post->nb[1], 0);
-    ggml_tensor * post_b = ggml_view_2d(ctx0, route.post, 1, nt, route.post->nb[1], sizeof(float));
-    a = ggml_add(ctx0, next_a, ggml_mul(ctx0, branch, post_a));
-    b = ggml_add(ctx0, next_b, ggml_mul(ctx0, branch, post_b));
-    return ggml_reshape_3d(ctx0, ggml_concat(ctx0, a, b, 0), n_embd, 2, nt);
+    GGML_UNUSED(il);
+    return ggml_mhc_merge(ctx0, residual, branch, route.packed);
 }
 
 llama_model_sensenova_loop::graph::graph(const llm_graph_params & params) : graph_base(params) {
@@ -227,9 +160,8 @@ llama_model_sensenova_loop::graph::graph(const llm_graph_params & params) : grap
             if (mhc) {
                 streams = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, streams, 2*n_embd, streams->ne[2]), inp_out_ids);
                 streams = ggml_reshape_3d(ctx0, streams, n_embd, 2, cur->ne[1]);
-                attn_route.post = ggml_get_rows(ctx0, attn_route.post, inp_out_ids);
-                if (attn_route.mix) {
-                    attn_route.mix = ggml_get_rows(ctx0, attn_route.mix, inp_out_ids);
+                if (attn_route.packed) {
+                    attn_route.packed = ggml_get_rows(ctx0, attn_route.packed, inp_out_ids);
                 }
             }
         }

@@ -11652,6 +11652,108 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_mhc_route
+
+void ggml_compute_forward_mhc_route(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * residual = dst->src[0];
+    const struct ggml_tensor * weight   = dst->src[1];
+    const struct ggml_tensor * bias     = dst->src[2];
+    const int32_t iterations     = ggml_get_op_params_i32(dst, 0);
+    const bool    fixed_identity = ggml_get_op_params_i32(dst, 1) != 0;
+    const float   pre_scale      = ggml_get_op_params_f32(dst, 2);
+
+    const int64_t d  = residual->ne[0];
+    const int64_t nt = residual->ne[2];
+    const int n_route = fixed_identity ? 4 : 8;
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float * w = (const float *) weight->data;
+    const float * b = (const float *) bias->data;
+    for (int64_t t = ith; t < nt; t += nth) {
+        const float * va = (const float *) ((const char *) residual->data + t * residual->nb[2]);
+        const float * vb = (const float *) ((const char *) residual->data + t * residual->nb[2] + residual->nb[1]);
+        float * po = (float *) ((char *) dst->data + t * dst->nb[1]);
+
+        double sum_sq = 0.0;
+        double dot[8] = {0};
+        for (int64_t i = 0; i < d; ++i) {
+            const float xa = va[i];
+            const float xb = vb[i];
+            sum_sq += (double) xa * xa + (double) xb * xb;
+            for (int k = 0; k < n_route; ++k) {
+                dot[k] += (double) w[k * 2 * d + i] * xa + (double) w[k * 2 * d + d + i] * xb;
+            }
+        }
+        const float rms = 1.0f / sqrtf((float)(sum_sq / (double)(2 * d)) + 1e-6f);
+        float lg[8] = {0};
+        for (int k = 0; k < n_route; ++k) {
+            lg[k] = (float) dot[k] * rms + b[k];
+        }
+        const float pre0 = (1.0f / (1.0f + expf(-lg[0]))) * pre_scale;
+        const float pre1 = (1.0f / (1.0f + expf(-lg[1]))) * pre_scale;
+        po[d + 0] = 2.0f / (1.0f + expf(-lg[2]));
+        po[d + 1] = 2.0f / (1.0f + expf(-lg[3]));
+        if (fixed_identity) {
+            po[d + 2] = 1.0f; po[d + 3] = 0.0f;
+            po[d + 4] = 0.0f; po[d + 5] = 1.0f;
+        } else {
+            float m[2][2] = { { lg[4], lg[5] }, { lg[6], lg[7] } };
+            for (int it = 0; it < iterations; ++it) {
+                for (int r = 0; r < 2; ++r) {
+                    const float mx  = fmaxf(m[r][0], m[r][1]);
+                    const float lse = mx + logf(expf(m[r][0] - mx) + expf(m[r][1] - mx));
+                    m[r][0] -= lse; m[r][1] -= lse;
+                }
+                for (int c = 0; c < 2; ++c) {
+                    const float mx  = fmaxf(m[0][c], m[1][c]);
+                    const float lse = mx + logf(expf(m[0][c] - mx) + expf(m[1][c] - mx));
+                    m[0][c] -= lse; m[1][c] -= lse;
+                }
+            }
+            po[d + 2] = expf(m[0][0]); po[d + 3] = expf(m[0][1]);
+            po[d + 4] = expf(m[1][0]); po[d + 5] = expf(m[1][1]);
+        }
+        po[d + 6] = 0.0f;
+        po[d + 7] = 0.0f;
+        for (int64_t i = 0; i < d; ++i) {
+            po[i] = pre0 * va[i] + pre1 * vb[i];
+        }
+    }
+}
+
+// ggml_compute_forward_mhc_merge
+
+void ggml_compute_forward_mhc_merge(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * residual = dst->src[0];
+    const struct ggml_tensor * branch   = dst->src[1];
+    const struct ggml_tensor * packed   = dst->src[2];
+    const int64_t d  = residual->ne[0];
+    const int64_t nt = residual->ne[2];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t t = ith; t < nt; t += nth) {
+        const float * va = (const float *) ((const char *) residual->data + t * residual->nb[2]);
+        const float * vb = (const float *) ((const char *) residual->data + t * residual->nb[2] + residual->nb[1]);
+        const float * vx = (const float *) ((const char *) branch->data   + t * branch->nb[1]);
+        const float * vp = (const float *) ((const char *) packed->data   + t * packed->nb[1]);
+        float * oa = (float *) ((char *) dst->data + t * dst->nb[2]);
+        float * ob = (float *) ((char *) dst->data + t * dst->nb[2] + dst->nb[1]);
+        const float p0 = vp[d + 0], p1 = vp[d + 1];
+        const float m0 = vp[d + 2], m1 = vp[d + 3], m2 = vp[d + 4], m3 = vp[d + 5];
+        for (int64_t i = 0; i < d; ++i) {
+            const float a = va[i], b = vb[i], x = vx[i];
+            oa[i] = m0 * a + m1 * b + p0 * x;
+            ob[i] = m2 * a + m3 * b + p1 * x;
+        }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_post
 
 static void ggml_compute_forward_dsv4_hc_post_f32(
