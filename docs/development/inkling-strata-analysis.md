@@ -485,5 +485,55 @@ Logs and scripts (git-ignored, not committed): `C:\Users\erokh\junie-local-proje
 `bench_client.py` (shared nonce'd client, both engines), `llama_session_32k.sh`/`llama_session_76k.sh`,
 `strata_session.sh`, and the `*_session.log` / `*_results.log` / `*_server.log` files per run.
 
-This section and its results are uncommitted (working-tree change only, per `AGENTS.md`: no agent commit without
-explicit human approval).
+### 11.1 Strata with its built-in drafter (decode reference, not comparable)
+
+Inkling-2-Mini SQ-15 ships a built-in speculative drafter (DSpark) with the model, no extra download. The measurement
+above deliberately ran with `--mtp off --drafter off` to isolate the attention/compute-buffer comparison from
+speculative decoding. This subsection re-runs decode with the drafter on, as a separate reference number only.
+
+**Not comparable to the llama.cpp decode numbers above or anywhere else in this doc.** Our llama.cpp side has no
+active speculative decoding in this comparison and will not get one here: `ggml-org/llama.cpp` PR #32218
+(`pwilkin/inkling2-dspark`, "feat: Inkling 2 DSpark support") was checked and ruled out, out of scope, not pursued.
+As of this writing it is open, not merged, and not close: ggerganov (code owner) has requested changes that are
+still blocking despite two approvals (ngxson, ruixiang63). It already went through three rewrites (the author's own,
+one from ggerganov that tried to reuse more existing code, then ngxson's parallel branch cherry-picked on top).
+Reviewer ruixiang63 flagged that it touches broad files seemingly unrelated to Inkling2 (`common/sampling.cpp`,
+`common/speculative.cpp`, `src/llama-context.cpp`) in ways "unclear... could break existing DSpark models," and
+noted the root complication: Inkling2's DSpark variant uses a markov-rnn head instead of the standard Markov head
+llama.cpp's DSpark sampler expects, and lacks the confidence head that sampler relies on, so this is new sampling
+logic, not just wiring up an existing mechanism. Community reports on the PR also include a GGUF tensor-shape
+mismatch that requires reconverting the draft model, and a tensor-split assertion failure on multi-GPU setups. The
+numbers below are Strata's own best case with drafting on, nothing more.
+
+**Config:** same launch as section 11 except drafting was left on, explicitly as `--drafter dspark` (checked valid
+via `strata launch --plan`, which reported `"drafting": "Drafting: DSpark Block-8 (built into the model)"` for the
+default too — `--mtp` was simply omitted, no `off`). Confirmed what actually loaded three ways: the server's own run
+config `strata-inkling-2-mini-sq-15.json` has `"drafting": "dspark"` and no `--draft off` in the engine args (unlike
+section 11's config, which had `--draft off`); the startup log advertises "embedded DSpark drafter"; and every
+response's `timings` carries non-zero `draft_n`/`draft_n_accepted` (e.g. the sanity call: `"draft_n": 19,
+"draft_n_accepted": 1`). Same requests, same rep counts (3 / 2), same `max_tokens` 4000 cap, same nonce anti-cache,
+same GPU lock discipline, one session per request.
+
+| request | rep | prompt tok | completion tok | prefill t/s | decode t/s | VRAM after response MiB |
+|---|---|---|---|---|---|---|
+| 32k | 0 | 32139 | 1722 | 4973.7 | 110.2 | 18417 |
+| 32k | 1 | 32138 | 115 | 5002.6 | 146.0 | 18417 |
+| 32k | 2 | 32139 | 1488 | 5002.8 | 109.4 | 18385 |
+| 76k | 0 | 75967 | 100 | 3858.4 | 109.9 | 19819 |
+| 76k | 1 | 75968 | 100 | 3901.9 | 118.8 | 19817 |
+
+Mean: 32k decode **121.9 t/s** (prefill 4993.0 t/s, as expected prefill is not materially affected by drafting,
+within noise of the no-drafter 4973.6 t/s), 76k decode **114.4 t/s** (prefill 3880.2 t/s, also within noise of the
+no-drafter 3792.2 t/s). VRAM after load: 17195 MiB (32k session), 17163 MiB (76k session) — about in line with the
+no-drafter runs; VRAM after generation is higher (18385-18417 MiB at 32k, 19817-19819 MiB at 76k) since the drafter
+model and its own working state are resident.
+
+Against this doc's no-drafter Strata decode numbers (section 11: 89.3 t/s at 32k, 76.4 t/s at 76k), the built-in
+drafter is **1.36x faster at 32k and 1.50x faster at 76k** — but again, there is nothing on the llama.cpp side of
+this doc to compare that ratio against; it describes Strata's own drafting benefit, not a cross-engine gap. Both 76k
+reps and one 32k rep stopped at a short, round completion length (100-115 tokens, `finish_reason: tool_calls`),
+so per-rep decode t/s there is a small-sample estimate (the model's own early-stop choice, same caveat as the
+generated-length differences noted in section 11).
+
+Section 11 above is already committed (`faa9edfa0`); this subsection (11.1) is a working-tree change on top of it,
+uncommitted per `AGENTS.md` (no agent commit without explicit human approval).
