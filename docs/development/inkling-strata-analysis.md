@@ -835,3 +835,20 @@ All under `tmp/inkling/` (git-ignored).
 - `logs/dspark-s6/nsys-k7.nsys-rep` and `.sqlite`, `nsys-k3.nsys-rep` and `.sqlite`, `strata-nsys.nsys-rep` and `.sqlite`: traces.
 - `logs/dspark-s6/draft-kernel-seq.txt`, `strata-draft-kernel-seq.txt`: ordered kernels of one draft.
 - `tools/dspark_s6_nsys.sh`, `dspark_s6_strata.sh`, `dspark_s6_an.py`: session scripts and trace analysis (its host-window lines are labelled ms but are us).
+
+## 15. Drafter speed fixes (2026-11-24)
+
+Fixes from the list in 14.5, each measured alone. 32k and 76k requests, K=7, request sampling, greedy draft, `-c 98304 -ub 512`. Logs: `tmp/inkling/logs/dspark-s7/`, `dspark-s8/`.
+
+| Change | Exact | 32k draft ms | 32k decode t/s | 76k draft ms | 76k decode t/s |
+|---|---|---|---|---|---|
+| PR #32218 as is (13.5) | - | 4.01 | 101.3 | 4.24 | 101.5 |
+| F1: no `draw` subgraph in greedy mode | yes | 3.37 | 102.9 | - | - |
+| F1 + F2: drafted tokens from the argmax chain (packed into `h_nextn`), no logits, no backend sampler | yes | 3.12 | 103.6 | 3.34 | 103.4 |
+| F1 + F2 + `markov_w2` in Q8_0 (new drafter file, no code) | no, acceptance equal to 3 decimals | 2.06 | 107.7 | 2.29 | 107.2 |
+
+- Exact means: same generated token count (1684 on 32k) and the same `acc rate/pos` as before. Teacher forcing with F1 + F2 (step 2 run 1): 298 of 300, the same two misses as before. `--spec-draft-sampling probabilistic` keeps the old path (18.8 t/s, as in 13.8).
+- Drafter file with Q8_0 `markov_w2`: `dspark-Inkling-2-Mini-BF16-w2q8.gguf` (657 MiB), made with `llama-quantize --pure --allow-requantize --tensor-type 'markov_w2\.weight=q8_0' --tensor-type '\.weight$=bf16' <BF16-mainline.gguf> <out> Q8_0`. Only `markov_w2.weight` changes type. Acceptance at 76k: (0.706, 0.506, 0.364, 0.286, 0.228, 0.166, 0.125) against (0.704, 0.504, 0.364, 0.288, 0.230, 0.166, 0.125).
+- Tried and dropped: scoring the Markov steps only on the top 512 candidates of the base logits (Strata `K_cand`). Draft 1.75 ms, but acceptance falls from position 2 on (32k mean acc len 2.55 against 3.01), decode 94.3 (32k) and 86 t/s (76k). Patch kept in `tmp/inkling/patches/dspark-f1f2f5.diff`.
+- Not done: F3 (reuse of the two draft-context graphs, about 0.3 ms per round): `gf_res_prev` already has two slots, but one scheduler serves both graphs, and allocating one invalidates the other; real reuse needs a second scheduler in `llama_context`. Cheaper option: merge the injection into the block decode as one mixed batch. F4 (`f_rnn` on the device, about 0.15 ms): needs a mixed state input in `llama-graph.cpp`.
+- Against Strata (121.9 / 114.4 t/s): 32k -12%, 76k -6% at fixed K=7. Next: windowed K (plan step 4).
