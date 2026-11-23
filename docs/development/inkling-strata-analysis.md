@@ -537,3 +537,203 @@ generated-length differences noted in section 11).
 
 Section 11 above is already committed (`faa9edfa0`); this subsection (11.1) is a working-tree change on top of it,
 uncommitted per `AGENTS.md` (no agent commit without explicit human approval).
+
+## 12. DSpark drafter on llama.cpp
+
+Analysis of Strata's drafter and the implementation plan are in `inkling-dspark-plan.md` (2026-11-23, plan only, nothing implemented).
+It supersedes the "ruled out" note on #32218 in 11.1: the PR was rewritten, its head `9f57b4453` is 692 lines on a base that our HEAD already contains, and Unsloth publishes drafter GGUFs for it.
+Results of that plan go below this line.
+
+## 13. DSpark drafter measurements (plan step 3, 2026-11-23)
+
+Setup. Target `Inkling-2-Mini-UD-Q3_K_XL.gguf`. Server flags `-c 98304 -ub 512 -np 1 -fa on -ngl 99 --jinja`, drafter flags `-md <file> --spec-type draft-dspark --spec-draft-n-max K -ngld 99`.
+Spec binary: this branch (HEAD `07d22ba2e`) plus PR #32218 at `9f57b4453` (staged diff, CUDA build). Baseline binary: `3692ecb40` (no PR).
+Drafter files: `dspark-Inkling-2-Mini-BF16-mainline.gguf` 749,371,936 bytes (0.75 GB), `dspark-Inkling-2-Mini-Q8_0-mainline.gguf` 503,889,952 bytes (0.50 GB). BF16 unless a table says Q8_0.
+Requests: `req_32k.json` (32,144 tokens) and `req_76k.json` (75,985 tokens), the captured Junie requests, seed 100000, stop string `</COMMAND>`, tools set.
+Sampling: the requests carry no sampling fields. The server uses the GGUF defaults: temperature 1.0, top_k 0, top_p 1.0, min_p 0. "Request sampling" below means these.
+Draft sampling: default (`--spec-draft-sampling greedy`) unless a row says otherwise.
+Client: `tmp/inkling/tools/dspark_client.py` (own client; `cache_prompt=false` forces a full prefill every rep, so there is no prompt cache hit between reps). Two reps per session.
+Generation length: `max_tokens` 4000 for 32k and 2000 for 76k (a 76k session with 4000 tokens does not fit the 5 minute cap). Many replies end earlier by themselves (tool call).
+One session per request and configuration, each under the GPU lock, wall cap 300 s. Logs: `tmp/inkling/logs/dspark-s3/` (`<tag>.client.txt`, `<tag>.server.log`). Table script: `tmp/inkling/tools/dspark_s3_table.py`.
+`-lv 4` (needed for the per-position acceptance line) does not change speed: 32k, K=3, 2 reps each, decode 100.78 and 101.16 t/s without it and 100.82 and 101.58 t/s with it. All spec sessions use `-lv 4`.
+
+### 13.1 Step 2 result (lossless gate)
+
+Accepted by the user as passed. Run 1: 298 of 300 tokens are the top-1 of the baseline binary. The misses are at step 5 (gap 0.0187) and step 20 (gap 0.0695, the teacher margin there was 0.013).
+The user accepted the step 20 miss as a near tie, because a control run with the baseline binary only (ngram-simple drafts, no PR code, run c2) also flipped a token, with gap 0.0921.
+Runs 2 to 5: 99 of 100, 300 of 300, run 4 identical to run 1, 20 of 20. Logs: `tmp/inkling/logs/dspark-s2/`.
+
+### 13.2 Scope
+
+The user cut the batch after the first results ("overtesting, the drafter speed will change next"). Deferred until the drafter speed work: M1 (synthetic round cost; the first M1 try failed because `ignore_eos` cannot be combined with the tool grammar), M8 (top draft candidates), the extra `-lv 4` VRAM load, the baseline re-run at the end of the batch (B1).
+Measured before the cut and kept: `--spec-draft-sampling probabilistic`, temperature 0, Q8_0 drafter (13.7 to 13.9).
+
+### 13.3 Baseline (B, binary `3692ecb40`, no drafter)
+
+| Request | Prompt tokens | Gen tokens | Prefill t/s (rep0, rep1) | Decode t/s (rep0, rep1) | VRAM MiB after load | VRAM MiB after gen |
+|---|---|---|---|---|---|---|
+| 32k | 32144 | 1727 | 2705, 2747 | 80.75, 80.70 | 17264 | 17300 |
+| 76k | 75985 | 2000 (cap) | 2495, 2508 | 74.03, 74.09 | 17264 | 17300, 17307 |
+
+Speedups below use the mean of the two reps: 80.72 t/s (32k) and 74.06 t/s (76k). Baseline B at the start only.
+
+### 13.4 M3: decode speed, BF16 drafter, request sampling, draft sampling greedy
+
+| Request | K | Decode t/s (rep0, rep1) | Speedup vs B | Gen tokens | Prefill t/s (rep0, rep1) | VRAM MiB load / gen |
+|---|---|---|---|---|---|---|
+| 32k | 1 | 92.69, 92.30 | 1.15 | 1962 | 2624, 2660 | 19239 / 19329 |
+| 32k | 2 | 111.59, 111.70 | 1.38 | 1690 | 2605, 2657 | 19243 / 19333 |
+| 32k | 3 | 92.74, 93.29 | 1.15 (disturbed, see notes) | 1098 | 2492, 2467 | 19949 / 19661 |
+| 32k | 5 | 99.34, 104.84 | 1.26 | 1529 | 2406, 2476 | 19535 / 19622 |
+| 32k | 7 | 100.86, 101.72 | 1.26 | 1684 | 2606, 2653 | 19510 / 19601 |
+| 76k | 1 | 80.70, 80.78 | 1.09 | 2000 | 2417, 2432 | 19442 / 19529 |
+| 76k | 2 | 91.01, 91.30 | 1.23 | 2000 | 2409, 2434 | 19297 / 19391 |
+| 76k | 3 | 95.04, 95.10 | 1.28 | 2000 | 2409, 2426 | 19303 / 19452 |
+| 76k | 5 | 97.52, 97.85 | 1.32 | 2000 | 2417, 2433 | 19365 / 19414 |
+| 76k | 7 | 101.33, 101.60 | 1.37 | 2000 | 2409, 2432 | 19246 / 19531 |
+
+Notes.
+- The 32k K=3 row looks low. The same configuration ran four times in the `-lv` check (K=3, 32k): 100.78, 101.16, 100.82, 101.58 t/s (mean 101.1, speedup 1.25), with the same 1098 generated tokens. The M3 session of K=3 had 700 MiB more VRAM after load (19949 against 19247), so another process was using the GPU. Treat 101.1 as the K=3 value for 32k. The prefill of that session is low too (2467 to 2492 t/s).
+- The text differs between K values on the 32k request (1962, 1690, 1098, 1529, 1684 tokens, baseline 1727), because verify batches use other kernels than single-token decode (D3) and the sampling is random with a fixed seed. Speed and acceptance between K values on 32k compare different texts. On 76k all runs end at the 2000 token cap, but the text differs there too.
+- The idle desktop already uses about 1.1 GiB, and other processes add a few hundred MiB, so single VRAM readings have a spread of 300 to 700 MiB.
+
+### 13.5 Round time split (rep1 of each M3 session)
+
+`round_ms = decode_s * 1000 / (draft_n / K)`, `draft_ms = dur(g) / #gen drafts` from the `statistics` line (cumulative over both reps), `verify_ms = round_ms - draft_ms` (target batch of K+1 tokens, rollback and acceptance included), `c = round_ms * baseline_tps / 1000` (round cost in single-token decodes, with the real acceptance, not the synthetic one). BF16, request sampling.
+
+| Request | K | round ms | draft ms | verify ms | draft share of round | c | Strata c(K+1) |
+|---|---|---|---|---|---|---|---|
+| 32k | 1 | 18.5 | 1.60 | 16.9 | 8.6% | 1.50 | 1.51 |
+| 32k | 2 | 20.5 | 2.04 | 18.5 | 10.0% | 1.66 | 1.74 |
+| 32k | 3 (undisturbed run, rep1 of the check) | 24.0 | 2.43 | 21.6 | 10.1% | 1.94 | 1.96 |
+| 32k | 5 | 28.1 | 3.47 | 24.6 | 12.3% | 2.27 | 2.35 |
+| 32k | 7 | 29.5 | 4.00 | 25.5 | 13.6% | 2.38 | 2.69 |
+| 76k | 1 | 21.6 | 1.78 | 19.8 | 8.2% | 1.60 | 1.51 |
+| 76k | 2 | 23.4 | 2.22 | 21.2 | 9.5% | 1.74 | 1.74 |
+| 76k | 3 | 27.3 | 2.65 | 24.7 | 9.7% | 2.03 | 1.96 |
+| 76k | 5 | 30.1 | 3.47 | 26.7 | 11.5% | 2.23 | 2.35 |
+| 76k | 7 | 33.4 | 4.23 | 29.1 | 12.7% | 2.47 | 2.69 |
+
+The round cost in llama.cpp is close to the Strata model (that row is for Strata kernels). `draft_n` counts K per round, so a round that stopped early would make `round_ms` slightly too small. The baseline single-token time is 12.4 ms (32k) and 13.5 ms (76k).
+
+### 13.6 M2 and M4: acceptance (statistics lines, both reps, same text in both reps)
+
+Acceptance rate per draft position and mean accepted length (includes the target token). BF16, request sampling, greedy draft sampling.
+
+| Request | K | Rate at positions 1..K | Mean acc len |
+|---|---|---|---|
+| 32k | 1 | 0.717 | 1.72 |
+| 32k | 2 | 0.752, 0.546 | 2.30 |
+| 32k | 3 | 0.676, 0.440, 0.324 | 2.44 |
+| 32k | 5 | 0.698, 0.483, 0.344, 0.235, 0.179 | 2.94 |
+| 32k | 7 | 0.677, 0.459, 0.312, 0.225, 0.163, 0.107, 0.062 | 3.01 |
+| 76k | 1 | 0.747 | 1.75 |
+| 76k | 2 | 0.690, 0.450 | 2.14 |
+| 76k | 3 | 0.711, 0.516, 0.376 | 2.60 |
+| 76k | 5 | 0.679, 0.465, 0.353, 0.258, 0.196 | 2.95 |
+| 76k | 7 | 0.704, 0.504, 0.364, 0.288, 0.230, 0.166, 0.125 | 3.38 |
+
+M4 (block size, K=3 against K=7, positions 1..3): 32k 0.676, 0.440, 0.324 against 0.677, 0.459, 0.312. 76k 0.711, 0.516, 0.376 against 0.704, 0.504, 0.364. The difference is at most 1.9 points (32k position 2), 1.2 points or less in the other cells, and the signs are mixed. The texts differ, so this is only a rough bound.
+No code prompt was run (M2 asked for one); the two requests are Junie agent turns.
+
+### 13.7 Temperature 0 (request overridden to temperature 0, BF16, greedy draft)
+
+The replies are short (148 to 178 tokens, the first tool call), so t/s is a small sample. No baseline at temperature 0 was run, so no speedup is claimed.
+
+| Request | K | Decode t/s (rep0, rep1) | Gen tokens | Rate at positions 1..K | Mean acc len |
+|---|---|---|---|---|---|
+| 32k | 3 | 116.88, 117.85 | 148 | 0.833, 0.688, 0.542 | 3.06 |
+| 32k | 7 | 140.93, 142.12 | 156 | 0.914, 0.714, 0.571, 0.457, 0.371, 0.286, 0.114 | 4.43 |
+| 76k | 3 | 103.38, 106.05 | 178 | 0.833, 0.617, 0.500 | 2.95 |
+| 76k | 7 | 117.29, 118.53 | 178 | 0.822, 0.600, 0.444, 0.356, 0.267, 0.267, 0.178 | 3.93 |
+
+Positions 1..3 at K=3 against K=7: 76k 0.833, 0.617, 0.500 against 0.822, 0.600, 0.444. 32k 0.833, 0.688, 0.542 against 0.914, 0.714, 0.571. Only 35 to 60 rounds per session, so not reliable to one point.
+
+### 13.8 `--spec-draft-sampling probabilistic` (BF16, request sampling)
+
+| Request | K | Decode t/s | Gen tokens | Mean acc len | Rate at positions 1..K |
+|---|---|---|---|---|---|
+| 32k | 3 | 20.60, 20.77 | 1596 | 2.70 | 0.761, 0.555, 0.384 |
+| 32k | 7 | 18.88 (one rep, the 300 s cap cut the session) | 2475 | 3.22 | 0.713, 0.514, 0.357, 0.253, 0.179, 0.117, 0.084 |
+| 76k | 3 | 23.32, 23.32 | 168 | 3.13 | 0.907, 0.704, 0.519 |
+| 76k | 7 | 21.74, 21.97 | 426 | 3.19 | 0.806, 0.537, 0.388, 0.224, 0.119, 0.090, 0.022 |
+
+Odd: decode is 4 to 5 times slower than the baseline (0.23 to 0.31 of B). The round takes 130 to 170 ms (`verify_ms` 127 to 165 against 25 for greedy draft), while the draft itself costs 3.3 to 5.3 ms. The slowdown is in the probabilistic path (the draft distribution `q` that goes to the verifier), not in the drafter. Not analysed here. The acceptance is not worse than with greedy draft sampling.
+
+### 13.9 M5: Q8_0 drafter (request sampling, greedy draft)
+
+| Request | K | Decode t/s (rep0, rep1) | Speedup vs B | Mean acc len | Rate at positions 1..3 | Draft ms |
+|---|---|---|---|---|---|---|
+| 32k | 3 | 101.14, 101.00 | 1.25 | 2.45 | 0.679, 0.441, 0.325 | 2.30 |
+| 32k | 7 | 100.55, 101.07 | 1.25 | 2.99 | 0.674, 0.457, 0.311 | 3.88 |
+| 76k | 3 | 94.76, 94.35 | 1.28 | 2.59 | 0.710, 0.510, 0.366 | 2.50 |
+| 76k | 7 | 100.24, 100.73 | 1.36 | 3.36 | 0.705, 0.502, 0.360 | 4.14 |
+
+Same text and acceptance as BF16 within 0.5 points (K=7 positions 1..3 on 32k: 0.674, 0.457, 0.311 against 0.677, 0.459, 0.312). Decode speed is equal within noise. The draft step is 0.1 to 0.3 ms shorter. Q8_0 saves 234 MiB of weights.
+
+### 13.10 M6: VRAM (K=7, nvidia-smi of the whole GPU)
+
+| Config | After load MiB | After gen MiB |
+|---|---|---|
+| B (no drafter) | 17264 | 17300 |
+| BF16, K=7 | 19246 to 19510 | 19347 to 19601 |
+| Q8_0, K=7 | 19508 to 19521 | 19608 to 19624 |
+
+Increase over B: about +2.0 GiB after load (19246 against 17264, the lowest BF16 reading) and +2.0 to +2.3 GiB after generation. Reserve lines of the K=7 BF16 session (32k), from the server log:
+
+| Item | MiB |
+|---|---|
+| drafter weights, BF16 file (Q8_0 file: 469.11) | 703.25 |
+| drafter KV, two caches (384 + 14) | 398.00 |
+| drafter compute buffer (graph pp bs=512, tg bs=1) | 787.86 (+ 102.27 host) |
+| target recurrent state with 7 snapshots (K=3: 14.62) | 29.25 |
+| target compute buffer, at load, then after warmup | 129.62, 138.63 |
+| target KV (unchanged) | 3072 + 240 |
+
+The plan estimate (1.0 to 1.2 GiB, section 5) was too low by the draft compute buffer, which the plan had as unknown: 788 MiB for the drafter graph at `-ub 512`. The KV estimate (384 MiB + 12 MiB) was right. The listed lines add up to about 1.9 GiB, which matches the measurement. The baseline server was not run with `-lv 4`, so its reserve lines were not collected. The extra `-lv 4` load was skipped (13.2), but every spec session already runs with `-lv 4`.
+
+### 13.11 M7: prefill
+
+Prefill t/s, mean of two reps (baseline 2726 on 32k, 2502 on 76k). Drafter, K=1, 2, 7 on 32k: 2642, 2631, 2630 (-3.1 to -3.5%). On 76k: 2425, 2422, 2420 (-3.1 to -3.3%). The disturbed 32k sessions (K=3, K=5, see 13.4) show 2406 to 2492. The prefill loss with the drafter is about 3.1 to 3.5% on both requests, for all K.
+
+### 13.12 Decision table (plan step 3)
+
+| Finding | Fires? | Numbers |
+|---|---|---|
+| best fixed K gives 1.2x or more | yes, go to step 4 (draft length rule) | 32k: K=2 1.38, K=3 1.25 (undisturbed), K=5 1.26, K=7 1.26. 76k: K=7 1.37, K=5 1.32, K=3 1.28. K=1 gives 1.15 and 1.09 |
+| M4 shows 2 points or more for the full block | no | at most 1.9 points, mixed sign, different texts |
+| draft is more than 10% of `t_round` at the best K | yes for K=5 and K=7 (step 6, ask the user first) | K=7 13.6% (32k) and 12.7% (76k), K=5 12.3% and 11.5%. K=2 and K=3 sit at 9.5 to 10.1%, on the line. Draft ms: 1.6 (K=1) to 4.0 and 4.2 (K=7) |
+| `c(K)` far above the Strata row and speedup below 1.1x | no | c is at or below the Strata row except 76k K=1 (1.60 against 1.51) and 76k K=3 (2.03 against 1.96). Speedup is below 1.1 only at 76k K=1 (1.09) |
+| acceptance at position 1 below 50% on the code prompt | no | position 1 is 0.68 to 0.75 on both requests (no code prompt run) |
+| prefill loss above 3% | yes, narrowly | 3.1 to 3.5% on both requests. Candidates: a larger `--spec-draft-n-ubatch`, reading `h_nextn` only for the last 9 rows of a chunk |
+
+Other findings. On 76k the speedup grows with K (1.09 to 1.37). On 32k it is flat above K=2, but the 32k texts differ per K. The verify cost per round is nearly flat (K=1: 17 to 20 ms, K=7: 26 to 29 ms), so more K pays while acceptance holds; positions 6 and 7 accept 6 to 17% and add little. The probabilistic draft mode is 4 to 5 times slower than the baseline (13.8).
+
+### 13.13 Memory traffic per round against the bandwidth floor
+
+Question: how close is a round to "read the memory it needs once"? GPU RTX 5090, 1792 GB/s peak. Sizes from the target GGUF (12.68 GiB weights).
+
+| Item | Size | Read per forward pass |
+|---|---|---|
+| attention + router weights of one layer | 26.4 MiB | 48 visits |
+| loop control weights (layers 6..17) | 9.0 MiB | 36 loop visits |
+| one expert of one layer (gate_up IQ3_XXS + down IQ4_NL) | 3.79 MiB | 8 per token per visit |
+| lm head (Q5_K) | 304 MiB | once |
+| global KV, 8 layer visits, f16 | 32 KiB per context token | 1.0 GiB at 32k, 2.3 GiB at 76k |
+| SWA KV, 40 layer visits, window 1024 | 160 MiB | once |
+
+No shared expert. Every visit reads its weights again from VRAM: between two visits of a loop layer about 700 MiB of other weights pass, the 96 MB L2 cannot keep them.
+For a verify batch of M tokens a visit touches `128 * (1 - (15/16)^M)` distinct experts if routing were random (8, 29, 51 for M = 1, 4, 8). Real routing is correlated, so the byte counts below are an upper bound.
+
+| Tokens per pass | Bytes read (32k) | Time at peak bandwidth | Measured (13.5) | Share of peak |
+|---|---|---|---|---|
+| 1 (plain decode) | 4.7 GB | 2.6 ms | 12.4 ms | 21% |
+| 1, 76k | 6.2 GB | 3.4 ms | 13.5 ms | 26% |
+| 4 (K=3 verify) | 8.7 GB | 4.9 ms | 21.6 ms | 23% |
+| 8 (K=7 verify) | 13.0 GB | 7.2 ms | 25.5 ms | 28% |
+| all experts, loop layers 3 times (upper bound) | about 26 GB | 14.5 ms | - | - |
+
+Findings.
+- The plain decode runs 4 to 5 times above its bandwidth floor. From 32k to 76k the KV read grows by 1.4 GB and the time by 1.1 ms, so attention runs close to the bandwidth; the rest (about 11 ms for 3.5 GB of weights, about 330 GB/s) looks bound by latency and launches (48 visits of small matrices, n_embd 2304). Not profiled yet.
+- Strata without the drafter is at the same level (89.3 t/s at 32k = 11.2 ms per token). Its advantage is the drafter and the draft policy, not the target pass.
+- The verify cost per extra token is small (c in 13.5 is at or below the Strata model). The draft is the cheapest part to fix: 4.0 ms of a 29.5 ms round at K=7, about 9 times the 0.45 ms that Strata claims. A rough floor for this drafter (3 BF16 layers, 7 Markov steps over the full vocabulary) is about 1.5 ms (estimate, not checked).
