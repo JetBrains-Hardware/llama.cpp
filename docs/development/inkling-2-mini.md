@@ -106,6 +106,45 @@ Implemented `--kvq` for `inkling2` and `inkling2_loop` on top of `erokhins/kvq-r
   - Replays at `-c 98304 -np 1 -fa on --kvq`: `14.1 GiB` VRAM across both 32k (`2,609-2,653 t/s` prefill, `70.1-70.2 t/s` decode, deterministic `1,799` tok, `0.00 ms` prefetch join, `0` failed fits) and 76k (`2,523-2,538 t/s` prefill, `66.4 t/s` decode).
   - Teacher forcing on `flow 144` (`23,709` prompt tokens, 100 greedy steps, `--kvq` vs exact `-ctk q8_0 -ctv q8_0 -fa on`): **96/100** top-1 match, **100/100** top-5 match, median `|d_logprob| = 0.00456`, `ppl_ratio = 1.0075`, exact prefill/decode agreement at step 50.
 
+## 16 GB card (15.5 GiB) budget, vision, and DSpark planning
+
+After cherry-picking `posmask` (`1e29b33ea`, drops the `kq_mask` tensor; `-c 98304` load VRAM drops to `17,080 MiB` standard / `14,385 MiB` `--kvq`), the `--kvq` VRAM breakdown for `UD-Q3_K_XL` (`-ngl 99 -fa on -np 1 -ub 512`) is:
+
+- **Fixed base (`~13.63 GiB` / `~13,960 MiB`, O(1) in `n_ctx`):** `12,984 MiB` weights + `128 MiB` SWA KV (40 layers, `q8_0`, 1,536 cells) + `36 MiB` full-attn ring tail (8 layers, `q8_0`, 2,048 cells) + `4 MiB` short-conv state + `130 MiB` compute buffer (`4 B/tok` growth) + `~680 MiB` CUDA/WDDM overhead.
+- **Per-token scaling (`5.65 KiB/tok` above ~72k):** `3.52 KiB/tok` coarse `K2/V1` codes + KLT tables (`28.2 MiB` per 8,192-token chunk) + `2.13 KiB/tok` 1-layer `q8_0` prefill scratch `kvq_scr` (shared with the fixed `154 MiB` decode resident buffers). Lazy host RAM for pinned KV pages is `~20.5 KiB/tok` (`~2.6 GiB` at 128k, `~5.2 GiB` at 256k).
+- Note: using `-ub 2048` instead of `-ub 512` adds `+388 MiB` to the fixed compute buffer (`~-70k` max context).
+
+### Max context in 15.5 GiB (`15,872 MiB`)
+
+| Configuration (`UD-Q3_K_XL`, `-fa on -np 1 -ub 512`) | Fixed base | Scaling | Est. VRAM @ 128k | Max context in 15.5 GiB |
+|---|---:|---:|---:|---:|
+| Standard F16 KV (`+ hridaya423 + posmask`) | `~13.68 GiB` | `32.0 KiB/tok` | `~17.68 GiB` (OOM) | `~56k-60k` |
+| Standard Q8_0 KV (`-ctk q8_0 -ctv q8_0`) | `~13.57 GiB` | `17.0 KiB/tok` | `~15.70 GiB` (OOM) | `~110k-118k` |
+| `--kvq` text only | `~13.63 GiB` | `5.65 KiB/tok` | `~14.34 GiB` (`~15.05 GiB` @ 256k) | `~330k-345k` |
+| `--kvq` + Vision on CPU (`--no-mmproj-offload`) | `~13.63 GiB` | `5.65 KiB/tok` | `~14.34 GiB` | `~330k-345k` |
+| `--kvq` + Vision on GPU (`mmproj Q8_0`) | `~14.2 GiB` | `5.65 KiB/tok` | `~14.9 GiB` | `~230k-245k` |
+| `--kvq` + DSpark drafter (`Q8_0` / `F16` draft KV) | `~14.25 GiB` | `7.8-9.7 KiB/tok` | `~15.2-15.5 GiB` | `~130k-160k` (`~220k` if draft KV capped) |
+| `--kvq` + Vision on GPU + DSpark | `~14.8 GiB` | `7.8-9.7 KiB/tok` | `~15.8-16.0 GiB` (OOM) | `~70k-90k` |
+
+### Vision (`--mmproj`) and DSpark (`-md`) notes
+
+- **Vision (`inkling2v`):** supported in this branch (upstream PR `#32217`, `tools/mtmd/models/inkling2v.cpp`), not enabled in our runs yet. Costs `~0.5-0.9 GiB` fixed on GPU (`mmproj Q8_0` `~350 MiB` or `F16/BF16` `~640 MiB` + `~150-300 MiB` vision compute; `0 B/tok` scaling), or `0 MiB` VRAM with `--no-mmproj-offload` (CPU).
+- **Drafter (DSpark, not MTP):** Inkling-2-Mini uses a co-trained 3-layer DSpark drafter (DFlash variant: block-8 non-causal attention + Markov RNN head, attention pattern `SWA-1025, Global, SWA-1025`, tapping 4 target layers `[5, 23, 41, 48]`). Standard MTP (`n_layer_nextn`) is not used. Upstream support is still open draft PR `#32218` (Strata implements it in `ink_dspark.cuh`). Costs `~0.5-0.8 GiB` fixed (`~0.4-0.65 GiB` weights + `~12 MiB` SWA KV + `~80-120 MiB` scratch) plus `2.13 KiB/tok` (`Q8_0`) or `4.0 KiB/tok` (`F16`) for its global draft KV layer unless capped to a smaller window. Note: `--kvq` packed decode already supports `L <= 8`, but draft-rejection KV rollback with `--kvq` will need verification when enabling DSpark.
+
+### Possible solutions for GPU vision without permanent VRAM overhead
+
+Vision encoding runs strictly before LLM prefill/decode and never overlaps with it. Relevant upstream work (none merged yet):
+
+- `ggml-org/llama.cpp#28320` (open draft, `--mmproj-vram-swap`): calls `llama_sched_release()` to free idle LLM compute buffers during image encode, runs a transient GPU `mtmd_context`, then re-reserves. Limitation here: `posmask` already shrank our LLM compute buffer to `~130 MiB`, which is not enough on its own for `mmproj-Q8_0` (`~350 MiB`) + vision compute (`~150-300 MiB`).
+- `ggml-org/llama.cpp#28346` (open draft, `--mmproj-evict-draft`): keeps `mmproj` in host RAM and temporarily evicts draft model GPU weights to host RAM during image/audio encode (`llama_model_weights_swap_prepare/evict/restore`), then restores them. Directly solves the Vision + DSpark case.
+- `ggml-org/llama.cpp#20246` (discussion): temporarily evicting a subset of LLM layers to RAM during vision encode (no PR yet).
+
+Candidate approaches to revisit later on this branch (ordered by simplicity):
+
+1. **Borrow pure scratch (`llama_sched` + `kvq_scr`, zero copy cost):** at 256k-320k `--kvq` context, the LLM compute buffer (`~130 MiB`) plus `kvq_scr` (`~544-680 MiB`) provide `~670-810 MiB` of stateless scratch that can be freed and reallocated around image encode with no D2H/H2D copy.
+2. **Swap with DSpark draft weights (`#28346` pattern):** when running DSpark, evicting `~500 MiB` of draft weights to host RAM and restoring them over PCIe 4.0/5.0 x16 takes `~20-40 ms` each way.
+3. **Evict a few LLM layer buffers (extension of `#28346`):** works at any context size and without a drafter; evicting `~1 GiB` (2-3 MoE layers) and restoring takes `~50-100 ms` round-trip over PCIe using the same `ggml_backend_buffer` evict/restore mechanism scoped to a subset of layers.
+
 ## Local tools (not committed)
 
 Everything lives in the git-ignored `tmp/inkling/` of this worktree (`/tmp/` is in `.gitignore`):
