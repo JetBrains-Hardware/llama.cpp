@@ -170,7 +170,7 @@ mask-present case and be checked with `teacher_force.py` and `test-backend-ops`.
 - Answered: compute buffer at HEAD, see section 10 step 0 (mask = 1 KiB/tok at `-ub 512`, fixed part about 130 MiB CUDA0).
 - Answered: `-np 2` works in both modes and gives the same text as the baseline (section 10, step 3 correctness).
 - Open: context shift and `--cache-reuse` with the pos mask are not tested (plan step 3.6).
-- Open: other backends (Vulkan, Metal, ...) do not refuse `src[6]` of FLASH_ATTN_EXT (plan step 5); this fork stays CUDA and CPU only for now.
+- Open, **correctness risk**: only CUDA and CPU are correct for Inkling-2 on this branch. Other backends (Vulkan, Metal, SYCL, OpenCL, CANN, OpenVINO, WebGPU, Hexagon, zDNN, spacemit) do not check `src[6]` (the rel bias) of FLASH_ATTN_EXT in `supports_op`: they accept the node and ignore the bias. This was already wrong at f929fd85c (no bias). With the pos mask it is worse: there is no mask tensor, so such a backend also attends to every cell (future and stale cells). No crash, only wrong output. Fix (plan step 5, not done, decision 2026-11-23: CUDA/CPU only for now): refuse `src[6]` in each of these `supports_op` (one line each, Metal needs its own check), then the scheduler falls back to CPU. Must be done before any use on these backends or any upstream PR.
 - Open: K/V types other than F16 make the mma kernel convert K/V in a temporary that scales with `n_kv` (not measured).
 - Upstream direction: #32740 contract (indexed bias + F16 mask) differs from hridaya423's `kpos`/`qpos` API. Rebase cost
   if upstream merges first.
@@ -257,7 +257,7 @@ Gate 2 items 2-5, teacher = baseline binary f929fd85c, both `-fa on`:
 | 4 | default prompt | 100/100 | 0.00000 |
 | 5 | sweep 7..2100 vs `-fa off`, with and without the switch | 12/12 both | output identical line by line |
 
-All exact. Step 3 (milestone measurements) is not done yet.
+All exact. Step 3 results are in the subsections below.
 
 ### Step 3 speed and VRAM
 
@@ -331,3 +331,45 @@ Item 5, CPU reference end to end (`teacher_force.py --ngl 0 --n-tokens 20`, prom
 | `LLAMA_ATTN_POS_MASK_DISABLE=1` | 20/20 | 0.00000 | 0.28323 |
 
 Both runs are identical to each other and an exact match vs the teacher.
+
+### Step 3.6 position shifts
+
+Logs: `tmp/inkling/logs/strata-s36` (`all.sh`, `sess.sh`, `<tag>.server.log`, `<tag>.p*.txt`). Three configs: baseline f929fd85c, new (pos mask), new with `LLAMA_ATTN_POS_MASK_DISABLE=1` (dense). `/completion`, temperature 0, fixed seed.
+
+What the model supports:
+- Without `--swa-full` the server says "cache_reuse is not supported by this context, it will be disabled". `llama_kv_cache_iswa::get_can_shift()` needs the base and SWA caches to have the same size (8192 vs 1536 by default). With `--swa-full` shifts are allowed (cache reuse and context shift).
+- `--cache-reuse` does shift (`reusing chunk with size 1127, shifting KV cache [2210, 3337) -> [1544, 2671)`), but right after it the server logs "forcing full prompt re-processing due to lack of cache data" and recomputes the prompt. Likely cause: the recurrent state of the hybrid memory cannot follow a shift. So cache reuse gives no real test of shifted cells for this model (and no speed gain).
+- `--context-shift` works: two "slot context shift, n_keep = 0, n_left = 4095, n_discard = 2047" events per run, generation continues over cells with moved positions.
+
+| scenario | args | base vs pos vs dense |
+|---|---|---|
+| cache reuse, request A+B+C then A+C | `-c 8192 --cache-reuse 256 --swa-full` | identical (also identical to a fresh server, because of the full re-processing) |
+| context shift, 2669 token prompt, long generation | `-c 4096 --context-shift --swa-full`, 2 shifts | identical |
+
+The pos mask gives the same text as the dense mask and the baseline after real context shifts.
+
+### Step 3.6 position shifts
+
+Logs and scripts: `tmp/inkling/logs/strata-s36`. Model Inkling-2-Mini UD-Q3_K_XL, `-ngl 99 -fa on -np 1 --jinja`, `/completion` raw prompt, temperature 0, seed 1. Configs: baseline `f929fd85c`, new pos mask, new with `LLAMA_ATTN_POS_MASK_DISABLE=1` (dense).
+
+What is supported:
+- By default both `--cache-reuse` and `--context-shift` are refused. Log: "cache_reuse is not supported by this context, it will be disabled".
+- Cause: `llama_kv_cache_iswa::get_can_shift()` also needs `kv_base->get_size() == kv_swa->get_size()`. The default SWA cache is smaller (1536 against 8192 cells).
+- With `--swa-full` both caches have equal size and both features are enabled.
+- Cache reuse: the chunk is shifted (`seq_rm` + `seq_add`), but the server then logs "forcing full prompt re-processing due to lack of cache data" and clears the sequence. The model has a recurrent state (checkpoints with pos_min == pos_max), which cannot follow a moved chunk. So the shifted cells are never attended to. This scenario does not exercise kpos on shifted cells.
+- Context shift (`--context-shift -c 4096 --swa-full`): works, shifted KV is used for the rest of the generation. This is the real test.
+
+Runs (all `--swa-full`):
+- S1: `-c 8192 --cache-reuse 256 -lv 4`. P1 = A+B+C (3337 tokens), P2 = A+C (2671 tokens). Log: "reusing chunk with size 1127, shifting KV cache [2210, 3337) -> [1544, 2671)", then the forced full re-processing.
+- S2: `-c 4096 --context-shift -lv 4`, prompt 2669 tokens, n_predict 3600, ignore_eos. Log: "slot context shift, n_keep = 0, n_left = 4095, n_discard = 2047", 2 shifts in every config.
+- Fresh: P2 on a fresh server, reference only.
+
+| comparison | text | identical |
+|---|---|---|
+| S1 P2: pos vs dense | 499ac5c7 | yes |
+| S1 P2: pos vs baseline | 499ac5c7 | yes |
+| S1 P2: pos vs fresh server | 499ac5c7 | yes |
+| S2 (12680 bytes, 2 shifts): pos vs dense | 90de4a52 | yes |
+| S2: pos vs baseline | 90de4a52 | yes |
+
+No finding. Caveat: S1 proves only that reuse with forced re-processing is stable. S2 is the position-moving test.

@@ -328,6 +328,7 @@ Pre-existing gap from `f929fd85c`, made worse by the pos mask (a backend that ig
 
 ## 6. Known limits after this work (state them in the results section)
 
+- **Only CUDA and CPU give correct results.** Step 5 is not done (decision 2026-11-23). Every other backend accepts the node, ignores the bias, and with the pos mask also has no mask, so it attends to all cells: wrong output, no error. Do step 5 before any use on another backend or any upstream PR.
 - 4 B per context token remain (`kpos`), on the device and on the host.
 - `-np N` with a unified cache keeps the dense mask in the reserved buffer (D4).
 - K/V cache types other than F16 make the mma kernel convert K and V to F16 in a temporary that scales with `n_kv` (`ggml_cuda_flash_attn_ext_get_alloc_size`, `fattn.cu:789`). Not measured, not part of this plan; relevant only with `-ctk` / `-ctv`.
