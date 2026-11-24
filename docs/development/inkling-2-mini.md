@@ -17,12 +17,12 @@ llama-server \
   --port 8765 --jinja
 ```
 
-- **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `15.10 GiB` peak PP / `14.75 GiB` TG process VRAM, `3,085 / 2,997 t/s` prefill, `107.6 / 97.0 t/s` decode (`59.2% / 51.8%` acceptance).
+- **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.96-14.99 GiB` peak PP / `14.59-14.60 GiB` TG process VRAM, `3,096 / 3,011 t/s` prefill, `111.5 / 118.0 t/s` decode (`58.8% / 62.8%` acceptance).
 - **Max context in `15.5 GiB` (`15,872 MiB`, 16 GB card):**
-  - Default (`-ub 2048`, uncapped draft KV): **`~160k-165k`** (PP-bound at `6.13 KiB/tok`; `-c 131072` fits comfortably at `~15.30 GiB` PP / `~15.06 GiB` TG).
-  - With `LLAMA_DSPARK_KV_CAP=4096` (`-ub 2048`): **`~295k-305k`** (TG-bound at `5.65 KiB/tok`; `-c 262144` fits at `~15.27 GiB` TG / `~15.08 GiB` PP).
+  - Default (`-ub 2048`, uncapped draft KV): **`~180k-185k`** (PP-bound at `6.13 KiB/tok`; `-c 131072` fits comfortably at `~15.16 GiB` PP / `~14.90 GiB` TG).
+  - With `LLAMA_DSPARK_KV_CAP=4096` (`-ub 2048`): **`~320k-328k`** (TG-bound at `5.65 KiB/tok`; `-c 262144` fits at `~15.12 GiB` TG / `~14.94 GiB` PP).
 - **Why each knob:**
-  - `--kvq`: two-tier KV cache for the 8 full-attention slots (`~5.65 KiB/tok` vs `32 KiB/tok` FP16).
+  - `--kvq`: two-tier KV cache for the 8 full-attention slots (`~5.65 KiB/tok` vs `32 KiB/tok` FP16), plus compact `1,280`-cell SWA cache (`106.25 MiB`) using per-layer SWA prefill scratch so `-ub 2048` adds zero permanent SWA VRAM.
   - `--kvq-prefill-free-codes`: frees KVQ `codes + tables` during prefill and re-uploads from pinned host RAM (`~5-15 ms`), offsetting the `-ub 2048` compute buffer at PP peak.
   - `-b 2048 -ub 2048`: raises MoE utilization from `32` to `128` tokens/expert (`+32%` faster prefill vs `-ub 512`).
   - `-md dspark-Inkling-2-Mini-Q8_0-mainline.gguf`: full `Q8_0` drafter saves `188 MiB` vs `BF16-w2q8` with zero acceptance loss.
@@ -30,7 +30,7 @@ llama-server \
   - `--spec-draft-n-ubatch 512`: bit-exact; saves `134 MiB` PP / `24 MiB` TG with no speed loss.
   - `layer_inp_dev` is `F16` by default in this branch (saves `36 MiB` PP at `-b 2048`, zero acceptance loss).
   - **Do NOT pass `-ctkd` / `-ctvd` (`q8_0`/`q4_0`):** DSpark block-8 decode selects `MMA_F16`, which dequantizes the entire draft KV cache into `384 MiB` of TG compute buffer on every step (more VRAM and slower).
-- **Long context (`128k-256k` on 16 GB):** add `LLAMA_DSPARK_KV_CAP=4096` in the environment to cap DSpark's global layer-1 KV to a 4k sliding window (`14.74 GiB` peak @ 96k, saves `0.5-1.0 GiB` @ 128k-256k, ~10-14% TG cost on 76k, unaffected PP).
+- **Long context (`128k-256k` on 16 GB):** add `LLAMA_DSPARK_KV_CAP=4096` in the environment to cap DSpark's global layer-1 KV to a 4k sliding window (`14.60 GiB` peak @ 96k, saves `0.5-1.0 GiB` @ 128k-256k, unaffected PP).
 - **Vision (optional):** pass `--no-mmproj-offload` if adding `-mm <mmproj.gguf>` on a 16 GB card (`0 MiB` VRAM).
 
 ## Support in ggml-org/llama.cpp
@@ -296,6 +296,24 @@ Key takeaways:
 - **Zero-loss defaults (`-347 MiB` PP / `-203 MiB` TG):** `Q8_0-mainline` drafter + `--spec-draft-n-ubatch 512` + `F16` `layer_inp_dev` (now default in `src/llama-context.cpp`) gave identical greedy output hashes and identical acceptance (`59.2% / 51.8%`) with `<1%` speed difference, bringing `-ub 2048` at 96k down to `15.10 GiB` peak / `14.75 GiB` TG.
 - **Opt-in draft KV cap (`LLAMA_DSPARK_KV_CAP=4096` in `src/llama-kv-cache-iswa.cpp`):** caps DSpark layer-1 global KV to a 4k sliding window (`-366 MiB` @ 96k, `-0.5 to -1.0 GiB` @ 128k-256k) at the cost of ~10-14% TG speed on 76k (PP unaffected).
 - **Why `-ctkd/-ctvd` (`q8_0`/`q4_0`) was rejected:** in `ggml/src/ggml-cuda/fattn.cu:805-810`, DSpark's block-8 decode picks `BEST_FATTN_KERNEL_MMA_F16`, which allocates a `384 MiB` (`192+192 MiB`) `F16` dequantization buffer in the draft TG compute graph (`19.25 -> 385.92 MiB`) and dequantizes the entire draft KV cache on every draft step.
+
+### Compact SWA KV cache + per-layer prefill scratch (Option B)
+
+Previously, raising `-ub` from `512` to `2048` permanently inflated the 40-layer SWA KV cache (`q8_0`) from `1,536` cells (`127.5 MiB`) to `3,072` cells (`255.0 MiB`) even though decode only ever reads the last `1,024` tokens. Implemented Option B across `src/llama-kv-cache.{h,cpp}`, `src/llama-memory-hybrid-kvq.{h,cpp}`, and `src/models/inkling2.cpp`:
+
+- Keeps persistent `mem_swa` permanently at `GGML_PAD(min(kv_size, n_swa + 256), 256) = 1,280` cells (`106.25 MiB`) when `!swa_full && !v_trans && n_ubatch > 256`.
+- For single-sequence prefill ubatches `> 256` tokens, concatenates `[k_old, Kcur]` / `[v_old, Vcur]` in a single per-layer `q8_0` scratch tensor (reused across all 40 SWA layers), runs FlashAttention over the concatenated window, and writes only the trailing `min(n_tokens, n_swa)` tokens back into `mem_swa`.
+
+Measured on RTX 5090 (`-c 98304 -b 2048 -ub 2048 -np 1 -fa on --kvq --kvq-prefill-free-codes`, `Q8_0` DSpark `K=4`, `dub=512`, `F16` `layer_inp_dev`, greedy `temp=0`):
+
+| Config | SWA KV buf | Compute buf | Peak proc VRAM (32k / 76k) | End proc VRAM (32k / 76k) | PP (32k / 76k) | Est. max ctx (`15.5 GiB`) |
+|---|---:|---:|---:|---:|---|---|
+| Before (default, uncapped draft KV) | `255.0 MiB` | `558.5 MiB` | `15,460 / 15,472 MiB` (`15.10 GiB`) | `15,098 / 15,110 MiB` (`14.75 GiB`) | `3,085 / 2,997 t/s` | `~160k-165k` |
+| **After Option B (default, uncapped)** | **`106.25 MiB`** | **`540.4 MiB`** | **`15,317 / 15,347 MiB` (`14.96-14.99 GiB`)** | **`14,945 / 14,955 MiB` (`14.59-14.60 GiB`)** | **`3,096 / 3,011 t/s`** | **`~180k-185k`** |
+| Before (`LLAMA_DSPARK_KV_CAP=4096`) | `255.0 MiB` | `558.5 MiB` | `15,092 / 15,102 MiB` (`14.74 GiB`) | `14,730 / 14,737 MiB` (`14.39 GiB`) | `3,073 / 2,989 t/s` | `~295k-305k` |
+| **After Option B (`LLAMA_DSPARK_KV_CAP=4096`)** | **`106.25 MiB`** | **`540.4 MiB`** | **`14,945 / 14,975 MiB` (`14.59-14.62 GiB`)** | **`14,573 / 14,589 MiB` (`14.23-14.25 GiB`)** | **`3,100 / 3,004 t/s`** | **`~320k-328k`** |
+
+Verification: on the 32,144-token prompt (`16` SWA-scratch ubatches), first-token logprobs match `--swa-full` to `0.0018` (`-23.2332` vs `-23.2350`), and multi-turn prefix-cache continuation (`swa_scratch` -> direct `<= 256` path) with `LLAMA_ATTN_POS_MASK_DISABLE=1` passed cleanly.
 
 ## Local tools (not committed)
 
