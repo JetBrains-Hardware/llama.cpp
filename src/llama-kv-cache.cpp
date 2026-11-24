@@ -1365,6 +1365,50 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
     return c0 + pos_max + 1;
 }
 
+bool llama_kv_cache::get_kv_span(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv, int32_t * span) const {
+    if (sinfo.n_stream() != 1 || ubatch.n_seqs_unq != 1 || !ubatch.token || !ubatch.pos ||
+            ubatch.is_pos_2d() || ubatch.is_mixed() ||
+            ubatch.n_tokens == 0 || ubatch.n_tokens > n_kv || n_kv > INT32_MAX ||
+            sinfo.idxs[0].size() != ubatch.n_tokens ||
+            (swa_type != LLAMA_SWA_TYPE_STANDARD && swa_type != LLAMA_SWA_TYPE_NONE)) {
+        return false;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id_unq[0];
+    const auto & cells = v_cells[sinfo.strm[0]];
+    const int64_t first_q = ubatch.pos[0];
+    const int64_t last_q = first_q + ubatch.n_tokens - 1;
+    const int64_t first_k = swa_type == LLAMA_SWA_TYPE_STANDARD ? std::max<int64_t>(0, first_q - n_swa + 1) : 0;
+    const int64_t count = last_q - first_k + 1;
+    const uint32_t last_cell = sinfo.idxs[0].back();
+    if (first_q < 0 || last_q != cells.seq_pos_max(seq_id) || count > n_kv || last_cell >= n_kv) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.pos[i] != first_q + i || ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id) {
+            return false;
+        }
+    }
+
+    const uint32_t first_cell = (last_cell + n_kv + 1 - count) % n_kv;
+    // Check the whole visible span and reject duplicate positions outside it.
+    for (uint32_t i = 0; i < n_kv; ++i) {
+        const uint32_t cell = first_cell + i < n_kv ? first_cell + i : first_cell + i - n_kv;
+        const bool in_seq = !cells.is_empty(cell) && cells.seq_has(cell, seq_id);
+        if (i < count) {
+            if (!in_seq || cells.pos_get(cell) != first_k + i) {
+                return false;
+            }
+        } else if (in_seq && cells.pos_get(cell) >= first_k && cells.pos_get(cell) <= last_q) {
+            return false;
+        }
+    }
+
+    span[0] = first_cell;
+    span[1] = count;
+    return true;
+}
+
 uint32_t llama_kv_cache::get_n_kv_slices(const llama_ubatch & ubatch) {
     if (ubatch.n_seqs_unq == 1) {
         return 1;
@@ -3155,6 +3199,11 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
 
     const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
     return result <= (uint32_t) n_kv ? result : 0;
+}
+
+bool llama_kv_cache_context::get_kv_span(int32_t * span) const {
+    return i_cur < sinfos.size() && i_cur < ubatches.size() &&
+        kv->get_kv_span(sinfos[i_cur], ubatches[i_cur], n_kv, span);
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {

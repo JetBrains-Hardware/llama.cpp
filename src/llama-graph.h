@@ -821,6 +821,7 @@ public:
 
     // [base, swa] K/V cells of the banded attention, 0 = dense
     uint32_t n_kv_banded[2] = { 0, 0 };
+    ggml_tensor * kv_span[2] = { nullptr, nullptr };
     bool     banded         = false;
 
     const uint32_t extent;

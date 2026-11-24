@@ -29,6 +29,8 @@ struct bias_test_config {
     bool strided_rel = false;
     float v_scale = 1.0f;
     float v_bias = 0.0f;
+    int32_t first_cell = 0;
+    int32_t cell_count = 0;
 };
 
 struct test_data {
@@ -85,6 +87,12 @@ static test_data make_data(const bias_test_config & c) {
     data.rel.resize(c.extent*c.hq*c.nq*c.rel_batch);
     data.mask.resize(c.nkv*c.nq);
 
+    const int64_t count = c.cell_count ? c.cell_count : c.nkv;
+    std::vector<int64_t> position(c.nkv, count);
+    for (int64_t i = 0; i < count; ++i) {
+        position[(c.first_cell + i) % c.nkv] = i;
+    }
+
     for (size_t i = 0; i < data.q.size(); ++i) {
         data.q[i] = 0.20f*std::sin(float(i)*0.017f + 0.13f);
     }
@@ -104,7 +112,7 @@ static test_data make_data(const bias_test_config & c) {
     }
     for (int64_t iq = 0; iq < c.nq; ++iq) {
         for (int64_t ik = 0; ik < c.nkv; ++ik) {
-            const int64_t dist = iq + (c.nkv - c.nq) - ik;
+            const int64_t dist = iq + count - c.nq - position[ik];
             const bool visible = !c.use_mask || (dist >= 0 && (!c.sliding || dist < c.extent));
             data.mask[iq*c.nkv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
         }
@@ -120,7 +128,7 @@ static test_data make_data(const bias_test_config & c) {
         for (int64_t ih = 0; ih < c.hq; ++ih) {
             for (int64_t iq = 0; iq < c.nq; ++iq) {
                 for (int64_t ik = 0; ik < c.nkv; ++ik) {
-                    const int64_t dist = iq + (c.nkv - c.nq) - ik;
+                    const int64_t dist = iq + count - c.nq - position[ik];
                     if (dist >= 0 && dist < c.extent) {
                         data.dense_bias[((ib*c.hq + ih)*c.nq + iq)*c.nkv + ik] =
                             data.rel_rounded[((irb*c.nq + iq)*c.hq + ih)*c.extent + dist];
@@ -160,7 +168,10 @@ static run_result run_graph(
         r = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32,
             c.extent, c.hq, c.nq, c.rel_batch);
     }
-    ggml_tensor * m = c.use_mask ? ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, c.nkv, c.nq, 1, 1) : nullptr;
+    ggml_tensor * m = c.use_mask && (dense || !c.cell_count) ?
+        ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, c.nkv, c.nq, 1, 1) : nullptr;
+    ggml_tensor * span = !dense && c.cell_count ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 2) : nullptr;
+    ggml_tensor * sinks = c.cell_count ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, c.hq) : nullptr;
     ggml_set_name(q, "q");
     ggml_set_name(k, "k");
     ggml_set_name(v, "v");
@@ -173,6 +184,10 @@ static run_result run_graph(
     ggml_tensor * bias = nullptr;
     if (!dense) {
         out = ggml_flash_attn_ext_banded(ctx.get(), q, k, v, m, r, 1.0f/float(c.d), c.extent);
+        if (span) {
+            ggml_flash_attn_ext_banded_set_kv_span(out, span, c.sliding ? c.extent : 0);
+            ggml_flash_attn_ext_add_sinks(out, sinks);
+        }
     } else {
         bias = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, c.nkv, c.nq, c.hq, c.n_batch);
         ggml_set_name(bias, "dense_bias");
@@ -181,6 +196,9 @@ static run_result run_graph(
         scores = ggml_scale(ctx.get(), scores, 1.0f/float(c.d));
         scores = ggml_add(ctx.get(), scores, bias);
         scores = ggml_soft_max_ext(ctx.get(), scores, m, 1.0f, 0.0f);
+        if (sinks) {
+            ggml_soft_max_add_sinks(scores, sinks);
+        }
         ggml_tensor * vt = ggml_cont(ctx.get(), ggml_transpose(ctx.get(), v));
         out = ggml_mul_mat(ctx.get(), vt, scores);
         ggml_prec_set_acc(out, GGML_PREC_F32);
@@ -213,6 +231,14 @@ static run_result run_graph(
     }
     if (m) {
         ggml_backend_tensor_set(m, data.mask.data(), 0, data.mask.size()*sizeof(data.mask[0]));
+    }
+    if (span) {
+        const int32_t values[] = { c.first_cell, c.cell_count };
+        ggml_backend_tensor_set(span, values, 0, sizeof(values));
+    }
+    if (sinks) {
+        const std::vector<float> values(c.hq, 0.25f);
+        ggml_backend_tensor_set(sinks, values.data(), 0, values.size()*sizeof(float));
     }
     if (bias) {
         ggml_backend_tensor_set(bias, data.dense_bias.data(), 0, data.dense_bias.size()*sizeof(float));
@@ -258,7 +284,7 @@ static std::vector<float> naive_materialized(const bias_test_config & c, const t
                 const int64_t ih = (row / c.nq) % c.hq;
                 const int64_t iq = row % c.nq;
                 const int64_t ihkv = ih / (c.hq/c.hkv);
-                float row_max = -INFINITY;
+                float row_max = c.cell_count ? 0.25f : -INFINITY;
                 for (int64_t ik = 0; ik < c.nkv; ++ik) {
                     float dot = 0.0f;
                     for (int64_t id = 0; id < c.d; ++id) {
@@ -270,7 +296,7 @@ static std::vector<float> naive_materialized(const bias_test_config & c, const t
                     scores[row*c.nkv + ik] = score;
                     row_max = std::max(row_max, score);
                 }
-                float sum = 0.0f;
+                float sum = c.cell_count ? std::exp(0.25f - row_max) : 0.0f;
                 for (int64_t ik = 0; ik < c.nkv; ++ik) {
                     const float p = std::exp(scores[row*c.nkv + ik] - row_max);
                     scores[row*c.nkv + ik] = p;
@@ -421,11 +447,11 @@ int main(int argc, char ** argv) {
     overflow_arithmetic_self_test();
     ggml_backend_load_all();
     ggml_backend_dev_t chosen = nullptr;
-    const enum ggml_backend_dev_type wanted = backend_kind == "cuda" ?
-        GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == wanted) {
+        const bool matches = backend_kind == "cuda" ? std::strncmp(ggml_backend_dev_name(dev), "CUDA", 4) == 0 :
+            ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (matches) {
             chosen = dev;
             break;
         }
@@ -497,6 +523,10 @@ int main(int argc, char ** argv) {
             {"batch_broadcast",   64, 16, 16, 8, 2,   8, GGML_TYPE_F16,  true, false, 2, 1, false},
             {"heads64_gqa4",      64, 16, 16, 64, 16, 8, GGML_TYPE_F16, true, false},
             {"heads64_gqa8",      64, 16, 16, 64,  8, 8, GGML_TYPE_F16, true, false},
+            {"span_padded",     128, 33, 256, 6, 2, 64, GGML_TYPE_F16, true, false, 1, 1, false, 1.0f, 0.0f, 27, 183},
+            {"span_wrapped",    128, 33, 256, 6, 2, 64, GGML_TYPE_F16, true, true,  1, 1, false, 1.0f, 0.0f, 221, 183},
+            {"span_decode",     128,  1, 768, 6, 2, 64, GGML_TYPE_F16, true, true,  1, 1, false, 1.0f, 0.0f, 740, 740},
+            {"span_verify",     128,  8, 256, 6, 2, 64, GGML_TYPE_F16, true, true,  1, 1, false, 1.0f, 0.0f, 114, 147},
         };
     } else if (suite == "medium") {
         configs = {

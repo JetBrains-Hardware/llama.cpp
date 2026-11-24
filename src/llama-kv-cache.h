@@ -196,6 +196,7 @@ public:
 
     // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
     uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+    bool get_kv_span(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t n_kv, int32_t * span) const;
 
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
@@ -425,6 +426,7 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_pos_contiguous() const;
+    bool get_kv_span(int32_t * span) const;
     uint32_t get_n_kv_rows() const;
     uint32_t get_size() const;
 

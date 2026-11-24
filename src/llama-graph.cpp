@@ -1460,6 +1460,15 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch) {
     const auto * attn_ctx = mctx->get_attn();
 
+    for (int i = 0; i < 2; ++i) {
+        if (kv_span[i] && kv_span[i]->buffer) {
+            int32_t span[2];
+            const auto * cache = i ? attn_ctx->get_swa() : attn_ctx->get_base();
+            GGML_ASSERT(cache->get_kv_span(span));
+            ggml_backend_tensor_set(kv_span[i], span, 0, sizeof(span));
+        }
+    }
+
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
         attn_ctx->get_base()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
@@ -1510,7 +1519,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     const auto * attn_ctx = mctx->get_attn();
 
-    // the masks are always dense, see build_inp_mem_hybrid_iswa_rel()
+    // The fallback mask tensors carry the padded cache shape even when the banded path leaves them unused.
 
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
@@ -1533,8 +1542,11 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     if (banded) {
-        res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
-        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+        for (int i = 0; i < 2; ++i) {
+            const auto * cache = i ? attn_ctx->get_swa() : attn_ctx->get_base();
+            int32_t span[2];
+            res &= kv_span[i] ? cache->get_kv_span(span) : cache->get_n_kv_pos_contiguous() == n_kv_banded[i];
+        }
     }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();

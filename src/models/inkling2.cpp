@@ -335,9 +335,12 @@ bool llama_model_inkling2::graph::use_banded(int il, bool swa) {
     ggml_tensor * pq = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hd, 1, nh, 1);
     ggml_tensor * pk = ggml_new_tensor_4d(ctx0, cache->type_k(), hd, 1, nkv, 1);
     ggml_tensor * pv = ggml_new_tensor_4d(ctx0, cache->type_v(), hd, 1, nkv, 1);
-    ggml_tensor * pm = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
+    ggml_tensor * pm = inp->kv_span[swa] ? nullptr : ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, 1, 1, 1);
     ggml_tensor * pr = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, nh, 1, 1);
     ggml_tensor * op = ggml_flash_attn_ext_banded(ctx0, pq, pk, pv, pm, pr, 1.0f, 1);
+    if (inp->kv_span[swa]) {
+        ggml_flash_attn_ext_banded_set_kv_span(op, inp->kv_span[swa], swa ? hparams.n_swa : 0);
+    }
     ggml_flash_attn_ext_add_sinks(op, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, nh, 1, 1));
     ggml_prec_set_acc(op, GGML_PREC_F32);
     const bool ok = ggml_backend_dev_supports_op(dev, op);
@@ -355,8 +358,18 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     for (int i = 0; i < 2 && inp->banded; ++i) {
         // a ubatch of several sequences is dense at runtime, so the reserved worst case (a ubatch
         // of every sequence) must be dense too, else the dense graph outgrows the reserved buffer
-        inp->n_kv_banded[i] = ubatch.n_seqs_unq != 1 ? 0 :
-            (i ? attn->mctx->get_swa() : attn->mctx->get_base())->get_n_kv_pos_contiguous();
+        const auto * cache = i ? attn->mctx->get_swa() : attn->mctx->get_base();
+        int32_t span[2];
+        if (cparams.causal_attn && hparams.n_swa <= INT32_MAX &&
+                cache->type_k() == GGML_TYPE_F16 && cache->type_v() == GGML_TYPE_F16 &&
+                cache->get_kv_span(span)) {
+            inp->kv_span[i] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
+            ggml_set_input(inp->kv_span[i]);
+            ggml_set_name(inp->kv_span[i], i ? "attn_kv_span_swa" : "attn_kv_span");
+            inp->n_kv_banded[i] = cache->get_n_kv();
+        } else if (ubatch.n_seqs_unq == 1) {
+            inp->n_kv_banded[i] = cache->get_n_kv_pos_contiguous();
+        }
     }
     // the reserve graph: the cache offers the banded path for a ubatch of placeholder positions (all 0),
     // while at runtime it does so only for consecutive ones
@@ -534,7 +547,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
             // one banded mask per graph and cache: each layer's own view would be a separate scheduler input copy
             ggml_tensor *& m = mask_banded[is_swa];
-            if (!m) {
+            if (!m && !inp->kv_span[is_swa]) {
                 m = ggml_cont(ctx0, ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
                         mask->nb[1], mask->nb[2], mask->nb[3], 0));
             }
@@ -542,6 +555,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
+            if (inp->kv_span[is_swa]) {
+                ggml_flash_attn_ext_banded_set_kv_span(cur, inp->kv_span[is_swa], is_swa ? hparams.n_swa : 0);
+            }
             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});

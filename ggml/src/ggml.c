@@ -5572,6 +5572,14 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+void ggml_flash_attn_ext_banded_set_kv_span(struct ggml_tensor * a, struct ggml_tensor * span, int32_t window) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED && a->src[3] == NULL);
+    GGML_ASSERT(a->ne[3] == 1 && window >= 0);
+    GGML_ASSERT(span->type == GGML_TYPE_I32 && ggml_nelements(span) == 2 && ggml_is_contiguous(span));
+    a->src[7] = span;
+    ggml_set_op_params_i32(a, 6, window);
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,

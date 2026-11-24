@@ -9031,6 +9031,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * rel     = dst->src[6];
     const ggml_tensor * kv_rows = dst->src[5];
+    const auto * kv_span = rel && dst->src[7] ? (const int32_t *) dst->src[7]->data : nullptr;
+    const int32_t window = kv_span ? ggml_get_op_params_i32(dst, 6) : 0;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9140,6 +9142,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+            int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+            if (kv_span) {
+                const int64_t cell = ic >= kv_span[0] ? ic - kv_span[0] : ic + nek1 - kv_span[0];
+                rel_dist = iq1 + (kv_span[1] - neq1) - cell;
+                if (rel_dist < 0 || (window > 0 && rel_dist >= window)) {
+                    continue;
+                }
+            }
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9162,8 +9172,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
 
             if (rel) {
-                // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
                 }
