@@ -3,6 +3,36 @@
 Branch `erokhins/inkling` (rebased on `erokhins/kvq-rebase`): the fork CI and `--kvq` commits on top of ggml-org/master, which already supports the model.
 No loader changes were needed for the Unsloth `UD-Q3_K_XL` file.
 
+## Recommended default settings (`llama-server`)
+
+Best tested configuration for **Inkling-2-Mini `UD-Q3_K_XL` + DSpark** on a 16 GB card (`15.5 GiB` usable VRAM):
+
+```sh
+llama-server \
+  -m Inkling-2-Mini-UD-Q3_K_XL.gguf \
+  -md dspark-Inkling-2-Mini-Q8_0-mainline.gguf \
+  --spec-type draft-dspark --spec-draft-n-max 4 --spec-draft-n-ubatch 512 \
+  -ngl 99 -ngld 99 -fa on -c 98304 -b 2048 -ub 2048 -np 1 \
+  --kvq --kvq-prefill-free-codes \
+  --port 8765 --jinja
+```
+
+- **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `15.10 GiB` peak PP / `14.75 GiB` TG process VRAM, `3,085 / 2,997 t/s` prefill, `107.6 / 97.0 t/s` decode (`59.2% / 51.8%` acceptance).
+- **Max context in `15.5 GiB` (`15,872 MiB`, 16 GB card):**
+  - Default (`-ub 2048`, uncapped draft KV): **`~160k-165k`** (PP-bound at `6.13 KiB/tok`; `-c 131072` fits comfortably at `~15.30 GiB` PP / `~15.06 GiB` TG).
+  - With `LLAMA_DSPARK_KV_CAP=4096` (`-ub 2048`): **`~295k-305k`** (TG-bound at `5.65 KiB/tok`; `-c 262144` fits at `~15.27 GiB` TG / `~15.08 GiB` PP).
+- **Why each knob:**
+  - `--kvq`: two-tier KV cache for the 8 full-attention slots (`~5.65 KiB/tok` vs `32 KiB/tok` FP16).
+  - `--kvq-prefill-free-codes`: frees KVQ `codes + tables` during prefill and re-uploads from pinned host RAM (`~5-15 ms`), offsetting the `-ub 2048` compute buffer at PP peak.
+  - `-b 2048 -ub 2048`: raises MoE utilization from `32` to `128` tokens/expert (`+32%` faster prefill vs `-ub 512`).
+  - `-md dspark-Inkling-2-Mini-Q8_0-mainline.gguf`: full `Q8_0` drafter saves `188 MiB` vs `BF16-w2q8` with zero acceptance loss.
+  - `--spec-draft-n-max 4`: `K=4` gives `n_rep * (K+1) = 15` query columns per KV head, filling `15/16` of `kvq-attn`'s `N=16` MMA tile.
+  - `--spec-draft-n-ubatch 512`: bit-exact; saves `134 MiB` PP / `24 MiB` TG with no speed loss.
+  - `layer_inp_dev` is `F16` by default in this branch (saves `36 MiB` PP at `-b 2048`, zero acceptance loss).
+  - **Do NOT pass `-ctkd` / `-ctvd` (`q8_0`/`q4_0`):** DSpark block-8 decode selects `MMA_F16`, which dequantizes the entire draft KV cache into `384 MiB` of TG compute buffer on every step (more VRAM and slower).
+- **Long context (`128k-256k` on 16 GB):** add `LLAMA_DSPARK_KV_CAP=4096` in the environment to cap DSpark's global layer-1 KV to a 4k sliding window (`14.74 GiB` peak @ 96k, saves `0.5-1.0 GiB` @ 128k-256k, ~10-14% TG cost on 76k, unaffected PP).
+- **Vision (optional):** pass `--no-mmproj-offload` if adding `-mm <mmproj.gguf>` on a 16 GB card (`0 MiB` VRAM).
+
 ## Support in ggml-org/llama.cpp
 
 | PR | What |
@@ -242,6 +272,30 @@ Measured on RTX 5090 (`-c 98304 -b 2048 -np 1 -fa on -ngl 99 --kvq`, DSpark `w2q
 | After (`-ub 2048` + `--kvq-prefill-free-codes`) | 32k / 76k | `558.5 MiB` | **`16,991 / 17,003` (`~15.44-15.45 GiB`)** | `16,489 / 16,489` | **`3,120 / 3,029 t/s` (+32%)** | `97.8 / 97.7 t/s` |
 
 *Notes: the earlier `-ub 512` baseline only sampled post-request VRAM (no `0.25 s` PP peak polling); `76k` at `-ub 512` hit an `802`-token high-acceptance trajectory (`619/732`, `143.5-144.6 t/s`). Bit-exactness confirmed on `req_32k.json`: `--kvq` no-draft (`-ub 512`) reproduced the exact `1,799` generated tokens (`2,432 -> 2,555 t/s` PP), and `--kvq` + DSpark `K=4` (`-ub 512`) produced identical token counts and acceptances with and without `--kvq-prefill-free-codes` (`1,831 tok`, `1145/2740` on 32k; `802 tok`, `619/732` on 76k).*
+
+### Drafter VRAM optimizations (measured results)
+
+Evaluated drafter-side VRAM optimizations at `-c 98304 -b 2048 -ub 2048 -np 1 -fa on --kvq --kvq-prefill-free-codes` (`K=4`, greedy `temp=0`, 512 gen tokens on `req_32k.json` and `req_76k.json`, `0.25 s` peak VRAM polling):
+
+| Config | Peak proc VRAM (32k / 76k) | End proc VRAM (32k / 76k) | PP (32k / 76k) | TG (32k / 76k) | Acceptance (32k / 76k) | Verdict |
+|---|---:|---:|---|---|---|---|
+| Baseline (`w2q8`, `dub=2048`, `F16` KV, `F32` inp) | `15,807 / 15,819 MiB` | `15,301 / 15,313 MiB` | `3,090 / 3,004 t/s` | `110.7 / 97.9 t/s` | `59.2% / 51.8%` | Baseline |
+| + `--spec-draft-n-ubatch 512` (`-134` PP / `-24` TG) | `15,673 / 15,687 MiB` | `15,277 / 15,287 MiB` | `3,067 / 2,990 t/s` | `109.1 / 97.0 t/s` | `59.2% / 51.8%` | Take (bit-exact) |
+| + `layer_inp_dev` `F16` (`-36` PP) | `15,637 / 15,645 MiB` | `15,277 / 15,283 MiB` | `3,078 / 2,993 t/s` | `106.1 / 97.1 t/s` | `59.2% / 51.8%` | Take (zero loss) |
+| `Q8_0-mainline` + `dub=512` (`-188` weights) | `15,495 / 15,505 MiB` | `15,097 / 15,107 MiB` | `3,073 / 2,991 t/s` | `105.6 / 94.5 t/s` | `59.2% / 51.8%` | Take (zero loss) |
+| **Recommended default (`Q8_0` + `dub=512` + `F16` inp)** | **`15,460 / 15,472 MiB` (`15.10 GiB`)** | **`15,098 / 15,110 MiB` (`14.75 GiB`)** | **`3,085 / 2,997 t/s`** | **`107.6 / 97.0 t/s`** | **`59.2% / 51.8%`** | **Take (default)** |
+| `w2q8` + `dub=512` + `cap=16384` (`-318` KV) | `15,355 / 15,369 MiB` | `14,959 / 14,971 MiB` | `3,063 / 2,977 t/s` | `105.5 / 84.0 t/s` | `57.2% / 40.8%` | Worse than `4k` |
+| `w2q8` + `dub=512` + `cap=8192` (`-350` KV) | `15,323 / 15,337 MiB` | `14,927 / 14,939 MiB` | `3,062 / 2,983 t/s` | `107.0 / 84.2 t/s` | `59.1% / 39.4%` | Opt-in (`>=128k`) |
+| `w2q8` + `dub=512` + `cap=4096` (`-366` KV) | `15,307 / 15,329 MiB` | `14,911 / 14,931 MiB` | `3,068 / 2,991 t/s` | `108.8 / 87.4 t/s` | `57.2% / 41.5%` | Opt-in (`>=128k`) |
+| `w2q8` + `dub=512` + `cap=1025` (`-378` KV) | `15,297 / 15,309 MiB` | `14,899 / 14,911 MiB` | `3,061 / 2,989 t/s` | `106.2 / 72.8 t/s` | `55.2% / 28.7%` | Reject (`-25%` 76k) |
+| **Combined long-ctx (`Q8_0` + `dub=512` + `F16` inp + `cap=4096`)** | **`15,092 / 15,102 MiB` (`14.74 GiB`)** | **`14,730 / 14,737 MiB` (`14.39 GiB`)** | **`3,073 / 2,989 t/s`** | **`101.9 / 83.8 t/s`** | **`56.7% / 41.5%`** | **Take (`128k-256k`)** |
+| `-ctkd q8_0 -ctvd q8_0` (sampled run, `MMA_F16` dequant) | `+0` to `-110` PP, **`+187 MiB` TG** | `15,471 / 15,486 MiB` | `3,084 / 3,001 t/s` | `92.4 / 88.0 t/s` | `41.2% / 41.1%` | Reject (strictly worse) |
+
+Key takeaways:
+
+- **Zero-loss defaults (`-347 MiB` PP / `-203 MiB` TG):** `Q8_0-mainline` drafter + `--spec-draft-n-ubatch 512` + `F16` `layer_inp_dev` (now default in `src/llama-context.cpp`) gave identical greedy output hashes and identical acceptance (`59.2% / 51.8%`) with `<1%` speed difference, bringing `-ub 2048` at 96k down to `15.10 GiB` peak / `14.75 GiB` TG.
+- **Opt-in draft KV cap (`LLAMA_DSPARK_KV_CAP=4096` in `src/llama-kv-cache-iswa.cpp`):** caps DSpark layer-1 global KV to a 4k sliding window (`-366 MiB` @ 96k, `-0.5 to -1.0 GiB` @ 128k-256k) at the cost of ~10-14% TG speed on 76k (PP unaffected).
+- **Why `-ctkd/-ctvd` (`q8_0`/`q4_0`) was rejected:** in `ggml/src/ggml-cuda/fattn.cu:805-810`, DSpark's block-8 decode picks `BEST_FATTN_KERNEL_MMA_F16`, which allocates a `384 MiB` (`192+192 MiB`) `F16` dequantization buffer in the draft TG compute graph (`19.25 -> 385.92 MiB`) and dequantizes the entire draft KV cache on every draft step.
 
 ## Local tools (not committed)
 
