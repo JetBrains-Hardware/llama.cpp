@@ -91,6 +91,7 @@ public:
         ggml_tensor * stage = nullptr; // f32 [ROW/4, n_stage], rows to scatter (set by enable, one for all layers)
         ggml_tensor * slots = nullptr; // i32 [n_stage], their rows of rkv_h, the rest trash rows (trash_row)
         ggml_tensor * trig[KIND_COUNT] = {}; // host f32 [1], per kind
+        std::vector<ggml_tensor *> trig_tile; // host f32 [1], per tiled scratch host block (t >= 1)
     };
 
     // the tensors hold n_rows coarse rows, table sets of n_chunk_rows rows (fit mode)
@@ -106,7 +107,7 @@ public:
     llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
             int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate = 0, size_t shared_min = 0,
             bool host_prealloc = false, size_t host_max_bytes = 0, size_t host_keep_bytes = 0,
-            const std::vector<int32_t> & layer_order = {});
+            const std::vector<int32_t> & layer_order = {}, int32_t scr_block = 0, int32_t scr_rel_keep = 0);
     ~llama_kvq_store();
 
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
@@ -171,7 +172,7 @@ public:
     void begin_ubatch(const llama_ubatch & ubatch);
 
     // called once per ubatch of the scratch path
-    void begin_scr(const llama_ubatch & ubatch);
+    void begin_scr(const llama_ubatch & ubatch, int64_t r0 = 0);
 
     // the rows of the positions [n_host, n) of the sequence in the host store, or in the host ring (the copy on the host at a switch, see the class comment)
     void sync_store(int32_t seq, int32_t n);
@@ -238,6 +239,11 @@ public:
     // the scratch triggers of layer il, see the class comment
     void build_scr_up  (ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
     void build_scr_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const;
+    void build_scr_tile(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int32_t tile) const;
+
+    bool    scr_tiled()     const { return scr_tiled_; }
+    int64_t scr_tile_rows() const { return n_scr_tile_; }
+    int64_t scr_tail_off()  const { return n_scr_tail_off; }
 
     // K or V of scratch rows [r0, r0 + n): [D, G, n, 1], like a cache view
     ggml_tensor * get_scr(ggml_context * ctx, bool is_v, int64_t n, int64_t r0 = 0) const;
@@ -299,7 +305,7 @@ public:
     int32_t n_chunk_rows() const { return n_crow; }
     int32_t n_head_kv()    const { return G; }
     int32_t n_words(bool is_v) const { return is_v ? nwv : nwk; }
-    int64_t n_ring()       const { return n_scr - n_rows_; } // cells of the ring cache
+    int64_t n_ring()       const { return n_cell; } // cells of the ring cache
 
     std::vector<int32_t> layer_ids() const;
 
@@ -434,6 +440,13 @@ private:
     ggml_tensor * scr    = nullptr; // q8_0 [D, 2, n_scr, G], K and V row of each scratch row (fit mode)
     int64_t       n_scr  = 0;
     bool          scr_ok = false;
+    bool          scr_tiled_     = false;
+    int32_t       n_scr_tile_    = 0; // rows per ping-pong tile when scr_tiled_
+    int64_t       n_scr_tail_off = 0; // start row of the tail region in scr when scr_tiled_
+    int32_t       ub_scr_r0      = 0; // host tile end row for the current scratch ubatch
+    int32_t       ub_scr_tiles   = 0; // host tile count for the current scratch ubatch
+    ggml_backend_event_ptr ev_scr_tile[2];
+    ggml_backend_event_ptr ev_scr_free;
     ggml_context_ptr        ctx_scr;
     ggml_backend_buffer_ptr buf_scr;
 
@@ -525,6 +538,7 @@ private:
     void issue_tail(layer & l, ggml_backend_event_t ev, ggml_backend_t stream);
     void read_ring(layer & l);
     void read_scr(layer & l);
+    void upload_scr_range(ggml_backend_t cp, layer & l, int32_t p0, int32_t p1, int64_t dst_row);
     void ring_copy(int32_t s, bool to_store, int32_t p0, int32_t p1);
     void wait_mirrors();
     void reset_base();

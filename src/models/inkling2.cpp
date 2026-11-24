@@ -163,7 +163,15 @@ public:
                     ggml_backend_tensor_set(kpos_scr, pos.data(), 0, n*sizeof(int32_t));
                 }
             }
-            mctx->get_store()->begin_scr(*ubatch);
+            if (scr_set_pos && scr_set_pos->buffer) {
+                const int64_t off = store->scr_tail_off();
+                std::vector<int32_t> pos(ubatch->n_tokens);
+                for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+                    pos[i] = (int32_t) (off + ubatch->pos[i] - scr_r0);
+                }
+                ggml_backend_tensor_set(scr_set_pos, pos.data(), 0, pos.size()*sizeof(int32_t));
+            }
+            mctx->get_store()->begin_scr(*ubatch, scr_r0);
         }
     }
 
@@ -233,6 +241,9 @@ public:
             if (kpos_scr && kpos_scr->ne[0] != cur_rows - scr_r0) {
                 return false;
             }
+            if (scr_set_pos && scr_set_pos->ne[0] != p.ubatch.n_tokens) {
+                return false;
+            }
         }
         mctx = mc;
         return true;
@@ -275,7 +286,8 @@ public:
     ggml_tensor * pt_s      = nullptr;
     ggml_tensor * bias_s    = nullptr;
     llm_attn_mask mask_scr;
-    ggml_tensor * kpos_scr  = nullptr;
+    ggml_tensor * kpos_scr    = nullptr;
+    ggml_tensor * scr_set_pos = nullptr;
 };
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
@@ -646,6 +658,11 @@ llama_model_inkling2::llm_graph_input_kvq * llama_model_inkling2::graph::build_i
         inp_q->kpos_scr = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_last, 1);
         ggml_set_input(inp_q->kpos_scr);
         ggml_set_name(inp_q->kpos_scr, "kvq_kpos_scr");
+        if (store->scr_tiled()) {
+            inp_q->scr_set_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(inp_q->scr_set_pos);
+            ggml_set_name(inp_q->scr_set_pos, "kvq_scr_set_pos");
+        }
     }
 
     return (llm_graph_input_kvq *) res->add_input(std::move(inp_q));
@@ -856,14 +873,15 @@ ggml_tensor * llama_model_inkling2::graph::build_attn_kvq_scratch(
     ggml_build_forward_expand(gf, k_cur);
 
     store->build_scr_join(ctx0, gf, sched, il);
-    ggml_tensor * pos = ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
+    const bool tiled = store->scr_tiled();
+    ggml_tensor * pos = tiled ? inp_kvq->scr_set_pos : ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
     ggml_build_forward_expand(gf, store->build_scr_set(ctx0, false, k_cur, pos));
     ggml_build_forward_expand(gf, store->build_scr_set(ctx0, true,  v_cur, pos));
 
     GGML_ASSERT(cparams.flash_attn);
     ggml_tensor * q_fa = ggml_permute(ctx0, q_cur, 0, 2, 1, 3); // [D, n_tokens, n_head]
     const int64_t r0   = !inp_kvq->scr_cells ? inp_kvq->scr_r0 : 0;
-    const int64_t nb   = pr.scr_block >= 256 ? pr.scr_block/256*256 : n_rows;
+    const int64_t nb   = tiled ? store->scr_tile_rows() : (pr.scr_block >= 256 ? pr.scr_block/256*256 : n_rows);
 
     ggml_tensor * mask_last = inp_kvq->pos_mask ? nullptr : (!inp_kvq->scr_cells ? inp_kvq->mask_scr.raw : inp_hyb->get_attn()->self_attn_mask.raw);
     if (mask_last && mask_last->type != GGML_TYPE_F16) {
@@ -872,11 +890,18 @@ ggml_tensor * llama_model_inkling2::graph::build_attn_kvq_scratch(
 
     ggml_tensor * cur = nullptr;
     ggml_tensor * lse = nullptr;
+    int32_t tile = 0;
     for (int64_t b0 = 0; b0 < n_rows; ) {
         const bool    last = b0 >= r0;
         const int64_t n    = last ? (n_rows - b0) : std::min(nb, r0 - b0);
-        ggml_tensor * kb   = ggml_permute(ctx0, store->get_scr(ctx0, false, n, b0), 0, 2, 1, 3);
-        ggml_tensor * vb   = ggml_permute(ctx0, store->get_scr(ctx0, true,  n, b0), 0, 2, 1, 3);
+        if (tiled && !last && tile > 0) {
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, lse);
+            store->build_scr_tile(ctx0, gf, sched, il, tile);
+        }
+        const int64_t scr_off = !tiled ? b0 : (last ? store->scr_tail_off() : (int64_t) (tile & 1)*nb);
+        ggml_tensor * kb   = ggml_permute(ctx0, store->get_scr(ctx0, false, n, scr_off), 0, 2, 1, 3);
+        ggml_tensor * vb   = ggml_permute(ctx0, store->get_scr(ctx0, true,  n, scr_off), 0, 2, 1, 3);
 
         if (r0 == 0) {
             ggml_tensor * table = ggml_sub_inplace(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
@@ -913,6 +938,7 @@ ggml_tensor * llama_model_inkling2::graph::build_attn_kvq_scratch(
             lse = ggml_add(ctx0, lse, ggml_softplus(ctx0, dl));
         }
         b0 += n;
+        tile++;
     }
 
     if (r0 > 0) {

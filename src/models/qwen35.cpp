@@ -206,7 +206,15 @@ public:
             if (!scr_cells) {
                 mctx->set_input_kvq_scr(mask_scr.raw, ubatch, n_host, scr_r0);
             }
-            mctx->get_store()->begin_scr(*ubatch);
+            if (scr_set_pos && scr_set_pos->buffer) {
+                const int64_t off = store->scr_tail_off();
+                std::vector<int32_t> pos(ubatch->n_tokens);
+                for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+                    pos[i] = (int32_t) (off + ubatch->pos[i] - scr_r0);
+                }
+                ggml_backend_tensor_set(scr_set_pos, pos.data(), 0, pos.size()*sizeof(int32_t));
+            }
+            mctx->get_store()->begin_scr(*ubatch, scr_r0);
         }
     }
 
@@ -244,6 +252,9 @@ public:
                 res &= scr_rows == kvq_scr_rows(store, n_host, gparams.ubatch) && scr_r0 == kvq_scr_r0(p, n_host);
                 res &= mask_scr.raw->ne[1] == gparams.ubatch.n_tokens;
             }
+            if (res && scratch && scr_set_pos) {
+                res &= scr_set_pos->ne[0] == gparams.ubatch.n_tokens;
+            }
         }
 
         params = p;
@@ -280,6 +291,7 @@ public:
     bool    scr_cells = false;
 
     llm_attn_mask mask_scr; // F16 [scr_rows - scr_r0, n_tokens], scratch attention, row r = position r (see kvq_scr_rows)
+    ggml_tensor * scr_set_pos = nullptr;
     int64_t       scr_rows = 0;
     int64_t       scr_r0   = 0; // see kvq_scr_r0
 
@@ -513,13 +525,20 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
             ggml_set_name(inp->mask_attn.raw,  "kvq_mask_attn");
             ggml_set_name(inp->mask_early.raw, "kvq_mask_early");
         }
-        if (inp->scratch && !inp->scr_cells) {
-            inp->scr_rows      = kvq_scr_rows(inp->store, inp->n_host, ubatch);
-            inp->scr_r0        = kvq_scr_r0(inp->params, inp->n_host);
-            inp->mask_scr.n_kv = inp->scr_rows - inp->scr_r0;
-            inp->mask_scr.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->mask_scr.n_kv, n_tokens);
-            ggml_set_input(inp->mask_scr.raw);
-            ggml_set_name(inp->mask_scr.raw, "kvq_mask_scr");
+        if (inp->scratch) {
+            if (!inp->scr_cells) {
+                inp->scr_rows      = kvq_scr_rows(inp->store, inp->n_host, ubatch);
+                inp->scr_r0        = kvq_scr_r0(inp->params, inp->n_host);
+                inp->mask_scr.n_kv = inp->scr_rows - inp->scr_r0;
+                inp->mask_scr.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->mask_scr.n_kv, n_tokens);
+                ggml_set_input(inp->mask_scr.raw);
+                ggml_set_name(inp->mask_scr.raw, "kvq_mask_scr");
+            }
+            if (inp->store->scr_tiled()) {
+                inp->scr_set_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+                ggml_set_input(inp->scr_set_pos);
+                ggml_set_name(inp->scr_set_pos, "kvq_scr_set_pos");
+            }
         }
     } else if (mctx_kvq->get_store() != nullptr) {
         // reserve graph in fit mode: the statistics nodes of a large ubatch
@@ -537,6 +556,11 @@ llama_model_qwen35::llm_graph_input_kvq * llama_model_qwen35::graph::build_inp_k
             inp->mask_scr.raw  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->mask_scr.n_kv, n_tokens);
             ggml_set_input(inp->mask_scr.raw);
             ggml_set_name(inp->mask_scr.raw, "kvq_mask_scr");
+            if (inp->store->scr_tiled()) {
+                inp->scr_set_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+                ggml_set_input(inp->scr_set_pos);
+                ggml_set_name(inp->scr_set_pos, "kvq_scr_set_pos");
+            }
         }
     }
 
@@ -733,7 +757,8 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
 
     // after the readback of the rows of the layer before (the same scratch rows)
     store->build_scr_join(ctx0, gf, sched, il);
-    ggml_tensor * pos = ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
+    const bool tiled = store->scr_tiled();
+    ggml_tensor * pos = tiled ? inp_kvq->scr_set_pos : ggml_view_1d(ctx0, inp_pos, n_tokens, 0);
     ggml_build_forward_expand(gf, store->build_scr_set(ctx0, false, k_cur, pos));
     ggml_build_forward_expand(gf, store->build_scr_set(ctx0, true,  v_cur, pos));
 
@@ -748,16 +773,23 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
     // the host rows [0, r0) in key blocks without a mask, then the rows [r0, n_rows) with the mask, so the f16 copies of K/V
     // are made per block; the partial results are merged by their log-sum-exp l: w = sigmoid(l_b - l), o += (o_b - o)*w, l += softplus(l_b - l)
     const int64_t r0 = !inp_kvq->scr_cells ? inp_kvq->scr_r0 : 0;
-    const int64_t nb = inp_kvq->params.scr_block/256*256;
+    const int64_t nb = tiled ? store->scr_tile_rows() : inp_kvq->params.scr_block/256*256;
 
     ggml_tensor * cur = nullptr;
     ggml_tensor * lse = nullptr;
+    int32_t tile = 0;
     for (int64_t b0 = 0; b0 < n_rows; ) {
         const bool    last = b0 >= r0;
         const int64_t n    = last ? n_rows - b0 : std::min(nb, r0 - b0);
+        if (tiled && !last && tile > 0) {
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, lse);
+            store->build_scr_tile(ctx0, gf, sched, il, tile);
+        }
+        const int64_t scr_off = !tiled ? b0 : (last ? store->scr_tail_off() : (int64_t) (tile & 1)*nb);
 
-        ggml_tensor * k = ggml_permute(ctx0, store->get_scr(ctx0, false, n, b0), 0, 2, 1, 3);
-        ggml_tensor * v = ggml_permute(ctx0, store->get_scr(ctx0, true,  n, b0), 0, 2, 1, 3);
+        ggml_tensor * k = ggml_permute(ctx0, store->get_scr(ctx0, false, n, scr_off), 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx0, store->get_scr(ctx0, true,  n, scr_off), 0, 2, 1, 3);
 
         if (r0 == 0) {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, mask, kq_scale, hparams.f_max_alibi_bias, softcap);
@@ -782,6 +814,7 @@ ggml_tensor * llama_model_qwen35::graph::build_attn_kvq_scratch(
             }
         }
         b0 += n;
+        tile++;
     }
     cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     ggml_build_forward_expand(gf, cur);

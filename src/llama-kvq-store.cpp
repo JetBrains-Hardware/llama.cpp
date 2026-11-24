@@ -350,7 +350,7 @@ static int kvq_popcount(uint64_t x) {
 
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
         int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min, bool host_prealloc, size_t host_max_bytes, size_t host_keep_bytes,
-        const std::vector<int32_t> & layer_order) :
+        const std::vector<int32_t> & layer_order, int32_t scr_block, int32_t scr_rel_keep) :
     n_rows_(n_rows), n_crow(n_chunk_rows),
     D(head_dim), ROW((size_t) (head_dim/32)*34), TAB_SLOT((size_t) head_dim*head_dim + (size_t) 3*head_dim*sizeof(float)) {
     if (D != 128 && D != 256) {
@@ -488,11 +488,27 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, in
         }
     }
 
+    // tiled scratch: two ping-pong host tiles plus a tail region for [r0, n_rows)
+    const int32_t tile     = scr_block >= 256 ? (scr_block/256)*256 : 0;
+    const int32_t tail_max = GGML_PAD((int32_t) cells.size() + scr_rel_keep + 512, 256);
+    if (tile > 0 && (int64_t) n_rows + (int64_t) cells.size() > 2*(int64_t) tile + tail_max) {
+        scr_tiled_     = true;
+        n_scr_tile_    = tile;
+        n_scr_tail_off = 2*tile;
+        n_scr          = 2*tile + tail_max;
+    } else {
+        scr_tiled_     = false;
+        n_scr_tile_    = 0;
+        n_scr_tail_off = 0;
+        n_scr          = n_rows + cells.size();
+    }
+    const int32_t max_tiles = scr_tiled_ ? (n_rows + n_scr_tile_ - 1)/n_scr_tile_ : 0;
+
     ctx_dev   = init_ctx(layers.size()*8 + 5 + 2*N_TBUF + (size_t) n_sq*(2*layers.size() + 1));
     ctx_codes = init_ctx(layers.size()*4);
     ctx_alias = init_ctx(n_bufs);
     n_str = std::min<int32_t>(n_sq, GGML_KVQ_MAX_STREAM);
-    ctx_host  = init_ctx(layers.size()*KIND_COUNT);
+    ctx_host  = init_ctx(layers.size()*(KIND_COUNT + (max_tiles > 1 ? max_tiles - 1 : 0)));
 
     // the device buffers of the packed path share the memory of the scratch (the prompt path), see scr_alloc and dec_alloc:
     // the rotating and tail buffers hold nothing from one round to the next, an own buffer gets its mirror back after a scratch
@@ -540,6 +556,14 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, in
             ggml_format_name(t.trig[k], "kvq_trig%d-%d", k, l.il);
             trig_of[t.trig[k]] = { (size_t) (&l - layers.data()), k };
         }
+        if (max_tiles > 1) {
+            t.trig_tile.resize(max_tiles, nullptr);
+            for (int32_t ti = 1; ti < max_tiles; ++ti) {
+                t.trig_tile[ti] = ggml_new_tensor_1d(ctx_host.get(), GGML_TYPE_F32, 1);
+                ggml_format_name(t.trig_tile[ti], "kvq_trig_t%d-%d", ti, l.il);
+                trig_of[t.trig_tile[ti]] = { (size_t) (&l - layers.data()), KIND_COUNT + ti - 1 };
+            }
+        }
     }
     bias    = ggml_new_tensor_1d(ctx_dev.get(), GGML_TYPE_F32, n_rows);
     ggml_set_name(bias,    "kvq_bias");
@@ -548,8 +572,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, in
         ggml_set_name(q.pt, "kvq_pt");
     }
 
-    // the scratch of the large ubatches, one row per position of the coarse region, then one per ring cell (see scr_alloc)
-    n_scr   = n_rows + cells.size();
+    // the scratch of the large ubatches (tiled or full, see scr_alloc)
     ctx_scr = init_ctx(1);
     scr     = ggml_new_tensor_4d(ctx_scr.get(), GGML_TYPE_Q8_0, D, 2, n_scr, G);
     ggml_set_name(scr, "kvq_scr");
@@ -686,7 +709,10 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, in
         }
     }
     ev_ord.reset(ggml_backend_event_new(dev));
-    if (!ev_ord) {
+    ev_scr_tile[0].reset(ggml_backend_event_new(dev));
+    ev_scr_tile[1].reset(ggml_backend_event_new(dev));
+    ev_scr_free.reset(ggml_backend_event_new(dev));
+    if (!ev_ord || !ev_scr_tile[0] || !ev_scr_tile[1] || !ev_scr_free) {
         throw std::runtime_error("packed two-tier mode needs backend events");
     }
 
@@ -1325,12 +1351,27 @@ void llama_kvq_store::read_ring(layer & l) {
 // passed the attention of the layer (the same layout, one copy per kv head)
 void llama_kvq_store::read_scr(layer & l) {
     const size_t n = (size_t) (ub_p1 - ub_p0)*2*ROW;
+    const int64_t src_base = scr_tiled_ ? (n_scr_tail_off + (ub_p0 - ub_scr_r0)) : ub_p0;
     for (int32_t g = 0; g < G; ++g) {
         chunk_runs(ub_p0, ub_p1, [&](int32_t p, int32_t m) {
-            ggml_backend_tensor_get_async(backend_cp.get(), scr, row_ptr(cur, l.li, g, p), g*scr->nb[3] + p*scr->nb[2], (size_t) m*2*ROW);
+            const int64_t sr = src_base + (p - ub_p0);
+            ggml_backend_tensor_get_async(backend_cp.get(), scr, row_ptr(cur, l.li, g, p), g*scr->nb[3] + sr*scr->nb[2], (size_t) m*2*ROW);
         });
     }
     l.cnt.rb_bytes += (int64_t) G*n;
+}
+
+void llama_kvq_store::upload_scr_range(ggml_backend_t cp, layer & l, int32_t p0, int32_t p1, int64_t dst_row) {
+    if (p1 <= p0) {
+        return;
+    }
+    for (int32_t g = 0; g < G; ++g) {
+        chunk_runs(p0, p1, [&](int32_t p, int32_t m) {
+            ggml_backend_tensor_set_async(cp, scr, row_ptr(cur, l.li, g, p),
+                    g*scr->nb[3] + (dst_row + (p - p0))*scr->nb[2], (size_t) m*2*ROW);
+        });
+    }
+    l.cnt.scr_bytes += (int64_t) G*(size_t) (p1 - p0)*2*ROW;
 }
 
 // host ring: the rows of the positions [p0, p1) of every layer between the host store [g][row][K, V] and the host ring [cell][g][ROW] (K, V)
@@ -1526,12 +1567,15 @@ void llama_kvq_store::begin_ubatch(const llama_ubatch & ub) {
     l0.tb_ready = false;
 }
 
-void llama_kvq_store::begin_scr(const llama_ubatch & ub) {
+void llama_kvq_store::begin_scr(const llama_ubatch & ub, int64_t r0) {
     use_seq(kvq_ubatch_seq(ub, n_seq()));
     seq_state & q = seqs[cur];
     kvq_ubatch_pos(ub, ub_p0, ub_p1);
     ub_lo[0] = ub_p0;
     ub_hi[0] = ub_p1;
+    ub_scr_r0    = scr_tiled_ ? (int32_t) r0 : 0;
+    ub_scr_tiles = scr_tiled_ ? (int32_t) ((r0 + n_scr_tile_ - 1)/n_scr_tile_) : 0;
+    GGML_ASSERT(!scr_tiled_ || (ub_p0 >= ub_scr_r0 && ub_p1 - ub_scr_r0 <= n_scr - n_scr_tail_off));
     sync_store(cur, ub_p0);
     q.st_ok = ub_p1;
     q.rg_ok = std::min(q.rg_ok, ub_p0);
@@ -1633,6 +1677,13 @@ void llama_kvq_store::build_scr_up(ggml_context * ctx, ggml_cgraph * gf, ggml_ba
 void llama_kvq_store::build_scr_join(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const {
     GGML_ASSERT(scr_ok);
     kvq_build_trigger(ctx, gf, sched, dev, bias, get_layer(il).trig[KIND_SCR_JOIN], KIND_SCR_JOIN, il);
+}
+
+void llama_kvq_store::build_scr_tile(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il, int32_t tile) const {
+    GGML_ASSERT(scr_ok && scr_tiled_);
+    const auto & tt = get_layer(il).trig_tile;
+    GGML_ASSERT(tile >= 1 && tile < (int32_t) tt.size() && tt[tile] != nullptr);
+    kvq_build_trigger(ctx, gf, sched, dev, bias, tt[tile], KIND_COUNT + tile - 1, il);
 }
 
 void llama_kvq_store::build_scr_rb(ggml_context * ctx, ggml_cgraph * gf, ggml_backend_sched_t sched, int32_t il) const {
@@ -1939,20 +1990,43 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
         if (it->second.first > 0) {
             read_scr(layers[it->second.first - 1]);
         }
-        const size_t n = (size_t) ub_p0*2*ROW;
-        for (int32_t g = 0; g < G; ++g) {
-            chunk_runs(0, ub_p0, [&](int32_t p, int32_t m) {
-                ggml_backend_tensor_set_async(cp, scr, row_ptr(cur, l.li, g, p), g*scr->nb[3] + p*scr->nb[2], (size_t) m*2*ROW);
-            });
+        if (scr_tiled_) {
+            upload_scr_range(cp, l, ub_scr_r0, ub_p0, n_scr_tail_off);
+            if (ub_scr_tiles >= 1) {
+                upload_scr_range(cp, l, 0, std::min(ub_scr_r0, n_scr_tile_), 0);
+            }
+            ggml_backend_event_record(l.ev_sd.get(), cp);
+            if (ub_scr_tiles >= 2) {
+                upload_scr_range(cp, l, n_scr_tile_, std::min(ub_scr_r0, 2*n_scr_tile_), n_scr_tile_);
+                ggml_backend_event_record(ev_scr_tile[1].get(), cp);
+            }
+        } else {
+            upload_scr_range(cp, l, 0, ub_p0, 0);
+            ggml_backend_event_record(l.ev_sd.get(), cp);
         }
-        ggml_backend_event_record(l.ev_sd.get(), cp);
         cnt.n_scr++;
-        cnt.scr_bytes += (int64_t) G*n;
-        cnt.t_scr     += kvq_now() - t0;
+        cnt.t_scr += kvq_now() - t0;
         return true;
     }
     if (kind == KIND_SCR_JOIN) {
         ggml_backend_event_wait(backend, l.ev_sd.get());
+        cnt.t_scr += kvq_now() - t0;
+        return true;
+    }
+    if (kind >= KIND_COUNT) {
+        // tile t >= 1: main stream finished FA on tile t - 1 (slot (t + 1) & 1), prefetch tile t + 1 into it, then wait for tile t
+        const int32_t ti = kind - KIND_COUNT + 1;
+        if (ti + 1 < ub_scr_tiles) {
+            ggml_backend_t cp = backend_cp.get();
+            ggml_backend_event_record(ev_scr_free.get(), backend);
+            ggml_backend_event_wait(cp, ev_scr_free.get());
+            const int32_t b0 = (ti + 1)*n_scr_tile_;
+            const int32_t b1 = std::min(ub_scr_r0, b0 + n_scr_tile_);
+            const int slot = (ti + 1) & 1;
+            upload_scr_range(cp, l, b0, b1, (int64_t) slot*n_scr_tile_);
+            ggml_backend_event_record(ev_scr_tile[slot].get(), cp);
+        }
+        ggml_backend_event_wait(backend, ev_scr_tile[ti & 1].get());
         cnt.t_scr += kvq_now() - t0;
         return true;
     }
