@@ -281,6 +281,23 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        // Warp-level masked-KV skip: if all 32 KV columns handled by this warp are -inf (0xFC00)
+        // for every active query column, their scores are -inf (even with finite rel_bias), so
+        // KQ_max, KQ_sum, and VKQ are unchanged and we skip loading K/V completely.
+        if (mask && slope > 0.0f) {
+            bool all_masked = true;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    const half m = maskh[j*ne11 + threadIdx.y*WARP_SIZE + threadIdx.x];
+                    all_masked = all_masked && __half_as_ushort(m) == 0xFC00u;
+                }
+            }
+            if (ggml_cuda_all(all_masked)) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 

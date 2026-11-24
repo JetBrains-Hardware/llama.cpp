@@ -120,23 +120,52 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     // every pass starts from the prelude output
     auto * prelude = cur;
     const auto prelude_blocks = blocks;
+
+    // when all core layers run on the same device, batch all loop message queries into one mix + rms_norm per pass
+    bool core_same_dev = (end - start) > 1;
+    for (int ip = start + 1; ip < end && core_same_dev; ++ip) {
+        core_same_dev &= (model.dev_layer(ip) == model.dev_layer(start));
+    }
+    ggml_tensor * pass_msg_query = nullptr;
+    if (core_same_dev && m.n_passes > 1) {
+        pass_msg_query = m.loop_layers[0].msg_query;
+        for (int i = 1; i < end - start; ++i) {
+            pass_msg_query = ggml_concat(ctx0, pass_msg_query, m.loop_layers[i].msg_query, 1);
+        }
+    }
+
     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
         // the bank of the previous pass: its blocks after the first core block, and its output
         std::vector<ggml_tensor *> bank;
         ggml_tensor * bank_out = nullptr;
+        ggml_tensor * pass_msgs = nullptr;
+        ggml_tensor * pass_msgs_norm = nullptr;
         if (pass > 0) {
             bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
             bank_out = cur;
             cur = prelude;
             blocks = prelude_blocks;
+            if (pass_msg_query) {
+                pass_msgs = mix(bank, bank_out, pass_msg_query, start);
+                pass_msgs_norm = ggml_rms_norm(ctx0, pass_msgs, 1e-6f);
+            }
         }
+        auto slice_msg = [&](ggml_tensor * t, int ip) -> ggml_tensor * {
+            if (!t) {
+                return nullptr;
+            }
+            const int64_t off = (int64_t) (ip - start) * LOOP_CTRL_COUNT;
+            return ggml_view_3d(ctx0, t, n_embd, LOOP_CTRL_COUNT, n_tokens, t->nb[1], t->nb[2], off * t->nb[1]);
+        };
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
             const int ip_tgt = ip + lead;
             if (lead > 0 && ip_tgt < end && !hparams.is_swa(ip_tgt) && ip / block_sz == ip_tgt / block_sz) {
                 const int il_tgt = pass == 0 ? ip_tgt : m.n_phys + (pass - 1)*(end - start) + (ip_tgt - start);
                 build_kvq_prefetch(il_tgt, cur, blocks, pass > 0 ? &bank : nullptr, bank_out,
-                        pass > 0 ? &m.loop_layers[ip_tgt - start] : nullptr);
+                        pass > 0 ? &m.loop_layers[ip_tgt - start] : nullptr,
+                        pass > 0 ? slice_msg(pass_msgs, ip_tgt) : nullptr,
+                        pass > 0 ? slice_msg(pass_msgs_norm, ip_tgt) : nullptr);
             }
             res->t_layer_inp[visit++] = cur;
             if (pass == 0) {
@@ -144,7 +173,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query, il), &loop);
+            ggml_tensor * layer_msgs      = pass_msgs ? slice_msg(pass_msgs, ip) : mix(bank, bank_out, loop.msg_query, il);
+            ggml_tensor * layer_msgs_norm = pass_msgs_norm ? slice_msg(pass_msgs_norm, ip) : nullptr;
+            cur = build_layer(il, ip, cur, blocks, layer_msgs, &loop, layer_msgs_norm);
         }
     }
 
