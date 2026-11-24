@@ -1121,7 +1121,7 @@ void launch_fattn(
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
     GGML_ASSERT(!kv_rows || !use_sparse);
-    GGML_ASSERT(!rel_table || (!kv_rows && !use_sparse && ncols2 == 1));
+    GGML_ASSERT(!rel_table || (!kv_rows && !use_sparse && (ncols2 == 1 || (!stream_k && ncols2 == 3))));
 
     ggml_tensor * KQV = dst;
 

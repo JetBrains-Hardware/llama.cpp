@@ -1459,6 +1459,48 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         __syncthreads();
     }
 
+    // Precompute query tile position bounds for maskless position-aware attention (rel_bias.window > 0)
+    // so tiles with zero visible keys (outside SWA window, future causal keys, or INT32_MAX padding)
+    // are skipped BEFORE loading K/V or executing MMA.
+    int     rb_q_min = 0;
+    int     rb_q_max = 0;
+    int64_t rb_k_lo  = 0;
+    const bool rb_pos_skip = rbt.table != nullptr && rbt.window > 0 && !use_sparse;
+    if (rb_pos_skip) {
+        const int q0 = jt * ncols1;
+        const int q1 = min(rbt.n_q, q0 + ncols1);
+        if (q0 < q1) {
+            rb_q_min = rbt.qpos[q0];
+            rb_q_max = rb_q_min;
+            for (int q = q0 + 1; q < q1; ++q) {
+                const int qp = rbt.qpos[q];
+                rb_q_min = min(rb_q_min, qp);
+                rb_q_max = max(rb_q_max, qp);
+            }
+            rb_k_lo = int64_t(rb_q_min) - int64_t(rbt.window) + 1;
+        } else {
+            rb_q_min = 0;
+            rb_q_max = -1;
+            rb_k_lo  = 1;
+        }
+    }
+    auto tile_visible = [&](const int tile_kb0) -> bool {
+        if (!rb_pos_skip) {
+            return true;
+        }
+        const int k0 = tile_kb0 * nbatch_fa;
+        const int k1 = min(rbt.n_kv, k0 + nbatch_fa);
+        const int tid = threadIdx.y * warp_size + threadIdx.x;
+        bool vis = false;
+        for (int k = k0 + tid; k < k1; k += nwarps * warp_size) {
+            const int kp = rbt.kpos[k];
+            if (kp <= rb_q_max && int64_t(kp) >= rb_k_lo) {
+                vis = true;
+            }
+        }
+        return __syncthreads_or(vis) != 0;
+    };
+
     // With multi-stage loading the K/V block order is rotated, see flash_attn_ext_f16.
     // Then K/V blocks >= iter_k wrap around to 0 and the fully masked K/V blocks >= kb0_max are skipped.
     const int iter_k   = (ne11 + nbatch_fa - 1) / nbatch_fa;
@@ -1467,47 +1509,62 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     const int nkb      = max(1, nkb_pre + nkb_post);
     int       kb0      = nstages > 1 && nkb_pre == 0 && nkb_post > 0 ? 0 : kb0_start;
 
-    // Preload mask and K data for first iteration when using cp_async with multiple stages:
     if constexpr (nstages > 1) {
         static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
         static_assert(nbatch_K2 == DKQp/2, "batching not implemented for multi-stage pipeline");
         constexpr bool use_cp_async = true;
         constexpr bool oob_check    = false;
         constexpr int  k_VKQ_sup    = nbatch_fa;
-        if (mask_h) {
-            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
-        }
-        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0*nbatch_fa, k_VKQ_sup, indices);
-    }
 
-    // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    if constexpr (nstages > 1) {
-        constexpr bool oob_check = false;
-        for (int ikb = 1; ikb < nkb; ++ikb) {
-            const int kb0_next = kb0 + 1 == kb0_max ? 0 : kb0 + 1;
-            constexpr bool last_iter = false;
-            constexpr int  k_VKQ_sup = nbatch_fa;
-            flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, kb0_next, k_VKQ_sup, rbt);
-            kb0 = kb0_next;
+        int ikb = 0;
+        while (ikb < nkb && !tile_visible(kb0)) {
+            kb0 = kb0 + 1 == kb0_max ? 0 : kb0 + 1;
+            ++ikb;
         }
-        constexpr bool last_iter = true;
-        constexpr int  k_VKQ_sup = nbatch_fa;
-        flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-             T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, rbt);
+        if (ikb < nkb) {
+            // Preload mask and K data for first visible iteration:
+            if (mask_h) {
+                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                    (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
+            }
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                (K_h2, tile_K, min(nbatch_K2, DKQ/2), stride_K, kb0*nbatch_fa, k_VKQ_sup, indices);
+
+            while (true) {
+                int ikb_next = ikb + 1;
+                int kb0_next = kb0 + 1 == kb0_max ? 0 : kb0 + 1;
+                while (ikb_next < nkb && !tile_visible(kb0_next)) {
+                    kb0_next = kb0_next + 1 == kb0_max ? 0 : kb0_next + 1;
+                    ++ikb_next;
+                }
+                if (ikb_next < nkb) {
+                    constexpr bool last_iter = false;
+                    flash_attn_ext_f16_iter
+                        <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                         T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                        (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                         ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                         KQ_max, KQ_rowsum, jt, kb0, kb0_next, k_VKQ_sup, rbt);
+                    kb0 = kb0_next;
+                    ikb = ikb_next;
+                } else {
+                    constexpr bool last_iter = true;
+                    flash_attn_ext_f16_iter
+                        <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                         T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                        (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                         ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                         KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, rbt);
+                    break;
+                }
+            }
+        }
     } else if constexpr (ncols2 == 1 || use_sparse) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
+            if (!tile_visible(kb0)) {
+                continue;
+            }
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1517,17 +1574,22 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, kb0 + 1, k_VKQ_sup, rbt);
         }
-        constexpr bool last_iter = true;
-        const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
-        flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, rbt);
+        if (tile_visible(kb0)) {
+            constexpr bool last_iter = true;
+            const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
+            flash_attn_ext_f16_iter
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, rbt);
+        }
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
+            if (!tile_visible(kb0)) {
+                continue;
+            }
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1537,14 +1599,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, kb0 + 1, k_VKQ_sup, rbt);
         }
-        constexpr bool last_iter = true;
-        constexpr int  k_VKQ_sup = nbatch_fa;
-        flash_attn_ext_f16_iter
-            <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
-             T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-            (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
-             ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-             KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, rbt);
+        if (tile_visible(kb0)) {
+            constexpr bool last_iter = true;
+            constexpr int  k_VKQ_sup = nbatch_fa;
+            flash_attn_ext_f16_iter
+                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, last_iter, oob_check,
+                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
+                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                 KQ_max, KQ_rowsum, jt, kb0, kb0, k_VKQ_sup, rbt);
+        }
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
