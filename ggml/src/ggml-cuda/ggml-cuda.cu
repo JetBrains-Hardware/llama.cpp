@@ -4745,6 +4745,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Inkling-2 loop control: CONCAT + MUL_MAT(down) + 2x (MUL_MAT + TANH + MUL + SUB/ADD)
+    if (node->op == GGML_OP_CONCAT) {
+        static const bool loop_ctrl_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_LOOP_CTRL_FUSION");
+        ggml_cuda_loop_control_match match;
+        const int n = loop_ctrl_disabled ? 0 : ggml_cuda_match_loop_control(cgraph, i, match);
+        if (n > 0) {
+            ggml_cuda_op_loop_control(*cuda_ctx, match);
+            return n - 1;
+        }
+    }
+
     // y = c -/+ tanh(a)*b: UNARY(TANH), MUL, SUB/ADD
     if (node->op == GGML_OP_UNARY) {
         static const bool tanh_mul_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_TANH_MUL_ADDSUB_FUSION");

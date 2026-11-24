@@ -238,14 +238,34 @@ static bool dspark_draws(const llama_ubatch & ubatch, int64_t n_embd, int64_t i_
     return false;
 }
 
+// true when every block in the ubatch draws its tokens (speculative.cpp reads only h_nextn, not logits)
+static bool dspark_all_draws(const llama_ubatch & ubatch, int64_t n_embd, int64_t i_draft_beg) {
+    if (!ubatch.embd_state || ubatch.n_seqs_unq == 0) {
+        return false;
+    }
+    const int64_t block_drafts = ubatch.n_tokens / ubatch.n_seqs_unq;
+    if (block_drafts <= i_draft_beg) {
+        return false;
+    }
+    for (int64_t b = 0; b < ubatch.n_seqs_unq; ++b) {
+        if (!(ubatch.embd_state[(b*block_drafts + i_draft_beg)*n_embd + 1] > 0.0f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // a reused block graph must keep its draw mode
 struct llm_graph_input_dspark_draw : public llm_graph_input_i {
     bool draws;
+    bool all_draws;
     int64_t i_draft_beg;
-    llm_graph_input_dspark_draw(bool draws, int64_t i_draft_beg) : draws(draws), i_draft_beg(i_draft_beg) {}
+    llm_graph_input_dspark_draw(bool draws, bool all_draws, int64_t i_draft_beg)
+        : draws(draws), all_draws(all_draws), i_draft_beg(i_draft_beg) {}
     void set_input(const llama_ubatch *) override {}
     bool can_reuse(const llm_graph_params & params) override {
-        return draws == dspark_draws(params.ubatch, params.model->hparams.n_embd, i_draft_beg);
+        return draws     == dspark_draws    (params.ubatch, params.model->hparams.n_embd, i_draft_beg) &&
+               all_draws == dspark_all_draws(params.ubatch, params.model->hparams.n_embd, i_draft_beg);
     }
 };
 
@@ -321,10 +341,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     }
 
     // greedy blocks need no draw: the chain is the argmax of each step, and the tokens come back in h_nextn instead of the logits
-    const bool draws = rnn_state && dspark_draws(g.ubatch, n_embd, i_draft_beg);
-    const bool chain = rnn_state && !draws;
+    const bool draws       = rnn_state && dspark_draws(g.ubatch, n_embd, i_draft_beg);
+    const bool all_draws   = rnn_state && dspark_all_draws(g.ubatch, n_embd, i_draft_beg);
+    const bool chain       = rnn_state && !draws;
+    const bool skip_logits = chain || all_draws;
     if (rnn_state) {
-        res->add_input(std::make_unique<llm_graph_input_dspark_draw>(draws, i_draft_beg));
+        res->add_input(std::make_unique<llm_graph_input_dspark_draw>(draws, all_draws, i_draft_beg));
     }
 
     // the draws keep the top n_cand candidates, q of the verifier is their distribution
@@ -369,7 +391,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     if (!sample_from_anchor) {
         // bonus anchor slot: pass the logits through unbiased, pad the (unread) confidence column
-        if (!chain) {
+        if (!skip_logits) {
             cat = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, 0));
         }
         if (has_conf) {
@@ -434,7 +456,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             col = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col, 1.0f/softcap)), softcap);
         }
 
-        if (!chain) {
+        if (!skip_logits) {
             cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
         }
 
@@ -475,7 +497,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_build_forward_expand(g.gf, res->t_h_nextn);
     }
 
-    if (chain) {
+    if (skip_logits) {
         res->t_logits = nullptr;
         return;
     }
