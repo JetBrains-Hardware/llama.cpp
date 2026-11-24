@@ -235,6 +235,11 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // like prepare(), but purges [0, purge_before[i]) for each single-sequence ubatch before finding its slot
+    slot_info_vec_t prepare_trimmed(
+            const std::vector<llama_ubatch> & ubatches,
+            const std::vector<llama_pos>    & purge_before);
+
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
@@ -443,6 +448,8 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv_override) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv_override) const;
 
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;

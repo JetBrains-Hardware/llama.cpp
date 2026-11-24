@@ -65,7 +65,11 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
     rel_keep((llama_pos) model.hparams.n_relative_extent) {
     GGML_UNUSED(unified);
     if (swa_type != LLAMA_SWA_TYPE_NONE && model.hparams.is_swa_any()) {
-        const uint32_t kv_size_swa = swa_full ? kv_size : GGML_PAD(std::min(kv_size, n_swa + n_ubatch), 256);
+        // compact SWA cache: large prefill ubatches use per-layer scratch and only persist the last n_swa tokens
+        const bool swa_compact = !swa_full && !v_trans && n_ubatch > 256 && kv_size > n_swa + 256;
+        const uint32_t kv_size_swa = swa_full
+            ? kv_size
+            : GGML_PAD(std::min(kv_size, n_swa + (swa_compact ? 256u : n_ubatch)), 256);
         mem_swa = std::make_unique<llama_kv_cache>(
             model,
             no_alloc,
@@ -86,6 +90,8 @@ llama_memory_hybrid_kvq::llama_memory_hybrid_kvq(
             nullptr,
             nullptr,
             "SWA");
+        n_swa_win      = n_swa;
+        swa_direct_max = swa_compact ? (kv_size_swa - n_swa) : UINT32_MAX;
     }
     get_mem_attn()->set_ring(true);
     LLAMA_LOG_INFO("%s: tail: the attention cache is a ring of %u cells per stream (%u streams) for %u positions%s\n", "llama_memory_hybrid_kvq",
@@ -175,15 +181,53 @@ llama_memory_context_ptr llama_memory_hybrid_kvq::init_batch(llama_batch_allocr 
     }
 
     slot_info_vec_t heads_swa;
+    std::vector<llama_ubatch> ubatches_swa;
+    std::vector<llama_pos>    swa_purge_before;
+    std::vector<uint8_t>      swa_scratch_flags;
     if (mem_swa) {
-        heads_swa = mem_swa->prepare(ubatches);
+        bool any_swa_scratch = false;
+        ubatches_swa.reserve(ubatches.size());
+        swa_purge_before.reserve(ubatches.size());
+        swa_scratch_flags.reserve(ubatches.size());
+        for (const auto & ub : ubatches) {
+            if (ub.n_tokens > swa_direct_max && ub.n_seqs_unq == 1 && !ub.is_pos_2d()) {
+                any_swa_scratch = true;
+                const uint32_t n_keep = std::min<uint32_t>(ub.n_tokens, n_swa_win);
+                const uint32_t off    = ub.n_tokens - n_keep;
+                llama_pos p_max = ub.pos[0];
+                for (uint32_t i = 1; i < ub.n_tokens; ++i) {
+                    p_max = std::max(p_max, ub.pos[i]);
+                }
+                llama_ubatch ub_trim = ub;
+                ub_trim.n_tokens     = n_keep;
+                ub_trim.n_seq_tokens = n_keep;
+                ub_trim.token        = ub.token    ? ub.token    + off : nullptr;
+                ub_trim.pos          = ub.pos      + off;
+                ub_trim.n_seq_id     = ub.n_seq_id + off;
+                ub_trim.seq_id       = ub.seq_id   + off;
+                ub_trim.output       = ub.output   ? ub.output   + off : nullptr;
+                ub_trim.type         = ub.type     ? ub.type     + off : nullptr;
+                ubatches_swa.push_back(std::move(ub_trim));
+                swa_purge_before.push_back(std::max<llama_pos>(0, p_max + 1 - (llama_pos) n_swa_win));
+                swa_scratch_flags.push_back(1);
+            } else {
+                ubatches_swa.push_back(ub);
+                swa_purge_before.push_back(-1);
+                swa_scratch_flags.push_back(0);
+            }
+        }
+        heads_swa = any_swa_scratch
+            ? mem_swa->prepare_trimmed(ubatches_swa, swa_purge_before)
+            : mem_swa->prepare(ubatches);
         if (heads_swa.empty()) {
             release(bseq.size());
             return std::make_unique<llama_memory_hybrid_kvq_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
     }
 
-    return std::make_unique<llama_memory_hybrid_kvq_context>(this, std::move(heads_attn), std::move(heads_swa), std::move(ubatches));
+    return std::make_unique<llama_memory_hybrid_kvq_context>(
+            this, std::move(heads_attn), std::move(heads_swa), std::move(ubatches),
+            std::move(ubatches_swa), std::move(swa_purge_before), std::move(swa_scratch_flags));
 }
 
 llama_pos llama_memory_hybrid_kvq::n_pos(llama_seq_id seq) const {
@@ -996,6 +1040,7 @@ llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(llama_memory_hy
     ctx_swa(mem->get_mem_swa() ? mem->get_mem_swa()->init_full() : nullptr),
     params(kvq_params_reserve(mem->get_params())),
     store(mem->fit_graph_kind() > 0 ? mem->get_store() : nullptr),
+    swa_direct_max(mem->get_swa_direct_max()),
     status(llama_memory_hybrid_context::get_status()) {
 }
 
@@ -1006,6 +1051,7 @@ llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(llama_memory_hy
     params(mem->get_params()),
     is_packed_reserve(packed_reserve),
     store(mem->get_store()),
+    swa_direct_max(mem->get_swa_direct_max()),
     status(llama_memory_hybrid_context::get_status()) {
 }
 
@@ -1018,6 +1064,7 @@ llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(
     ctx_swa(mem->get_mem_swa() ? mem->get_mem_swa()->init_update(lctx, optimize) : nullptr),
     params(mem->get_params()),
     store(nullptr),
+    swa_direct_max(mem->get_swa_direct_max()),
     status(llama_memory_hybrid_context::get_status()) {
 }
 
@@ -1025,13 +1072,19 @@ llama_memory_hybrid_kvq_context::llama_memory_hybrid_kvq_context(
         llama_memory_hybrid_kvq * mem,
                 slot_info_vec_t   sinfos_attn,
                 slot_info_vec_t   sinfos_swa,
-      std::vector<llama_ubatch>   ubatches) :
+      std::vector<llama_ubatch>   ubatches,
+      std::vector<llama_ubatch>   ubatches_swa,
+        std::vector<llama_pos>    swa_purge_before,
+          std::vector<uint8_t>    swa_scratch_flags) :
     llama_memory_hybrid_context(mem, sinfos_attn, ubatches),
     kv_attn(mem->get_mem_attn()),
-    ctx_swa(mem->get_mem_swa() ? std::make_unique<llama_kv_cache_context>(mem->get_mem_swa(), std::move(sinfos_swa), ubatches) : nullptr),
+    ctx_swa(mem->get_mem_swa() ? std::make_unique<llama_kv_cache_context>(mem->get_mem_swa(), std::move(sinfos_swa), std::move(ubatches_swa)) : nullptr),
     mem_kvq(mem),
     params(mem->get_params()),
     store(mem->get_params().enabled ? mem->get_store() : nullptr),
+    swa_direct_max(mem->get_swa_direct_max()),
+    swa_purge_before(std::move(swa_purge_before)),
+    swa_scratch_flags(std::move(swa_scratch_flags)),
     status(llama_memory_hybrid_context::get_status()) {
 }
 
@@ -1044,6 +1097,7 @@ bool llama_memory_hybrid_kvq_context::next() {
     if (ctx_swa) {
         const bool res_swa = ctx_swa->next();
         GGML_ASSERT(res == res_swa);
+        ++i_cur_swa;
     }
     return res;
 }
@@ -1059,6 +1113,29 @@ bool llama_memory_hybrid_kvq_context::apply() {
 
     bool res = llama_memory_hybrid_context::apply();
     if (ctx_swa) {
+        if (mem_kvq && i_cur_swa < swa_scratch_flags.size() && swa_scratch_flags[i_cur_swa]) {
+            const llama_ubatch & ub = get_ubatch();
+            const llama_seq_id seq  = ub.seq_id_unq[0];
+            auto * mem_swa = mem_kvq->get_mem_swa();
+            const auto & cells = mem_swa->get_cells(seq);
+            const uint32_t used = cells.used_max_p1();
+            if (used == 0) {
+                swa_old_n_cur = 0;
+                swa_old_pos_cur.clear();
+            } else {
+                swa_old_n_cur = std::min<uint32_t>(GGML_PAD(used, 256), mem_swa->get_size());
+                swa_old_pos_cur.resize(swa_old_n_cur);
+                for (uint32_t j = 0; j < swa_old_n_cur; ++j) {
+                    swa_old_pos_cur[j] = (cells.is_empty(j) || !cells.seq_has(j, seq)) ? INT32_MAX : (int32_t) cells.pos_get(j);
+                }
+            }
+            if (swa_purge_before[i_cur_swa] > 0) {
+                mem_swa->seq_rm(seq, 0, swa_purge_before[i_cur_swa]);
+            }
+        } else {
+            swa_old_n_cur = 0;
+            swa_old_pos_cur.clear();
+        }
         res = res && ctx_swa->apply();
     }
 
@@ -1319,4 +1396,59 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_scr_pos(ggml_tensor * kpos, 
         }
     }
     ggml_backend_tensor_set(kpos, pos.data(), 0, n*sizeof(int32_t));
+}
+
+bool llama_memory_hybrid_kvq_context::swa_is_scratch(const llama_ubatch & ubatch) const {
+    if (!ctx_swa) {
+        return false;
+    }
+    if (mem_kvq) {
+        return i_cur_swa < swa_scratch_flags.size() && swa_scratch_flags[i_cur_swa] != 0;
+    }
+    return ubatch.n_tokens > swa_direct_max && ubatch.n_seqs_unq == 1 && !ubatch.is_pos_2d();
+}
+
+uint32_t llama_memory_hybrid_kvq_context::swa_old_n(const llama_ubatch & ubatch) const {
+    if (!swa_is_scratch(ubatch)) {
+        return 0;
+    }
+    if (mem_kvq) {
+        return swa_old_n_cur;
+    }
+    return get_swa()->get_n_kv();
+}
+
+void llama_memory_hybrid_kvq_context::set_input_swa_scratch(ggml_tensor * mask, ggml_tensor * kpos, const llama_ubatch * ubatch, uint32_t n_swa) const {
+    GGML_ASSERT(ubatch->n_seqs_unq == 1);
+    const int64_t n_old = swa_old_n_cur;
+    const int64_t n_tok = ubatch->n_tokens;
+    const int64_t n_cat = n_old + n_tok;
+
+    std::vector<int32_t> pos(n_cat);
+    if (n_old > 0) {
+        memcpy(pos.data(), swa_old_pos_cur.data(), n_old*sizeof(int32_t));
+    }
+    memcpy(pos.data() + n_old, ubatch->pos, n_tok*sizeof(int32_t));
+
+    if (kpos && kpos->buffer) {
+        GGML_ASSERT(kpos->type == GGML_TYPE_I32 && ggml_is_contiguous(kpos) && kpos->ne[0] == n_cat && kpos->ne[1] == 1);
+        ggml_backend_tensor_set(kpos, pos.data(), 0, n_cat*sizeof(int32_t));
+    }
+
+    if (mask && mask->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] == n_cat && mask->ne[1] == n_tok && mask->ne[3] == 1);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        ggml_fp16_t * dst = (ggml_fp16_t *) mask->data;
+        for (int64_t i = 0; i < n_tok; ++i) {
+            const int32_t qp = ubatch->pos[i];
+            ggml_fp16_t * d = dst + i*n_cat;
+            for (int64_t j = 0; j < n_cat; ++j) {
+                const int32_t kp = pos[j];
+                const bool ok = kp != INT32_MAX && kp <= qp && (qp - kp) < (int32_t) n_swa;
+                d[j] = ok ? zero : ninf;
+            }
+        }
+    }
 }

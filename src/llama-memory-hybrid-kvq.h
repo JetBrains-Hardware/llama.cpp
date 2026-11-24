@@ -118,6 +118,8 @@ public:
     // nullptr if the model has no SWA layers
     llama_kv_cache * get_mem_swa() const { return mem_swa.get(); }
 
+    uint32_t get_swa_direct_max() const { return swa_direct_max; }
+
     // nullptr before fit_enable
     llama_kvq_store * get_store() const { return store.get(); }
 
@@ -147,6 +149,8 @@ private:
     const uint32_t  n_ctx_max; // positions of the context
     const llama_pos rel_keep;  // trailing positions kept precise in the ring for relative-position bias (0 if none)
     std::unique_ptr<llama_kv_cache> mem_swa;
+    uint32_t n_swa_win      = 0;
+    uint32_t swa_direct_max = UINT32_MAX; // ubatches larger than this use per-layer SWA scratch in prefill
 
     // the state of one sequence (one per sequence of the memory, sized in fit_enable)
     struct seq_state {
@@ -219,7 +223,10 @@ public:
             llama_memory_hybrid_kvq * mem,
                     slot_info_vec_t   sinfos_attn,
                     slot_info_vec_t   sinfos_swa,
-          std::vector<llama_ubatch>   ubatches);
+          std::vector<llama_ubatch>   ubatches,
+          std::vector<llama_ubatch>   ubatches_swa,
+            std::vector<llama_pos>    swa_purge_before,
+              std::vector<uint8_t>    swa_scratch_flags);
 
     bool next()  override;
     bool apply() override;
@@ -255,6 +262,11 @@ public:
     // scratch key positions I32 [n_rows - r0, 1] for position-based masking: row r -> r if in host store or ring, else INT32_MAX
     void set_input_kvq_scr_pos(ggml_tensor * kpos, const llama_ubatch * ubatch, int32_t n_host, int64_t r0) const;
 
+    // per-layer SWA scratch during large-ubatch prefill (compact mem_swa holds only n_swa + 256 cells)
+    bool     swa_is_scratch(const llama_ubatch & ubatch) const;
+    uint32_t swa_old_n(const llama_ubatch & ubatch) const;
+    void     set_input_swa_scratch(ggml_tensor * mask, ggml_tensor * kpos, const llama_ubatch * ubatch, uint32_t n_swa) const;
+
     // packed mode: the ubatch does not take the packed path (prompt ubatches; small ones after a rollback into the coarse region)
     bool prompt_path(const llama_ubatch & ubatch) const;
 
@@ -274,6 +286,13 @@ private:
     bool is_packed_reserve = false;
 
     llama_kvq_store * store = nullptr;
+
+    uint32_t swa_direct_max = UINT32_MAX;
+    size_t   i_cur_swa      = 0;
+    uint32_t swa_old_n_cur  = 0;
+    std::vector<llama_pos> swa_purge_before;
+    std::vector<uint8_t>   swa_scratch_flags;
+    std::vector<int32_t>   swa_old_pos_cur;
 
     const llama_memory_status status;
 };

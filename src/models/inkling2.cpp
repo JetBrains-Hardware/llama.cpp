@@ -57,6 +57,8 @@ public:
             bool scr_cells,
             bool fit,
             bool pos_mask,
+            bool swa_scratch,
+            int64_t swa_old_n,
             int64_t scr_rows,
             int64_t scr_r0) :
         mctx(mctx),
@@ -74,6 +76,8 @@ public:
         scr_cells(scr_cells),
         fit(fit),
         pos_mask(pos_mask),
+        swa_scratch(swa_scratch),
+        swa_old_n(swa_old_n),
         codes_gen(store ? store->codes_gen() : 0),
         scr_rows(scr_rows),
         scr_r0(scr_r0) {}
@@ -81,17 +85,28 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         const auto * mctx_swa = mctx->get_swa();
         if (mctx_swa) {
-            if (swa_k_idxs) {
-                mctx_swa->set_input_k_idxs(swa_k_idxs, ubatch);
-            }
-            if (swa_v_idxs) {
-                mctx_swa->set_input_v_idxs(swa_v_idxs, ubatch);
-            }
-            if (swa_mask.raw) {
-                mctx_swa->set_input_attn_mask(swa_mask, ubatch, cparams.causal_attn);
-            }
-            if (swa_kv_pos) {
-                mctx_swa->set_input_kv_pos(swa_kv_pos, ubatch, pos_mask);
+            if (swa_scratch) {
+                const llama_ubatch & ub_swa = mctx_swa->get_ubatch();
+                if (swa_k_idxs) {
+                    mctx_swa->set_input_k_idxs(swa_k_idxs, &ub_swa);
+                }
+                if (swa_v_idxs) {
+                    mctx_swa->set_input_v_idxs(swa_v_idxs, &ub_swa);
+                }
+                mctx->set_input_swa_scratch(swa_mask.raw, swa_kv_pos, ubatch, hparams.n_swa);
+            } else {
+                if (swa_k_idxs) {
+                    mctx_swa->set_input_k_idxs(swa_k_idxs, ubatch);
+                }
+                if (swa_v_idxs) {
+                    mctx_swa->set_input_v_idxs(swa_v_idxs, ubatch);
+                }
+                if (swa_mask.raw) {
+                    mctx_swa->set_input_attn_mask(swa_mask, ubatch, cparams.causal_attn);
+                }
+                if (swa_kv_pos) {
+                    mctx_swa->set_input_kv_pos(swa_kv_pos, ubatch, pos_mask);
+                }
             }
         }
         if (q_pos && q_pos->buffer) {
@@ -160,7 +175,18 @@ public:
         if (pos_mask != inkling_kvq_use_pos_mask(hparams, p.cparams, p.ubatch)) {
             return false;
         }
-        if (swa_kv_pos && mc->get_swa() && mc->get_swa()->get_n_kv() != swa_kv_pos->ne[0]) {
+        const bool cur_swa_scr = mc->swa_is_scratch(p.ubatch);
+        if (cur_swa_scr != swa_scratch) {
+            return false;
+        }
+        if (swa_scratch) {
+            if ((int64_t) mc->swa_old_n(p.ubatch) != swa_old_n) {
+                return false;
+            }
+            if (swa_kv_pos && swa_kv_pos->ne[0] != swa_old_n + p.ubatch.n_tokens) {
+                return false;
+            }
+        } else if (swa_kv_pos && mc->get_swa() && mc->get_swa()->get_n_kv() != swa_kv_pos->ne[0]) {
             return false;
         }
         if (mc->packed_reserve() || store == nullptr) {
@@ -228,6 +254,8 @@ public:
     bool scr_cells;
     bool fit;
     bool pos_mask;
+    bool swa_scratch;
+    int64_t swa_old_n;
     uint32_t codes_gen;
     int64_t scr_rows;
     int64_t scr_r0;
@@ -547,20 +575,39 @@ llama_model_inkling2::llm_graph_input_kvq * llama_model_inkling2::graph::build_i
     const int64_t scr_r0    = (scratch && !scr_cells) ? inkling_kvq_scr_r0(pr, n_host, (int32_t) hparams.n_relative_extent) : 0;
 
     const bool pos_mask = inkling_kvq_use_pos_mask(hparams, cparams, ubatch);
+    const bool swa_scratch = mctx_kvq->swa_is_scratch(ubatch);
+    const int64_t swa_old_n = swa_scratch ? (int64_t) mctx_kvq->swa_old_n(ubatch) : 0;
 
-    auto inp_q = std::make_unique<llm_graph_input_kvq>(mctx_kvq, hparams, cparams, store, pr, seqs, n_coarse_s, n_host, packed_small, scratch, scr_cells, fit, pos_mask, scr_rows, scr_r0);
+    auto inp_q = std::make_unique<llm_graph_input_kvq>(mctx_kvq, hparams, cparams, store, pr, seqs, n_coarse_s, n_host, packed_small, scratch, scr_cells, fit, pos_mask, swa_scratch, swa_old_n, scr_rows, scr_r0);
 
     const auto * mctx_swa = mctx_kvq->get_swa();
     const int64_t n_stream = ubatch.n_seqs_unq > 0 ? ubatch.n_seqs_unq : 1;
     if (mctx_swa) {
-        inp_q->swa_k_idxs = mctx_swa->build_input_k_idxs(ctx0, ubatch);
-        inp_q->swa_v_idxs = mctx_swa->build_input_v_idxs(ctx0, ubatch);
-        if (!pos_mask) {
-            inp_q->swa_mask.raw = inkling_build_kq_mask_raw(ctx0, mctx_swa->get_n_kv(), n_tokens, n_stream, "kvq_swa_mask");
+        if (swa_scratch) {
+            const int64_t n_keep = std::min<int64_t>(n_tokens, hparams.n_swa);
+            inp_q->swa_k_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_keep);
+            ggml_set_input(inp_q->swa_k_idxs);
+            ggml_set_name(inp_q->swa_k_idxs, "kvq_swa_k_idxs");
+            inp_q->swa_v_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_keep);
+            ggml_set_input(inp_q->swa_v_idxs);
+            ggml_set_name(inp_q->swa_v_idxs, "kvq_swa_v_idxs");
+            const int64_t n_cat = swa_old_n + n_tokens;
+            if (!pos_mask) {
+                inp_q->swa_mask.raw = inkling_build_kq_mask_raw(ctx0, n_cat, n_tokens, 1, "kvq_swa_mask");
+            }
+            inp_q->swa_kv_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_cat, 1);
+            ggml_set_input(inp_q->swa_kv_pos);
+            ggml_set_name(inp_q->swa_kv_pos, "kvq_swa_kv_pos");
+        } else {
+            inp_q->swa_k_idxs = mctx_swa->build_input_k_idxs(ctx0, ubatch);
+            inp_q->swa_v_idxs = mctx_swa->build_input_v_idxs(ctx0, ubatch);
+            if (!pos_mask) {
+                inp_q->swa_mask.raw = inkling_build_kq_mask_raw(ctx0, mctx_swa->get_n_kv(), n_tokens, n_stream, "kvq_swa_mask");
+            }
+            inp_q->swa_kv_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mctx_swa->get_n_kv(), n_stream);
+            ggml_set_input(inp_q->swa_kv_pos);
+            ggml_set_name(inp_q->swa_kv_pos, "kvq_swa_kv_pos");
         }
-        inp_q->swa_kv_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mctx_swa->get_n_kv(), n_stream);
-        ggml_set_input(inp_q->swa_kv_pos);
-        ggml_set_name(inp_q->swa_kv_pos, "kvq_swa_kv_pos");
     }
 
     inp_q->q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -1019,18 +1066,42 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 ggml_tensor * zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
                 const auto * mctx_swa = inp_kvq->mctx->get_swa();
-                ggml_build_forward_expand(gf, mctx_swa->cpy_k(ctx0, Kcur, inp_kvq->swa_k_idxs, il));
-                ggml_build_forward_expand(gf, mctx_swa->cpy_v(ctx0, Vcur, inp_kvq->swa_v_idxs, il));
-
-                const int64_t n_kv_swa = mctx_swa->get_n_kv();
-                ggml_tensor * k = mctx_swa->get_k(ctx0, il);
-                ggml_tensor * v = mctx_swa->get_v(ctx0, il);
-
-                const int64_t n_stream = inp_kvq->swa_kv_pos->ne[1];
-                ggml_tensor * q_pos_swa = n_stream > 1 ? ggml_reshape_2d(ctx0, inp_kvq->q_pos, n_tokens/n_stream, n_stream) : inp_kvq->q_pos;
                 const int32_t n_window = inp_kvq->pos_mask ? (int32_t) hparams.n_swa : 0;
-                const llm_graph_rel_bias rel = { table, inp_kvq->swa_kv_pos, q_pos_swa, n_window };
-                cur = build_attn_mha(Qcur, k, v, nullptr, inp_kvq->swa_mask.raw, nullptr, zero_sinks, nullptr, n_kv_swa, kq_scale, il, &rel);
+
+                if (inp_kvq->swa_scratch) {
+                    const int64_t n_old  = inp_kvq->swa_old_n;
+                    const int64_t n_cat  = n_old + n_tokens;
+                    const int64_t n_keep = std::min<int64_t>(n_tokens, hparams.n_swa);
+
+                    // per-layer scratch [D, n_head_kv, n_old + n_tokens] reused across all SWA layers
+                    ggml_tensor * k_new = ggml_cast(ctx0, Kcur, mctx_swa->type_k());
+                    ggml_tensor * v_new = ggml_cast(ctx0, Vcur, mctx_swa->type_v());
+                    ggml_tensor * k_cat = n_old > 0 ? ggml_concat(ctx0, mctx_swa->get_k(ctx0, il, (uint32_t) n_old), k_new, 2) : k_new;
+                    ggml_tensor * v_cat = n_old > 0 ? ggml_concat(ctx0, mctx_swa->get_v(ctx0, il, (uint32_t) n_old), v_new, 2) : v_new;
+
+                    const llm_graph_rel_bias rel = { table, inp_kvq->swa_kv_pos, inp_kvq->q_pos, n_window };
+                    cur = build_attn_mha(Qcur, k_cat, v_cat, nullptr, inp_kvq->swa_mask.raw, nullptr, zero_sinks, nullptr, n_cat, kq_scale, il, &rel);
+                    ggml_build_forward_expand(gf, cur);
+
+                    // persist only the trailing n_keep tokens after old SWA cells were copied into k_cat/v_cat
+                    const int64_t off = n_tokens - n_keep;
+                    ggml_tensor * k_keep = ggml_view_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_keep, Kcur->nb[1], Kcur->nb[2], off*Kcur->nb[2]);
+                    ggml_tensor * v_keep = ggml_view_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_keep, Vcur->nb[1], Vcur->nb[2], off*Vcur->nb[2]);
+                    ggml_build_forward_expand(gf, mctx_swa->cpy_k(ctx0, k_keep, inp_kvq->swa_k_idxs, il));
+                    ggml_build_forward_expand(gf, mctx_swa->cpy_v(ctx0, v_keep, inp_kvq->swa_v_idxs, il));
+                } else {
+                    ggml_build_forward_expand(gf, mctx_swa->cpy_k(ctx0, Kcur, inp_kvq->swa_k_idxs, il));
+                    ggml_build_forward_expand(gf, mctx_swa->cpy_v(ctx0, Vcur, inp_kvq->swa_v_idxs, il));
+
+                    const int64_t n_kv_swa = mctx_swa->get_n_kv();
+                    ggml_tensor * k = mctx_swa->get_k(ctx0, il);
+                    ggml_tensor * v = mctx_swa->get_v(ctx0, il);
+
+                    const int64_t n_stream = inp_kvq->swa_kv_pos->ne[1];
+                    ggml_tensor * q_pos_swa = n_stream > 1 ? ggml_reshape_2d(ctx0, inp_kvq->q_pos, n_tokens/n_stream, n_stream) : inp_kvq->q_pos;
+                    const llm_graph_rel_bias rel = { table, inp_kvq->swa_kv_pos, q_pos_swa, n_window };
+                    cur = build_attn_mha(Qcur, k, v, nullptr, inp_kvq->swa_mask.raw, nullptr, zero_sinks, nullptr, n_kv_swa, kq_scale, il, &rel);
+                }
             } else if (inp_kvq->packed_small) {
                 cur = build_attn_kvq_packed(Qcur, Kcur, Vcur, raw_table, sinks_raw, kq_scale, il);
             } else if (inp_kvq->scratch) {

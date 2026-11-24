@@ -853,6 +853,43 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_trimmed(
+        const std::vector<llama_ubatch> & ubatches,
+        const std::vector<llama_pos>    & purge_before) {
+    GGML_ASSERT(ubatches.size() == purge_before.size());
+
+    slot_info_vec_t res;
+    auto v_cells_old = v_cells;
+    auto v_heads_old = v_heads;
+
+    bool success = true;
+    for (size_t i = 0; i < ubatches.size(); ++i) {
+        const auto & ubatch = ubatches[i];
+        if (purge_before[i] > 0) {
+            GGML_ASSERT(ubatch.n_seqs_unq == 1);
+            seq_rm(ubatch.seq_id_unq[0], 0, purge_before[i]);
+        }
+
+        const auto sinfo_new = find_slot(ubatch, false);
+        if (sinfo_new.empty()) {
+            success = false;
+            break;
+        }
+
+        res.push_back(sinfo_new);
+        apply_ubatch(sinfo_new, ubatch);
+    }
+
+    v_cells = std::move(v_cells_old);
+    v_heads = std::move(v_heads_old);
+
+    if (!success) {
+        return {};
+    }
+
+    return res;
+}
+
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -3140,6 +3177,14 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv_override) const {
+    return kv->get_k(ctx, il, n_kv_override, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv_override) const {
+    return kv->get_v(ctx, il, n_kv_override, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_k_scale(int32_t il) const {
