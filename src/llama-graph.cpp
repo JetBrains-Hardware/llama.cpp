@@ -3241,7 +3241,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         if (rel) {
             ggml_tensor * table = ggml_reshape_4d(ctx0, rel->table, rel->table->ne[0], rel->table->ne[1], rel->table->ne[2]/n_stream, n_stream);
-            ggml_tensor * qpos  = ggml_reshape_2d(ctx0, rel->qpos, rel->qpos->ne[0]/n_stream, n_stream);
+            ggml_tensor * qpos  = rel->qpos->ne[1] == n_stream
+                ? rel->qpos
+                : ggml_reshape_2d(ctx0, rel->qpos, ggml_nelements(rel->qpos)/n_stream, n_stream);
             ggml_flash_attn_ext_add_rel_bias(cur, table, rel->kpos, qpos);
             if (rel->n_window > 0) {
                 ggml_flash_attn_ext_set_pos_window(cur, rel->n_window);

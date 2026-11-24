@@ -12,7 +12,7 @@ static int64_t inkling_kvq_scr_rows(const llama_kvq_store * store, int32_t n_hos
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         p_max = std::max(p_max, ubatch.pos[i]);
     }
-    return std::min<int64_t>(store->n_rows() + store->n_ring(), GGML_PAD(p_max + 1, 256));
+    return std::min<int64_t>((int64_t) n_host + store->n_ring(), GGML_PAD((int64_t) p_max + 1, 256));
 }
 
 static int64_t inkling_kvq_scr_r0(const llama_kvq_params & p, int32_t n_host, int32_t rel_extent) {
@@ -1123,9 +1123,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                     ggml_tensor * k = mctx_swa->get_k(ctx0, il);
                     ggml_tensor * v = mctx_swa->get_v(ctx0, il);
 
-                    const int64_t n_stream = inp_kvq->swa_kv_pos->ne[1];
-                    ggml_tensor * q_pos_swa = n_stream > 1 ? ggml_reshape_2d(ctx0, inp_kvq->q_pos, n_tokens/n_stream, n_stream) : inp_kvq->q_pos;
-                    const llm_graph_rel_bias rel = { table, inp_kvq->swa_kv_pos, q_pos_swa, n_window };
+                    const llm_graph_rel_bias rel = { table, inp_kvq->swa_kv_pos, inp_kvq->q_pos, n_window };
                     cur = build_attn_mha(Qcur, k, v, nullptr, inp_kvq->swa_mask.raw, nullptr, zero_sinks, nullptr, n_kv_swa, kq_scale, il, &rel);
                 }
             } else if (inp_kvq->packed_small) {
@@ -1150,10 +1148,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 if (kq_mask->type != GGML_TYPE_F16) {
                     kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
                 }
-                const int64_t n_stream = kq_mask->ne[3];
+                const int64_t n_stream = k->ne[3];
                 ggml_tensor * kpos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-                ggml_tensor * q_pos_b = n_stream > 1 ? ggml_reshape_2d(ctx0, inp_kvq->q_pos, n_tokens/n_stream, n_stream) : inp_kvq->q_pos;
-                const llm_graph_rel_bias rel = { table, kpos, q_pos_b };
+                const llm_graph_rel_bias rel = { table, kpos, inp_kvq->q_pos };
                 cur = build_attn_mha(Qcur, k, v, nullptr, kq_mask, nullptr, zero_sinks, nullptr, n_kv, kq_scale, il, &rel);
             }
         } else {

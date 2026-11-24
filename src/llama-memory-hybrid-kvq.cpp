@@ -166,11 +166,17 @@ llama_memory_context_ptr llama_memory_hybrid_kvq::init_batch(llama_batch_allocr 
         }
         for (auto & e : by_len) {
             std::sort(e.second.begin(), e.second.end());
-            for (size_t i = 0; i < e.second.size(); i += store->n_streams()) {
-                const size_t n = std::min<size_t>(store->n_streams(), e.second.size() - i);
-                if (n > 1) {
-                    groups.emplace_back(e.second.begin() + i, e.second.begin() + i + n);
+            for (size_t i = 0; i < e.second.size(); ) {
+                size_t j = i + 1;
+                // non-unified mem_swa views streams as a contiguous range [s0..s1]; split groups across gaps in seq_id
+                while (j < e.second.size() && j - i < (size_t) store->n_streams() &&
+                       (!mem_swa || e.second[j] == e.second[j - 1] + 1)) {
+                    ++j;
                 }
+                if (j - i > 1) {
+                    groups.emplace_back(e.second.begin() + i, e.second.begin() + j);
+                }
+                i = j;
             }
         }
     }
