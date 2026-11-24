@@ -145,6 +145,37 @@ Candidate approaches to revisit later on this branch (ordered by simplicity):
 2. **Swap with DSpark draft weights (`#28346` pattern):** when running DSpark, evicting `~500 MiB` of draft weights to host RAM and restoring them over PCIe 4.0/5.0 x16 takes `~20-40 ms` each way.
 3. **Evict a few LLM layer buffers (extension of `#28346`):** works at any context size and without a drafter; evicting `~1 GiB` (2-3 MoE layers) and restoring takes `~50-100 ms` round-trip over PCIe using the same `ggml_backend_buffer` evict/restore mechanism scoped to a subset of layers.
 
+## DSpark speculative decoding + `--kvq` (`w2q8` drafter)
+
+Cherry-picked `9181600bc..d5f770140` from `erokhins/inkling-strata` onto `erokhins/inkling` (`58bbe32bb..4f906547c`: PR `#32218` Inkling-2 DSpark drafter + `fbb525132` greedy argmax-chain draft optimization, which cuts draft compute from `788 MiB` to `36 MiB`).
+
+Measured on RTX 5090 with `Inkling-2-Mini-UD-Q3_K_XL.gguf` + `dspark-Inkling-2-Mini-BF16-w2q8.gguf` (`-c 98304 -ub 512 -np 1 -fa on -ngl 99`, `--spec-type draft-dspark -ngld 99`, `cache_prompt=false`, idle GPU `1,181 MiB`):
+
+| Request | Mode | VRAM (`nvidia-smi` / ~proc) | RAM WS / Priv (`kvq` pinned) | Prefill | Decode (gen tok, mean acc) |
+|---|---|---|---|---|---|
+| 32k (32,144 tok) | `--kvq` (no draft) | 15,160 MiB (~14.0 GiB) | 15.1 / 17.1 GiB (821 MiB) | 2,432 t/s (13.2s) | 64.3 t/s (1,799 tok) |
+| 32k (32,144 tok) | `--kvq` + DSpark `K=2` | 16,290 MiB (~15.1 GiB) | 16.0 / 18.5 GiB (821 MiB) | 2,376 t/s (13.5s) | 98.0 t/s (495 tok, 2.26) |
+| 32k (32,144 tok) | `--kvq` + DSpark `K=3` | 16,293 MiB (~15.1 GiB) | 16.0 / 18.5 GiB (821 MiB) | 2,365 t/s (13.6s) | 92.3 t/s (1,607 tok, 2.47) |
+| 32k (32,144 tok) | `--kvq` + DSpark `K=4` | 16,310 MiB (~15.1 GiB) | 16.0 / 18.5 GiB (821 MiB) | 2,373 t/s (13.6s) | **99.5 t/s** (2,135 tok, 2.80) |
+| 32k (32,144 tok) | `--kvq` + DSpark `K=7` | 16,320 MiB (~15.1 GiB) | 16.0 / 18.5 GiB (821 MiB) | 2,385 t/s (13.5s) | 93.9 t/s (1,687 tok, 3.01) |
+| 32k (32,144 tok) | `std` + DSpark `K=7` | 19,116 MiB (~17.9 GiB) | 15.3 / 20.6 GiB (n/a) | 2,466 t/s (13.0s) | 102.3 t/s (1,684 tok, 3.01) |
+| 76k (75,985 tok) | `--kvq` (no draft) | 15,174 MiB (~14.0 GiB) | 16.0 / 18.0 GiB (1,642 MiB) | 2,345 t/s (32.4s) | 60.8 t/s (225 tok) |
+| 76k (75,985 tok) | `--kvq` + DSpark `K=2` | 16,296 MiB (~15.1 GiB) | 16.9 / 19.5 GiB (1,642 MiB) | 2,300 t/s (33.0s) | 116.6 t/s (802 tok, 2.86*) |
+| 76k (75,985 tok) | `--kvq` + DSpark `K=3` | 16,314 MiB (~15.1 GiB) | 16.9 / 19.4 GiB (1,642 MiB) | 2,293 t/s (33.1s) | 88.1 t/s (2,000 tok, 2.45) |
+| 76k (75,985 tok) | `--kvq` + DSpark `K=4` | 16,318 MiB (~15.1 GiB) | 16.9 / 19.4 GiB (1,642 MiB) | 2,300 t/s (33.0s) | **96.7 t/s** (2,000 tok, 2.84) |
+| 76k (75,985 tok) | `--kvq` + DSpark `K=7` | 16,354 MiB (~15.2 GiB) | 16.9 / 19.4 GiB (1,642 MiB) | 2,305 t/s (33.0s) | 90.2 t/s (2,000 tok, 3.04) |
+| 76k (75,985 tok) | `std` + DSpark `K=7` | 19,118 MiB (~17.9 GiB) | 15.5 / 20.8 GiB (n/a) | 2,275 t/s (33.4s) | 101.4 t/s (2,000 tok, 3.38) |
+
+*Note: `K=2` on 76k hit an unusually high-acceptance 802-token trajectory (`2.86` mean acc out of `K+1=3`).*
+
+Key findings:
+
+- **Recommended `K` for `--kvq` + DSpark: `--spec-draft-n-max 4` (`K=4`).** It delivers the best consistent decode throughput (`99.5 t/s` at 32k, `96.7 t/s` at 76k; `+55%` to `+59%` over `--kvq` no-draft) with only `~2-2.5%` prefill overhead. With `n_rep = 3`, `K=4` gives `n_rep * (K + 1) = 15` query columns per KV head, filling `15/16` of `kvq-attn`'s `N=16` MMA tile without spilling into a second tile (whereas `K=7` spills to `24` columns and slows down to `93.9 / 90.2 t/s`).
+- **VRAM overhead:** DSpark (`w2q8`) adds `+1,150 MiB` (`+1.12 GiB`) total at `-c 98304` (`657.5 MiB` draft weights + `398 MiB` draft KV + `36 MiB` draft compute + `18 MiB` RS snapshots + `10.5 MiB` target compute), keeping `--kvq` + DSpark at `~15.1 GiB` process VRAM (`~2.8 GiB` below `std` + DSpark, fitting inside a 16 GB card at 96k).
+- **Host RAM:** WorkingSet increases by `~0.9 GiB` with DSpark (`15.1-16.0 GiB -> 16.0-16.9 GiB`, including `821 MiB` / `1,642 MiB` of `--kvq` pinned KV pages); Private bytes stay at `18.5-19.5 GiB` (`~1.4-2.1 GiB` below `std` + DSpark's `20.6-20.8 GiB`).
+- **Correctness note:** Acceptance rates on `--kvq` + DSpark (`3.01` at `K=7` on 32k) match `std` + DSpark (`3.01`), indicating healthy draft verification; formal teacher-forcing rollback verification specifically for `--kvq` + DSpark is still TODO.
+- **Recommended launch flags (`--kvq` + DSpark):** `llama-server -m <model.gguf> -md <dspark-w2q8.gguf> --spec-type draft-dspark --spec-draft-n-max 4 -ngl 99 -ngld 99 -fa on -c 98304 -ub 512 -np 1 --kvq --port 8765 --jinja`
+
 ## Local tools (not committed)
 
 Everything lives in the git-ignored `tmp/inkling/` of this worktree (`/tmp/` is in `.gitignore`):
