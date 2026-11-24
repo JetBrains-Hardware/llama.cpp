@@ -57,8 +57,8 @@ public:
     // the ring rows of the positions [n_host, p) of the sequence to the host store, no fit
     void spill(int32_t seq, const llama_kv_cache & kv, llama_pos p);
 
-    // the positions [p0, inf) of the sequence were removed: cancels the jobs with rows there, the coarse region drops back to the chunk of p0
-    void remove(int32_t seq, llama_pos p0);
+    // the positions [p0, inf) of the sequence were removed: cancels the jobs with rows past p_fit, the coarse region drops back to the chunk of p_fit
+    void remove(int32_t seq, llama_pos p0, llama_pos p_fit = -1);
 
     // the smallest shared memory of the store for a fit of one layer per group, n_stage rows per job
     static size_t shared_min(int64_t head_dim, int32_t n_head_kv, int32_t n_stage, int32_t bits_k, int32_t bits_v);

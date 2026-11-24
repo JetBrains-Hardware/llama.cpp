@@ -266,7 +266,7 @@ bool llama_memory_hybrid_kvq::tail_wait(const llama_batch_allocr & balloc, llama
     bool waited = false;
     if (!room() && !small) {
         // the complete chunks before the batch, then the rest of the ring rows to the host store
-        fitter->poll(seq, kv, n_pos(seq), true);
+        fitter->poll(seq, kv, n_fit(n_pos(seq)), true);
         tail_release(seq);
         if (!room()) {
             fitter->spill(seq, kv, p0);
@@ -333,7 +333,7 @@ bool llama_memory_hybrid_kvq::tail_restore(llama_seq_id seq, llama_pos p_lo, lla
 bool llama_memory_hybrid_kvq::settle(llama_seq_id seq, llama_pos n, bool end) {
     store->sync_store(seq, n_pos(seq));
     // models with relative-position bias keep the trailing rel_keep positions precise in the ring so all coarse rows have dist >= rel_keep
-    const llama_pos n_settle = rel_keep > 0 ? std::max<llama_pos>(0, n - rel_keep) : n;
+    const llama_pos n_settle = n_fit(n);
     // the end of a prompt: the context frees its prompt buffers, then the device codes are allocated and the host copy uploaded
     // while the CPU fits the last rows
     const llama_pos e = fitter->settle(seq, *get_mem_attn(), n_settle, [&](llama_pos e_lay) {
@@ -447,17 +447,21 @@ bool llama_memory_hybrid_kvq::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         if (mem_swa) {
             mem_swa->seq_rm(seq_id, p0, p1);
         }
+        const llama_pos q_fit = n_fit(q0);
         // the rows before q0 that leave the coarse region stay in the host store, the next fit_wait fits them again
-        fitter->remove(seq, q0);
+        fitter->remove(seq, q0, q_fit);
         seqs[seq].n_released = std::min(seqs[seq].n_released, q0);
         // the pages of the chunks without rows go back to the pool, the chunk that keeps rows stays
-        store->release_from(seq, (q0 + store->n_chunk_rows() - 1)/store->n_chunk_rows());
-        // the chunk that keeps rows gets new rows, the next end of prompt fits it again: it must not be a page that another sequence holds
-        // (copy on write; its kept sums and fitted range were dropped above, the copy has the rows before q0)
-        if (q0 % store->n_chunk_rows() != 0 && !store->make_private(seq, q0/store->n_chunk_rows())) {
-            LLAMA_LOG_ERROR("%s: no page for a private copy of the shared chunk %d of sequence %d: the page pool is full, the sequence is emptied\n", __func__, q0/store->n_chunk_rows(), seq);
-            seq_clear(seq);
-            return false;
+        const int32_t C = store->n_chunk_rows();
+        const int32_t c_end = (q0 + C - 1)/C;
+        store->release_from(seq, c_end);
+        // chunks that keep rows past q_fit (or are partial) will be refitted: they must not be shared with another sequence
+        for (int32_t c = q_fit/C; c < c_end; ++c) {
+            if ((int64_t) (c + 1)*C > q_fit && !store->make_private(seq, c)) {
+                LLAMA_LOG_ERROR("%s: no page for a private copy of the shared chunk %d of sequence %d: the page pool is full, the sequence is emptied\n", __func__, c, seq);
+                seq_clear(seq);
+                return false;
+            }
         }
         return true;
     }
@@ -911,7 +915,7 @@ int32_t llama_memory_hybrid_kvq::fit_graph_kind() const {
 
 void llama_memory_hybrid_kvq::fit_poll(llama_seq_id seq, uint32_t n_tokens) {
     if (fitter) {
-        fitter->poll(seq, *get_mem_attn(), n_pos(seq), n_tokens > (uint32_t) params.max_batch);
+        fitter->poll(seq, *get_mem_attn(), n_fit(n_pos(seq)), n_tokens > (uint32_t) params.max_batch);
         tail_release(seq);
     }
 }

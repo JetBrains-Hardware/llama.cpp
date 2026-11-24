@@ -1135,30 +1135,33 @@ void llama_kvq_fitter::cancel(int32_t seq, const std::function<bool(const job &)
     }
 }
 
-void llama_kvq_fitter::remove(int32_t seq, llama_pos p0) {
+void llama_kvq_fitter::remove(int32_t seq, llama_pos p0, llama_pos p_fit) {
+    if (p_fit < 0 || p_fit > p0) {
+        p_fit = p0;
+    }
     seq_fit & sq = seqs[seq];
     const int32_t C  = store.n_chunk_rows();
-    const int32_t c0 = p0 / C;
+    const int32_t c0 = p_fit / C;
 
-    cancel(seq, [&](const job & jb) { return jb.r1 > p0; });
+    cancel(seq, [&](const job & jb) { return jb.r1 > p_fit; });
 
     // a removal in the chunk that collects statistics keeps the removed queries, unless all of them go or the removal goes back
     // to the end of the last fit of its rows; into a complete chunk: its statistics are collected again from the ones read when it was complete
     if (sq.n_snap <= c0) {
-        if (p0 == (llama_pos) c0*C && sq.n_snap == c0) {
+        if (p_fit == (llama_pos) c0*C && sq.n_snap == c0) {
             store.synchronize();
             set_stats(seq, nullptr, nullptr);
-        } else if (p0 == sq.acc_pos && sq.n_snap == c0) {
+        } else if (p_fit == sq.acc_pos && sq.n_snap == c0) {
             store.synchronize();
             set_stats(seq, &sq.acc_gram, &sq.acc_gsum);
         }
-        if (p0 < sq.acc_pos) {
+        if (p_fit < sq.acc_pos) {
             sq.acc_pos = -1;
         }
     } else {
         sq.acc_pos = -1;
         store.synchronize();
-        if (p0 > (llama_pos) c0*C) {
+        if (p_fit > (llama_pos) c0*C) {
             const llama_kvq_pool::sums & ks = store.get_pool().chunk_sums(store.page_of_chunk(seq, c0));
             set_stats(seq, &ks.gram, &ks.gsum);
         } else {
@@ -1168,8 +1171,8 @@ void llama_kvq_fitter::remove(int32_t seq, llama_pos p0) {
         sq.n_snap = c0;
     }
 
-    // the coarse rows at or after p0: back to the chunk grid, the rows before p0 stay in the host store
-    if (store.n_coarse(seq) > p0) {
+    // the coarse rows at or after p_fit: back to the chunk grid, the rows before p0 stay in the host store
+    if (store.n_coarse(seq) > p_fit) {
         const int32_t n0 = store.n_coarse(seq);
         store.set_n_coarse(seq, c0*C);
         for (int32_t t = c0; t < (int32_t) sq.slot_fit.size(); ++t) {

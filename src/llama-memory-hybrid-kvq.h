@@ -171,6 +171,9 @@ private:
     // positions in the sequence: the ring, or the host store when the ring is empty
     llama_pos n_pos(llama_seq_id seq) const;
 
+    // positions eligible for coarse fit (keeps the trailing rel_keep positions precise in the ring)
+    llama_pos n_fit(llama_pos n) const { return rel_keep > 0 ? std::max<llama_pos>(0, n - rel_keep) : n; }
+
     // tail: removes the rows of the host store of the sequence from the ring
     void tail_release(llama_seq_id seq);
 
