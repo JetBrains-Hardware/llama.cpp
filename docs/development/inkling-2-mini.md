@@ -32,7 +32,7 @@ llama-server \
   - `layer_inp_dev` is `F16` by default in this branch (saves `36 MiB` PP at `-b 2048`, zero acceptance loss).
   - **Do NOT pass `-ctkd` / `-ctvd` (`q8_0`/`q4_0`):** DSpark block-8 decode selects `MMA_F16`, which dequantizes the entire draft KV cache into `384 MiB` of TG compute buffer on every step (more VRAM and slower).
 - **Long context (`256k-500k` on 16 GB):** main default stays uncapped (best acceptance up to `~230k`); for long contexts up to `~500k`, add `LLAMA_DSPARK_KV_CAP=8192` in the environment to cap DSpark's global layer-1 KV to an 8k sliding window (`+16 MiB` over `4096`, recovers `+4.6%` 76k acceptance to `58.8%`, unaffected PP).
-- **Vision (optional):** pass `--no-mmproj-offload` if adding `-mm <mmproj.gguf>` on a 16 GB card (`0 MiB` VRAM).
+- **Vision (optional):** add `-mm mmproj-Inkling-2-Mini-F16.gguf --mmproj-vram-swap` for GPU-accelerated vision with `0 MiB` permanent VRAM (keeps weights in host RAM and borrows the freed LLM compute + KVQ `buf_codes` window during encode; add `--image-max-tokens 5184` for unscaled native `3840x2160` 4K). Use `--no-mmproj-offload` for CPU-only fallback.
 
 ## Support in ggml-org/llama.cpp
 
@@ -359,6 +359,22 @@ Re-tested `LLAMA_DSPARK_KV_CAP` under the adopted defaults (`-c 98304 -b 2048 -u
 | `16384` | `14,912 / 14,937 MiB` | `14,542 / 14,561 MiB` | `+34 to +46 MiB` | `3,040.5 / 2,959.4 t/s` | `111.7 / 105.4 t/s` | `62.0% / 58.8%` |
 
 - Main default stays uncapped (`~230k-235k` max context in `15.5 GiB`). For long contexts up to `~500k`, `LLAMA_DSPARK_KV_CAP=8192` is the recommended opt-in: `+16 MiB` over `4096` (`~475k-480k` in `15.5 GiB`) while capturing all of `16384`'s `76k` acceptance gain (`58.8%` vs `54.2%`).
+
+### 4K vision + 475k context (`--mmproj-vram-swap`)
+
+Implemented `--mmproj-vram-swap` (env `LLAMA_ARG_MMPROJ_VRAM_SWAP`) across `llama-context`, `mtmd`, `common`, and `llama-server` (and lifted the blanket `--kvq` multimodal rejection in `tools/server/server.cpp`):
+
+- Keeps `mmproj` weights in host RAM (`0 MiB` permanent GPU VRAM, skips GPU warmup and `mtmd_backends` CUDA init at load).
+- Inside `encode_mtmd_chunk`, calls `llama_context_release_transient_vram(ctx_tgt)` (frees LLM device compute buffers and `--kvq-prefill-free-codes` `buf_codes`), transiently creates `mtmd`'s GPU backend, uploads `mmproj` weights (`609.7 MiB` `F16` in `~47-48 ms`), runs FlashAttention ViT encode, and immediately frees weights, compute buffers, and the GPU backend (`~6-8 ms`, releasing its cuBLAS workspace / CUDA pool so TG VRAM stays minimal) before LLM prefill resumes.
+
+Measured on RTX 5090 at `-c 475000 -b 2048 -ub 2048 -np 1 -fa on --kvq --kvq-prefill-free-codes --kvq-resident-cap 4096`, `LLAMA_DSPARK_KV_CAP=8192`, `Q8_0` DSpark `K=4`, `dub=512`, `mmproj-Inkling-2-Mini-F16.gguf` (`609.7 MiB`), `--mmproj-vram-swap`, greedy `temp=0`, running a `3840x2160` 4K PNG -> `req_76k` text -> second 4K PNG:
+
+| Resolution mode | Loaded proc VRAM | Transient vision VRAM (wt + comp) | Upload / Encode / Release | Peak proc VRAM (4K / 76k / 4K-after-76k) | PP / TG (4K img) | 76k text PP |
+|---|---:|---:|---|---:|---|---|
+| Default 4K (`4096` cap, `3400x1920`, `4,122` tok) | `14,673 MiB` (`14.33 GiB`) | `609.7 + 393.6 MiB` (`0.98 GiB`) | `47.5 / ~307 / 6.4 ms` | **`15,813 / 15,825 / 15,825 MiB` (`15.44-15.45 GiB`)** | `1,799-1,991` / `138.4-140.2 t/s` | `3,181.9 t/s` |
+| Native 4K (`--image-max-tokens 5184`, `3840x2160`, `5,226` tok) | `14,673 MiB` (`14.33 GiB`) | `609.7 + 500.1 MiB` (`1.08 GiB`) | `47.1 / ~579 / 7.9 ms` | **`15,812 / 15,840 / 15,840 MiB` (`15.44-15.47 GiB`)** | `1,804-1,971` / `133.5-136.8 t/s` | `3,180.4 t/s` |
+
+- Both default 4K and native `3840x2160` 4K fit cleanly under `15.5 GiB` (`15.44-15.47 GiB` peak) at `-c 475000` with zero LLM or drafter weight eviction, read all shapes and verbatim text (including small `36pt` text) accurately, and produced identical deterministic outputs before and after the 76k text turn.
 
 ## Local tools (not committed)
 
