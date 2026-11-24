@@ -29,6 +29,41 @@ json server_chat_convert_responses_tools(const json & tools) {
     return chatcmpl_tools;
 }
 
+// Reasoning text for a Responses input item.
+// Spec-shaped clients put the text in summary[] and omit or leave content empty;
+// content[].text still wins when present.
+static std::string responses_reasoning_text(const json & item) {
+    auto first_text = [](const json & parts, bool summary) -> std::string {
+        if (!parts.is_array()) {
+            return {};
+        }
+        for (const json & part : parts) {
+            if (!part.is_object() || !part.contains("text") || !part.at("text").is_string()) {
+                continue;
+            }
+            if (summary && json_value(part, "type", std::string("summary_text")) != "summary_text") {
+                continue;
+            }
+            const std::string text = part.at("text").get<std::string>();
+            if (!text.empty()) {
+                return text;
+            }
+        }
+        return {};
+    };
+
+    if (item.contains("content")) {
+        const std::string from_content = first_text(item.at("content"), false);
+        if (!from_content.empty()) {
+            return from_content;
+        }
+    }
+    if (item.contains("summary")) {
+        return first_text(item.at("summary"), true);
+    }
+    return {};
+}
+
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
@@ -133,8 +168,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 chatcmpl_messages.push_back(item);
             } else if (exists_and_is_string(item, "role") &&
                 item.at("role") == "assistant" &&
-                exists_and_is_string(item, "type") &&
-                item.at("type") == "message"
+                (!item.contains("type") ||
+                    (exists_and_is_string(item, "type") && item.at("type") == "message"))
             ) {
                 // #responses_create-input-input_item_list-item-output_message
                 auto chatcmpl_content = json::array();
@@ -254,29 +289,23 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_call_id", item.at("call_id")},
                     });
                 }
-            } else if (exists_and_is_array(item, "summary") &&
-                exists_and_is_string(item, "type") &&
+            } else if (exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
                 // #responses_create-input-input_item_list-item-reasoning
-
-                if (!exists_and_is_array(item, "content")) {
-                    throw std::invalid_argument("item['content'] is not an array");
-                }
-                if (item.at("content").empty()) {
-                    throw std::invalid_argument("item['content'] is empty");
-                }
-                if (!exists_and_is_string(item.at("content")[0], "text")) {
-                    throw std::invalid_argument("item['content']['text'] is not a string");
+                // Spec-shaped reasoning items may omit content, pass empty content/summary, or set summary: null.
+                const std::string reasoning_text = responses_reasoning_text(item);
+                if (reasoning_text.empty()) {
+                    continue;
                 }
 
                 if (merge_prev) {
                     auto & prev_msg = chatcmpl_messages.back();
-                    prev_msg["reasoning_content"] = item.at("content")[0].at("text");
+                    prev_msg["reasoning_content"] = reasoning_text;
                 } else {
                     chatcmpl_messages.push_back(json {
                         {"role", "assistant"},
                         {"content", json::array()},
-                        {"reasoning_content", item.at("content")[0].at("text")},
+                        {"reasoning_content", reasoning_text},
                     });
                 }
             } else {
