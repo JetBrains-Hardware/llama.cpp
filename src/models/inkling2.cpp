@@ -32,11 +32,20 @@ static ggml_tensor * inkling_build_kq_mask_raw(ggml_context * ctx0, int64_t n_kv
     return raw;
 }
 
+static bool inkling_kvq_use_pos_mask(const llama_hparams & hparams, const llama_cparams & cparams, const llama_ubatch & ubatch) {
+    static const bool enabled = getenv("LLAMA_ATTN_POS_MASK_DISABLE") == nullptr;
+
+    return enabled && cparams.flash_attn && cparams.causal_attn && !hparams.use_alibi &&
+        hparams.swa_type == LLAMA_SWA_TYPE_STANDARD && !ubatch.is_pos_2d() &&
+        (!cparams.kv_unified || ubatch.n_seqs_unq == 1);
+}
+
 // two-tier KVQ graph inputs for inkling2 (SWA cache inputs + KVQ packed/scratch masks and positions)
 class llama_model_inkling2::llm_graph_input_kvq : public llm_graph_input_i {
 public:
     llm_graph_input_kvq(
             const llama_memory_hybrid_kvq_context * mctx,
+            const llama_hparams & hparams,
             const llama_cparams & cparams,
             llama_kvq_store * store,
             const llama_kvq_params & params,
@@ -47,9 +56,11 @@ public:
             bool scratch,
             bool scr_cells,
             bool fit,
+            bool pos_mask,
             int64_t scr_rows,
             int64_t scr_r0) :
         mctx(mctx),
+        hparams(hparams),
         cparams(cparams),
         store(store),
         params(params),
@@ -62,6 +73,7 @@ public:
         scratch(scratch),
         scr_cells(scr_cells),
         fit(fit),
+        pos_mask(pos_mask),
         codes_gen(store ? store->codes_gen() : 0),
         scr_rows(scr_rows),
         scr_r0(scr_r0) {}
@@ -79,7 +91,7 @@ public:
                 mctx_swa->set_input_attn_mask(swa_mask, ubatch, cparams.causal_attn);
             }
             if (swa_kv_pos) {
-                mctx_swa->set_input_kv_pos(swa_kv_pos, ubatch, false);
+                mctx_swa->set_input_kv_pos(swa_kv_pos, ubatch, pos_mask);
             }
         }
         if (q_pos && q_pos->buffer) {
@@ -119,12 +131,14 @@ public:
             mctx->get_store()->begin_ubatch(*ubatch);
         }
         if (scratch) {
-            if (!scr_cells) {
+            if (!scr_cells && mask_scr.raw) {
                 mctx->set_input_kvq_scr(mask_scr.raw, ubatch, n_host, scr_r0);
             }
             if (kpos_scr && kpos_scr->buffer) {
                 if (scr_cells) {
-                    mctx->get_attn()->set_input_kv_pos(kpos_scr, ubatch, false);
+                    mctx->get_attn()->set_input_kv_pos(kpos_scr, ubatch, pos_mask);
+                } else if (pos_mask) {
+                    mctx->set_input_kvq_scr_pos(kpos_scr, ubatch, n_host, scr_r0);
                 } else {
                     const int64_t n = kpos_scr->ne[0];
                     std::vector<int32_t> pos(n);
@@ -143,7 +157,10 @@ public:
         if (mc == nullptr || mc->get_store() != store) {
             return false;
         }
-        if (swa_mask.raw && mc->get_swa() && mc->get_swa()->get_n_kv() != swa_mask.raw->ne[0]) {
+        if (pos_mask != inkling_kvq_use_pos_mask(hparams, p.cparams, p.ubatch)) {
+            return false;
+        }
+        if (swa_kv_pos && mc->get_swa() && mc->get_swa()->get_n_kv() != swa_kv_pos->ne[0]) {
             return false;
         }
         if (mc->packed_reserve() || store == nullptr) {
@@ -184,7 +201,7 @@ public:
             if (cur_cells != scr_cells || cur_nh != n_host || cur_rows != scr_rows) {
                 return false;
             }
-            if (!scr_cells && mask_scr.raw->ne[1] != p.ubatch.n_tokens) {
+            if (!scr_cells && mask_scr.raw && mask_scr.raw->ne[1] != p.ubatch.n_tokens) {
                 return false;
             }
             if (kpos_scr && kpos_scr->ne[0] != cur_rows - scr_r0) {
@@ -196,6 +213,7 @@ public:
     }
 
     const llama_memory_hybrid_kvq_context * mctx;
+    const llama_hparams & hparams;
     const llama_cparams & cparams;
     llama_kvq_store * store;
     llama_kvq_params  params;
@@ -209,6 +227,7 @@ public:
     bool scratch;
     bool scr_cells;
     bool fit;
+    bool pos_mask;
     uint32_t codes_gen;
     int64_t scr_rows;
     int64_t scr_r0;
@@ -411,7 +430,7 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
     for (ggml_tensor * block : blocks) {
         states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
     }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
+    states = blocks.empty() ? ggml_rms_norm(ctx0, states, 1e-6f) : ggml_rms_norm_inplace(ctx0, states, 1e-6f);
 
     ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
 
@@ -527,14 +546,18 @@ llama_model_inkling2::llm_graph_input_kvq * llama_model_inkling2::graph::build_i
     const int64_t scr_rows  = scratch ? (scr_reserve ? store->n_rows() + store->n_ring() : (scr_cells ? mctx_kvq->get_attn()->get_n_kv() : inkling_kvq_scr_rows(store, n_host, ubatch))) : 0;
     const int64_t scr_r0    = (scratch && !scr_cells) ? inkling_kvq_scr_r0(pr, n_host, (int32_t) hparams.n_relative_extent) : 0;
 
-    auto inp_q = std::make_unique<llm_graph_input_kvq>(mctx_kvq, cparams, store, pr, seqs, n_coarse_s, n_host, packed_small, scratch, scr_cells, fit, scr_rows, scr_r0);
+    const bool pos_mask = inkling_kvq_use_pos_mask(hparams, cparams, ubatch);
+
+    auto inp_q = std::make_unique<llm_graph_input_kvq>(mctx_kvq, hparams, cparams, store, pr, seqs, n_coarse_s, n_host, packed_small, scratch, scr_cells, fit, pos_mask, scr_rows, scr_r0);
 
     const auto * mctx_swa = mctx_kvq->get_swa();
     const int64_t n_stream = ubatch.n_seqs_unq > 0 ? ubatch.n_seqs_unq : 1;
     if (mctx_swa) {
         inp_q->swa_k_idxs = mctx_swa->build_input_k_idxs(ctx0, ubatch);
         inp_q->swa_v_idxs = mctx_swa->build_input_v_idxs(ctx0, ubatch);
-        inp_q->swa_mask.raw = inkling_build_kq_mask_raw(ctx0, mctx_swa->get_n_kv(), n_tokens, n_stream, "kvq_swa_mask");
+        if (!pos_mask) {
+            inp_q->swa_mask.raw = inkling_build_kq_mask_raw(ctx0, mctx_swa->get_n_kv(), n_tokens, n_stream, "kvq_swa_mask");
+        }
         inp_q->swa_kv_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, mctx_swa->get_n_kv(), n_stream);
         ggml_set_input(inp_q->swa_kv_pos);
         ggml_set_name(inp_q->swa_kv_pos, "kvq_swa_kv_pos");
@@ -570,7 +593,7 @@ llama_model_inkling2::llm_graph_input_kvq * llama_model_inkling2::graph::build_i
 
     if (scratch) {
         const int64_t n_last = scr_rows - scr_r0;
-        if (!scr_cells) {
+        if (!scr_cells && !pos_mask) {
             inp_q->mask_scr.raw = inkling_build_kq_mask_raw(ctx0, n_last, n_tokens, 1, "kvq_mask_scr");
         }
         inp_q->kpos_scr = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_last, 1);
@@ -795,8 +818,8 @@ ggml_tensor * llama_model_inkling2::graph::build_attn_kvq_scratch(
     const int64_t r0   = !inp_kvq->scr_cells ? inp_kvq->scr_r0 : 0;
     const int64_t nb   = pr.scr_block >= 256 ? pr.scr_block/256*256 : n_rows;
 
-    ggml_tensor * mask_last = !inp_kvq->scr_cells ? inp_kvq->mask_scr.raw : inp_hyb->get_attn()->self_attn_mask.raw;
-    if (mask_last->type != GGML_TYPE_F16) {
+    ggml_tensor * mask_last = inp_kvq->pos_mask ? nullptr : (!inp_kvq->scr_cells ? inp_kvq->mask_scr.raw : inp_hyb->get_attn()->self_attn_mask.raw);
+    if (mask_last && mask_last->type != GGML_TYPE_F16) {
         mask_last = ggml_cast(ctx0, mask_last, GGML_TYPE_F16);
     }
 
@@ -809,11 +832,14 @@ ggml_tensor * llama_model_inkling2::graph::build_attn_kvq_scratch(
         ggml_tensor * vb   = ggml_permute(ctx0, store->get_scr(ctx0, true,  n, b0), 0, 2, 1, 3);
 
         if (r0 == 0) {
-            ggml_tensor * table = ggml_sub(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
+            ggml_tensor * table = ggml_sub_inplace(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
             ggml_tensor * zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
             ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q_fa, kb, vb, mask_last, kq_scale, 0.0f, 0.0f);
             ggml_flash_attn_ext_add_sinks(fa, zero_sinks);
             ggml_flash_attn_ext_add_rel_bias(fa, table, ggml_reshape_1d(ctx0, inp_kvq->kpos_scr, n), inp_kvq->q_pos);
+            if (inp_kvq->pos_mask) {
+                ggml_flash_attn_ext_set_pos_window(fa, INT32_MAX);
+            }
             ggml_prec_set_acc(fa, GGML_PREC_F32);
             cur = ggml_reshape_2d(ctx0, fa, D*n_head, n_tokens);
             break;
@@ -822,6 +848,9 @@ ggml_tensor * llama_model_inkling2::graph::build_attn_kvq_scratch(
         ggml_tensor * fa = ggml_flash_attn_ext_lse(ctx0, q_fa, kb, vb, last ? mask_last : nullptr, kq_scale, 0.0f, 0.0f);
         if (last) {
             ggml_flash_attn_ext_add_rel_bias(fa, raw_table, ggml_reshape_1d(ctx0, inp_kvq->kpos_scr, n), inp_kvq->q_pos);
+            if (inp_kvq->pos_mask) {
+                ggml_flash_attn_ext_set_pos_window(fa, INT32_MAX);
+            }
         }
         ggml_prec_set_acc(fa, GGML_PREC_F32);
 
@@ -919,8 +948,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-        for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+        if (is_swa) {
+            inputs[0] = inputs[1] = inputs[2] = ggml_reshape_2d(ctx0, mixed, n_embd, n_tokens);
+        } else {
+            for (int j = 0; j < 3; ++j) {
+                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]));
+            }
         }
     }
 
@@ -981,7 +1014,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         if (inp_kvq) {
             if (is_swa) {
-                ggml_tensor * table = ggml_sub(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
+                ggml_tensor * table = ggml_sub_inplace(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
                 cb(table, "rel_table", il);
                 ggml_tensor * zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
@@ -993,9 +1026,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 ggml_tensor * k = mctx_swa->get_k(ctx0, il);
                 ggml_tensor * v = mctx_swa->get_v(ctx0, il);
 
-                const int64_t n_stream = inp_kvq->swa_mask.raw->ne[3];
+                const int64_t n_stream = inp_kvq->swa_kv_pos->ne[1];
                 ggml_tensor * q_pos_swa = n_stream > 1 ? ggml_reshape_2d(ctx0, inp_kvq->q_pos, n_tokens/n_stream, n_stream) : inp_kvq->q_pos;
-                const llm_graph_rel_bias rel = { table, inp_kvq->swa_kv_pos, q_pos_swa };
+                const int32_t n_window = inp_kvq->pos_mask ? (int32_t) hparams.n_swa : 0;
+                const llm_graph_rel_bias rel = { table, inp_kvq->swa_kv_pos, q_pos_swa, n_window };
                 cur = build_attn_mha(Qcur, k, v, nullptr, inp_kvq->swa_mask.raw, nullptr, zero_sinks, nullptr, n_kv_swa, kq_scale, il, &rel);
             } else if (inp_kvq->packed_small) {
                 cur = build_attn_kvq_packed(Qcur, Kcur, Vcur, raw_table, sinks_raw, kq_scale, il);
@@ -1003,7 +1037,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 cur = build_attn_kvq_scratch(Qcur, Kcur, Vcur, raw_table, sinks_raw, kq_scale, il);
             } else {
                 // fallback (reserve graph / KVQ disabled): standard ring attention with rel bias
-                ggml_tensor * table = ggml_sub(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
+                ggml_tensor * table = ggml_sub_inplace(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
                 cb(table, "rel_table", il);
                 ggml_tensor * zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
@@ -1026,7 +1060,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 cur = build_attn_mha(Qcur, k, v, nullptr, kq_mask, nullptr, zero_sinks, nullptr, n_kv, kq_scale, il, &rel);
             }
         } else {
-            ggml_tensor * table = ggml_sub(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
+            ggml_tensor * table = ggml_sub_inplace(ctx0, raw_table, ggml_reshape_3d(ctx0, sinks_raw, 1, n_head, n_tokens));
             cb(table, "rel_table", il);
 
             ggml_tensor * zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);

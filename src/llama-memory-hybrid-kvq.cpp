@@ -1293,3 +1293,30 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_scr(ggml_tensor * mask, cons
         }
     }
 }
+
+void llama_memory_hybrid_kvq_context::set_input_kvq_scr_pos(ggml_tensor * kpos, const llama_ubatch * ubatch, int32_t n_host, int64_t r0) const {
+    if (kpos == nullptr || kpos->buffer == nullptr) {
+        return;
+    }
+    GGML_ASSERT(ubatch->n_seqs_unq == 1 && kpos->type == GGML_TYPE_I32 && ggml_is_contiguous(kpos));
+    GGML_ASSERT(r0 >= 0 && r0 <= n_host && r0 + kpos->ne[0] > n_host);
+
+    const llama_seq_id seq = ubatch->seq_id_unq[0];
+    const auto & cells = kv_attn->get_cells(seq);
+
+    const int64_t n    = kpos->ne[0];
+    const int64_t size = cells.size();
+    GGML_ASSERT(r0 + n - n_host <= size);
+
+    std::vector<int32_t> pos(n);
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t r = r0 + i;
+        if (r < n_host) {
+            pos[i] = (int32_t) r;
+        } else {
+            const int64_t j = r % size;
+            pos[i] = (!cells.is_empty(j) && cells.seq_has(j, seq) && cells.pos_get(j) == r) ? (int32_t) r : INT32_MAX;
+        }
+    }
+    ggml_backend_tensor_set(kpos, pos.data(), 0, n*sizeof(int32_t));
+}
