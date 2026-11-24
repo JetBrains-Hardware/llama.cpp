@@ -176,6 +176,53 @@ Key findings:
 - **Correctness note:** Acceptance rates on `--kvq` + DSpark (`3.01` at `K=7` on 32k) match `std` + DSpark (`3.01`), indicating healthy draft verification; formal teacher-forcing rollback verification specifically for `--kvq` + DSpark is still TODO.
 - **Recommended launch flags (`--kvq` + DSpark):** `llama-server -m <model.gguf> -md <dspark-w2q8.gguf> --spec-type draft-dspark --spec-draft-n-max 4 -ngl 99 -ngld 99 -fa on -c 98304 -ub 512 -np 1 --kvq --port 8765 --jinja`
 
+## VRAM breakdown and optimization roadmap (DSpark + `--kvq` + larger `-ub`)
+
+From `bench_kvq_dspark_k4.log` (`UD-Q3_K_XL`, `-c 98304 -b 2048 -ub 512 -np 1 --kvq`, DSpark `w2q8` `K=4`), measured process VRAM is **`15,129 MiB` (`14.77 GiB`)** in prefill (PP) and `~14,820 MiB` (`14.47 GiB`) in decode (TG):
+
+| Component | PP (`-ub 512`) | TG (`K=4`) | Scales with `-c` | Scales with `-ub` | Notes |
+|---|---:|---:|---|---|---|
+| Target weights (`UD-Q3_K_XL`) | `12,685 MiB` | `12,685 MiB` | No | No | Fixed (`12.39 GiB`) |
+| Target SWA KV (`q8_0`, 1536 cells) + rot + RS | `149 MiB` | `149 MiB` | No | `+85 MiB` / `+1k ub` | `127.5` SWA + `3.1` rot + `18.3` RS |
+| Target KVQ codes + tables | `338 MiB` | `338 MiB` | `3.52 KiB/tok` (`901 MiB` @ 256k) | No | Unused in PP (`--kvq-prefill-free-codes` frees it) |
+| Target KVQ shared (`max(scr, dec)`) | `213 MiB` (`scr`) | `213 MiB` (`dec=191`) | `2.13 KiB/tok` (`551 MiB` @ 256k) | Tiny | `scr`, `fitter`, and `dec` share one pool |
+| Target `layer_inp_dev` (4 layers F32) | `72 MiB` (`2048` rows) | `0.2 MiB` (`5` rows) | No | Scales with `-b` | Shrinks in TG; `F32` for full `n_batch` in PP |
+| Target compute (`sched_reserve`) | `240 MiB` | `~20 MiB` (`phase_set`) | `~4 B/tok` | `~450 MiB` / `+1k ub` | `raw_table` + `table` (`F32` x 2) is `96 MiB` (`384 MiB` @ `ub=2048`) |
+| DSpark draft weights (`w2q8`) | `657 MiB` | `657 MiB` | No | No | 3 backbone layers still `BF16` (`~450 MiB`); `markov_w2` (`~207 MiB`) unused in PP |
+| DSpark draft KV (1 global + 2 SWA) | `398 MiB` | `398 MiB` | `4.0 KiB/tok` (`1,024 MiB` @ 256k) | Tiny | Currently `F16`; costs more than all 8 target KVQ layers combined |
+| DSpark draft compute | `36 MiB` | `19 MiB` | No | Tiny | Shrinks via `phase_set` |
+| KVQ misc (`qacc`/`gacc`/bias) + CUDA/cuBLAS | `~340 MiB` | `~340 MiB` | No | No | Fixed overhead |
+| **Total Process VRAM** | **`15,129 MiB`** | **`~14,820 MiB`** | **`9.65 KiB/tok`** | | |
+
+Why larger `-ub` matters: Inkling-2-Mini is a 128-expert top-8 MoE, so `-ub 512` averages only `32` tokens/expert (bandwidth-bound) vs `128` tokens/expert at `-ub 2048`. Raising `-ub` from `512` to `2048` currently adds `~680 MiB` to target PP compute (of which `384 MiB` is two live `F32` copies of `raw_table`/`table`) plus `+127.5 MiB` to SWA KV (`3072` cells).
+
+### Potential optimizations (3 tiers)
+
+- **Tier 1 (zero code changes - CLI flags + quantized drafter GGUF):** saves `~785 MiB` @ 96k, `~957 MiB` @ 128k, `~1,648 MiB` @ 256k:
+  1. `--kvq-prefill-free-codes` (already implemented in `src/llama-kvq-store.cpp`): frees KVQ `codes + tables` during PP and re-uploads from pinned host RAM at end of prompt (`~5-15 ms`). Saves `338 MiB` @ 96k, `450 MiB` @ 128k, `901 MiB` @ 256k at PP peak.
+  2. `-ctkd q8_0 -ctvd q8_0` (or `q4_0`, already wired in `common/arg.cpp`): cuts DSpark global KV from `F16` (`384 MiB` @ 96k) to `204 MiB` (`q8_0`, `-180 MiB`) or `108 MiB` (`q4_0`, `-276 MiB`) in both PP and TG.
+  3. Full `Q8_0` DSpark GGUF (quantize the 3 `BF16` backbone layers as well as `markov_w2`): cuts drafter weights from `657 MiB` to `~390 MiB` (`-267 MiB` in both PP and TG).
+- **Tier 2 (small code changes - makes `-ub 2048` cheap and caps draft KV scaling):**
+  4. `ggml_sub_inplace` for sink subtraction on `raw_table` (`src/models/inkling2.cpp`): bit-exact; saves `48 MiB` @ `ub=512`, `192 MiB` @ `ub=2048`, `384 MiB` @ `ub=4096`.
+  5. Store `layer_inp_dev` in `F16`/`BF16` or size to `n_ubatch` (`src/llama-context.cpp`): saves `36-54 MiB` at `b=2048`.
+  6. Cap DSpark global KV window (e.g. `8k-16k` SWA, Strata-style `ink_dspark.cuh:1147`): turns `204-544 MiB` (`q8_0`) into a fixed `17-34 MiB` (`O(1)` in `n_ctx`); needs acceptance check on `req_76k.json`.
+  7. Drop `mask_scr` in `build_attn_kvq_scratch` using `posmask`: saves `~5 MiB` @ `ub=512` / `~20 MiB` @ `ub=2048`.
+- **Tier 3 (temporary eviction / scratch tiling - only needed for `-ub 4096`, `>256k` context, or GPU vision):**
+  8. Evict DSpark during long bulk prefill (`~390 MiB` weights + `36 MiB` compute; restore over PCIe in `~20-30 ms` for the final capped window, or evict `markov_w2` `~207 MiB` alone).
+  9. Tile `kvq_scr` on GPU in fixed `16k-32k` row blocks: caps `kvq_scr` at `~35-70 MiB` instead of `2.13 KiB/tok` (`551 MiB` @ 256k), keeping `kvq_shared` at `dec` size (`~191 MiB`) in both PP and TG.
+
+### Projected process VRAM (15.5 GiB target)
+
+| Configuration | PP (`-c 98k`) | TG (`-c 98k`) | PP (`-c 128k`) | PP / TG (`-c 256k`) |
+|---|---:|---:|---:|---:|
+| Current (`-ub 512`, `w2q8`, `F16` draft KV) | `14.77 GiB` | `14.47 GiB` | `15.08 GiB` | `16.29 / 15.99 GiB` (OOM) |
+| Tier 1 (`-ub 512`, `--kvq-prefill-free-codes`, `-ctkd/v q8_0`, full `Q8_0` draft) | `14.01 GiB` | `14.04 GiB` | `14.14 GiB` | `14.67 / 15.22 GiB` |
+| Tier 1 + Tier 2 (`sub_inplace`) at `-ub 2048` | `14.61 GiB` | `14.16 GiB` | `14.74 GiB` | `15.27 / 15.32 GiB` |
+| Tier 1 + Tier 2 (+ cap draft KV `16k`) at `-ub 2048` | `14.44 GiB` | `13.99 GiB` | `14.51 GiB` | `14.77 / 14.82 GiB` |
+| + Tier 3 (evict DSpark in PP + tile `kvq_scr`) at `-ub 2048` | `~14.05 GiB` | `~13.99 GiB` | `~14.12 GiB` | `~14.03 / ~14.47 GiB` |
+
+Note on Tier 3 vs `--kvq-prefill-free-codes`: with `--kvq-prefill-free-codes` + Tier 2 (`sub_inplace` + capped draft KV), Tier 3 is not needed for `-ub 2048` up to `256k` on a 16 GB card (`~14.4-14.8 GiB` in both PP and TG). At `256k`, freeing `codes` (`901 MiB`) during PP already offsets the `-ub 2048` compute buffer (`~728 MiB`), making TG slightly higher than PP (`14.82` vs `14.77 GiB`). Tier 3 only becomes useful for `-ub 4096` (PP jumps another `+~730 MiB`), `>256k-320k` context (where tiling `kvq_scr` reduces the shared pool in both PP and TG), or GPU vision (`mmproj` swap).
+
 ## Local tools (not committed)
 
 Everything lives in the git-ignored `tmp/inkling/` of this worktree (`/tmp/` is in `.gitignore`):
