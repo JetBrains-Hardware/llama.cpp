@@ -121,8 +121,10 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     auto * prelude = cur;
     const auto prelude_blocks = blocks;
 
-    // when all core layers run on the same device, batch all loop message queries into one mix + rms_norm per pass
-    bool core_same_dev = (end - start) > 1;
+    // when all core layers run on the same device and batch is small (decode / verify),
+    // batch all loop message queries into one mix + rms_norm per pass without inflating
+    // the prefill compute buffer (at n_tokens=2048, [n_embd, 48, 2048] x2 would add ~1.7 GiB).
+    bool core_same_dev = (end - start) > 1 && n_tokens <= 64;
     for (int ip = start + 1; ip < end && core_same_dev; ++ip) {
         core_same_dev &= (model.dev_layer(ip) == model.dev_layer(start));
     }
