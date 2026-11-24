@@ -2575,13 +2575,15 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * build_inputs();
         // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
+                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr,
+                ggml_tensor * messages_norm = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
 
         llm_graph_input_kvq * build_inp_kvq() const;
         int kvq_lead() const;
         void build_kvq_prefetch(int il_tgt, ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks,
-                const std::vector<ggml_tensor *> * bank = nullptr, ggml_tensor * bank_out = nullptr, const loop_layer * loop_tgt = nullptr);
+                const std::vector<ggml_tensor *> * bank = nullptr, ggml_tensor * bank_out = nullptr, const loop_layer * loop_tgt = nullptr,
+                ggml_tensor * precomputed_msg = nullptr, ggml_tensor * precomputed_msg_norm = nullptr);
         void build_kvq_qstat(ggml_tensor * q, int il);
         void build_kvq_gstat(ggml_tensor * gate_sigmoid, int il);
         ggml_tensor * build_attn_kvq_packed(ggml_tensor * q_cur, ggml_tensor * k_cur, ggml_tensor * v_cur,

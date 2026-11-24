@@ -736,7 +736,8 @@ int llama_model_inkling2::graph::kvq_lead() const {
 }
 
 void llama_model_inkling2::graph::build_kvq_prefetch(int il_tgt, ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks,
-        const std::vector<ggml_tensor *> * bank, ggml_tensor * bank_out, const loop_layer * loop_tgt) {
+        const std::vector<ggml_tensor *> * bank, ggml_tensor * bank_out, const loop_layer * loop_tgt,
+        ggml_tensor * precomputed_msg, ggml_tensor * precomputed_msg_norm) {
     if (!inp_kvq || !inp_kvq->packed_small || inp_kvq->params.lead <= 0) {
         return;
     }
@@ -759,10 +760,13 @@ void llama_model_inkling2::graph::build_kvq_prefetch(int il_tgt, ggml_tensor * c
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query, il_tgt);
         eq_in = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], 0));
     }
-    if (loop_tgt && bank && bank_out) {
-        ggml_tensor * msg = mix(*bank, bank_out, loop_tgt->msg_query, il_tgt);
-        ggml_tensor * mq  = ggml_cont(ctx0, ggml_view_2d(ctx0, msg, n_embd, n_tokens, msg->nb[2], LOOP_CTRL_Q*msg->nb[1]));
-        eq_in = control(eq_in, ggml_rms_norm(ctx0, eq_in, 1e-6f), mq, ggml_rms_norm(ctx0, mq, 1e-6f), *loop_tgt, LOOP_CTRL_Q);
+    if (loop_tgt && (precomputed_msg || (bank && bank_out))) {
+        ggml_tensor * msg = precomputed_msg ? precomputed_msg : mix(*bank, bank_out, loop_tgt->msg_query, il_tgt);
+        ggml_tensor * mq  = ggml_view_2d(ctx0, msg, n_embd, n_tokens, msg->nb[2], LOOP_CTRL_Q*msg->nb[1]);
+        ggml_tensor * mq_norm = precomputed_msg_norm
+            ? ggml_view_2d(ctx0, precomputed_msg_norm, n_embd, n_tokens, precomputed_msg_norm->nb[2], LOOP_CTRL_Q*precomputed_msg_norm->nb[1])
+            : ggml_rms_norm(ctx0, ggml_cont(ctx0, mq), 1e-6f);
+        eq_in = control(eq_in, ggml_rms_norm(ctx0, eq_in, 1e-6f), mq, mq_norm, *loop_tgt, LOOP_CTRL_Q);
     }
 
     eq_in = build_norm(eq_in, layer.attn_q_inp_norm, nullptr, LLM_NORM_RMS, il_tgt);
@@ -1055,7 +1059,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-        ggml_tensor * messages, const loop_layer * loop) {
+        ggml_tensor * messages, const loop_layer * loop, ggml_tensor * precomputed_messages_norm) {
     GGML_ASSERT(!messages == !loop);
 
     const auto & layer = model.layers[il];
@@ -1067,7 +1071,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
     // the message of controller ctrl, [n_embd, n_tokens], and the messages RMS-normalized once
-    ggml_tensor * messages_norm = messages ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr;
+    ggml_tensor * messages_norm = precomputed_messages_norm ? precomputed_messages_norm
+        : (messages ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr);
     auto message = [&](ggml_tensor * t, int ctrl) {
         return ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], ctrl*t->nb[1]);
     };
