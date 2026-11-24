@@ -35,3 +35,23 @@ struct ggml_cuda_row_norm_div_match {
 int ggml_cuda_match_row_norm_div(const ggml_cgraph * cgraph, int i, ggml_cuda_row_norm_div_match & match);
 
 void ggml_cuda_op_row_norm_div(ggml_backend_cuda_context & ctx, const ggml_cuda_row_norm_div_match & match);
+
+// Inkling-2 looped-layer control fusion:
+//   gate   = W_down   @ concat(cur_norm, msg_norm, dim=0)
+//   forget = tanh(W_forget @ gate)
+//   gain   = tanh(W_gain   @ gate)
+//   dst    = cur - forget * cur + gain * msg
+struct ggml_cuda_loop_control_match {
+    const ggml_tensor * cur_norm = nullptr;
+    const ggml_tensor * msg_norm = nullptr;
+    const ggml_tensor * cur      = nullptr;
+    const ggml_tensor * msg      = nullptr;
+    const ggml_tensor * w_down   = nullptr;
+    const ggml_tensor * w_forget = nullptr;
+    const ggml_tensor * w_gain   = nullptr;
+    ggml_tensor       * dst      = nullptr;
+};
+
+int ggml_cuda_match_loop_control(const ggml_cgraph * cgraph, int i, ggml_cuda_loop_control_match & match);
+
+void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_cuda_loop_control_match & match);

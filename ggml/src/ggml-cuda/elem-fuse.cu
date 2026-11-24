@@ -281,3 +281,359 @@ void ggml_cuda_op_row_norm_div(ggml_backend_cuda_context & ctx, const ggml_cuda_
         match.has_scale ? launch(row_norm_div_f32<false, true>) : launch(row_norm_div_f32<false, false>);
     }
 }
+
+// =================================================================================================
+// Inkling-2 looped-layer control fusion:
+//   gate = W_down @ concat(cur_norm, msg_norm, dim=0)  [R, T]
+//   dst  = cur - tanh(W_forget @ gate) * cur + tanh(W_gain @ gate) * msg  [D, T]
+// Eliminates CONCAT + 3x small F32 cuBLAS GEMMs + tanh_mul_addsub -> 2 fused bandwidth-optimal kernels.
+// =================================================================================================
+
+static bool loop_ctrl_vec_layout_ok(const ggml_tensor * t, int64_t D, int64_t T) {
+    return t != nullptr && t->type == GGML_TYPE_F32 &&
+           t->ne[0] == D && t->ne[1] == T && t->ne[2] == 1 && t->ne[3] == 1 &&
+           t->nb[0] == sizeof(float) && (t->nb[1] % sizeof(float)) == 0;
+}
+
+int ggml_cuda_match_loop_control(const ggml_cgraph * cgraph, int i, ggml_cuda_loop_control_match & match) {
+    if (i + 9 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * n_cat = cgraph->nodes[i];
+    if (n_cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(n_cat, 0) != 0) {
+        return 0;
+    }
+    if (cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_tensor * cur_norm = n_cat->src[0];
+    const ggml_tensor * msg_norm = n_cat->src[1];
+    if (!cur_norm || !msg_norm || cur_norm->type != GGML_TYPE_F32 || msg_norm->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const int64_t D = cur_norm->ne[0];
+    const int64_t T = cur_norm->ne[1];
+    if (D <= 0 || (D % 4) != 0 || T < 1 || T > 32 ||
+        !loop_ctrl_vec_layout_ok(cur_norm, D, T) || !loop_ctrl_vec_layout_ok(msg_norm, D, T)) {
+        return 0;
+    }
+
+    const ggml_tensor * n_down = cgraph->nodes[i + 1];
+    if (n_down->op != GGML_OP_MUL_MAT || n_down->src[1] != n_cat) {
+        return 0;
+    }
+    const ggml_tensor * w_down = n_down->src[0];
+    if (!w_down || w_down->type != GGML_TYPE_F32 || !ggml_is_contiguous(w_down) ||
+        w_down->ne[0] != 2 * D || w_down->ne[2] != 1 || w_down->ne[3] != 1) {
+        return 0;
+    }
+    const int64_t R = w_down->ne[1];
+    if (R < 1 || R > 128) {
+        return 0;
+    }
+
+    // Match the forget branch: [VIEW*], MUL_MAT(w_forget, n_down), UNARY(TANH), [VIEW*], MUL(tanh, cur), SUB(cur, mul)
+    int j = i + 2;
+    while (j < cgraph->n_nodes && j < i + 5 && elem_is_view_op(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) return 0;
+    const int idx_fmm = j;
+    const ggml_tensor * n_fmm = cgraph->nodes[j++];
+    if (n_fmm->op != GGML_OP_MUL_MAT || n_fmm->src[1] != n_down) {
+        return 0;
+    }
+    const ggml_tensor * w_forget = n_fmm->src[0];
+    if (!w_forget || w_forget->type != GGML_TYPE_F32 || !ggml_is_contiguous(w_forget) ||
+        w_forget->ne[0] != R || w_forget->ne[1] != D || w_forget->ne[2] != 1 || w_forget->ne[3] != 1) {
+        return 0;
+    }
+    if (j >= cgraph->n_nodes) return 0;
+    const int idx_ftanh = j;
+    const ggml_tensor * n_ftanh = cgraph->nodes[j++];
+    if (n_ftanh->op != GGML_OP_UNARY || ggml_get_unary_op(n_ftanh) != GGML_UNARY_OP_TANH || n_ftanh->src[0] != n_fmm) {
+        return 0;
+    }
+    while (j < cgraph->n_nodes && j < i + 9 && elem_is_view_op(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j + 1 >= cgraph->n_nodes) return 0;
+    const int idx_fmul = j;
+    const ggml_tensor * n_fmul = cgraph->nodes[j++];
+    const int idx_sub  = j;
+    const ggml_tensor * n_sub  = cgraph->nodes[j++];
+    if (n_fmul->op != GGML_OP_MUL || n_sub->op != GGML_OP_SUB) {
+        return 0;
+    }
+    const ggml_tensor * cur = nullptr;
+    if (n_fmul->src[0] == n_ftanh) {
+        cur = n_fmul->src[1];
+    } else if (n_fmul->src[1] == n_ftanh) {
+        cur = n_fmul->src[0];
+    } else {
+        return 0;
+    }
+    if (n_sub->src[0] != cur || n_sub->src[1] != n_fmul || !loop_ctrl_vec_layout_ok(cur, D, T)) {
+        return 0;
+    }
+
+    // Match the gain branch: [VIEW*], MUL_MAT(w_gain, n_down), UNARY(TANH), [VIEW*], MUL(tanh, msg), ADD(n_sub, mul)
+    while (j < cgraph->n_nodes && j < i + 12 && elem_is_view_op(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j + 3 >= cgraph->n_nodes) return 0;
+    const int idx_gmm = j;
+    const ggml_tensor * n_gmm = cgraph->nodes[j++];
+    if (n_gmm->op != GGML_OP_MUL_MAT || n_gmm->src[1] != n_down) {
+        return 0;
+    }
+    const ggml_tensor * w_gain = n_gmm->src[0];
+    if (!w_gain || w_gain->type != GGML_TYPE_F32 || !ggml_is_contiguous(w_gain) ||
+        w_gain->ne[0] != R || w_gain->ne[1] != D || w_gain->ne[2] != 1 || w_gain->ne[3] != 1) {
+        return 0;
+    }
+    const int idx_gtanh = j;
+    const ggml_tensor * n_gtanh = cgraph->nodes[j++];
+    if (n_gtanh->op != GGML_OP_UNARY || ggml_get_unary_op(n_gtanh) != GGML_UNARY_OP_TANH || n_gtanh->src[0] != n_gmm) {
+        return 0;
+    }
+    while (j < cgraph->n_nodes && j < i + 16 && elem_is_view_op(cgraph->nodes[j]->op)) {
+        ++j;
+    }
+    if (j + 1 >= cgraph->n_nodes) return 0;
+    const int idx_gmul = j;
+    const ggml_tensor * n_gmul = cgraph->nodes[j++];
+    const int idx_add  = j;
+    ggml_tensor       * n_add  = cgraph->nodes[j++];
+    if (n_gmul->op != GGML_OP_MUL || n_add->op != GGML_OP_ADD) {
+        return 0;
+    }
+    const ggml_tensor * msg = nullptr;
+    if (n_gmul->src[0] == n_gtanh) {
+        msg = n_gmul->src[1];
+    } else if (n_gmul->src[1] == n_gtanh) {
+        msg = n_gmul->src[0];
+    } else {
+        return 0;
+    }
+    const bool add_ok = (n_add->src[0] == n_sub && n_add->src[1] == n_gmul) ||
+                        (n_add->src[1] == n_sub && n_add->src[0] == n_gmul);
+    if (!add_ok || !loop_ctrl_vec_layout_ok(msg, D, T) || !loop_ctrl_vec_layout_ok(n_add, D, T) || !ggml_is_contiguous(n_add)) {
+        return 0;
+    }
+    if (!ggml_cuda_elem_overlap_ok(n_add, cur) || !ggml_cuda_elem_overlap_ok(n_add, msg)) {
+        return 0;
+    }
+
+    const int n = j - i;
+    const ggml_op ops[10] = {
+        GGML_OP_CONCAT, GGML_OP_MUL_MAT,
+        GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB,
+        GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD,
+    };
+    const int idxs[10] = { i, i + 1, idx_fmm, idx_ftanh, idx_fmul, idx_sub, idx_gmm, idx_gtanh, idx_gmul, idx_add };
+    const int outs[1]  = { idx_add };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 10, ops, outs, 1)) {
+        return 0;
+    }
+
+    match.cur_norm = cur_norm;
+    match.msg_norm = msg_norm;
+    match.cur      = cur;
+    match.msg      = msg;
+    match.w_down   = w_down;
+    match.w_forget = w_forget;
+    match.w_gain   = w_gain;
+    match.dst      = n_add;
+    return n;
+}
+
+template <int TILE_T>
+static __global__ void loop_ctrl_down_f32(
+        const float * __restrict__ cur_norm,
+        const float * __restrict__ msg_norm,
+        const float * __restrict__ w_down,
+        float       * __restrict__ gate,
+        const int D, const int R, const int T,
+        const int64_t s_cn, const int64_t s_mn) {
+    constexpr int NTHREADS = 128;
+    constexpr int NWARPS   = NTHREADS / WARP_SIZE;
+
+    const int r  = blockIdx.x;
+    const int t0 = blockIdx.y * TILE_T;
+    const int tid  = threadIdx.x;
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+
+    const float * wd_a = w_down + (int64_t) r * (2 * D);
+    const float * wd_b = wd_a + D;
+
+    float acc[TILE_T];
+#pragma unroll
+    for (int it = 0; it < TILE_T; ++it) {
+        acc[it] = 0.0f;
+    }
+
+    const int D4 = D / 4;
+    const float4 * wd_a4 = (const float4 *) wd_a;
+    const float4 * wd_b4 = (const float4 *) wd_b;
+    const bool aligned_cn = ((uintptr_t) cur_norm % 16 == 0) && ((s_cn % 4) == 0);
+    const bool aligned_mn = ((uintptr_t) msg_norm % 16 == 0) && ((s_mn % 4) == 0);
+
+    if (aligned_cn && aligned_mn) {
+        for (int k4 = tid; k4 < D4; k4 += NTHREADS) {
+            const float4 wa = wd_a4[k4];
+            const float4 wb = wd_b4[k4];
+#pragma unroll
+            for (int it = 0; it < TILE_T; ++it) {
+                const int t = t0 + it;
+                if (t < T) {
+                    const float4 xa = ((const float4 *) (cur_norm + t * s_cn))[k4];
+                    const float4 xb = ((const float4 *) (msg_norm + t * s_mn))[k4];
+                    acc[it] += wa.x*xa.x + wa.y*xa.y + wa.z*xa.z + wa.w*xa.w +
+                               wb.x*xb.x + wb.y*xb.y + wb.z*xb.z + wb.w*xb.w;
+                }
+            }
+        }
+    } else {
+        for (int k = tid; k < D; k += NTHREADS) {
+            const float wa = wd_a[k];
+            const float wb = wd_b[k];
+#pragma unroll
+            for (int it = 0; it < TILE_T; ++it) {
+                const int t = t0 + it;
+                if (t < T) {
+                    acc[it] += wa * cur_norm[t * s_cn + k] + wb * msg_norm[t * s_mn + k];
+                }
+            }
+        }
+    }
+
+    __shared__ float smem[TILE_T][NWARPS];
+#pragma unroll
+    for (int it = 0; it < TILE_T; ++it) {
+        const float ws = warp_reduce_sum(acc[it]);
+        if (lane == 0) {
+            smem[it][warp] = ws;
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0 && lane < TILE_T) {
+        const int t = t0 + lane;
+        if (t < T) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int w = 0; w < NWARPS; ++w) {
+                sum += smem[lane][w];
+            }
+            gate[t * R + r] = sum;
+        }
+    }
+}
+
+template <int TILE_T>
+static __global__ void loop_ctrl_up_apply_f32(
+        const float * __restrict__ gate,
+        const float * __restrict__ w_forget,
+        const float * __restrict__ w_gain,
+        const float * __restrict__ cur,
+        const float * __restrict__ msg,
+        float       * __restrict__ dst,
+        const int D, const int R, const int T,
+        const int64_t s_cur, const int64_t s_msg, const int64_t s_dst) {
+    constexpr int NWARPS = 4;
+    const int d    = blockIdx.x * NWARPS + threadIdx.y;
+    const int t0   = blockIdx.y * TILE_T;
+    const int lane = threadIdx.x;
+    const int tid  = threadIdx.y * WARP_SIZE + lane;
+
+    __shared__ float s_gate[TILE_T][128];
+    const int total_g = TILE_T * R;
+    for (int idx = tid; idx < total_g; idx += NWARPS * WARP_SIZE) {
+        const int it = idx / R;
+        const int r  = idx % R;
+        const int t  = t0 + it;
+        s_gate[it][r] = (t < T) ? gate[t * R + r] : 0.0f;
+    }
+    __syncthreads();
+
+    if (d >= D) {
+        return;
+    }
+
+    const float * wf_row = w_forget + (int64_t) d * R;
+    const float * wg_row = w_gain   + (int64_t) d * R;
+
+    float f_acc[TILE_T];
+    float g_acc[TILE_T];
+#pragma unroll
+    for (int it = 0; it < TILE_T; ++it) {
+        f_acc[it] = 0.0f;
+        g_acc[it] = 0.0f;
+    }
+
+    for (int r = lane; r < R; r += WARP_SIZE) {
+        const float wf = wf_row[r];
+        const float wg = wg_row[r];
+#pragma unroll
+        for (int it = 0; it < TILE_T; ++it) {
+            const float gv = s_gate[it][r];
+            f_acc[it] += wf * gv;
+            g_acc[it] += wg * gv;
+        }
+    }
+
+#pragma unroll
+    for (int it = 0; it < TILE_T; ++it) {
+        const float f = warp_reduce_sum(f_acc[it]);
+        const float g = warp_reduce_sum(g_acc[it]);
+        const int t = t0 + it;
+        if (lane == 0 && t < T) {
+            const float c = cur[t * s_cur + d];
+            const float m = msg[t * s_msg + d];
+            dst[t * s_dst + d] = c - tanhf(f) * c + tanhf(g) * m;
+        }
+    }
+}
+
+void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_cuda_loop_control_match & match) {
+    const int D = (int) match.cur->ne[0];
+    const int T = (int) match.cur->ne[1];
+    const int R = (int) match.w_down->ne[1];
+
+    const int64_t s_cn  = match.cur_norm->nb[1] / sizeof(float);
+    const int64_t s_mn  = match.msg_norm->nb[1] / sizeof(float);
+    const int64_t s_cur = match.cur->nb[1]      / sizeof(float);
+    const int64_t s_msg = match.msg->nb[1]      / sizeof(float);
+    const int64_t s_dst = match.dst->nb[1]      / sizeof(float);
+
+    ggml_cuda_pool_alloc<float> gate_alloc(ctx.pool(), (size_t) T * R);
+    float * gate = gate_alloc.get();
+    cudaStream_t stream = ctx.stream();
+
+    if (T == 1) {
+        constexpr int TILE_T = 1;
+        ggml_cuda_kernel_launch(loop_ctrl_down_f32<TILE_T>,
+            ggml_cuda_kernel_launch_params(dim3(R, 1, 1), dim3(128, 1, 1), 0, stream),
+            (const float *) match.cur_norm->data, (const float *) match.msg_norm->data,
+            (const float *) match.w_down->data, gate, D, R, T, s_cn, s_mn);
+        ggml_cuda_kernel_launch(loop_ctrl_up_apply_f32<TILE_T>,
+            ggml_cuda_kernel_launch_params(dim3((D + 3) / 4, 1, 1), dim3(WARP_SIZE, 4, 1), 0, stream),
+            gate, (const float *) match.w_forget->data, (const float *) match.w_gain->data,
+            (const float *) match.cur->data, (const float *) match.msg->data, (float *) match.dst->data,
+            D, R, T, s_cur, s_msg, s_dst);
+    } else {
+        constexpr int TILE_T = 4;
+        const int nty = (T + TILE_T - 1) / TILE_T;
+        ggml_cuda_kernel_launch(loop_ctrl_down_f32<TILE_T>,
+            ggml_cuda_kernel_launch_params(dim3(R, nty, 1), dim3(128, 1, 1), 0, stream),
+            (const float *) match.cur_norm->data, (const float *) match.msg_norm->data,
+            (const float *) match.w_down->data, gate, D, R, T, s_cn, s_mn);
+        ggml_cuda_kernel_launch(loop_ctrl_up_apply_f32<TILE_T>,
+            ggml_cuda_kernel_launch_params(dim3((D + 3) / 4, nty, 1), dim3(WARP_SIZE, 4, 1), 0, stream),
+            gate, (const float *) match.w_forget->data, (const float *) match.w_gain->data,
+            (const float *) match.cur->data, (const float *) match.msg->data, (float *) match.dst->data,
+            D, R, T, s_cur, s_msg, s_dst);
+    }
+}
