@@ -223,6 +223,26 @@ Why larger `-ub` matters: Inkling-2-Mini is a 128-expert top-8 MoE, so `-ub 512`
 
 Note on Tier 3 vs `--kvq-prefill-free-codes`: with `--kvq-prefill-free-codes` + Tier 2 (`sub_inplace` + capped draft KV), Tier 3 is not needed for `-ub 2048` up to `256k` on a 16 GB card (`~14.4-14.8 GiB` in both PP and TG). At `256k`, freeing `codes` (`901 MiB`) during PP already offsets the `-ub 2048` compute buffer (`~728 MiB`), making TG slightly higher than PP (`14.82` vs `14.77 GiB`). Tier 3 only becomes useful for `-ub 4096` (PP jumps another `+~730 MiB`), `>256k-320k` context (where tiling `kvq_scr` reduces the shared pool in both PP and TG), or GPU vision (`mmproj` swap).
 
+### Bit-exact VRAM optimizations (measured results)
+
+Implemented the bit-exact, drafter-precision-preserving optimizations in `src/models/inkling2.cpp` and `src/llama-memory-hybrid-kvq.{h,cpp}`:
+
+- In-place sink subtraction (`ggml_sub_inplace`) on all four `raw_table` sites (saves `48 MiB` at `ub=512`, `192 MiB` at `ub=2048`).
+- In-place `ggml_rms_norm_inplace` in `mix()` when `!blocks.empty()`, and zero-copy `ggml_reshape_2d` replacing 3 redundant `ggml_cont` copies on SWA `mixed` inputs.
+- Position-based FlashAttention masking (`pos_mask` / `pos_window`, guarded by `LLAMA_ATTN_POS_MASK_DISABLE`) extended to `--kvq` SWA layers and `--kvq` scratch prefill (`set_input_kvq_scr_pos`), dropping `swa_mask.raw` and `mask_scr.raw` (`~24 MiB` at `ub=2048`) and removing per-ubatch CPU mask fills / H2D uploads.
+
+Measured on RTX 5090 (`-c 98304 -b 2048 -np 1 -fa on -ngl 99 --kvq`, DSpark `w2q8` `K=4`, `cache_prompt=false`, idle GPU `1,184 MiB`, peak VRAM polled every `0.25 s` during PP):
+
+| Mode | Request | Compute buf (`scr`) | Peak VRAM (`nvidia-smi` / ~proc) | End VRAM (TG) | Prefill | Decode |
+|---|---|---:|---:|---:|---|---|
+| Before (`-ub 512`, no `free-codes`) | 32k / 76k | `240.0 MiB` | `16,310 / 16,318` (`~14.77 GiB`)* | `16,310 / 16,318` | `2,373 / 2,300 t/s` | `99.5 / 96.7 t/s` |
+| After (`-ub 512`, no `free-codes`) | 32k / 76k | `222.7 MiB` | `16,657 / 16,695` (`~15.11-15.15 GiB`) | `16,369 / 16,381` | `2,514 / 2,476 t/s` (+6-8%) | `97.5 / 144.6* t/s` |
+| After (`-ub 512` + `--kvq-prefill-free-codes`) | 32k / 76k | `222.7 MiB` | **`16,361 / 16,393` (`~14.82-14.85 GiB`)** | `16,361 / 16,381` | `2,516 / 2,467 t/s` (+6-7%) | `97.3 / 143.5* t/s` |
+| After (`-ub 1024` + `--kvq-prefill-free-codes`) | 32k / 76k | `320.3 MiB` | **`16,496 / 16,589` (`~14.95-15.04 GiB`)** | `16,360 / 16,441` | **`2,925 / 2,843 t/s` (+23%)** | `101.3 / 92.1 t/s` |
+| After (`-ub 2048` + `--kvq-prefill-free-codes`) | 32k / 76k | `558.5 MiB` | **`16,991 / 17,003` (`~15.44-15.45 GiB`)** | `16,489 / 16,489` | **`3,120 / 3,029 t/s` (+32%)** | `97.8 / 97.7 t/s` |
+
+*Notes: the earlier `-ub 512` baseline only sampled post-request VRAM (no `0.25 s` PP peak polling); `76k` at `-ub 512` hit an `802`-token high-acceptance trajectory (`619/732`, `143.5-144.6 t/s`). Bit-exactness confirmed on `req_32k.json`: `--kvq` no-draft (`-ub 512`) reproduced the exact `1,799` generated tokens (`2,432 -> 2,555 t/s` PP), and `--kvq` + DSpark `K=4` (`-ub 512`) produced identical token counts and acceptances with and without `--kvq-prefill-free-codes` (`1,831 tok`, `1145/2740` on 32k; `802 tok`, `619/732` on 76k).*
+
 ## Local tools (not committed)
 
 Everything lives in the git-ignored `tmp/inkling/` of this worktree (`/tmp/` is in `.gitignore`):
