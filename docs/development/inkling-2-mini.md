@@ -17,12 +17,13 @@ llama-server \
   --port 8765 --jinja
 ```
 
-- **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.96-14.99 GiB` peak PP / `14.59-14.60 GiB` TG process VRAM, `3,096 / 3,011 t/s` prefill, `111.5 / 118.0 t/s` decode (`58.8% / 62.8%` acceptance).
+- **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.94-14.97 GiB` peak PP / `14.57-14.60 GiB` TG process VRAM, `3,059 / 2,977 t/s` prefill, `109.5 / 113.9 t/s` decode (`58.8% / 62.8%` acceptance).
 - **Max context in `15.5 GiB` (`15,872 MiB`, 16 GB card):**
-  - Default (`-ub 2048`, uncapped draft KV): **`~180k-185k`** (PP-bound at `6.13 KiB/tok`; `-c 131072` fits comfortably at `~15.16 GiB` PP / `~14.90 GiB` TG).
-  - With `LLAMA_DSPARK_KV_CAP=4096` (`-ub 2048`): **`~320k-328k`** (TG-bound at `5.65 KiB/tok`; `-c 262144` fits at `~15.12 GiB` TG / `~14.94 GiB` PP).
+  - Default (`-ub 2048`, uncapped draft KV): **`~220k-225k`** (`4.00 KiB/tok` PP / `7.52 KiB/tok` TG; `-c 131072` fits at `~15.07 GiB` PP / `~14.81 GiB` TG).
+  - With `LLAMA_DSPARK_KV_CAP=4096` (`-ub 2048`): **`~465k-470k`** (`0 B/tok` PP / `3.52 KiB/tok` TG; measured `-c 262144` at `14.38 GiB` PP / `14.78 GiB` TG, and `-c 500000` at `14.37 GiB` PP / `15.62 GiB` TG).
+  - With `LLAMA_DSPARK_KV_CAP=4096` + `-ot token_embd.weight=CPU` (`-303.7 MiB`): **`~550k-555k`** (`500k` fits at `~15.32 GiB` TG / `~14.07 GiB` PP).
 - **Why each knob:**
-  - `--kvq`: two-tier KV cache for the 8 full-attention slots (`~5.65 KiB/tok` vs `32 KiB/tok` FP16), plus compact `1,280`-cell SWA cache (`106.25 MiB`) using per-layer SWA prefill scratch so `-ub 2048` adds zero permanent SWA VRAM.
+  - `--kvq`: two-tier KV cache for the 8 full-attention slots (`3.52 KiB/tok` TG, `0 B/tok` PP with tiled `80.2 MiB` `kvq_scr` vs `32 KiB/tok` FP16), plus compact `1,280`-cell SWA cache (`106.25 MiB`) using per-layer SWA prefill scratch so `-ub 2048` adds zero permanent SWA VRAM.
   - `--kvq-prefill-free-codes`: frees KVQ `codes + tables` during prefill and re-uploads from pinned host RAM (`~5-15 ms`), offsetting the `-ub 2048` compute buffer at PP peak.
   - `-b 2048 -ub 2048`: raises MoE utilization from `32` to `128` tokens/expert (`+32%` faster prefill vs `-ub 512`).
   - `-md dspark-Inkling-2-Mini-Q8_0-mainline.gguf`: full `Q8_0` drafter saves `188 MiB` vs `BF16-w2q8` with zero acceptance loss.
@@ -314,6 +315,26 @@ Measured on RTX 5090 (`-c 98304 -b 2048 -ub 2048 -np 1 -fa on --kvq --kvq-prefil
 | **After Option B (`LLAMA_DSPARK_KV_CAP=4096`)** | **`106.25 MiB`** | **`540.4 MiB`** | **`14,945 / 14,975 MiB` (`14.59-14.62 GiB`)** | **`14,573 / 14,589 MiB` (`14.23-14.25 GiB`)** | **`3,100 / 3,004 t/s`** | **`~320k-328k`** |
 
 Verification: on the 32,144-token prompt (`16` SWA-scratch ubatches), first-token logprobs match `--swa-full` to `0.0018` (`-23.2332` vs `-23.2350`), and multi-turn prefix-cache continuation (`swa_scratch` -> direct `<= 256` path) with `LLAMA_ATTN_POS_MASK_DISABLE=1` passed cleanly.
+
+### Tiled KVQ prefill scratch (Option 1b)
+
+Previously, `kvq_scr` in `llama_kvq_store` allocated `n_rows + n_cell` rows (`2.13 KiB/tok` -> `551 MiB` @ 256k, `1,058 MiB` @ 500k), forcing the shared `buf_scr` pool to stay inflated even during decode (`dec` only uses `~191 MiB`). Implemented Option 1b across `src/llama-kvq-store.{h,cpp}`, `src/llama-memory-hybrid-kvq.cpp`, `src/models/inkling2.cpp`, and `src/models/qwen35.cpp`:
+
+- Caps `kvq_scr` to two ping-pong `scr_block` (`16,384`-row) host tiles plus a fixed tail region (`GGML_PAD(n_cell + rel_keep + 512, 256)` rows): **`80.2 MiB` fixed** for Inkling-2 regardless of `n_ctx` (`0 B/tok` PP scaling; `buf_scr` never grows past `dec` size).
+- Uses per-tile host triggers (`build_scr_tile`) so `backend_cp` prefetches tile `t + 1` into the opposite ping-pong slot while FlashAttention runs on tile `t` (disabled cleanly when `--kvq-scr-block 0` or `n_rows + n_cell` already fits).
+
+Measured on RTX 5090 (`-b 2048 -ub 2048 -np 1 -fa on --kvq --kvq-prefill-free-codes`, `Q8_0` DSpark `K=4`, `dub=512`, `F16` `layer_inp_dev`, greedy `temp=0`):
+
+| Config | `kvq_scr` | Loaded / PP proc VRAM | Peak / TG proc VRAM | PP (`32k` / `76k`) | TG (`32k` / `76k`) |
+|---|---:|---:|---:|---|---|
+| `-c 98304` (default, uncapped draft KV) | `80.2 MiB` | `15,087 MiB` (`14.73 GiB`) | `15,295-15,325` PP / `14,923-14,947` TG | `3,059 / 2,977 t/s` | `109.5 / 113.9 t/s` (`58.8% / 62.8%`) |
+| `-c 262144` (`LLAMA_DSPARK_KV_CAP=4096`) | `80.2 MiB` | `14,721 MiB` (`14.38 GiB`) | `15,135 MiB` (`14.78 GiB`) | `2,959 t/s` (`76k`) | `66.2 t/s` (64 tok, `44.3%`) |
+| `-c 500000` (`LLAMA_DSPARK_KV_CAP=4096`) | `80.2 MiB` | `14,715 MiB` (`14.37 GiB`) | `15,991 MiB` (`15.62 GiB`) | `2,956 t/s` (`76k`) | `65.4 t/s` (64 tok, `44.3%`, bit-exact w/ 256k) |
+
+Next-step VRAM headroom options (item 2, to push `500k` cleanly under `15.5 GiB`):
+
+- `-ot token_embd.weight=CPU`: `token_embd.weight` is `Q5_K [2304, 201024]` = **`303.7 MiB`** (frees `303.7 MiB` in both PP and TG with ~0% speed loss; drops `500k` TG to `~15.32 GiB`, max context `~550k-555k` in `15.5 GiB`).
+- `--kvq-resident-cap 4096` (from `8192`): halves `resident` (`137.1 -> ~68.6 MiB`, **`-68.5 MiB`** in TG; needs acceptance/KL check).
 
 ## Local tools (not committed)
 
