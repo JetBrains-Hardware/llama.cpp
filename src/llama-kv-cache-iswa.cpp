@@ -66,11 +66,24 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return  model.hparams.is_swa(il);
     };
 
-    const uint32_t size_base = kv_size;
+    uint32_t size_base = kv_size;
+    uint32_t base_n_swa = 0;
+    llama_swa_type base_swa_type = LLAMA_SWA_TYPE_NONE;
+
+    if (model.arch == LLM_ARCH_DFLASH) {
+        if (const char * env = getenv("LLAMA_DSPARK_KV_CAP")) {
+            const uint32_t cap = (uint32_t) std::max(0, atoi(env));
+            if (cap >= hparams.n_swa && cap < size_base) {
+                base_n_swa    = cap;
+                base_swa_type = LLAMA_SWA_TYPE_STANDARD;
+                size_base     = GGML_PAD(std::min(size_base, cap*(unified ? n_seq_max : 1) + n_ubatch), 256);
+            }
+        }
+    }
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
-    uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    uint32_t size_swa = GGML_PAD(std::min(kv_size, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
@@ -80,7 +93,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         size_swa = size_base;
     }
 
-    LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
+    LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells (cap = %u)\n", __func__, size_base, base_n_swa);
 
     llama_memory_t mem_other_base = nullptr;
     if (mem_other) {
@@ -95,7 +108,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+            base_n_swa, base_swa_type, mem_other_base, filter_base, reuse, share);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 

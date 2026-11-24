@@ -1679,7 +1679,7 @@ void llama_context::layer_inp_dev_alloc() {
     };
     ctx_layer_inp_dev.reset(ggml_init(params));
 
-    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_layer_inp*model.hparams.n_embd, layer_inp_rows > 0 ? layer_inp_rows : cparams.n_batch);
+    layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F16, n_layer_inp*model.hparams.n_embd, layer_inp_rows > 0 ? layer_inp_rows : cparams.n_batch);
     ggml_set_name(layer_inp_dev, "layer_inp_dev");
 
     layer_inp_dev_dev = model.dev_output();
