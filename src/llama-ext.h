@@ -347,6 +347,9 @@ LLAMA_API bool llama_memory_kvq_fit_set_hold(llama_memory_t mem, bool hold);
 // scheduler splits of the last graph
 LLAMA_API int32_t llama_context_n_splits(const struct llama_context * ctx);
 
+// release device compute buffers and freeable KVQ device codes so another subsystem (e.g. mtmd) can borrow VRAM
+LLAMA_API void llama_context_release_transient_vram(struct llama_context * ctx);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

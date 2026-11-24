@@ -2733,6 +2733,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-vram-swap"},
+        {"--no-mmproj-vram-swap"},
+        string_format("keep multimodal projector weights in host RAM and upload transiently to GPU during encode (default: %s)", params.mmproj_vram_swap ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.mmproj_vram_swap = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_VRAM_SWAP"));
+    add_opt(common_arg(
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"

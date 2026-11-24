@@ -64,7 +64,8 @@ ggml_backend_dev_t mtmd_select_device(bool use_gpu, ggml_backend_dev_t device) {
 }
 
 mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_nodes,
-                             ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data) {
+                             ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data)
+    : max_nodes(max_nodes), cb_eval(cb_eval), cb_eval_user_data(cb_eval_user_data) {
     threadpool = mtmd_threadpool_init(n_threads);
 
     backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -102,6 +103,52 @@ mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_n
     sched.reset(ggml_backend_sched_new(ptrs.data(), bufts.data(), ptrs.size(), max_nodes, false, true));
     if (cb_eval != nullptr) {
         ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+    }
+}
+
+bool mtmd_backends::acquire_gpu(ggml_backend_dev_t device) {
+    if (device == nullptr) {
+        return false;
+    }
+    if (backend != nullptr && backend != backend_cpu) {
+        return true;
+    }
+    sched.reset();
+    ptrs.clear();
+    bufts.clear();
+
+    ggml_backend_t dev_backend = ggml_backend_dev_init(device, nullptr);
+    if (!dev_backend) {
+        LOG_ERR("%s: failed to initialize \"%s\" backend\n", __func__, ggml_backend_dev_name(device));
+        backend = backend_cpu;
+        ptrs.push_back(backend_cpu);
+        bufts.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
+        sched.reset(ggml_backend_sched_new(ptrs.data(), bufts.data(), ptrs.size(), max_nodes, false, true));
+        return false;
+    }
+    backend = dev_backend;
+    ptrs.push_back(backend);
+    bufts.push_back(ggml_backend_get_default_buffer_type(backend));
+    ptrs.push_back(backend_cpu);
+    bufts.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
+    sched.reset(ggml_backend_sched_new(ptrs.data(), bufts.data(), ptrs.size(), max_nodes, false, true));
+    if (cb_eval != nullptr) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+    }
+    return true;
+}
+
+void mtmd_backends::release_gpu() {
+    if (backend != nullptr && backend != backend_cpu) {
+        ggml_backend_synchronize(backend);
+        sched.reset();
+        ggml_backend_free(backend);
+        backend = backend_cpu;
+        ptrs.clear();
+        bufts.clear();
+        ptrs.push_back(backend_cpu);
+        bufts.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
+        sched.reset(ggml_backend_sched_new(ptrs.data(), bufts.data(), ptrs.size(), max_nodes, false, true));
     }
 }
 

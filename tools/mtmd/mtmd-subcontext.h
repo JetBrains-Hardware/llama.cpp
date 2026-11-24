@@ -46,10 +46,18 @@ struct mtmd_backends {
     // its buffers fit the largest graph reserved by the subcontexts
     ggml_backend_sched_ptr sched;
 
+    int max_nodes = 0;
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
+
     // device nullptr means CPU
     mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_nodes,
                   ggml_backend_sched_eval_callback cb_eval, void * cb_eval_user_data);
     ~mtmd_backends();
+
+    // transiently attach/detach GPU backend (frees CUDA pool & cuBLAS workspace on release)
+    bool acquire_gpu(ggml_backend_dev_t device);
+    void release_gpu();
 
     std::map<ggml_backend_dev_t, size_t> get_mem_compute() const;
 

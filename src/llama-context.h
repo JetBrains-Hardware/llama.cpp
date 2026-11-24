@@ -82,6 +82,9 @@ struct llama_context {
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
+    // release device compute buffers and freeable KVQ codes so another subsystem can borrow VRAM
+    void release_transient_vram();
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
@@ -421,8 +424,9 @@ private:
 
     // compute buffers per phase: the prompt ubatches (pp) and the ubatches of at most n_tokens_tg tokens (tg), see phase_set
     // the device buffers hold the sizes of the current phase only; host buffers are kept (SIZE_MAX)
-    bool     phase_on    = false; // cparams.phase_bufs and the context can use it
-    bool     phase_tg    = false;
+    bool     phase_on       = false; // cparams.phase_bufs and the context can use it
+    bool     phase_tg       = false;
+    bool     phase_released = false;
     uint32_t n_tokens_tg = 0;
     std::vector<size_t> phase_size_pp; // the reserve of the pp graph
     std::vector<size_t> phase_size_tg; // the reserve of a tg graph (0 with the two-tier cache), at least the largest size used in a tg phase

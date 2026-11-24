@@ -952,6 +952,24 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    struct vram_swap_guard {
+        mtmd_context * mctx = nullptr;
+        ~vram_swap_guard() {
+            if (mctx) {
+                mtmd_vram_swap_release(mctx);
+            }
+        }
+    } swap_guard;
+
+    if (mtmd_is_vram_swap(mctx)) {
+        llama_context_release_transient_vram(slot.ctx_tgt);
+        if (!mtmd_vram_swap_acquire(mctx)) {
+            SLT_ERR(slot, "failed to acquire GPU VRAM for mtmd batch, chunk idx = %zu\n", idx);
+            return -1;
+        }
+        swap_guard.mctx = mctx;
+    }
+
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
@@ -1339,6 +1357,7 @@ private:
         mtmd_context_params mparams = mtmd_context_params_default();
         if (has_mmproj) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;
+            mparams.vram_swap        = params_base.mmproj_vram_swap;
             mparams.device           = params_base.mmproj_device;
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
@@ -1364,7 +1383,7 @@ private:
 
         // optionally fit mmproj memory usage
         // on resume params_base already holds the margin from the first load
-        if (has_mmproj && params_base.fit_params && !is_resume) {
+        if (has_mmproj && params_base.fit_params && !params_base.mmproj_vram_swap && !is_resume) {
             const auto & mmproj_mem = mmproj_usage.backend_mem_usage;
             const int64_t t_elapsed = mmproj_usage_t_us;
             if (!mmproj_mem.empty()) {

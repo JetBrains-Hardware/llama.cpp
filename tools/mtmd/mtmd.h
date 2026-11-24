@@ -133,6 +133,9 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // keep weights in host RAM and upload transiently to GPU during encode
+    bool vram_swap;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -146,6 +149,11 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
                                             const struct mtmd_context_params ctx_params);
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
+
+// transient GPU residency when vram_swap is enabled (no-ops otherwise)
+MTMD_API bool mtmd_is_vram_swap(const mtmd_context * ctx);
+MTMD_API bool mtmd_vram_swap_acquire(mtmd_context * ctx);
+MTMD_API void mtmd_vram_swap_release(mtmd_context * ctx);
 
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk

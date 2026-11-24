@@ -124,10 +124,6 @@ static bool server_kvq_prepare_params(common_params & params) {
     // ubatches of up to this many tokens use the packed attention (llama_kvq_params::max_batch)
     const int32_t kvq_max_batch = llama_kvq_params().max_batch;
 
-    if (!params.mmproj.path.empty() || !params.mmproj.hf_repo.empty() || !params.mmproj.url.empty()) {
-        SRV_ERR("%s", "--kvq: multimodal projectors are not supported\n");
-        return false;
-    }
     if (params.embedding) {
         SRV_ERR("%s", "--kvq: embeddings are not supported\n");
         return false;

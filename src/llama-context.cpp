@@ -1985,7 +1985,7 @@ bool llama_context::ubatch_tg(const llama_ubatch & ubatch, const llama_memory_co
 }
 
 void llama_context::phase_set(bool tg) {
-    if (tg == phase_tg) {
+    if (tg == phase_tg && !phase_released) {
         return;
     }
     const int64_t t0 = ggml_time_us();
@@ -1995,7 +1995,7 @@ void llama_context::phase_set(bool tg) {
         const size_t s = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
         size0 += phase_size_pp[i] != SIZE_MAX ? s : 0;
         // the next tg phase starts with the sizes this one reached
-        if (!tg && phase_size_tg[i] != SIZE_MAX) {
+        if (!tg && !phase_released && phase_size_tg[i] != SIZE_MAX) {
             phase_size_tg[i] = std::max(phase_size_tg[i], s);
         }
     }
@@ -2012,7 +2012,8 @@ void llama_context::phase_set(bool tg) {
         LLAMA_LOG_WARN("%s: a compute buffer of the %s phase was not allocated, the next graph reserves it\n", __func__, tg ? "tg" : "pp");
     }
     gf_res_prev_active = nullptr;
-    phase_tg = tg;
+    phase_tg       = tg;
+    phase_released = false;
 
     size_t size1 = 0;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -2023,6 +2024,34 @@ void llama_context::phase_set(bool tg) {
     t_phase_switch += ms;
     LLAMA_LOG_INFO("%s: %s phase, device compute buffers %.2f -> %.2f MiB in %.2f ms (%.2f ms of it the wait for the queued work)\n", __func__,
             tg ? "tg" : "pp", size0/1048576.0, size1/1048576.0, ms, (t1 - t0)/1000.0);
+}
+
+void llama_context::release_transient_vram() {
+    if (auto * kvq = mem_kvq; kvq && kvq->get_store()) {
+        kvq->get_store()->synchronize();
+        kvq->get_store()->codes_free();
+    }
+    if (!sched) {
+        return;
+    }
+    size_t size0 = 0;
+    std::vector<size_t> sizes(backend_ptrs.size(), SIZE_MAX);
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (!ggml_backend_buft_is_host(backend_buft[i])) {
+            size0 += ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            sizes[i] = 0;
+        }
+    }
+    if (size0 == 0) {
+        return;
+    }
+    for (auto * backend : backend_ptrs) {
+        ggml_backend_synchronize(backend);
+    }
+    ggml_backend_sched_resize_buffers(sched.get(), sizes.data());
+    gf_res_prev_active = nullptr;
+    phase_released     = true;
+    LLAMA_LOG_INFO("%s: released %.2f MiB device compute buffers\n", __func__, size0/1048576.0);
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -5482,6 +5511,12 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 int32_t llama_context_n_splits(const struct llama_context * ctx) {
     return ggml_backend_sched_get_n_splits(ctx->get_sched());
+}
+
+void llama_context_release_transient_vram(struct llama_context * ctx) {
+    if (ctx) {
+        ctx->release_transient_vram();
+    }
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

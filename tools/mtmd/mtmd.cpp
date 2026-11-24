@@ -606,6 +606,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* vram_swap         */ false,
     };
     return params;
 }
@@ -892,6 +893,92 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
+    // transient GPU residency: weights stay in buf_host and are uploaded only during encode
+    struct vram_swap_model {
+        mtmd_model * model = nullptr;
+        ggml_backend_buffer_ptr buf_host;
+        std::vector<std::pair<ggml_tensor *, void *>> host_ptrs;
+    };
+    bool vram_swap = false;
+    bool vram_swap_on_dev = false;
+    ggml_backend_dev_t vram_swap_dev = nullptr;
+    std::vector<vram_swap_model> vram_swap_models;
+
+    bool vram_swap_acquire() {
+        if (!vram_swap || vram_swap_on_dev) {
+            return true;
+        }
+        const int64_t t0 = ggml_time_us();
+        if (backends && !backends->acquire_gpu(vram_swap_dev)) {
+            return false;
+        }
+        ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(vram_swap_dev);
+        size_t total_bytes = 0;
+        for (auto & sm : vram_swap_models) {
+            for (auto & [t, _] : sm.host_ptrs) {
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
+            sm.model->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(sm.model->ctx_data.get(), dev_buft));
+            if (!sm.model->buf) {
+                LOG_ERR("%s: failed to allocate transient GPU buffer for mmproj weights\n", __func__);
+                for (auto & sm2 : vram_swap_models) {
+                    sm2.model->buf.reset();
+                    for (auto & [t, ptr] : sm2.host_ptrs) {
+                        t->buffer = sm2.buf_host.get();
+                        t->data   = ptr;
+                    }
+                }
+                if (backends) {
+                    backends->release_gpu();
+                }
+                return false;
+            }
+            ggml_backend_buffer_set_usage(sm.model->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            for (auto & [t, ptr] : sm.host_ptrs) {
+                const size_t nbytes = ggml_nbytes(t);
+                ggml_backend_tensor_set(t, ptr, 0, nbytes);
+                total_bytes += nbytes;
+            }
+        }
+        vram_swap_on_dev = true;
+        LOG_INF("%s: uploaded %.1f MiB mmproj weights to %s in %.2f ms\n", __func__,
+                total_bytes / 1048576.0, ggml_backend_dev_name(vram_swap_dev), (ggml_time_us() - t0) / 1000.0);
+        return true;
+    }
+
+    void vram_swap_release() {
+        if (!vram_swap || !vram_swap_on_dev) {
+            return;
+        }
+        const int64_t t0 = ggml_time_us();
+        size_t comp_bytes = 0;
+        if (backends && backends->sched) {
+            for (size_t i = 0; i < backends->ptrs.size(); ++i) {
+                if (!ggml_backend_buft_is_host(backends->bufts[i])) {
+                    comp_bytes += ggml_backend_sched_get_buffer_size(backends->sched.get(), backends->ptrs[i]);
+                }
+            }
+        }
+        if (backends) {
+            backends->release_gpu();
+        }
+        size_t wt_bytes = 0;
+        for (auto & sm : vram_swap_models) {
+            if (sm.model->buf) {
+                wt_bytes += ggml_backend_buffer_get_size(sm.model->buf.get());
+                sm.model->buf.reset();
+            }
+            for (auto & [t, ptr] : sm.host_ptrs) {
+                t->buffer = sm.buf_host.get();
+                t->data   = ptr;
+            }
+        }
+        vram_swap_on_dev = false;
+        LOG_INF("%s: released %.1f MiB mmproj weights + %.1f MiB compute buffers + GPU backend in %.2f ms\n", __func__,
+                wt_bytes / 1048576.0, comp_bytes / 1048576.0, (ggml_time_us() - t0) / 1000.0);
+    }
+
     // TODO @ngxson : add timings
 
     mtmd_context(const char * mmproj_fname,
@@ -942,10 +1029,33 @@ struct mtmd_context {
         model_params.progress_callback           = ctx_params.progress_callback;
         model_params.progress_callback_user_data = ctx_params.progress_callback_user_data;
 
-        ggml_backend_buffer_type_t buft = device
+        const bool use_vram_swap = ctx_params.vram_swap && device != nullptr && !no_alloc;
+        vram_swap     = use_vram_swap;
+        vram_swap_dev = use_vram_swap ? device : nullptr;
+
+        ggml_backend_buffer_type_t buft = (device && !use_vram_swap)
             ? ggml_backend_dev_buffer_type(device)
             : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
         models = mtmd_model_load(mmproj_fname, model_params, buft);
+
+        if (use_vram_swap) {
+            for (mtmd_model * m : { models.v.get(), models.a.get(), models.gen_a.get() }) {
+                if (!m || !m->buf || !m->ctx_data) {
+                    continue;
+                }
+                vram_swap_model sm;
+                sm.model    = m;
+                sm.buf_host = std::move(m->buf);
+                for (ggml_tensor * t = ggml_get_first_tensor(m->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(m->ctx_data.get(), t)) {
+                    if (t->buffer != nullptr && t->view_src == nullptr) {
+                        sm.host_ptrs.emplace_back(t, t->data);
+                    }
+                }
+                vram_swap_models.push_back(std::move(sm));
+            }
+            LOG_INF("%s: mmproj vram_swap enabled (weights kept in host RAM, transient GPU %s)\n",
+                    __func__, ggml_backend_dev_name(device));
+        }
 
         // soprano and pocket-tts without voice cloning have no encoder
         if (!models.v && !models.a && !models.gen_a) {
@@ -960,13 +1070,13 @@ struct mtmd_context {
         }
 
         // no_alloc only measures memory, nothing is computed
-        backends = std::make_unique<mtmd_backends>(device, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
+        backends = std::make_unique<mtmd_backends>(use_vram_swap ? nullptr : device, no_alloc ? 1 : ctx_params.n_threads, max_nodes,
                                                    ctx_params.cb_eval, ctx_params.cb_eval_user_data);
 
         // like llama_context::sched_reserve(), each warmup reserves its graph on the shared scheduler
         mtmd_subctx_params sctx_params {
             /* flash_attn_type   */ mtmd_to_flash_attn_type(ctx_params.flash_attn_type),
-            /* warmup            */ ctx_params.warmup,
+            /* warmup            */ use_vram_swap ? false : ctx_params.warmup,
         };
         if (models.v) {
             ctx_v = std::make_unique<mtmd_subcontext>(*models.v, *backends, sctx_params);
@@ -1650,6 +1760,26 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+bool mtmd_is_vram_swap(const mtmd_context * ctx) {
+    return ctx != nullptr && ctx->vram_swap;
+}
+
+bool mtmd_vram_swap_acquire(mtmd_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return ctx->vram_swap_acquire();
+}
+
+void mtmd_vram_swap_release(mtmd_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    ctx->vram_swap_release();
 }
 
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge) {
