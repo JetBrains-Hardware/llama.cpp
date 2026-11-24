@@ -20,7 +20,7 @@ llama-server \
 - **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.87-14.90 GiB` peak PP / `14.51-14.54 GiB` TG process VRAM, `3,060 / 2,974 t/s` prefill, `108.5 / 113.6 t/s` decode (`61.1% / 62.3%` acceptance).
 - **Max context in `15.5 GiB` (`15,872 MiB`, 16 GB card):**
   - Default (`-ub 2048`, uncapped draft KV): **`~230k-235k`** (`4.00 KiB/tok` PP / `7.52 KiB/tok` TG; `-c 131072` fits at `~15.01 GiB` PP / `~14.75 GiB` TG).
-  - With `LLAMA_DSPARK_KV_CAP=4096` (`-ub 2048`): **`~480k-485k`** (`0 B/tok` PP / `3.52 KiB/tok` TG; measured `-c 500000` at `14.31 GiB` loaded / `15.55 GiB` TG).
+  - With `LLAMA_DSPARK_KV_CAP=8192` (`-ub 2048`, recommended for long context up to `~500k`): **`~475k-480k`** (`0 B/tok` PP / `3.52 KiB/tok` TG; `+16 MiB` vs `4096`, recovers `+4.6%` acceptance on `76k`; `4096` reaches `~480k-485k`, measured `-c 500000` at `14.31 GiB` loaded / `15.55 GiB` TG).
 - **Why each knob:**
   - `--kvq`: two-tier KV cache for the 8 full-attention slots (`3.52 KiB/tok` TG, `0 B/tok` PP with tiled `80.2 MiB` `kvq_scr` vs `32 KiB/tok` FP16), plus compact `1,280`-cell SWA cache (`106.25 MiB`) using per-layer SWA prefill scratch so `-ub 2048` adds zero permanent SWA VRAM.
   - `--kvq-prefill-free-codes`: frees KVQ `codes + tables` during prefill and re-uploads from pinned host RAM (`~5-15 ms`), offsetting the `-ub 2048` compute buffer at PP peak.
@@ -31,7 +31,7 @@ llama-server \
   - `--spec-draft-n-ubatch 512`: bit-exact; saves `134 MiB` PP / `24 MiB` TG with no speed loss.
   - `layer_inp_dev` is `F16` by default in this branch (saves `36 MiB` PP at `-b 2048`, zero acceptance loss).
   - **Do NOT pass `-ctkd` / `-ctvd` (`q8_0`/`q4_0`):** DSpark block-8 decode selects `MMA_F16`, which dequantizes the entire draft KV cache into `384 MiB` of TG compute buffer on every step (more VRAM and slower).
-- **Long context (`128k-256k` on 16 GB):** add `LLAMA_DSPARK_KV_CAP=4096` in the environment to cap DSpark's global layer-1 KV to a 4k sliding window (`14.60 GiB` peak @ 96k, saves `0.5-1.0 GiB` @ 128k-256k, unaffected PP).
+- **Long context (`256k-500k` on 16 GB):** main default stays uncapped (best acceptance up to `~230k`); for long contexts up to `~500k`, add `LLAMA_DSPARK_KV_CAP=8192` in the environment to cap DSpark's global layer-1 KV to an 8k sliding window (`+16 MiB` over `4096`, recovers `+4.6%` 76k acceptance to `58.8%`, unaffected PP).
 - **Vision (optional):** pass `--no-mmproj-offload` if adding `-mm <mmproj.gguf>` on a 16 GB card (`0 MiB` VRAM).
 
 ## Support in ggml-org/llama.cpp
@@ -346,6 +346,19 @@ Tested `-ot ^token_embd\.weight$=CPU` and `--kvq-resident-cap 4096` on `req_32k.
 
 - **`-ot ^token_embd\.weight$=CPU` saves `0 MiB`:** `llama.cpp` already maps `token_embd.weight` (`303.67 MiB`) to `CPU_Mapped` by default (`output.weight` is the `303.67 MiB` tensor on GPU).
 - **`--kvq-resident-cap 4096` adopted as default:** cuts device `resident` by `-68.0 MiB` and host `other` by `-70.0 MiB` with `<1%` speed delta, unchanged acceptance, and bit-identical 500k output hash (`cfa946bbe33e`), pushing `15.5 GiB` max context to `~480k-485k` (`~230k-235k` uncapped).
+
+### DSpark KV cap sweep (`4k` / `8k` / `16k` under new defaults)
+
+Re-tested `LLAMA_DSPARK_KV_CAP` under the adopted defaults (`-c 98304 -b 2048 -ub 2048 --kvq --kvq-prefill-free-codes --kvq-resident-cap 4096`, `Q8_0` DSpark `K=4`, `dub=512`, greedy `temp=0`; identical output hashes across `4096`/`8192`/`16384` on both 32k `c2d31af20b81` and 76k `c38c6d9814dd`):
+
+| `LLAMA_DSPARK_KV_CAP` | Peak proc VRAM (32k / 76k) | End proc VRAM (32k / 76k) | Delta vs `4096` | PP (32k / 76k) | TG (32k / 76k) | Acceptance (32k / 76k) |
+|---|---:|---:|---:|---|---|---|
+| `None` (default, uncapped) | `15,226 / 15,256 MiB` | `14,856 / 14,880 MiB` | `+353 to +360 MiB` | `3,056.1 / 2,978.7 t/s` | `105.6 / 111.8 t/s` | `61.1% / 62.3%` |
+| `4096` | `14,866 / 14,903 MiB` | `14,496 / 14,527 MiB` | baseline | `3,044.2 / 2,960.3 t/s` | `106.4 / 105.5 t/s` | `59.2% / 54.2%` |
+| **`8192` (rec. for `~500k`)** | **`14,882 / 14,912 MiB`** | **`14,512 / 14,536 MiB`** | **`+9 to +16 MiB`** | **`3,038.3 / 2,967.7 t/s`** | **`105.6 / 106.9 t/s`** | **`59.2% / 58.8%`** |
+| `16384` | `14,912 / 14,937 MiB` | `14,542 / 14,561 MiB` | `+34 to +46 MiB` | `3,040.5 / 2,959.4 t/s` | `111.7 / 105.4 t/s` | `62.0% / 58.8%` |
+
+- Main default stays uncapped (`~230k-235k` max context in `15.5 GiB`). For long contexts up to `~500k`, `LLAMA_DSPARK_KV_CAP=8192` is the recommended opt-in: `+16 MiB` over `4096` (`~475k-480k` in `15.5 GiB`) while capturing all of `16384`'s `76k` acceptance gain (`58.8%` vs `54.2%`).
 
 ## Local tools (not committed)
 
