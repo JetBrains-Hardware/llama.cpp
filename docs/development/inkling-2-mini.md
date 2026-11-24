@@ -13,18 +13,18 @@ llama-server \
   -md dspark-Inkling-2-Mini-Q8_0-mainline.gguf \
   --spec-type draft-dspark --spec-draft-n-max 4 --spec-draft-n-ubatch 512 \
   -ngl 99 -ngld 99 -fa on -c 98304 -b 2048 -ub 2048 -np 1 \
-  --kvq --kvq-prefill-free-codes \
+  --kvq --kvq-prefill-free-codes --kvq-resident-cap 4096 \
   --port 8765 --jinja
 ```
 
-- **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.94-14.97 GiB` peak PP / `14.57-14.60 GiB` TG process VRAM, `3,059 / 2,977 t/s` prefill, `109.5 / 113.9 t/s` decode (`58.8% / 62.8%` acceptance).
+- **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.87-14.90 GiB` peak PP / `14.51-14.54 GiB` TG process VRAM, `3,060 / 2,974 t/s` prefill, `108.5 / 113.6 t/s` decode (`61.1% / 62.3%` acceptance).
 - **Max context in `15.5 GiB` (`15,872 MiB`, 16 GB card):**
-  - Default (`-ub 2048`, uncapped draft KV): **`~220k-225k`** (`4.00 KiB/tok` PP / `7.52 KiB/tok` TG; `-c 131072` fits at `~15.07 GiB` PP / `~14.81 GiB` TG).
-  - With `LLAMA_DSPARK_KV_CAP=4096` (`-ub 2048`): **`~465k-470k`** (`0 B/tok` PP / `3.52 KiB/tok` TG; measured `-c 262144` at `14.38 GiB` PP / `14.78 GiB` TG, and `-c 500000` at `14.37 GiB` PP / `15.62 GiB` TG).
-  - With `LLAMA_DSPARK_KV_CAP=4096` + `-ot token_embd.weight=CPU` (`-303.7 MiB`): **`~550k-555k`** (`500k` fits at `~15.32 GiB` TG / `~14.07 GiB` PP).
+  - Default (`-ub 2048`, uncapped draft KV): **`~230k-235k`** (`4.00 KiB/tok` PP / `7.52 KiB/tok` TG; `-c 131072` fits at `~15.01 GiB` PP / `~14.75 GiB` TG).
+  - With `LLAMA_DSPARK_KV_CAP=4096` (`-ub 2048`): **`~480k-485k`** (`0 B/tok` PP / `3.52 KiB/tok` TG; measured `-c 500000` at `14.31 GiB` loaded / `15.55 GiB` TG).
 - **Why each knob:**
   - `--kvq`: two-tier KV cache for the 8 full-attention slots (`3.52 KiB/tok` TG, `0 B/tok` PP with tiled `80.2 MiB` `kvq_scr` vs `32 KiB/tok` FP16), plus compact `1,280`-cell SWA cache (`106.25 MiB`) using per-layer SWA prefill scratch so `-ub 2048` adds zero permanent SWA VRAM.
   - `--kvq-prefill-free-codes`: frees KVQ `codes + tables` during prefill and re-uploads from pinned host RAM (`~5-15 ms`), offsetting the `-ub 2048` compute buffer at PP peak.
+  - `--kvq-resident-cap 4096`: halves KVQ `resident` from `137.1` to `69.1 MiB` (`-68 MiB` VRAM, `-70 MiB` host RAM) with `<1%` speed impact and unchanged acceptance.
   - `-b 2048 -ub 2048`: raises MoE utilization from `32` to `128` tokens/expert (`+32%` faster prefill vs `-ub 512`).
   - `-md dspark-Inkling-2-Mini-Q8_0-mainline.gguf`: full `Q8_0` drafter saves `188 MiB` vs `BF16-w2q8` with zero acceptance loss.
   - `--spec-draft-n-max 4`: `K=4` gives `n_rep * (K+1) = 15` query columns per KV head, filling `15/16` of `kvq-attn`'s `N=16` MMA tile.
@@ -331,10 +331,21 @@ Measured on RTX 5090 (`-b 2048 -ub 2048 -np 1 -fa on --kvq --kvq-prefill-free-co
 | `-c 262144` (`LLAMA_DSPARK_KV_CAP=4096`) | `80.2 MiB` | `14,721 MiB` (`14.38 GiB`) | `15,135 MiB` (`14.78 GiB`) | `2,959 t/s` (`76k`) | `66.2 t/s` (64 tok, `44.3%`) |
 | `-c 500000` (`LLAMA_DSPARK_KV_CAP=4096`) | `80.2 MiB` | `14,715 MiB` (`14.37 GiB`) | `15,991 MiB` (`15.62 GiB`) | `2,956 t/s` (`76k`) | `65.4 t/s` (64 tok, `44.3%`, bit-exact w/ 256k) |
 
-Next-step VRAM headroom options (item 2, to push `500k` cleanly under `15.5 GiB`):
+### KVQ resident cap and embedding offload (measured results)
 
-- `-ot token_embd.weight=CPU`: `token_embd.weight` is `Q5_K [2304, 201024]` = **`303.7 MiB`** (frees `303.7 MiB` in both PP and TG with ~0% speed loss; drops `500k` TG to `~15.32 GiB`, max context `~550k-555k` in `15.5 GiB`).
-- `--kvq-resident-cap 4096` (from `8192`): halves `resident` (`137.1 -> ~68.6 MiB`, **`-68.5 MiB`** in TG; needs acceptance/KL check).
+Tested `-ot ^token_embd\.weight$=CPU` and `--kvq-resident-cap 4096` on `req_32k.json` and `req_76k.json` at `-c 98304` and `-c 500000` (`LLAMA_DSPARK_KV_CAP=4096`, greedy `temp=0`):
+
+| Config (`-b 2048 -ub 2048`, `Q8_0` DSpark `K=4`, `dub=512`, `--kvq --kvq-prefill-free-codes`) | `resident` | Loaded proc VRAM | Peak / End proc VRAM | PP (`32k` / `76k`) | TG (`32k` / `76k`, acc) |
+|---|---:|---:|---:|---|---|
+| Baseline `-c 98304` (tiled `121bd1080`) | `137.1 MiB` | `15,087 MiB` | `15,295-15,325` / `14,923-14,947 MiB` | `3,058.7 / 2,977.0 t/s` | `109.5 / 113.9 t/s` (`58.8% / 62.8%`) |
+| `-c 98304` + `-ot ^token_embd\.weight$=CPU` | `137.1 MiB` | `15,088 MiB` (`+1`) | `15,296-15,333` / `14,924-14,955 MiB` | `3,064.6 / 2,977.1 t/s` | `110.7 / 111.6 t/s` (`58.8% / 62.8%`) |
+| `-c 98304` + `--kvq-resident-cap 4096` | **`69.1 MiB`** | **`15,023 MiB` (`-64`)** | **`15,231-15,261` / `14,861-14,885 MiB`** | **`3,059.5 / 2,974.4 t/s`** | **`108.5 / 113.6 t/s` (`61.1% / 62.3%`)** |
+| Baseline `-c 500000` (`cap=4096`, `76k` 64 tok) | `137.1 MiB` | `14,715 MiB` | `15,991 MiB` (`15.62 GiB`) | `2,956.0 t/s` | `65.4 t/s` (`44.3%`, `cfa946bbe33e`) |
+| `-c 500000` + `-ot ^token_embd\.weight$=CPU` | `137.1 MiB` | `14,715 MiB` (`0`) | `15,989 MiB` (`15.61 GiB`) | `2,952.2 t/s` | `66.0 t/s` (`44.3%`, `cfa946bbe33e`) |
+| `-c 500000` + `--kvq-resident-cap 4096` | **`69.1 MiB`** | **`14,651 MiB` (`-64`)** | **`15,924 MiB` (`15.55 GiB`, `-67`)** | **`2,948.8 t/s`** | **`64.3 t/s` (`44.3%`, `cfa946bbe33e`)** |
+
+- **`-ot ^token_embd\.weight$=CPU` saves `0 MiB`:** `llama.cpp` already maps `token_embd.weight` (`303.67 MiB`) to `CPU_Mapped` by default (`output.weight` is the `303.67 MiB` tensor on GPU).
+- **`--kvq-resident-cap 4096` adopted as default:** cuts device `resident` by `-68.0 MiB` and host `other` by `-70.0 MiB` with `<1%` speed delta, unchanged acceptance, and bit-identical 500k output hash (`cfa946bbe33e`), pushing `15.5 GiB` max context to `~480k-485k` (`~230k-235k` uncapped).
 
 ## Local tools (not committed)
 
