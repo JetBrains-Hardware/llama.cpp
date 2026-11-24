@@ -4733,6 +4733,19 @@ struct test_mul_mat_shared_src1 : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_SHARED_SRC1";
+// Row L2 clip fusion (Inkling 2 q/k/r clip): y = c*clamp(t/(sqrt(sum(c^2)) + eps), 0, 1), c = x (* w)
+// CUDA matches the chain [mul,] sqr, sum_rows, sqrt, scale, [fill,] div, clamp, mul
+struct test_clip_rows_fuse : public test_case {
+    const std::array<int64_t, 4> ne; // [D, H, T, 1]
+    const bool with_w;
+    const bool shared_limit; // threshold tensor filled outside the chain
+    const bool inplace_fill; // ggml_fill_inplace on the norm: overwrites the denominator, must not fuse
+    const bool inplace_sqr;  // ggml_sqr_inplace on c: overwrites the input of the final mul, must not fuse
+    const bool limit_is_c;   // the limit is c = x*w itself (one column), an intermediate of the chain: must not fuse
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CLIP_ROWS_FUSE";
     }
 
     bool run_whole_graph() override { return true; }
@@ -4816,6 +4829,40 @@ struct test_mul_mat_shared_src1 : public test_case {
         }
         out = ggml_add(ctx, out, ggml_mul_mat(ctx, a1, y));
         out = ggml_add(ctx, out, ggml_mul_mat(ctx, a2, y));
+    std::string vars() override {
+        return VARS_TO_STR6(ne, with_w, shared_limit, inplace_fill, inplace_sqr, limit_is_c);
+    }
+
+    test_clip_rows_fuse(std::array<int64_t, 4> ne = {128, 24, 7, 1}, bool with_w = true, bool shared_limit = false,
+                        bool inplace_fill = false, bool inplace_sqr = false, bool limit_is_c = false)
+        : ne(ne), with_w(with_w), shared_limit(shared_limit), inplace_fill(inplace_fill), inplace_sqr(inplace_sqr),
+          limit_is_c(limit_is_c) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * limit = nullptr;
+        if (shared_limit) {
+            limit = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2], ne[3]), 1.5f);
+        }
+
+        ggml_tensor * c = x;
+        if (with_w) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            ggml_set_name(w, "w");
+            c = ggml_mul(ctx, x, w);
+        }
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, inplace_sqr ? ggml_sqr_inplace(ctx, c) : ggml_sqr(ctx, c)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        if (limit_is_c) {
+            limit = c;
+        }
+        if (!limit) {
+            limit = inplace_fill ? ggml_fill_inplace(ctx, norm, 1.5f) : ggml_fill(ctx, norm, 1.5f);
+        }
+        ggml_tensor * factor = ggml_div(ctx, limit, norm);
+        ggml_tensor * out = ggml_mul(ctx, c, ggml_clamp(ctx, factor, 0.0f, 1.0f));
         ggml_set_name(out, "out");
         return out;
     }
@@ -12091,6 +12138,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    // row L2 clip fusion: short and long rows, decode (few rows) and prefill (many rows) block sizes
+    for (bool with_w : { true, false }) {
+        for (bool shared_limit : { false, true }) {
+            test_cases.emplace_back(new test_clip_rows_fuse({ 128,  24,   1, 1}, with_w, shared_limit));
+            test_cases.emplace_back(new test_clip_rows_fuse({ 128,   8, 512, 1}, with_w, shared_limit));
+            test_cases.emplace_back(new test_clip_rows_fuse({  16,  24,  33, 1}, with_w, shared_limit));
+            test_cases.emplace_back(new test_clip_rows_fuse({1100,   3,   5, 1}, with_w, shared_limit));
+        }
+        // an in-place fill of the norm overwrites the denominator: the chain must run unfused
+        test_cases.emplace_back(new test_clip_rows_fuse({ 128,  24,   7, 1}, with_w, false, true));
+        // an in-place sqr of c overwrites the input of the final mul: the chain must run unfused
+        test_cases.emplace_back(new test_clip_rows_fuse({ 128,  24,   7, 1}, with_w, false, false, true));
+    }
+    // a one-column limit that is c = x*w itself is an intermediate of the chain: the chain must run unfused
+    test_cases.emplace_back(new test_clip_rows_fuse({   1,  24,   7, 1}, true, false, false, false, true));
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
