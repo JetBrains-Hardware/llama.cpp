@@ -424,6 +424,14 @@ struct llama_layer {
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
+    // per-layer context K/V from mixed target features (Inkling2 DSpark)
+    struct ggml_tensor * dflash_ctx_mix         = nullptr;
+    struct ggml_tensor * dflash_ctx_norm        = nullptr;
+    struct ggml_tensor * dflash_wk_ctx          = nullptr;
+    struct ggml_tensor * dflash_wv_ctx          = nullptr;
+    struct ggml_tensor * dflash_attn_k_ctx_norm = nullptr;
+    struct ggml_tensor * dflare_norm            = nullptr; // fused Inkling2 DSpark: norm of the per-layer feature mix
+
     struct ggml_tensor * lilicorr_attn_norm       = nullptr;
     struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
     struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
@@ -692,6 +700,9 @@ struct llama_layer {
     struct ggml_tensor * mudd_up          = nullptr;
     struct ggml_tensor * mudd_up_b        = nullptr;
 
+    // diffusion-gemma encoder-mode per-layer output scale (prompt positions)
+    struct ggml_tensor * enc_out_scale = nullptr;
+
     // inkling2
     struct ggml_tensor * attn_rel         = nullptr;
     struct ggml_tensor * attn_rel_bias    = nullptr;
@@ -721,6 +732,15 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    // inkling (private arch)
+    struct ggml_tensor * wr             = nullptr; // attn_r  [n_embd, n_head*d_rel]
+    struct ggml_tensor * attn_rel_proj  = nullptr; // [rel_extent, d_rel] (checkpoint [d_rel, E] orientation)
+    struct ggml_tensor * shortconv_k    = nullptr; // [K, kvw]
+    struct ggml_tensor * shortconv_v    = nullptr; // [K, kvw]
+    struct ggml_tensor * shortconv_attn = nullptr; // [K, n_embd]
+    struct ggml_tensor * shortconv_mlp  = nullptr; // [K, n_embd]
+    struct ggml_tensor * ffn_gscale     = nullptr; // F32 [1]
 };
 
 struct llama_device {
@@ -864,6 +884,12 @@ struct llama_model {
     // hrm-text initial low-cycle state
     struct ggml_tensor * hrm_z_l_init = nullptr;
 
+    // diffusion-gemma self-conditioning gated MLP (model-level, decoder-only)
+    struct ggml_tensor * sc_pre_norm = nullptr;
+    struct ggml_tensor * sc_gate     = nullptr;
+    struct ggml_tensor * sc_up       = nullptr;
+    struct ggml_tensor * sc_down     = nullptr;
+
     // metis16 hyper-connection stream embeddings, depth memory and continuation head
     struct ggml_tensor * stream_embd             = nullptr;
     struct ggml_tensor * depth_mem_state_write   = nullptr;
@@ -939,6 +965,13 @@ struct llama_model {
     struct ggml_tensor * dspark_joint_proj   = nullptr; // rnn markov head
     struct ggml_tensor * dspark_joint_proj_b = nullptr;
     struct ggml_tensor * dspark_mask_embd    = nullptr; // per-slot mask embeddings
+    struct ggml_tensor * dspark_markov_w2_b      = nullptr;
+    struct ggml_tensor * dspark_markov_ctx_mix   = nullptr; // rnn markov head: f_rnn from target features
+    struct ggml_tensor * dspark_markov_ctx_norm  = nullptr;
+    struct ggml_tensor * dspark_fuse         = nullptr;
+    struct ggml_tensor * dspark_norm         = nullptr;
+    struct ggml_tensor * dspark_hidden_out   = nullptr;
+    struct ggml_tensor * dspark_hidden_out_b = nullptr;
 
     // zaya1
     struct ggml_tensor * res_scale_in   = nullptr;
@@ -1067,6 +1100,12 @@ struct llama_model {
 
     // apply Hadamard transform to the lightning indexer keys
     virtual bool lid_k_hdmd() const { return false; }
+
+    // the layer whose weights layer il uses (looped layers share the weights of their first visit)
+    virtual int32_t layer_weights(int32_t il) const { return il; }
+
+    // layers that hold weights: the unit of n_gpu_layers and of the device splits
+    uint32_t n_layer_weights() const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

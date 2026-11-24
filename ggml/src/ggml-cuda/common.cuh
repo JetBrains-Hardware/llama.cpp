@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -64,6 +65,14 @@
 #define GGML_CUDA_CC_OFFSET_AMD      0x1000000
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000
 #define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
+
+// datacenter Blackwell (sm_100 / sm_103: B200, B300); consumer Blackwell is GGML_CUDA_CC_BLACKWELL
+#define GGML_CUDA_CC_IS_BLACKWELL_DC(cc) (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 1000 && cc < 1100)
+// GPUs with the small-batch decode tuning (MMVF / vector FA at 2-8 tokens): NVIDIA from Turing on, except Hopper.
+// Measured faster on T4 (7.5), A100 (8.0), L4 (8.9), B200 (10.0), RTX PRO 6000 (12.0); Hopper (9.x) is not measured,
+// so it keeps the previous choice.
+#define GGML_CUDA_CC_HAS_SMALL_BATCH_TUNING(cc) (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING && \
+    !(cc >= GGML_CUDA_CC_HOPPER && cc < 1000))
 
 // AMD
 // GCN/CDNA, wave size is 64
@@ -1269,6 +1278,27 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ1_M> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ1_XS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR1_XS;
+    static constexpr int qi = QI1_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ1_XXS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR1_XXS;
+    static constexpr int qi = QI1_XXS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ1_XXXS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR1_XXXS;
+    static constexpr int qi = QI1_XXXS;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
     static constexpr int qk = QK4_NL;
     static constexpr int qr = QR4_NL;
@@ -1395,6 +1425,49 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
 
+// a MUL_MAT src1 quantized for MMVQ or MMQ, kept from one MUL_MAT node to the next one that reads the same tensor
+// (GGML_CUDA_DISABLE_Q8_1_REUSE=1 turns it off). The graph evaluation loop enables it for MUL_MAT nodes on one stream
+// and drops it at the start and end of a graph and after any node whose output overlaps the quantized tensor.
+// The buffer is a pool allocation: it is freed only between nodes, when it is the top of the pool stack.
+struct ggml_cuda_src1_cache {
+    bool                enabled = false;
+    const ggml_tensor * src1    = nullptr;
+    const void        * data    = nullptr;
+    int64_t             ne[GGML_MAX_DIMS] = {};
+    size_t              nb[GGML_MAX_DIMS] = {};
+    int                 layout  = -1;
+    ggml_cuda_pool    * pool    = nullptr;
+    void              * ptr     = nullptr;
+    size_t              size    = 0;
+    int64_t             n_hit   = 0;
+    int64_t             n_miss  = 0;
+
+    void release() {
+        if (ptr) {
+            pool->free(ptr, size);
+        }
+        src1 = nullptr;
+        data = nullptr;
+        pool = nullptr;
+        ptr  = nullptr;
+        size = 0;
+    }
+
+    // after a node ran: drop the cache when the node wrote memory of the quantized tensor
+    void invalidate_if_written(const ggml_tensor * node) {
+        if (!src1 || !node->data) {
+            return;
+        }
+        const char * lo  = (const char *) data;
+        const char * hi  = lo + ggml_nbytes(src1);
+        const char * nlo = (const char *) node->data;
+        const char * nhi = nlo + ggml_nbytes(node);
+        if (nlo < hi && lo < nhi) {
+            release();
+        }
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1411,15 +1484,21 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Map from graph key to cuda_graph - allows multiple graphs per context when the
+    // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same
+    // split is called with different tensor shapes (e.g. a speculative verify batch)
+    // a cuda graph instance is only valid for the shapes it captured, so a caller that
+    // alternates shapes needs one instance per shape to stay on the graph path. the map is
+    // bounded only by the time based sweep below, as upstream does: tensor split mode alone
+    // needs about 2 * n_layers + 1 graphs per device and shape, so any count cap small enough
+    // to matter evicts graphs that are still in use and re-captures them on every token
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
     int64_t next_graph_eviction_time = 0;
     int64_t last_graph_use_time = 0;
 
     // defined in ggml-cuda.cu, which includes graph.cuh
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr, int64_t time_now = ggml_time_us());
+    ggml_cuda_graph * cuda_graph(uint64_t graph_key, int64_t time_now = ggml_time_us());
 
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
@@ -1479,6 +1558,8 @@ struct ggml_backend_cuda_context {
     }
 #endif
 
+    ggml_cuda_src1_cache src1_cache;
+
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
@@ -1495,6 +1576,32 @@ struct ggml_backend_cuda_context {
         return pool(device);
     }
 };
+
+// the buffer for src1 quantized with `layout` (nbytes or more) when the src1 cache is on, else nullptr;
+// *hit is set when the buffer already holds src1 in that layout, so that the quantization can be skipped
+static inline void * ggml_cuda_src1_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, int layout, size_t nbytes, bool * hit) {
+    ggml_cuda_src1_cache & c = ctx.src1_cache;
+    *hit = false;
+    if (!c.enabled || !ggml_is_contiguous(src1) || src1->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (c.src1 == src1 && c.data == src1->data && c.layout == layout && c.size >= nbytes && c.pool == &ctx.pool() &&
+            memcmp(c.ne, src1->ne, sizeof(c.ne)) == 0 && memcmp(c.nb, src1->nb, sizeof(c.nb)) == 0) {
+        *hit = true;
+        c.n_hit++;
+        return c.ptr;
+    }
+    c.release();
+    c.pool   = &ctx.pool();
+    c.ptr    = c.pool->alloc(nbytes, &c.size);
+    c.src1   = src1;
+    c.data   = src1->data;
+    c.layout = layout;
+    memcpy(c.ne, src1->ne, sizeof(c.ne));
+    memcpy(c.nb, src1->nb, sizeof(c.nb));
+    c.n_miss++;
+    return c.ptr;
+}
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

@@ -294,6 +294,21 @@ struct mtmd_model_loader {
 
             // model-specific params
             switch (model.proj_type) {
+                case PROJECTOR_TYPE_INKLING:
+                    {
+                        if (is_vision) {
+                            hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                            hparams.image_resize_pad  = PAD_NONE;
+                            hparams.warmup_image_size = hparams.patch_size;
+                        } else {
+                            hparams.audio_chunk_len   = 0;
+                            hparams.audio_sample_rate = 16000;
+                            hparams.audio_n_fft       = 1600;
+                            hparams.audio_window_len  = 1600;
+                            hparams.audio_hop_len     = 800;
+                            hparams.warmup_audio_size = 4;
+                        }
+                    } break;
                 case PROJECTOR_TYPE_MLP:
                 case PROJECTOR_TYPE_MLP_NORM:
                 case PROJECTOR_TYPE_LDP:
@@ -616,6 +631,23 @@ struct mtmd_model_loader {
                         const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.dsv4_max_n_token));
                         hparams.set_warmup_n_tokens(warmup_side * warmup_side);
                     } break;
+                case PROJECTOR_TYPE_KIMIK3:
+                    {
+                        hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                        hparams.rope_theta = 10000.0f;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+
+                        int min_pixels = 0, max_pixels = 0;
+                        get_u32(KEY_IMAGE_MIN_PIXELS, min_pixels, false);
+                        get_u32(KEY_IMAGE_MAX_PIXELS, max_pixels, false);
+                        if (min_pixels > 0 && max_pixels > 0) {
+                            hparams.image_min_pixels = min_pixels;
+                            hparams.image_max_pixels = max_pixels;
+                            hparams.warmup_image_size = static_cast<int>(std::sqrt(max_pixels));
+                        } else {
+                            hparams.set_limit_image_tokens(2, 4096);
+                        }
+                    } break;
                 case PROJECTOR_TYPE_GEMMA3:
                     {
                         // default value (used by all model sizes in gemma 3 family)
@@ -917,9 +949,13 @@ struct mtmd_model_loader {
                         hparams.n_merge = 2;
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
-                        get_f32(KEY_SWIGLU_CLAMP, hparams.swiglu_clamp, true);
-                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
-                        get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
+                        // pre-upstream files: swiglu_limit, no pixel budget keys
+                        const bool legacy = gguf_find_key(ctx_gguf.get(), KEY_SWIGLU_CLAMP) < 0;
+                        get_f32(legacy ? "clip.vision.swiglu_limit" : KEY_SWIGLU_CLAMP, hparams.swiglu_clamp, true);
+                        hparams.image_min_pixels = 12544;
+                        hparams.image_max_pixels = 6272000;
+                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels, !legacy);
+                        get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, !legacy);
                         hparams.set_limit_image_tokens();
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
@@ -1619,6 +1655,7 @@ struct mtmd_model_loader {
         const bool has_patch_embd = (
             model.modality  == MTMD_MODALITY_VISION &&
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
+            model.proj_type != PROJECTOR_TYPE_INKLING &&
             model.proj_type != PROJECTOR_TYPE_DEEPSEEKOCR &&
             model.proj_type != PROJECTOR_TYPE_DEEPSEEKOCR2);
 
@@ -1636,6 +1673,7 @@ struct mtmd_model_loader {
 
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
+            model.proj_type != PROJECTOR_TYPE_INKLING &&
             model.proj_type != PROJECTOR_TYPE_QWEN3TTS_SPKENC &&
             model.proj_type != PROJECTOR_TYPE_ZONOS3_SPKENC &&
             model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN &&
@@ -1888,6 +1926,23 @@ struct mtmd_model_loader {
         };
 
         switch (model.proj_type) {
+            case PROJECTOR_TYPE_INKLING:
+                {
+                    if (model.modality == MTMD_MODALITY_VISION) {
+                        model.inkling_hmlp_layers.resize(hparams.n_layer);
+                        for (int il = 0; il < hparams.n_layer; ++il) {
+                            auto & layer = model.inkling_hmlp_layers[il];
+                            layer.linear_w = get_tensor(mtmd_format(TN_INKLING_HMLP_LINEAR, il));
+                            layer.norm_w = il + 1 < hparams.n_layer
+                                ? get_tensor(mtmd_format(TN_INKLING_HMLP_NORM, il))
+                                : nullptr;
+                        }
+                        model.inkling_hmlp_final_norm_w = get_tensor(TN_INKLING_HMLP_FINAL_NORM);
+                    } else {
+                        model.inkling_dmel_embd_w       = get_tensor(TN_INKLING_DMEL_EMBD);
+                        model.inkling_dmel_final_norm_w = get_tensor(TN_INKLING_DMEL_FINAL_NORM);
+                    }
+                } break;
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
                 {
@@ -2426,6 +2481,13 @@ struct mtmd_model_loader {
                     model.mm_1_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 1, "bias"));
                     model.mm_2_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_2_b = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "bias"));
+                } break;
+            case PROJECTOR_TYPE_KIMIK3:
+                {
+                    // patchmergerv2, bias-free, norm after the projection
+                    model.mm_1_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_2_w = get_tensor(mtmd_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_post_norm_w = get_tensor(mtmd_format(TN_MM_POST_NORM, "weight"));
                 } break;
             case PROJECTOR_TYPE_KIMIVL:
             case PROJECTOR_TYPE_PADDLEOCR:
@@ -4757,6 +4819,16 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
     projector_type proj = proj_type;
 
     switch (proj) {
+        case PROJECTOR_TYPE_INKLING:
+            {
+                if (modality == MTMD_MODALITY_AUDIO) {
+                    // One dMel row is one soft audio token.
+                    n_patches = img->nx();
+                } else {
+                    // Batch entries are temporal slices; each pair emits one token.
+                    n_patches = 1;
+                }
+            } break;
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
@@ -4861,6 +4933,7 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
         case PROJECTOR_TYPE_D1OMNI_V:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
+        case PROJECTOR_TYPE_KIMIK3:
         case PROJECTOR_TYPE_KIMIK31:
             {
                 // dynamic size
@@ -5153,6 +5226,10 @@ size_t mtmd_model::cbx_read_tensor(const char * name, float * out, size_t n_max)
 
 int mtmd_model::n_mmproj_embd() const {
     switch (proj_type) {
+        case PROJECTOR_TYPE_INKLING:
+            return modality == MTMD_MODALITY_AUDIO
+                ? inkling_dmel_final_norm_w->ne[0]
+                : inkling_hmlp_final_norm_w->ne[0];
         case PROJECTOR_TYPE_LDP:
             return mm_model_block_1_block_2_1_b->ne[0];
         case PROJECTOR_TYPE_LDPV2:
@@ -5237,6 +5314,7 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_KIMIK25:
+        case PROJECTOR_TYPE_KIMIK3:
         case PROJECTOR_TYPE_KIMIK31:
         case PROJECTOR_TYPE_YASA2:
         case PROJECTOR_TYPE_DEEPSEEK4V:

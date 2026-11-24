@@ -466,6 +466,13 @@
 #define TN_A_FFN_POST_NORM   "%s.blk.%d.ffn_post_norm.%s"
 #define TN_A_FFN_POST_NORM_1 "%s.blk.%d.ffn_post_norm_1.%s"
 
+// Inkling hMLP vision and dMel audio towers.
+#define TN_INKLING_HMLP_LINEAR     "v.hmlp.%d.linear.weight"
+#define TN_INKLING_HMLP_NORM       "v.hmlp.%d.norm.weight"
+#define TN_INKLING_HMLP_FINAL_NORM "v.hmlp.final_norm.weight"
+#define TN_INKLING_DMEL_EMBD       "a.dmel.embedding.weight"
+#define TN_INKLING_DMEL_FINAL_NORM "a.dmel.final_norm.weight"
+
 // mobilenetv5 (gemma3n) definitions
 #define TN_MNV5_STEM_CONV        "v.conv_stem.conv.weight"
 #define TN_MNV5_STEM_BIAS        "v.conv_stem.conv.bias"
@@ -537,6 +544,7 @@
 #define MTMD_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
 enum projector_type {
+    PROJECTOR_TYPE_INKLING,
     PROJECTOR_TYPE_MLP,
     PROJECTOR_TYPE_MLP_NORM,
     PROJECTOR_TYPE_LDP,
@@ -594,6 +602,7 @@ enum projector_type {
     PROJECTOR_TYPE_YOUTUVL,
     PROJECTOR_TYPE_YASA2,
     PROJECTOR_TYPE_KIMIK25,
+    PROJECTOR_TYPE_KIMIK3,
     PROJECTOR_TYPE_KIMIK31,
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
     PROJECTOR_TYPE_NEMOTRON_OMNI,
@@ -640,6 +649,7 @@ enum projector_type {
 };
 
 static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+    { PROJECTOR_TYPE_INKLING,           "inkling" },
     { PROJECTOR_TYPE_MLP,               "mlp" },
     { PROJECTOR_TYPE_LDP,               "ldp" },
     { PROJECTOR_TYPE_LDPV2,             "ldpv2"},
@@ -696,6 +706,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
     { PROJECTOR_TYPE_YASA2,             "yasa2"},
     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
+    { PROJECTOR_TYPE_KIMIK3,            "kimik3"},
     { PROJECTOR_TYPE_KIMIK31,           "kimik31"},
     { PROJECTOR_TYPE_NEMOTRON_V2_VL,    "nemotron_v2_vl"},
     { PROJECTOR_TYPE_NEMOTRON_OMNI,     "nemotron_omni"},
@@ -745,6 +756,9 @@ static projector_type projector_type_from_string(const std::string & str) {
         if (pair.second == str) {
             return pair.first;
         }
+    }
+    if (str == "glm5next") { // pre-upstream converter
+        return PROJECTOR_TYPE_GLM5V;
     }
     return PROJECTOR_TYPE_UNKNOWN;
 }

@@ -177,6 +177,7 @@ class Keys:
         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
+        HAS_MARKOV_CONTEXT                = "{arch}.has_markov_context"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
         REALTIME_DELAY_TOKENS             = "{arch}.realtime_delay_tokens"
@@ -573,7 +574,14 @@ class Keys:
             LAYERNORM_EPS   = "clip.gen.audio.attention.layer_norm_epsilon"
 
     class Diffusion:
-        SHIFT_LOGITS        = "diffusion.shift_logits"
+        SHIFT_LOGITS         = "diffusion.shift_logits"
+        CANVAS_LENGTH        = "diffusion.canvas_length"
+        EB_MAX_STEPS         = "diffusion.eb_max_steps"
+        EB_T_MIN             = "diffusion.eb_t_min"
+        EB_T_MAX             = "diffusion.eb_t_max"
+        EB_ENTROPY_BOUND     = "diffusion.eb_entropy_bound"
+        EB_STABILITY         = "diffusion.eb_stability_threshold"
+        EB_CONFIDENCE        = "diffusion.eb_confidence_threshold"
 
     class xIELU:
         ALPHA_P             = "xielu.alpha_p"
@@ -668,6 +676,7 @@ class MODEL_ARCH(IntEnum):
     GEMMA3N          = auto()
     GEMMA4           = auto()
     GEMMA4_ASSISTANT = auto()
+    DIFFUSION_GEMMA  = auto()
     GEMMA_EMBEDDING  = auto()
     GEMMA_EMBEDDING2 = auto()
     STARCODER2       = auto()
@@ -776,6 +785,7 @@ class MODEL_ARCH(IntEnum):
     TALKIE           = auto()
     MELLUM           = auto()
     NANBEIGE         = auto()
+    INKLING          = auto()
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
     MOSHI            = auto()
@@ -940,6 +950,11 @@ class MODEL_TENSOR(IntEnum):
     ATTN_K_NORM          = auto()
     LAYER_OUT_NORM       = auto()
     LAYER_OUT_SCALE      = auto()
+    ENC_LAYER_OUT_SCALE  = auto() # diffusion-gemma (encoder-mode per-layer scalar)
+    SC_PRE_NORM          = auto() # diffusion-gemma self-conditioning
+    SC_GATE              = auto() # diffusion-gemma self-conditioning
+    SC_UP                = auto() # diffusion-gemma self-conditioning
+    SC_DOWN              = auto() # diffusion-gemma self-conditioning
     ATTN_VRES_LAMBDA     = auto()
     PER_LAYER_TOKEN_EMBD = auto() # gemma3n
     PER_LAYER_MODEL_PROJ = auto() # gemma3n
@@ -1139,6 +1154,14 @@ class MODEL_TENSOR(IntEnum):
     SHORTCONV_CONV       = auto()
     SHORTCONV_INPROJ     = auto()
     SHORTCONV_OUTPROJ    = auto()
+    # inkling
+    ATTN_R               = auto()
+    ATTN_REL_PROJ        = auto()
+    SHORTCONV_K          = auto()
+    SHORTCONV_V          = auto()
+    SHORTCONV_ATTN       = auto()
+    SHORTCONV_MLP        = auto()
+    FFN_GSCALE           = auto()
     VISEXP_ATTN_QKV      = auto()
     VISEXP_ATTN_OUT      = auto()
     VISEXP_GATE          = auto()
@@ -1536,6 +1559,8 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_CONF_PROJ       = auto()  # confidence head
     DSPARK_JOINT_PROJ      = auto()  # rnn markov head
     DSPARK_MASK_EMBD       = auto()  # per-slot mask embeddings
+    DSPARK_MARKOV_CTX_MIX  = auto()  # rnn markov head: target feature mix
+    DSPARK_MARKOV_CTX_NORM = auto()  # rnn markov head: target feature norm
     ENGRAM_KV              = auto()
     ENGRAM_GATE            = auto()
     DFLASH_ATTN_CONV_BASE  = auto()
@@ -1545,6 +1570,11 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    DFLASH_CTX_MIX         = auto()  # per-layer target feature mix
+    DFLASH_CTX_NORM        = auto()  # per-layer target feature norm
+    DFLASH_ATTN_K_CTX      = auto()  # per-layer context K projection
+    DFLASH_ATTN_V_CTX      = auto()  # per-layer context V projection
+    DFLASH_ATTN_K_CTX_NORM = auto()
     LILICORR_TOKEN_PROJ           = auto()
     LILICORR_PASS_HIDDEN_PROJ     = auto()
     LILICORR_SLOT_EMBD            = auto()
@@ -1683,6 +1713,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.GEMMA3N:          "gemma3n",
     MODEL_ARCH.GEMMA4:           "gemma4",
     MODEL_ARCH.GEMMA4_ASSISTANT: "gemma4-assistant",
+    MODEL_ARCH.DIFFUSION_GEMMA:  "diffusion-gemma",
     MODEL_ARCH.GEMMA_EMBEDDING:  "gemma-embedding",
     MODEL_ARCH.GEMMA_EMBEDDING2: "gemma-embedding2",
     MODEL_ARCH.STARCODER2:       "starcoder2",
@@ -1792,6 +1823,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.MELLUM:           "mellum",
     MODEL_ARCH.NANBEIGE:         "nanbeige",
+    MODEL_ARCH.INKLING:          "inkling",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
     MODEL_ARCH.POCKETTTS:        "pockettts",
     MODEL_ARCH.MOSHI:            "moshi",
@@ -1954,6 +1986,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_POST_EXP_NORM:         "blk.{bid}.ffn_post_exp_norm",
     MODEL_TENSOR.LAYER_OUT_NORM:            "blk.{bid}.layer_output_norm",
     MODEL_TENSOR.LAYER_OUT_SCALE:           "blk.{bid}.layer_output_scale",
+    MODEL_TENSOR.ENC_LAYER_OUT_SCALE:       "blk.{bid}.enc_layer_output_scale", # diffusion-gemma
+    MODEL_TENSOR.SC_PRE_NORM:               "self_cond_pre_norm",               # diffusion-gemma
+    MODEL_TENSOR.SC_GATE:                   "self_cond_gate",                   # diffusion-gemma
+    MODEL_TENSOR.SC_UP:                     "self_cond_up",                     # diffusion-gemma
+    MODEL_TENSOR.SC_DOWN:                   "self_cond_down",                   # diffusion-gemma
     MODEL_TENSOR.ATTN_VRES_LAMBDA:          "blk.{bid}.attn_vres_lambda",
     MODEL_TENSOR.PER_LAYER_TOKEN_EMBD:      "per_layer_token_embd",           # gemma3n
     MODEL_TENSOR.PER_LAYER_MODEL_PROJ:      "per_layer_model_proj",           # gemma3n
@@ -2153,6 +2190,13 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SHORTCONV_CONV:            "blk.{bid}.shortconv.conv",
     MODEL_TENSOR.SHORTCONV_INPROJ:          "blk.{bid}.shortconv.in_proj",
     MODEL_TENSOR.SHORTCONV_OUTPROJ:         "blk.{bid}.shortconv.out_proj",
+    MODEL_TENSOR.ATTN_R:                    "blk.{bid}.attn_r",             # inkling
+    MODEL_TENSOR.ATTN_REL_PROJ:             "blk.{bid}.attn_rel_proj",      # inkling
+    MODEL_TENSOR.SHORTCONV_K:               "blk.{bid}.shortconv_k",        # inkling
+    MODEL_TENSOR.SHORTCONV_V:               "blk.{bid}.shortconv_v",        # inkling
+    MODEL_TENSOR.SHORTCONV_ATTN:            "blk.{bid}.shortconv_attn",     # inkling
+    MODEL_TENSOR.SHORTCONV_MLP:             "blk.{bid}.shortconv_mlp",      # inkling
+    MODEL_TENSOR.FFN_GSCALE:                "blk.{bid}.ffn_gscale",         # inkling
     MODEL_TENSOR.VISEXP_ATTN_QKV:           "blk.{bid}.vis_attn_qkv",
     MODEL_TENSOR.VISEXP_ATTN_OUT:           "blk.{bid}.vis_attn_output",
     MODEL_TENSOR.VISEXP_GATE:               "blk.{bid}.vis_gate",
@@ -2590,6 +2634,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
     MODEL_TENSOR.DSPARK_JOINT_PROJ:         "joint_proj",
     MODEL_TENSOR.DSPARK_MASK_EMBD:          "mask_embd",
+    MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX:     "markov_ctx_mix",
+    MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM:    "markov_ctx_norm",
     MODEL_TENSOR.ENGRAM_KV:                 "blk.{bid}.engram_kv",
     MODEL_TENSOR.ENGRAM_GATE:               "blk.{bid}.engram_gate",
     MODEL_TENSOR.DFLASH_ATTN_CONV_BASE:     "blk.{bid}.attn_conv_base",
@@ -2599,6 +2645,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.DFLASH_CTX_MIX:            "blk.{bid}.ctx_mix",
+    MODEL_TENSOR.DFLASH_CTX_NORM:           "blk.{bid}.ctx_norm",
+    MODEL_TENSOR.DFLASH_ATTN_K_CTX:         "blk.{bid}.attn_k_ctx",
+    MODEL_TENSOR.DFLASH_ATTN_V_CTX:         "blk.{bid}.attn_v_ctx",
+    MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM:    "blk.{bid}.attn_k_ctx_norm",
     MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
     MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
     MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
@@ -4221,6 +4272,39 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PER_LAYER_PROJ,
         MODEL_TENSOR.PER_LAYER_PROJ_NORM,
         MODEL_TENSOR.PER_LAYER_POST_NORM,
+    ],
+    MODEL_ARCH.DIFFUSION_GEMMA: [
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_PRE_NORM,
+        MODEL_TENSOR.FFN_PRE_NORM_2,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.FFN_POST_NORM_1,
+        MODEL_TENSOR.FFN_POST_NORM_2,
+        MODEL_TENSOR.LAYER_OUT_SCALE,
+        MODEL_TENSOR.ENC_LAYER_OUT_SCALE,
+        MODEL_TENSOR.SC_PRE_NORM,
+        MODEL_TENSOR.SC_GATE,
+        MODEL_TENSOR.SC_UP,
+        MODEL_TENSOR.SC_DOWN,
     ],
     MODEL_ARCH.GEMMA4_ASSISTANT: [
         MODEL_TENSOR.ROPE_FREQS,
@@ -6170,6 +6254,38 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_EXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
     ],
+    MODEL_ARCH.INKLING: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_R,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_REL_PROJ,
+        MODEL_TENSOR.SHORTCONV_K,
+        MODEL_TENSOR.SHORTCONV_V,
+        MODEL_TENSOR.SHORTCONV_ATTN,
+        MODEL_TENSOR.SHORTCONV_MLP,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_GSCALE,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+    ],
     MODEL_ARCH.LFM3: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -6461,6 +6577,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.LAYER_OUT_SCALE,
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.ATTN_NORM,
@@ -6512,6 +6629,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DSPARK_CONF_PROJ,
         MODEL_TENSOR.DSPARK_JOINT_PROJ,
         MODEL_TENSOR.DSPARK_MASK_EMBD,
+        MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX,
+        MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM,
         MODEL_TENSOR.DFLASH_ATTN_CONV_BASE,
         MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ,
         MODEL_TENSOR.DFLASH_FFN_CONV_BASE,
@@ -6519,6 +6638,11 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DFLASH_CTX_MIX,
+        MODEL_TENSOR.DFLASH_CTX_NORM,
+        MODEL_TENSOR.DFLASH_ATTN_K_CTX,
+        MODEL_TENSOR.DFLASH_ATTN_V_CTX,
+        MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM,
         MODEL_TENSOR.LILICORR_TOKEN_PROJ,
         MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ,
         MODEL_TENSOR.LILICORR_SLOT_EMBD,
@@ -7354,6 +7478,11 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    MXFP8   = 63  # fork-local; files written while it was 43 are read by size (GGUFReader)
+    # 42..63 reserved for upstream ggml (42 is Q2_0); fork-local types start at 64
+    IQ1_XS   = 64
+    IQ1_XXS  = 65
+    IQ1_XXXS = 66
     F8_E4M3 = 43
 
 
@@ -7411,6 +7540,10 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    # 41..63 reserved for upstream llama.cpp (41 is Q2_0); fork-local ftypes start at 64
+    MOSTLY_IQ1_XS        = 64  # except 1d tensors
+    MOSTLY_IQ1_XXS       = 65  # except 1d tensors
+    MOSTLY_IQ1_XXXS      = 66  # except 1d tensors
     MOSTLY_F8_E4M3       = 42  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
@@ -7473,6 +7606,7 @@ class DecisionType:
 
 
 class VisionProjectorType:
+    INKLING = "inkling"
     GEMMA3 = "gemma3"
     GEMMA3NV = "gemma3nv"
     GEMMA3NA = "gemma3na"
@@ -7506,6 +7640,7 @@ class VisionProjectorType:
     KIMIVL = "kimivl"
     PADDLEOCR = "paddleocr"
     KIMIK25 = "kimik25"
+    KIMIK3 = "kimik3"
     KIMIK31 = "kimik31"
     LIGHTONOCR = "lightonocr"
     COGVLM = "cogvlm"
@@ -7597,6 +7732,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.I64:     (1, 8),
     GGMLQuantizationType.F64:     (1, 8),
     GGMLQuantizationType.IQ1_M:   (256, QK_K // 8 + QK_K // 16  + QK_K // 32),
+    GGMLQuantizationType.IQ1_XS:   (256, 2 + QK_K // 8 + QK_K // 32 + QK_K // 64),
+    GGMLQuantizationType.IQ1_XXS:  (256, 2 + QK_K // 8 + QK_K // 32),
+    GGMLQuantizationType.IQ1_XXXS: (256, 2 + QK_K // 8 + QK_K // 64),
     GGMLQuantizationType.BF16:    (1, 2),
     GGMLQuantizationType.TQ1_0:   (256, 2 + 4 * 13),
     GGMLQuantizationType.TQ2_0:   (256, 2 + 64),
@@ -7604,6 +7742,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.MXFP8:   (32, 1 + 32),
     GGMLQuantizationType.F8_E4M3: (1, 1),
 }
 

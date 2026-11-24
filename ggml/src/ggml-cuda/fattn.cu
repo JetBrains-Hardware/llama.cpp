@@ -576,6 +576,48 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor * dst) {
+#ifndef FLASH_ATTN_AVAILABLE
+    // with GGML_CUDA_FA=OFF there is no MMA kernel to delegate to, use the standalone banded kernel
+    GGML_UNUSED(device); GGML_UNUSED(dst);
+    return false;
+#endif // FLASH_ATTN_AVAILABLE
+
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
+        return false;
+    }
+
+    const ggml_tensor * Q   = dst->src[0];
+    const ggml_tensor * K   = dst->src[1];
+    const ggml_tensor * V   = dst->src[2];
+    const ggml_tensor * rel = dst->src[6];
+
+    if (!Q || !K || !V || !rel) {
+        return false;
+    }
+
+    // the MMA kernel passes rel in the sinks slot
+    if (dst->src[4]) {
+        return false;
+    }
+
+    // the MMA ABI indexes rel linearly and by Q's batch
+    if (rel->type != GGML_TYPE_F32 || !ggml_is_contiguous(rel) ||
+        rel->ne[3] != Q->ne[3] || rel->ne[0] > (1 << 20)) {
+        return false;
+    }
+
+    if (K->type == GGML_TYPE_F32 || V->type == GGML_TYPE_F32) {
+        return false;
+    }
+
+    if ((Q->ne[0] != 64 && Q->ne[0] != 128) || V->ne[0] != Q->ne[0]) {
+        return false;
+    }
+
+    return turing_mma_available(ggml_cuda_info().devices[device].cc);
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -615,6 +657,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+
+    if (ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -694,6 +740,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {
+        // datacenter Blackwell: with a mask per head (no GQA packing) the vector kernel beats the MMA kernel up to 4 rows,
+        // e.g. 4 sequences of batched decode (B200: 16 us vs 28 us incl. the combine/fixup kernels); at 8 rows it loses
+        static const bool dc_tuning_disabled = getenv("GGML_CUDA_DISABLE_BLACKWELL_DC_DECODE_TUNING") != nullptr;
+        if (!dc_tuning_disabled && GGML_CUDA_CC_HAS_SMALL_BATCH_TUNING(cc) && can_use_vector_kernel && !gqa_opt_applies &&
+                Q->ne[1] <= 4 && !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
@@ -783,7 +836,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -791,6 +844,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
+
+    // the banded kernels read or convert K/V themselves; only the delegated FA kernel uses the F16 extra
+    if (dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED && !ggml_cuda_flash_attn_ext_banded_use_mma(device, dst)) {
+        return ggml_nbytes(dst);
+    }
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
@@ -837,4 +895,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+}
+
+bool ggml_cuda_flash_attn_ext_uses_vec(int device, const ggml_tensor * dst) {
+    return dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_VEC &&
+        ggml_cuda_get_fattn_vec_case(dst->src[0]->ne[0], dst->src[1]->type, dst->src[2]->type) != nullptr;
 }

@@ -24,7 +24,8 @@ static __global__ void mul_mat_vec_f(
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-    const int row         = blockIdx.x;
+    // a block of warp_size threads can take several rows, one warp each (blockDim.y rows per block)
+    const int row         = blockIdx.x*blockDim.y + threadIdx.y;
     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
     const int channel_dst = blockIdx.y;
     const int tid         = threadIdx.x;
@@ -53,7 +54,7 @@ static __global__ void mul_mat_vec_f(
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
 
-    x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
+    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)*stride_channel_x + int64_t(row)*stride_row;
     y   += int64_t(sample_y)  *stride_sample_y   + channel_y  *stride_channel_y;
     dst += int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
     if constexpr (is_multi_token_id) {
@@ -106,7 +107,7 @@ static __global__ void mul_mat_vec_f(
     }
 
     if (use_gate) {
-        gate_x += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
+        gate_x += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)*stride_channel_x + int64_t(row)*stride_row;
     }
 
     if constexpr (has_fusion) {
@@ -508,9 +509,20 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
+    // short rows (one warp each): pack several rows per block, each warp computes its row exactly as a single-warp block
+    int64_t rows_per_block = 1;
+    if (block_size_best == warp_size) {
+        for (const int64_t r : {8, 4, 2}) {
+            if (nrows % r == 0) {
+                rows_per_block = r;
+                break;
+            }
+        }
+    }
+
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
-    const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
-    const dim3 block_dims(block_size_best, 1, 1);
+    const dim3 block_nums(nrows/rows_per_block, nchannels_dst, nsamples_or_ntokens);
+    const dim3 block_dims(block_size_best, rows_per_block, 1);
     switch (block_size_best) {
         case   32: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 32, is_multi_token_id>
@@ -866,6 +878,16 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// Datacenter Blackwell (B200) at small batch sizes: MMF costs a near-constant ~12 us per matrix there (bound by its K
+// loop) while MMVF scales with rows x columns, so MMVF is faster for matrices with few rows.
+// Measured over the decode shapes of a batched MoE model: MMVF wins up to rows x columns = 4096 (e.g. 64 x 8, 384 x 8,
+// 1024 x 4) and loses from 8192 (1024 x 8, 3072 x 4); below 64 rows the existing rules already pick the faster kernel.
+static bool ggml_cuda_mmvf_blackwell_dc_small_rows(const int cc, const int64_t nrows, const int64_t ne11) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_BLACKWELL_DC_DECODE_TUNING") != nullptr;
+    return !disabled && GGML_CUDA_CC_HAS_SMALL_BATCH_TUNING(cc) && ne11 >= 2 && ne11 <= MMVF_MAX_BATCH_SIZE &&
+        nrows >= 64 && nrows*ne11 <= 4096;
+}
+
 bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, int64_t ne11) {
     const ggml_type type = src0->type;
     const int64_t * src0_ne = src0->ne;
@@ -887,6 +909,9 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                if (ggml_cuda_mmvf_blackwell_dc_small_rows(cc, src0_ne[1], ne11)) {
+                    return true;
+                }
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
@@ -904,6 +929,9 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                if (src0_small && ggml_cuda_mmvf_blackwell_dc_small_rows(cc, src0_ne[1], ne11)) {
+                    return true;
+                }
                 // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
@@ -937,6 +965,9 @@ bool ggml_cuda_should_use_mmvf(const ggml_tensor * src0, int cc, int warp_size, 
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                if (src0_small && ggml_cuda_mmvf_blackwell_dc_small_rows(cc, src0_ne[1], ne11)) {
+                    return true;
+                }
                 // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
                     return ne11 <= MMVF_MAX_BATCH_SIZE;

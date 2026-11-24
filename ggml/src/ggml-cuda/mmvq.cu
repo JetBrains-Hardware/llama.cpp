@@ -54,6 +54,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
+        case GGML_TYPE_IQ1_XS:  return vec_dot_iq1_xs_q8_1;
+        case GGML_TYPE_IQ1_XXS: return vec_dot_iq1_xxs_q8_1;
+        case GGML_TYPE_IQ1_XXXS: return vec_dot_iq1_xxxs_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
@@ -158,6 +161,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_S:   return 6;
+        case GGML_TYPE_IQ1_XS:  return 6;
+        case GGML_TYPE_IQ1_XXS: return 6;
+        case GGML_TYPE_IQ1_XXXS: return 6;
         case GGML_TYPE_IQ1_M:   return 6;
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 5;
@@ -198,6 +204,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_gcn(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_S:   return 5;
+        case GGML_TYPE_IQ1_XS:  return 5;
+        case GGML_TYPE_IQ1_XXS: return 5;
+        case GGML_TYPE_IQ1_XXXS: return 5;
         case GGML_TYPE_IQ1_M:   return 5;
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 4;
@@ -248,6 +257,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna1_rdna2(ggm
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_S:   return 6;
+        case GGML_TYPE_IQ1_XS:  return 6;
+        case GGML_TYPE_IQ1_XXS: return 6;
+        case GGML_TYPE_IQ1_XXXS: return 6;
         case GGML_TYPE_IQ1_M:   return 6;
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 4;
@@ -266,6 +278,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_S:   return 7;
+        case GGML_TYPE_IQ1_XS:  return 7;
+        case GGML_TYPE_IQ1_XXS: return 7;
+        case GGML_TYPE_IQ1_XXXS: return 7;
         case GGML_TYPE_IQ1_M:   return 7;
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 4;
@@ -419,6 +434,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 case GGML_TYPE_Q6_K:
                     return ne11 <= 4;
                 case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_XS:
+                case GGML_TYPE_IQ1_XXS:
+                case GGML_TYPE_IQ1_XXXS:
                     return ne11 <= 5;
                 case GGML_TYPE_IQ2_XXS:
                 case GGML_TYPE_IQ3_S:
@@ -810,7 +828,7 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int64_t kbx_offset = int64_t(sample_x)*stride_sample_x + int64_t(channel_x)*stride_channel_x + int64_t(row0)*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -1016,7 +1034,7 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    const int64_t kbx_offset  = int64_t(channel_x)*stride_channel_x + int64_t(row0)*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -1147,8 +1165,8 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
-template <ggml_type type>
-static void mul_mat_vec_q_moe_launch(
+template <ggml_type type, int rows_per_block>
+static void mul_mat_vec_q_moe_launch_rows(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
@@ -1156,7 +1174,6 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
     const dim3 block_dims(warp_size, ncols_dst);
@@ -1178,6 +1195,34 @@ static void mul_mat_vec_q_moe_launch(
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride);
     }
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_moe_launch(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride,
+        const int warp_size, const int nchannels_dst, const int cc, cudaStream_t stream) {
+
+    // 2 rows per block gives best perf based on tuning; on NVIDIA Turing to Ada and on datacenter Blackwell (cc 10.x) 4 rows
+    // give each warp more independent loads (NVFP4 experts at 4 and 8 tokens: -8% kernel time). Each row is reduced exactly
+    // as before. Hopper is not measured; consumer Blackwell (cc 12.x) measured 0.2-0.5% slower at 4 sequences, so both keep 2.
+    // The kernel reads whole row groups, so only a row count that 4 divides takes 4.
+#define MMVQ_MOE_LAUNCH(R) mul_mat_vec_q_moe_launch_rows<type, R>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x, \
+        stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst, \
+        ncols_dst, ids_stride, warp_size, nchannels_dst, stream)
+    // GGML_CUDA_DISABLE_MOE_VEC_ROWS4=1 keeps 2 rows per block everywhere
+    static const bool rows4_disabled = getenv("GGML_CUDA_DISABLE_MOE_VEC_ROWS4") != nullptr;
+    const bool rows4_cc = GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        ((cc >= GGML_CUDA_CC_TURING && cc < GGML_CUDA_CC_HOPPER) || (cc >= 1000 && cc < 1100));
+    if (!rows4_disabled && rows4_cc && nrows_x % 4 == 0) {
+        MMVQ_MOE_LAUNCH(4);
+    } else {
+        MMVQ_MOE_LAUNCH(2);
+    }
+#undef MMVQ_MOE_LAUNCH
 }
 
 template <ggml_type type>
@@ -1221,9 +1266,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
             GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ3_S,
         };
-        constexpr std::array<ggml_type, 8> iq_slow_other = {
-            GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
-            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
+        constexpr std::array<ggml_type, 11> iq_slow_other = {
+            GGML_TYPE_IQ1_S,   GGML_TYPE_IQ1_M,    GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+            GGML_TYPE_IQ2_S,   GGML_TYPE_IQ3_XXS,  GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ1_XS,  GGML_TYPE_IQ1_XXS,  GGML_TYPE_IQ1_XXXS,
         };
         constexpr std::array<ggml_type, 3> slow_pascal = {
             GGML_TYPE_IQ3_S,
@@ -1276,7 +1322,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst, cc, stream);
         return;
     }
 
@@ -1495,6 +1541,24 @@ static void mul_mat_vec_q_switch_type(
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
+        case GGML_TYPE_IQ1_XS:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_XS>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_IQ1_XXS:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_XXS>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_IQ1_XXXS:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_XXXS>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
         case GGML_TYPE_IQ1_M:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_M>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
@@ -1621,12 +1685,17 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    // src1 quantized by an earlier MUL_MAT of this graph that read the same tensor is reused as is
+    bool src1_q8_1_cached = false;
+    void * src1_q8_1_reuse = ids ? nullptr : ggml_cuda_src1_cache_get(ctx, src1, /*layout =*/ 0, nbytes_src1_q8_1, &src1_q8_1_cached);
+    ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
+    char * src1_q8_1 = src1_q8_1_reuse ? (char *) src1_q8_1_reuse : src1_q8_1_own.alloc(nbytes_src1_q8_1);
+    if (!src1_q8_1_cached) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, src1_q8_1, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1652,7 +1721,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

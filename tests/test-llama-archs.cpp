@@ -200,6 +200,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
 static bool host_experts_test(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_INKLING2_LOOP: // looped layers: the visits of a layer read the same experts, the MoE cache shares their slots
             return true;
         default:
             return false;
@@ -247,7 +248,8 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
+// looped: an inkling2 file in the earlier looped layout (one block per visit), loaded as inkling2_loop
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0, const bool looped = false) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -330,7 +332,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_embd  = 128;
         n_head  = 4;
         n_ff    = 24;
-        n_layer = 3;
+        n_layer = looped ? 4 : 3; // looped: prelude, two visits of the core, coda
     }
 
     uint32_t n_head_kv = n_head;
@@ -719,6 +721,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             ms.add_kv(LLM_KV_LOOP_COUNT,     uint32_t(2));
             ms.add_kv(LLM_KV_LOOP_GATE_RANK, uint32_t(8));
             ms.add_kv(LLM_KV_LOOP_VARYING,   false);
+        } else if (looped) {
+            // the same model in the earlier layout, the second visit of the core is stored as block 2
+            ms.add_kv(LLM_KV_LOOP_CORE_START, uint32_t(1));
+            ms.add_kv(LLM_KV_LOOP_CORE_END,   uint32_t(2));
+            ms.add_kv(LLM_KV_NUM_LOOPS,       uint32_t(2));
+            ms.add_kv(LLM_KV_LOOP_GATE_RANK,  uint32_t(8));
         }
         ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(4));
         ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab + 2);
@@ -731,7 +739,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,           uint32_t(2));
         std::vector<bool> pattern(n_layer);
         for (uint32_t i = 0; i < n_layer; ++i) {
-            pattern[i] = i % 2 == 0;
+            const uint32_t phys = looped && i >= 2 ? i - 1 : i;
+            pattern[i] = phys % 2 == 0;
         }
         std::vector<uint8_t> values(pattern.begin(), pattern.end());
         gguf_set_arr_data(ret.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN).c_str(), GGUF_TYPE_BOOL, values.data(), values.size());
@@ -833,11 +842,43 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,   clamp_exp);
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, clamp_shexp);
     }
+    if (arch == LLM_ARCH_INKLING) {
+        // all required: load_arch_hparams asserts each is nonzero
+        ms.add_kv(LLM_KV_INKLING_D_REL,               uint32_t(16));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT,          uint32_t(8));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,      uint32_t(4));
+        ms.add_kv(LLM_KV_INKLING_SHORTCONV_KERNEL,    uint32_t(3));
+        ms.add_kv(LLM_KV_INKLING_DENSE_BLOCK_COUNT,   uint32_t(1));
+        ms.add_kv(LLM_KV_INKLING_LOGIT_SCALE_DENOM,   16.0f);
+        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_N_FLOOR, uint32_t(n_ctx));
+        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_ALPHA,   0.0f);
+        ms.add_kv(LLM_KV_INKLING_UNPADDED_VOCAB_SIZE, n_vocab);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,        1.0f);
+    }
+    if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
+        // ISWA: the loader reads the SWA head lengths unconditionally, and they
+        // are separate keys from the non-SWA pair above.
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,   n_embd/n_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, n_embd/n_head);
+        // canvas_length splits the forward at P = n_tokens - canvas_length and
+        // the loader rejects anything <= 0. Kept well under the 128 tokens the
+        // backend comparison decodes, so both halves of that split are exercised.
+        ms.add_kv(LLM_KV_DIFFUSION_CANVAS_LENGTH, uint32_t(16));
+        // diffusion-gemma needs a mix: with every layer sliding, the non-SWA mask
+        // is built and used by nothing, so ggml-alloc never gives it a buffer and
+        // set_input dereferences a null one. A real model has both kinds of layer.
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back(il % 2);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
+    }
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
     ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
     // the inkling2_loop core boundaries must be multiples of the block size
-    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(arch == LLM_ARCH_INKLING2_LOOP ? 1 : 12));
+    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(arch == LLM_ARCH_INKLING2_LOOP || looped ? 1 : 12));
     ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
     ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
@@ -1102,6 +1143,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_INKLING:
         case LLM_ARCH_CLOVER_MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PHIMOE:
@@ -1112,6 +1154,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DIFFUSION_GEMMA:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_XING4_0:
@@ -1426,23 +1469,28 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             continue;
         }
 
-        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        // diffusion-gemma belongs here for the same reason as the other diffusion
+        // decoders: it sets causal_attn = false, so the whole batch is one
+        // encoder pass and n_ubatch must not be capped below n_tokens.
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1 || arch == LLM_ARCH_DIFFUSION_GEMMA;
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
-            if (!moe && moe_mandatory(arch)) {
+            // inkling2 has no dense config, that pass runs the earlier looped layout
+            const bool looped = !moe && arch == LLM_ARCH_INKLING2;
+            if (!moe && moe_mandatory(arch) && !looped) {
                 continue;
             }
-            const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            const std::string config_name = looped ? "Looped" : moe ? "MoE" : "Dense";
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe || looped, 0, looped);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
-                if (dc.host_experts && (!moe || !host_experts_test(arch))) {
+                if (dc.host_experts && (!(moe || looped) || !host_experts_test(arch))) {
                     continue;
                 }
                 const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
@@ -1465,6 +1513,13 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        if (looped) {
+                            char desc[128];
+                            llama_model_desc(model_and_ctx_cpu.first.get(), desc, sizeof(desc));
+                            if (std::string(desc).rfind("inkling2_loop ", 0) != 0) {
+                                throw std::runtime_error("the looped inkling2 layout did not load as inkling2_loop: " + std::string(desc));
+                            }
+                        }
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llama_arch_supports_sm_tensor(arch)) {
@@ -1535,7 +1590,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         }
                     }
 
-                    if (llama_arch_supports_save(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                    // the looped layout loads as inkling2_loop, which is not saved
+                    if (llama_arch_supports_save(arch) && !looped && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
                         test_executed = true;
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend

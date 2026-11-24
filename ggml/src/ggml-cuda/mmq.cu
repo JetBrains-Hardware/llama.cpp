@@ -48,6 +48,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_IQ1_S:
             mul_mat_q_case<GGML_TYPE_IQ1_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ1_M:
+            mul_mat_q_case<GGML_TYPE_IQ1_M, GGML_PREC_Q8>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ2_XXS:
             mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
@@ -62,6 +65,15 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
         case GGML_TYPE_IQ3_S:
             mul_mat_q_case<GGML_TYPE_IQ3_S, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ1_XS:
+            mul_mat_q_case<GGML_TYPE_IQ1_XS, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ1_XXS:
+            mul_mat_q_case<GGML_TYPE_IQ1_XXS, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ1_XXXS:
+            mul_mat_q_case<GGML_TYPE_IQ1_XXXS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, args, stream);
@@ -270,13 +282,18 @@ void ggml_cuda_mul_mat_q(
         const int ntj = (ne1 + J_best - 1) / J_best;
 
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        // src1 quantized by an earlier MUL_MAT of this graph in the same q8_1 layout is reused as is
+        bool src1_q8_1_cached = false;
+        void * src1_q8_1_reuse = use_native_fp4 ? nullptr :
+            ggml_cuda_src1_cache_get(ctx, src1, 1 + (int) mmq_get_q8_1_ds_layout(src0->type), nbytes_src1_q8_1, &src1_q8_1_cached);
+        ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
+        char * src1_q8_1 = src1_q8_1_reuse ? (char *) src1_q8_1_reuse : src1_q8_1_own.alloc(nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        if (!src1_q8_1_cached) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -284,11 +301,11 @@ void ggml_cuda_mul_mat_q(
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -301,7 +318,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -334,7 +351,7 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(),
+        ggml_cuda_launch_mm_ids_helper(ctx.pool(), (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(),
             ne02, ne12, n_expert_used, ne11, J_best, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -415,11 +432,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_Q6_K:
 // -------------------------------------------------
         case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
 // -------------------------------------------------
@@ -446,7 +467,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (turing_mma_available(cc)) {
-        return true;
+        // For dense IQ1_M, dequantization + cuBLAS is faster for large batch sizes:
+        if (type != GGML_TYPE_IQ1_M || n_experts > 0 || ne11 < 128) {
+            return true;
+        }
     }
 
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
@@ -498,6 +522,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                     return ne11 <= 128;
                 case GGML_TYPE_Q6_K:
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                case GGML_TYPE_IQ1_M:
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || ne11 <= 128;

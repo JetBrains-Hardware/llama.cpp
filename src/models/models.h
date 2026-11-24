@@ -966,6 +966,65 @@ struct llama_model_gemma4 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_model_diffusion_gemma : public llama_model_base {
+    llama_model_diffusion_gemma(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // canvas occupies the last canvas_length positions of the batch; everything before is the prompt
+    uint32_t canvas_length = 0;
+
+    // self-conditioning per-request state (set via llama_diffusion_set_sc before llama_decode). sc_enabled
+    // false = byte-identical to zero-SC; sc_use is a {0,1} gate (a block's first step uses 0); sc_logits_ptr
+    // is [n_vocab * C] host logits, the graph applies softmax(sc_logits * sc_temp_inv).
+    mutable const float * sc_logits_ptr = nullptr;
+    mutable float         sc_use        = 0.0f;
+    mutable float         sc_temp_inv   = 1.0f;
+    mutable bool          sc_enabled    = false;
+
+    // self-conditioning soft embedding: embed_tokens transposed to [n_vocab, n_embd] F16 in a device
+    // weights buffer (per-step matmul stays on-device). Built lazily on first use, freed in the destructor.
+    mutable ggml_tensor         * sc_embT     = nullptr;  // [n_vocab, n_embd] F16 (embed_tokens transposed)
+    mutable ggml_context        * sc_embT_ctx = nullptr;
+    mutable ggml_backend_buffer_t sc_embT_buf = nullptr;
+
+    // device-resident self-conditioning (opt-in via llama_diffusion_set_device_sc): keep the prev step's
+    // raw canvas logits in sc_dev (device) and read SC from it instead of a per-step 268 MB host upload.
+    // Bit-identical to the host path (same F32 logits); single-device, like the PKV store.
+    mutable bool                  sc_device_resident = false;
+    mutable ggml_tensor         * sc_dev      = nullptr;  // [n_vocab, sc_dev_C] F32 prev-step canvas logits
+    mutable ggml_context        * sc_dev_ctx  = nullptr;
+    mutable ggml_backend_buffer_t sc_dev_buf  = nullptr;
+    mutable int64_t               sc_dev_C    = 0;        // allocated canvas capacity (grow-only)
+
+    // prompt KV caching: the prompt's per-layer K,V are step-invariant, so compute once per block and
+    // reuse across denoising steps instead of recomputing the whole [prompt|canvas] forward.
+    //   PKV_UNIFIED : no-cache forward over [prompt|canvas] (default + safety fallback).
+    //   PKV_PREFILL : forward a chunk of the prompt; write its per-layer K,V into the store at pkv_prefill_off.
+    //   PKV_DECODE  : forward the canvas only; read the cached prompt K,V.
+    // Store is device-resident (in pkv_buf/pkv_ctx), allocated lazily from the PREFILL graph; element type
+    // follows flash-attn (F16 under FA - precision-neutral since FA casts K,V to F16 anyway - else F32).
+    enum pkv_phase_t { PKV_UNIFIED = 0, PKV_PREFILL = 1, PKV_DECODE = 2 };
+    mutable pkv_phase_t pkv_phase = PKV_UNIFIED;
+    mutable int64_t     pkv_P     = 0;   // prompt length of the current block
+    mutable int64_t     pkv_prefill_off = 0;   // PREFILL: global start position of the current prompt chunk
+    mutable int64_t     pkv_cap   = 0;   // allocated capacity (max P) of the store
+    mutable std::vector<ggml_tensor *> pkv_k;   // per layer [n_embd_head_k(il), n_head_kv(il), pkv_cap]
+    mutable std::vector<ggml_tensor *> pkv_v;
+    mutable ggml_context        * pkv_ctx = nullptr;
+    mutable ggml_backend_buffer_t pkv_buf = nullptr;
+
+    ~llama_model_diffusion_gemma() override;
+
+    struct graph : public llm_graph_context {
+        const llama_model & model;
+
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_gemma4_assistant : public llama_model_base {
     llama_model_gemma4_assistant(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1617,6 +1676,11 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_dflash2();
     void load_tensors_dflash2_conv();
     void load_tensors_dspark(int64_t n_vocab_draft);
+    void load_tensors_inkling2_head();
+
+    struct graph_inkling2_head : public llm_graph_context {
+        graph_inkling2_head(const llm_graph_params & params);
+    };
     void load_tensors_lilicorr();
     void load_tensors_layers_base();
     void load_tensors_layers_dsv4();
@@ -1643,8 +1707,13 @@ struct llama_model_dflash : public llama_model_base {
         graph_base(const llm_graph_params & params);
 
         ggml_tensor * build_inject();
+        void          build_inject_ctx_mix();
+        void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
+        ggml_tensor * build_inp_block(ggml_tensor * inp_tokens);
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
+        ggml_tensor * build_inkling2_embd(ggml_tensor * inp_tokens);
+        ggml_tensor * mix_target_features(ggml_tensor * features, int row, ggml_tensor * norm);
         ggml_tensor * build_logits(ggml_tensor * cur);
         ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il);
     };
@@ -1659,6 +1728,7 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_dspark : public graph_base {
         graph_dspark(const llm_graph_params & params);
+        void build_inkling2_block(ggml_tensor * tokens, ggml_tensor * hidden);
     };
 
     struct graph_lilicorr : public graph_base {
@@ -2519,8 +2589,9 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        // il: the layer whose device runs the mix (the shared stacks are kept per device), -1 if unknown
+        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, int il = -1);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
                 ggml_tensor * weight,
@@ -2529,7 +2600,8 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
+                const loop_layer & loop, int ctrl);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2542,6 +2614,14 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // banded flash attention for layer il on its device and cache
+        bool use_banded(int il, bool swa);
+        std::vector<std::pair<std::pair<bool, ggml_backend_dev_t>, bool>> banded_dev_ok;
+        // [base, swa] contiguous mask of the banded attention, shared by the layers of a graph
+        ggml_tensor * mask_banded[2] = { nullptr, nullptr };
+        // query rows of the dense bias the first banded full-attention layer also builds in the reserve graph:
+        // the small ubatches that stay dense take that bias at runtime, the reserve must hold it
+        int64_t n_rows_dense_reserve = 0;
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;
@@ -2549,6 +2629,19 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // the normalized block stacks of mix(), per block list
+        struct block_stack {
+            ggml_tensor * states   = nullptr;
+            ggml_tensor * states_t = nullptr;
+        };
+        std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_tensor *>>, block_stack> block_stacks;
+        // the rows of each mix, the stack of its blocks and its current input last
+        std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_tensor *>>, block_stack> mix_states;
+        const block_stack * stack(const std::vector<ggml_tensor *> & blocks, int il);
+
+        // the clip thresholds, per layer device, row count and threshold (and the zero sinks, keyed by -n_head)
+        std::map<std::pair<std::pair<ggml_backend_dev_t, int64_t>, float>, ggml_tensor *> clip_limits;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2563,6 +2656,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;
+    void load_legacy_hparams();
 
     int      n_phys     = 0;
     uint32_t core_start = 0;
@@ -2570,15 +2664,24 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     uint32_t n_passes   = 0;
     uint32_t gate_rank  = 0;
     bool     varying    = false; // trained for a varying number of passes
+    bool     legacy     = false; // earlier inkling2 looped layout, one block per visit
 
     // indexed by physical layer - core_start
     std::vector<loop_layer> loop_layers;
 
+    // legacy layout: the message queries of all core layers, {n_embd, 2*(core_end - core_start)} each
+    ggml_tensor * legacy_res_query    = nullptr;
+    ggml_tensor * legacy_kv_res_query = nullptr;
+
     struct graph : public llama_model_inkling2::graph {
         graph(const llm_graph_params & params);
+        ggml_tensor * legacy_query(int i) const;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    // every cache slot runs on the device of the physical layer it shares the weights of
+    int32_t layer_weights(int32_t il) const override { return layer_phys(il); }
 };
 
 struct llama_model_lfm2 : public llama_model_base {
@@ -2612,6 +2715,18 @@ struct llama_model_lfm2moe : public llama_model_base {
 
     template <bool iswa>
     using graph = llama_model_lfm2::graph<iswa>;
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_inkling : public llama_model_base {
+    llama_model_inkling(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

@@ -17,6 +17,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <algorithm>
@@ -25,6 +26,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <thread>
 #include <string>
 #include <unordered_set>
 
@@ -133,8 +135,62 @@ static llm_attn_mask build_attn_inp_attn_mask(
 
 // impl
 
+bool llm_graph_host_rows_supported(const ggml_tensor * tab) {
+    if (!tab || !tab->buffer || !tab->data || !ggml_backend_buffer_is_host(tab->buffer) || tab->view_src) {
+        return false;
+    }
+    if (tab->nb[0] != ggml_type_size(tab->type) || tab->ne[2] != 1 || tab->ne[3] != 1) {
+        return false;
+    }
+    return tab->type == GGML_TYPE_F32 || ggml_get_type_traits(tab->type)->to_float != nullptr;
+}
+
+void llm_graph_host_get_rows(const ggml_tensor * tab, const int32_t * ids, int64_t n_ids, float * dst) {
+    const int64_t nc = tab->ne[0];
+    const ggml_to_float_t to_float = tab->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(tab->type)->to_float;
+
+    auto run = [&](int64_t i0, int64_t i1) {
+        for (int64_t i = i0; i < i1; ++i) {
+            const int64_t r = ids[i];
+            GGML_ASSERT(r >= 0 && r < tab->ne[1]);
+            const char * src = (const char *) tab->data + r*tab->nb[1];
+            if (to_float) {
+                to_float(src, dst + i*nc, nc);
+            } else {
+                memcpy(dst + i*nc, src, nc*sizeof(float));
+            }
+        }
+    };
+
+    // split prompt-sized gathers over a few threads (the CPU GET_ROWS they replace is multi-threaded)
+    const int64_t n_elem = n_ids*nc;
+    const int     n_thr  = (int) std::min<int64_t>(8, std::max<int64_t>(1, n_elem >> 18));
+    if (n_thr <= 1) {
+        run(0, n_ids);
+        return;
+    }
+    std::vector<std::thread> workers;
+    const int64_t per = (n_ids + n_thr - 1)/n_thr;
+    for (int t = 1; t < n_thr; ++t) {
+        const int64_t i0 = std::min<int64_t>(n_ids, t*per);
+        const int64_t i1 = std::min<int64_t>(n_ids, i0 + per);
+        workers.emplace_back(run, i0, i1);
+    }
+    run(0, std::min<int64_t>(n_ids, per));
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
+    if (ubatch->token && tok_host) {
+        GGML_ASSERT(!ubatch->is_mixed());
+        const int64_t n_tokens = ubatch->n_tokens;
+
+        tok_rows.resize(n_tokens*n_embd);
+        llm_graph_host_get_rows(tok_host, ubatch->token, n_tokens, tok_rows.data());
+        ggml_backend_tensor_set(embd, tok_rows.data(), 0, tok_rows.size()*sizeof(float));
+    } else if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
@@ -146,7 +202,7 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd_rows, ubatch->embd_row, 0, n_tokens*ggml_element_size(embd_rows));
     }
 
-    if (ubatch->embd && embd && !ubatch->is_mixed()) {
+    if (ubatch->embd && embd && !ubatch->is_mixed() && !(tok_host && ubatch->token)) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1476,6 +1532,11 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
+    if (banded) {
+        res &= attn_ctx->get_base()->get_n_kv_pos_contiguous() == n_kv_banded[0];
+        res &= attn_ctx->get_swa()->get_n_kv_pos_contiguous()  == n_kv_banded[1];
+    }
+
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
@@ -1809,7 +1870,8 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+        enum ggml_prec   prec) const {
     if (!w_s) {
         w_s = model.get_w_scale(w);
     }
@@ -1824,6 +1886,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
 
     prec_policy.apply(res);
+
+    if (prec != GGML_PREC_UNDEFINED) {
+        // explicit precision wins; set on the base MUL_MAT before scale/LoRA changes the root op
+        ggml_prec_set_acc(res, prec);
+    }
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -2473,6 +2540,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (arch == LLM_ARCH_DEEPSEEK41) {
             // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
             weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+        } else if (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_single_pass) {
+            // DeepSeek-V4.1 draft: the same router normalisation as LLM_ARCH_DEEPSEEK41
+            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
         } else if (hparams.expert_weights_norm_eps > 0.0f) {
             weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, hparams.expert_weights_norm_eps);
         } else {
@@ -2735,7 +2805,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 }
 
 // input embeddings with optional lora
-ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
+ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale, bool host_gather) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
 
@@ -2748,6 +2818,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     const bool has_mixed = llm_arch_supports_mixed_batch(model.arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
 
     const int64_t n_tok_rows = has_mixed ? llm_graph_n_tok_rows(ubatch) : 0;
+
+    bool tok_host = host_gather && !has_mixed && n_embd_inp == n_embd && llm_graph_host_rows_supported(tok_embd) &&
+        tok_embd->ne[0] == n_embd && !(hdmd && hdmd->inv.count(tok_embd));
+    for (const auto & lora : *loras) {
+        tok_host = tok_host && lora.first->get_weight(tok_embd) == nullptr;
+    }
 
     // we have 3 standard paths to produce the input embeddings for the first layer:
     // - embd0: extract from the token embeddings weight (`tok_embd`) using the input token ids
@@ -2778,9 +2854,14 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // the embeddings placeholders for the 3 paths
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
-    {
+    if (tok_host) {
+        inp->tok_host = tok_embd;
+        embd0 = inp->embd;
+    } else {
         embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
         ggml_build_forward_order(gf, embd0);
+    }
+    {
 
         embd1 = inp->embd;
 
@@ -2834,7 +2915,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     std::array<ggml_tensor *, 3> inps = {};
 
     // token embeddings path (ubatch.token != nullptr)
-    inps[0] = build_tok(embd0, inp->tokens);
+    inps[0] = tok_host ? embd0 : build_tok(embd0, inp->tokens);
 
     // vector embeddings path (ubatch.embd != nullptr)
     inps[1] = embd1;
@@ -4396,7 +4477,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * kq_b,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        int64_t       i_row) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4409,7 +4491,30 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
+    if (cparams.flash_attn && kq_b->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16 && hparams.f_max_alibi_bias == 0.0f) {
+        // convert the bias to F16 in one copy, from the source of its contiguous copy when it is one (the same values),
+        // and add the mask in F16: the mask is 0 or -inf, so this rounds the same as adding in F32 and converting
+        ggml_tensor * src = kq_b->op == GGML_OP_CONT ? kq_b->src[0] : kq_b;
+        // a cast, not a copy into a new tensor: that tensor would be a graph leaf, which the allocator keeps
+        // for the whole graph, so the bias of every chunk and layer would stay allocated at once
+        ggml_tensor * bias = ggml_cast(ctx0, src, GGML_TYPE_F16);
+        if (kq_b->ne[1] != kq_mask->ne[1]) {
+            kq_mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_b->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], i_row*kq_mask->nb[1]);
+        }
+        kq_mask = ggml_add(ctx0, bias, kq_mask);
+        cb(kq_mask, "kq_mask_rel_pos", il);
+
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    }
+    if (kq_b->ne[1] != kq_mask->ne[1]) {
+        ggml_tensor *& dev = inp->self_kq_mask_dev[is_swa];
+        if (!dev) {
+            dev = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = ggml_view_4d(ctx0, dev, dev->ne[0], kq_b->ne[1], dev->ne[2], dev->ne[3],
+                dev->nb[1], dev->nb[2], dev->nb[3], i_row*dev->nb[1]);
+    } else if (kq_mask->type != GGML_TYPE_F32) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
     }
     kq_mask = ggml_add(ctx0, kq_b, kq_mask);
@@ -4670,6 +4775,15 @@ void llm_graph_context::build_sampling() const {
 
             assert(sampler->iface->backend_apply);
             sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+
+            // flag the outputs of every chain, active or not: the graph keeps its topology across ubatches, so the
+            // allocator can reuse the tensor addresses of a graph built for a different set of active chains, and an
+            // output that was an intermediate there (freed and overwritten by the next chain) would alias here
+            for (ggml_tensor * t : { data.sampled, data.probs, data.logits, data.candidates }) {
+                if (t != nullptr && t != logits_seq) {
+                    ggml_set_output(t);
+                }
+            }
 
             if (data.sampled     != nullptr) { res->t_sampling_all.push_back(data.sampled);     }
             if (data.probs       != nullptr) { res->t_sampling_all.push_back(data.probs);       }

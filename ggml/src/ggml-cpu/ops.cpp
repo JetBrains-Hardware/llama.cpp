@@ -695,6 +695,9 @@ void ggml_compute_forward_add(
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
@@ -1153,6 +1156,9 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
@@ -1285,6 +1291,9 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
@@ -5025,6 +5034,9 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
@@ -5356,6 +5368,9 @@ void ggml_compute_forward_set(
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
@@ -5569,6 +5584,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -5582,6 +5598,9 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
@@ -6276,6 +6295,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_F8_E4M3:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -6289,6 +6309,9 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
@@ -8834,10 +8857,11 @@ template<enum ggml_sort_order order>
 struct cmp_argsort {
     const float * data;
     bool operator()(int32_t a, int32_t b) const {
+        // ties must resolve to the lower id (MoE routers); std::sort is unstable
         if constexpr (order == GGML_SORT_ORDER_ASC) {
-            return data[a] < data[b];
+            return data[a] < data[b] || (data[a] == data[b] && a < b);
         } else {
-            return data[a] > data[b];
+            return data[a] > data[b] || (data[a] == data[b] && a < b);
         }
     }
 };
@@ -8906,7 +8930,8 @@ void ggml_compute_forward_argsort(
 struct cmp_top_k {
     const float * data;
     bool operator()(int32_t a, int32_t b) const {
-        return data[a] > data[b];
+        // ties must resolve to the lower id so the selected set matches the CUDA backend
+        return data[a] > data[b] || (data[a] == data[b] && a < b);
     }
 };
 
@@ -8967,6 +8992,30 @@ void ggml_compute_forward_top_k(
     }
 }
 
+static inline float ggml_flash_attn_ext_banded_load(
+        const ggml_tensor * rel,
+        int64_t iq1,
+        int64_t iq2,
+        int64_t iq3,
+        int64_t rel_idx) {
+    const char * ptr = (const char *) rel->data +
+        (size_t) rel_idx * rel->nb[0] +
+        (size_t) iq2    * rel->nb[1] +
+        (size_t) iq1    * rel->nb[2] +
+        (size_t) (iq3 % rel->ne[3]) * rel->nb[3];
+
+    switch (rel->type) {
+        case GGML_TYPE_F32:
+            return *(const float *) ptr;
+        case GGML_TYPE_F16:
+            return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ptr);
+        case GGML_TYPE_BF16:
+            return GGML_BF16_TO_FP32(*(const ggml_bf16_t *) ptr);
+        default:
+            GGML_ABORT("banded flash attention: unsupported rel_logits type");
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8980,6 +9029,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * rel     = dst->src[6];
     const ggml_tensor * kv_rows = dst->src[5];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
@@ -9111,6 +9161,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 s = logit_softcap*tanhf(s);
             }
 
+            if (rel) {
+                // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
+                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
+                    s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
+                }
+            }
+
             s += mv; // apply mask
 
             const float Mold = M;
@@ -9148,7 +9206,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         // sinks - apply only on the first kv-chunk
         if (sinks && ic_start == 0) {
-            const float s = ((float *)((char *) sinks->data))[h];
+            const float s = *(const float *)((const char *) sinks->data + h*sinks->nb[0] +
+                (sinks->ne[1] > 1 ? iq1*sinks->nb[1] : 0) + (sinks->ne[2] > 1 ? iq3*sinks->nb[2] : 0));
 
             float ms = 1.0f;
             float vs = 1.0f;
@@ -9562,6 +9621,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * rel   = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9665,7 +9725,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && rel == nullptr &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -9700,6 +9760,7 @@ void ggml_compute_forward_flash_attn_ext(
         ggml_tensor * dst) {
     switch (ggml_prec_get_acc(dst)) {
         case GGML_PREC_UNDEFINED:
+        case GGML_PREC_F32_PEDANTIC:
         case GGML_PREC_F32:
         case GGML_PREC_BF16:
             {

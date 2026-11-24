@@ -109,6 +109,17 @@ struct llama_hparams {
     uint32_t n_shortconv_l_cache  = 0;
     uint32_t n_sconv_channels     = 0;
 
+    // explicit override for the rolling state size per layer (see n_embd_r())
+    uint32_t n_embd_r_impl = 0;
+
+    // inkling (private arch)
+    uint32_t inkling_d_rel          = 0;
+    uint32_t inkling_rel_extent     = 0; // global (non-SWA) layers
+    uint32_t inkling_rel_extent_swa = 0; // local (SWA) layers
+    uint32_t inkling_log_n_floor    = 0; // 0 = log-N scaling disabled
+    float    inkling_log_alpha      = 0.0f;
+    uint32_t inkling_unpadded_n_vocab = 0; // 0 = no padded-vocab masking
+
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
@@ -299,11 +310,13 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
+    uint32_t dspark_context_rank = 0;
     uint32_t dflash_block_size       = 0;
     uint32_t dflash_conv_kernel_size = 0;
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    bool     dspark_f_rnn            = false; // rnn markov head reads f_rnn from embd_state
     uint32_t lilicorr_hidden_size    = 0;
     uint32_t lilicorr_candidate_topk = 0;
     uint32_t lilicorr_num_heads      = 0;

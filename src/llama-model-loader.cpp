@@ -15,6 +15,10 @@
 #include <regex>
 #include <unordered_set>
 
+#ifdef __linux__
+#include <unistd.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -67,6 +71,9 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_XS:    name = LLAMA_FTYPE_PREFIX "IQ3_XS - 3.3 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_XXS:   name = LLAMA_FTYPE_PREFIX "IQ3_XXS - 3.0625 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ1_S:     name = LLAMA_FTYPE_PREFIX "IQ1_S - 1.5625 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XS:    name = LLAMA_FTYPE_PREFIX "IQ1_XS - 1.4375 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XXS:   name = LLAMA_FTYPE_PREFIX "IQ1_XXS - 1.3125 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XXXS:  name = LLAMA_FTYPE_PREFIX "IQ1_XXXS - 1.1875 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ1_M:     name = LLAMA_FTYPE_PREFIX "IQ1_M - 1.75 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ4_NL:    name = LLAMA_FTYPE_PREFIX "IQ4_NL - 4.5 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
@@ -579,7 +586,7 @@ llama_model_loader::llama_model_loader(
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name), nullptr, arch_name.c_str());
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
@@ -780,7 +787,7 @@ llama_model_loader::llama_model_loader(
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name), nullptr, arch_name.c_str());
 
         files.emplace_back(new llama_file(file));
         contexts.emplace_back(ctx);
@@ -798,7 +805,7 @@ llama_model_loader::llama_model_loader(
         }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name), nullptr, arch_name.c_str());
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -860,6 +867,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS; break;
             case GGML_TYPE_IQ1_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_S;   break;
             case GGML_TYPE_IQ1_M:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_M;   break;
+            case GGML_TYPE_IQ1_XS:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_XS;   break;
+            case GGML_TYPE_IQ1_XXS:  ftype = LLAMA_FTYPE_MOSTLY_IQ1_XXS;  break;
+            case GGML_TYPE_IQ1_XXXS: ftype = LLAMA_FTYPE_MOSTLY_IQ1_XXXS; break;
             case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
@@ -1361,6 +1371,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // the deepseek41 Engram table (~200 GB) is a CPU get_rows gather table: never put it in device memory
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD && !ggml_backend_buft_is_host(buft)) {
+            LLAMA_LOG_WARN("llama_model_loader: %s (%zu MiB %s) must stay in host memory; ignoring placement on %s, using %s\n",
+                    tn.str().c_str(), ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                    ggml_backend_buft_name(buft), ggml_backend_buft_name(ggml_backend_cpu_buffer_type()));
+            buft = ggml_backend_cpu_buffer_type();
+        }
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
@@ -1502,7 +1520,88 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+#ifdef __linux__
+// bytes that can be populated without pushing the system into reclaim: MemAvailable minus max(2 GiB, MemTotal/16), 0 if unknown,
+// and no more than the cgroup's memory limits leave (a container's limit is usually far below the host's MemAvailable)
+static size_t llama_populate_budget() {
+    size_t avail = 0;
+    size_t total = 0;
+    if (FILE * f = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long long kb = 0;
+            if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+                total = kb*kiB;
+            } else if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                avail = kb*kiB;
+            }
+        }
+        fclose(f);
+    }
+    const size_t headroom = std::max(2*GiB, total/16);
+    return llama_mmap::cgroup_budget(avail > headroom ? avail - headroom : 0);
+}
+#endif
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    // a file with lazy ranges is mapped without MAP_POPULATE, so populate the tensors that are read from the mapping instead:
+    // not the lazy ones, nor the ones that were never created (TENSOR_SKIP, e.g. MTP without a drafter, or another model's)
+    // all or nothing per file, within the available RAM, else the pages fault in on demand as without MAP_POPULATE
+    // LLAMA_MMAP_POPULATE=0 turns this off; files without lazy ranges keep MAP_POPULATE either way, as before
+#ifdef __linux__
+    const char * populate_env = getenv("LLAMA_MMAP_POPULATE");
+    const bool populate_enabled = !populate_env || strcmp(populate_env, "0") != 0;
+    size_t populate_left = 0;
+    // sampled before any file is mapped: the files without lazy ranges are populated in full by MAP_POPULATE, and once
+    // mapped their pages are charged to the cgroup (memory.current) yet still counted in MemAvailable as page cache, so
+    // each is reserved exactly once here
+    if (populate_enabled && prefetch && use_mmap && !no_alloc && lazy.any()) {
+        populate_left = llama_populate_budget();
+        for (uint32_t i = 0; i < files.size(); i++) {
+            if (lazy.for_file(i).empty()) {
+                populate_left -= std::min(populate_left, files[i]->size());
+            }
+        }
+    }
+    const char * func = __func__;
+
+    auto populate = [&](uint32_t idx, llama_mmap & mapping) {
+        if (!populate_enabled) {
+            LLAMA_LOG_INFO("%s: file %u: not populating, LLAMA_MMAP_POPULATE=0\n", func, idx);
+            return;
+        }
+        llama_mmap::ranges rs;
+        for (const auto & [key, ctx] : ctx_map) {
+            if (key.lazy) {
+                continue;
+            }
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                const auto * w = get_weight(ggml_get_name(t));
+                if (w && w->idx == idx && !lazy.has(t)) {
+                    rs.emplace_back(w->offs, w->offs + ggml_nbytes(t));
+                }
+            }
+        }
+        rs = llama_mmap::page_runs(std::move(rs), mapping.size(), sysconf(_SC_PAGESIZE));
+        size_t need = 0;
+        for (const auto & r : rs) {
+            need += r.second - r.first;
+        }
+        if (need > populate_left) {
+            LLAMA_LOG_INFO("%s: file %u: not populating %.2f MiB of tensor data, over the RAM budget of %.2f MiB\n",
+                    func, idx, need/1024.0/1024.0, populate_left/1024.0/1024.0);
+            return;
+        }
+        const int64_t t_start_us = ggml_time_us();
+        const size_t done = mapping.populate(rs);
+        // a failed run may have populated part of itself, and the next file would likely fail the same way
+        populate_left = done < need ? 0 : populate_left - done;
+        LLAMA_LOG_INFO("%s: file %u: populated %.2f MiB of %.2f MiB tensor data in %zu runs (%.2f MiB file), %.0f ms\n",
+                func, idx, done/1024.0/1024.0, need/1024.0/1024.0, rs.size(), mapping.size()/1024.0/1024.0,
+                (ggml_time_us() - t_start_us)/1000.0);
+    };
+#endif
+
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1525,6 +1624,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
+#ifdef __linux__
+            if (prefetch_size > 0 && !is_numa && !no_alloc && !lazy.for_file(idx).empty()) {
+                populate(idx, *mapping);
+            }
+#endif
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
