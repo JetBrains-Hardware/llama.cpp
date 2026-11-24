@@ -262,19 +262,22 @@ static ggml_tensor * dspark_recurrent_step(ggml_context * ctx, const llama_model
     return ggml_tanh(ctx, chunk(2));
 }
 
+static ggml_tensor * inkling2_head_project(llm_graph_context & g, const llama_model & model, ggml_tensor * hidden) {
+    const auto [output, scale] = llama_model_dflash::get_lm_head(g, model);
+    auto * projected = g.build_lora_mm(output, hidden, scale);
+    ggml_prec_set_acc(projected, GGML_PREC_F32);
+    return projected;
+}
+
 static ggml_tensor * inkling2_head_step(llm_graph_context & g, const llama_model & model, ggml_tensor * & state,
-        ggml_tensor * prev, ggml_tensor * features, ggml_tensor * hidden) {
+        ggml_tensor * prev, ggml_tensor * features, ggml_tensor * base) {
     auto * prev_embd = ggml_get_rows(g.ctx0, model.dspark_markov_w1, prev);
     ggml_set_name(prev_embd, "dspark_prev_embd");
     auto * latent = dspark_recurrent_step(g.ctx0, model, state, prev_embd, features);
     auto * correction = ggml_add(g.ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    const auto [output, scale] = llama_model_dflash::get_lm_head(g, model);
-    auto * base = g.build_lora_mm(output, hidden, scale);
-    auto * bias = g.build_lora_mm(output, correction, scale);
-    ggml_prec_set_acc(base, GGML_PREC_F32);
-    ggml_prec_set_acc(bias, GGML_PREC_F32);
+    auto * bias = inkling2_head_project(g, model, correction);
     auto * logits = ggml_add(g.ctx0, base, bias);
-    logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, hidden->ne[1], logits->nb[1], 0));
+    logits = ggml_cont(g.ctx0, ggml_view_2d(g.ctx0, logits, model.hparams.n_vocab_unpadded, base->ne[1], logits->nb[1], 0));
     const float cap = model.hparams.f_final_logit_softcapping;
     return ggml_scale(g.ctx0, ggml_tanh(g.ctx0, ggml_scale(g.ctx0, logits, 1.0f/cap)), cap);
 }
@@ -289,7 +292,7 @@ llama_model_dflash::graph_inkling2_head::graph_inkling2_head(const llm_graph_par
     auto * state = ggml_view_2d(ctx0, inp->h, rank, n_tokens, inp->h->nb[1], 0);
     auto * features = ggml_view_2d(ctx0, inp->h, 2*n_embd, n_tokens, inp->h->nb[1], n_embd*sizeof(float));
     auto * hidden = ggml_view_2d(ctx0, features, n_embd, n_tokens, features->nb[1], 0);
-    res->t_logits = inkling2_head_step(*this, model, state, inp->tokens, features, hidden);
+    res->t_logits = inkling2_head_step(*this, model, state, inp->tokens, features, inkling2_head_project(*this, model, hidden));
     res->t_h_nextn = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
     ggml_build_forward_expand(gf, res->t_h_nextn);
     res->add_input(std::move(inp));
@@ -606,10 +609,17 @@ void llama_model_dflash::graph_dspark::build_inkling2_block(ggml_tensor * tokens
     }
     auto * prev = ggml_view_1d(ctx0, tokens, 1, 0);
     auto * state = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.dspark_context_rank), 0);
+    ggml_tensor * base_rows = nullptr;
+    if (n_outputs > 0) {
+        // The hidden rows are ready before the first Markov step.
+        auto * proposal_hidden = ggml_view_2d(ctx0, hidden, n_embd, n_outputs, hidden->nb[1], hidden->nb[1]);
+        base_rows = inkling2_head_project(*this, model, proposal_hidden);
+    }
     for (int i = 0; i < n_outputs; ++i) {
         auto * row = ggml_view_1d(ctx0, hidden, n_embd, (i + 1)*hidden->nb[1]);
         auto * features = ggml_concat(ctx0, row, inp->context, 0);
-        auto * logits = inkling2_head_step(*this, model, state, prev, features, row);
+        auto * base = ggml_view_1d(ctx0, base_rows, base_rows->ne[0], i*base_rows->nb[1]);
+        auto * logits = inkling2_head_step(*this, model, state, prev, features, base);
         ggml_build_forward_expand(gf, logits);
         const int first = ggml_graph_n_nodes(gf);
         if (inp->draws) {
