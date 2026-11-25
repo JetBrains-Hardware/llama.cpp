@@ -7,6 +7,11 @@ on:
         description: 'Create new release'
         required: true
         type: boolean
+      publish_failed:
+        description: 'Publish the release even if some builds fail'
+        required: false
+        default: false
+        type: boolean
   push:
     branches:
       - master
@@ -84,7 +89,7 @@ jobs:
         uses: ./.github/actions/get-tag-name
 
       - name: Create and push git tag
-        if: ${{ steps.check.outputs.should_release == 'true' }}
+        if: ${{ steps.check.outputs.should_release == 'true' && (github.event_name != 'workflow_dispatch' || inputs.create_release) }}
         run: |
           TAG="${{ steps.tag.outputs.name }}"
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
@@ -94,11 +99,26 @@ jobs:
             git push origin "${TAG}"
           fi
 
+      # read by release-publish.yml, workflow_run events do not carry the inputs
+      - name: Save release options
+        if: ${{ steps.check.outputs.should_release == 'true' }}
+        run: |
+          echo "create_release=${{ github.event_name != 'workflow_dispatch' || inputs.create_release }}" > release-options.txt
+          echo "publish_failed=${{ github.event_name == 'workflow_dispatch' && inputs.publish_failed }}" >> release-options.txt
+
+      - name: Upload release options
+        if: ${{ steps.check.outputs.should_release == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: release-options.txt
+          archive: false
+
   macos-cpu:
     needs: [check-release, ui-build]
     # disabled: we only ship linux/windows
     if: ${{ false && needs.check-release.outputs.should_release == 'true' }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: 'arm64'
@@ -173,6 +193,7 @@ jobs:
     needs: [check-release, ui-build]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: 'x64'
@@ -256,6 +277,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: 'x64'
@@ -335,6 +357,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           # label = short version used in artifact names / release body
@@ -887,6 +910,7 @@ jobs:
     runs-on: windows-2025-vs2026
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: 'x64'
@@ -959,6 +983,7 @@ jobs:
     runs-on: windows-2022
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - ROCM_VERSION: "10.0.0"
@@ -1125,6 +1150,7 @@ jobs:
       VULKAN_VERSION: 1.4.357.0
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - backend: 'vulkan'
@@ -1224,6 +1250,7 @@ jobs:
     runs-on: windows-2022
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           # CTK >= 13.5 bundles CCCL >= 3.5; omit GGML_CUDA_CCCL_VERSION for those versions.
@@ -1430,6 +1457,7 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     strategy:
+      fail-fast: false
       matrix:
         build: [fp32, fp16]
         include:
@@ -1534,6 +1562,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - ROCM_VERSION: "10.0.0"
