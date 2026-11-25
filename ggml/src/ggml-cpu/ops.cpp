@@ -9909,6 +9909,31 @@ static void ggml_compute_forward_ssm_conv_f32(
     const int n_t =  dst->ne[1]; // tokens per sequence
     const int n_s =  dst->ne[2]; // number of sequences in the batch
 
+    if (const auto * history = dst->src[2]) {
+        const int first = (nr + nth - 1)/nth*ith;
+        const int last = MIN(first + (nr + nth - 1)/nth, nr);
+        const auto read = [](const ggml_tensor * t, int i, int j, int k) {
+            return *reinterpret_cast<const float *>(static_cast<const char *>(t->data)
+                    + i*t->nb[0] + j*t->nb[1] + k*t->nb[2]);
+        };
+        for (int seq = 0; seq < n_s; ++seq) {
+            for (int pos = 0; pos < n_t; ++pos) {
+                auto * out = reinterpret_cast<float *>(static_cast<char *>(dst->data) + pos*dst->nb[1] + seq*dst->nb[2]);
+                for (int ch = first; ch < last; ++ch) {
+                    float sum = 0;
+                    for (int j = 0; j < nc; ++j) {
+                        const int input_pos = pos + j - (nc - 1);
+                        const float value = input_pos < 0 ? read(history, input_pos + nc - 1, ch, seq)
+                                                          : read(src0, input_pos, ch, seq);
+                        sum += value*read(src1, j, ch, 0);
+                    }
+                    out[ch] = sum;
+                }
+            }
+        }
+        return;
+    }
+
     GGML_ASSERT( dst->ne[0] == nr);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
