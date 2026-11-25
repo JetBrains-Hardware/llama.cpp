@@ -365,22 +365,26 @@ jobs:
           # CTK >= 13.5 bundles CCCL >= 3.5; omit GGML_CUDA_CCCL_VERSION for those versions.
           - build: 'x64'
             os: ubuntu-24.04
+            runner: ${{ vars.RUNNER_LINUX_X64 || 'ubuntu-24.04' }}
             cuda: '12.8.2'
             label: '12.8'
             defines: '-DGGML_CUDA_CCCL_VERSION=v3.4.3'
           - build: 'x64'
             os: ubuntu-24.04
+            runner: ${{ vars.RUNNER_LINUX_X64 || 'ubuntu-24.04' }}
             cuda: '13.5.0'
             label: '13.5'
             defines: ''
           # arm64 CUDA is needed for NVIDIA DGX Spark (GB10)
           - build: 'arm64'
             os: ubuntu-24.04-arm
+            runner: ${{ vars.RUNNER_LINUX_ARM64 || 'ubuntu-24.04-arm' }}
             cuda: '13.5.0'
             label: '13.5'
             defines: ''
 
-    runs-on: ${{ matrix.os }}
+    # os is kept for the ccache key, runner selects the machine
+    runs-on: ${{ matrix.runner }}
     container: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu24.04
 
     steps:
@@ -980,7 +984,7 @@ jobs:
     needs: [check-release]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
-    runs-on: windows-2022
+    runs-on: ${{ vars.RUNNER_WIN_X64 || 'windows-2022' }}
 
     strategy:
       fail-fast: false
@@ -1247,7 +1251,7 @@ jobs:
     needs: [check-release]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
-    runs-on: windows-2022
+    runs-on: ${{ vars.RUNNER_WIN_X64 || 'windows-2022' }}
 
     strategy:
       fail-fast: false
@@ -1559,7 +1563,7 @@ jobs:
     needs: [check-release, ui-build]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.RUNNER_LINUX_X64 || 'ubuntu-24.04' }}
 
     strategy:
       fail-fast: false
