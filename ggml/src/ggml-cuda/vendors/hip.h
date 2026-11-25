@@ -23,7 +23,9 @@ typedef uint64_t ggml_cuda_thread_mask_t;
 #define CUDA_R_16F  HIPBLAS_R_16F
 #define CUDA_R_16BF HIPBLAS_R_16B
 #define CUDA_R_32F  HIPBLAS_R_32F
+#define CUBLAS_SIDE_LEFT HIPBLAS_SIDE_LEFT
 #define CUBLAS_SIDE_RIGHT HIPBLAS_SIDE_RIGHT
+#define CUBLAS_FILL_MODE_LOWER HIPBLAS_FILL_MODE_LOWER
 #define CUBLAS_FILL_MODE_UPPER HIPBLAS_FILL_MODE_UPPER
 #define CUBLAS_DIAG_NON_UNIT HIPBLAS_DIAG_NON_UNIT
 #define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED hipDeviceAttributeVirtualMemoryManagementSupported
@@ -32,6 +34,8 @@ typedef uint64_t ggml_cuda_thread_mask_t;
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
+#define cublasDgemmStridedBatched hipblasDgemmStridedBatched
+#define cublasDtrsmBatched hipblasDtrsmBatched
 #define cublasStrsmBatched hipblasStrsmBatched
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy

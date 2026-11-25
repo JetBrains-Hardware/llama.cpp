@@ -156,7 +156,7 @@ static __global__ void kvq_fit_code(const float * y, const float * par, int32_t 
 template <typename T>
 static __device__ T kvq_tab_sum(T v, T * red) {
     for (int o = 16; o > 0; o >>= 1) {
-        v += __shfl_xor_sync(0xffffffff, v, o);
+        v += ggml_cuda_shfl_xor(v, o, 32);
     }
     __syncthreads();
     if (threadIdx.x % 32 == 0) {
@@ -215,7 +215,7 @@ static __global__ void __launch_bounds__(KVQ_TAB_NT) kvq_tab_chol(const float * 
                     s += v*v;
                 }
                 for (int o = 16; o > 0; o >>= 1) {
-                    s += __shfl_xor_sync(0xffffffff, s, o);
+                    s += ggml_cuda_shfl_xor(s, o, 32);
                 }
                 if (tid == 0) {
                     s = Lc[(size_t) j*n + j] - s;
@@ -610,8 +610,8 @@ static __global__ void kvq_tab_rot(const float * A_all, const int4 * __restrict_
                 base += 32;
                 cl = base + r < cap ? rcs[base + r] : make_float2(0.0f, 0.0f);
             }
-            const float c  = __shfl_sync(0xffffffff, cl.x, j - base);
-            const float s  = __shfl_sync(0xffffffff, cl.y, j - base);
+            const float c  = ggml_cuda_shfl(cl.x, j - base, 32);
+            const float s  = ggml_cuda_shfl(cl.y, j - base, 32);
             const float zi = row[i];
             row[i + 1] = s*zi + c*zn;
             zn = c*zi - s*zn;
@@ -647,8 +647,8 @@ static __global__ void kvq_tab_sign(double * U_all, const int * st_all, const in
         }
     }
     for (int o = 16; o > 0; o >>= 1) {
-        const double vo = __shfl_xor_sync(0xffffffff, vm, o);
-        const int    io = __shfl_xor_sync(0xffffffff, im, o);
+        const double vo = ggml_cuda_shfl_xor(vm, o, 32);
+        const int    io = ggml_cuda_shfl_xor(im, o, 32);
         if (vo > vm || (vo == vm && io < im)) {
             vm = vo;
             im = io;
@@ -783,7 +783,7 @@ __constant__ float kvq_fit_gauss_step[9] = { 0.0f, 1.596f, 0.9957f, 0.5860f, 0.3
 template <int op>
 static __device__ double kvq_bits_red(double v, double * red) {
     for (int o = 16; o > 0; o >>= 1) {
-        const double w = __shfl_xor_sync(0xffffffff, v, o);
+        const double w = ggml_cuda_shfl_xor(v, o, 32);
         v = op == 0 ? v + w : op == 1 ? fmin(v, w) : fmax(v, w);
     }
     __syncthreads();
@@ -858,8 +858,8 @@ static __global__ void kvq_fit_bits_k(const float * sigma, const int64_t ss2, co
             }
         }
         for (int o = 16; o > 0; o >>= 1) {
-            const double vo = __shfl_xor_sync(0xffffffff, vb, o);
-            const int    io = __shfl_xor_sync(0xffffffff, ib, o);
+            const double vo = ggml_cuda_shfl_xor(vb, o, 32);
+            const int    io = ggml_cuda_shfl_xor(ib, o, 32);
             if ((down ? vo > vb : vo < vb) || (vo == vb && io < ib)) {
                 vb = vo;
                 ib = io;
@@ -946,7 +946,7 @@ static __global__ void kvq_fit_pack_k(const float * x, const int64_t sx1, const 
             m = fmaxf(m, fabsf(row[i]));
         }
         for (int o = 16; o > 0; o >>= 1) {
-            m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+            m = fmaxf(m, ggml_cuda_shfl_xor(m, o, 32));
         }
         const float s = __fdiv_rn(m, 127.0f);
         if (inv) {

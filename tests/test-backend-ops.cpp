@@ -4758,33 +4758,6 @@ struct test_depth_mix_fuse : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "DEPTH_MIX_FUSE";
-// several MUL_MATs of quantized weights that read the same src1, as the projections of one layer input do
-// CUDA quantizes such a src1 once; mode 1 runs an unrelated MUL_MAT in between, mode 2 overwrites src1 in place between
-// the first and the second MUL_MAT, so that its quantization must be redone
-struct test_mul_mat_shared_src1 : public test_case {
-    const ggml_type type_a;
-    const ggml_type type_b;
-    const int64_t m;
-    const int64_t n;
-    const int64_t k;
-    const int mode;
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "MUL_MAT_SHARED_SRC1";
-// Row L2 clip fusion (Inkling 2 q/k/r clip): y = c*clamp(t/(sqrt(sum(c^2)) + eps), 0, 1), c = x (* w)
-// CUDA matches the chain [mul,] sqr, sum_rows, sqrt, scale, [fill,] div, clamp, mul
-struct test_clip_rows_fuse : public test_case {
-    const std::array<int64_t, 4> ne; // [D, H, T, 1]
-    const bool with_w;
-    const bool shared_limit; // threshold tensor filled outside the chain
-    const bool inplace_fill; // ggml_fill_inplace on the norm: overwrites the denominator, must not fuse
-    const bool inplace_sqr;  // ggml_sqr_inplace on c: overwrites the input of the final mul, must not fuse
-    const bool limit_is_c;   // the limit is c = x*w itself (one column), an intermediate of the chain: must not fuse
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "CLIP_ROWS_FUSE";
     }
 
     bool run_whole_graph() override { return true; }
@@ -4831,6 +4804,29 @@ struct test_clip_rows_fuse : public test_case {
             out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, states_t, ggml_nelements(states_t)), 0);
             out = ggml_concat(ctx, out, ggml_reshape_1d(ctx, normed, ggml_nelements(normed)), 0);
         }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// several MUL_MATs of quantized weights that read the same src1, as the projections of one layer input do
+// CUDA quantizes such a src1 once; mode 1 runs an unrelated MUL_MAT in between, mode 2 overwrites src1 in place between
+// the first and the second MUL_MAT, so that its quantization must be redone
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const int mode;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    bool run_whole_graph() override { return true; }
+
     double max_nmse_err() override {
         return 5e-4;
     }
@@ -4868,6 +4864,28 @@ struct test_clip_rows_fuse : public test_case {
         }
         out = ggml_add(ctx, out, ggml_mul_mat(ctx, a1, y));
         out = ggml_add(ctx, out, ggml_mul_mat(ctx, a2, y));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Row L2 clip fusion (Inkling 2 q/k/r clip): y = c*clamp(t/(sqrt(sum(c^2)) + eps), 0, 1), c = x (* w)
+// CUDA matches the chain [mul,] sqr, sum_rows, sqrt, scale, [fill,] div, clamp, mul
+struct test_clip_rows_fuse : public test_case {
+    const std::array<int64_t, 4> ne; // [D, H, T, 1]
+    const bool with_w;
+    const bool shared_limit; // threshold tensor filled outside the chain
+    const bool inplace_fill; // ggml_fill_inplace on the norm: overwrites the denominator, must not fuse
+    const bool inplace_sqr;  // ggml_sqr_inplace on c: overwrites the input of the final mul, must not fuse
+    const bool limit_is_c;   // the limit is c = x*w itself (one column), an intermediate of the chain: must not fuse
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CLIP_ROWS_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
     std::string vars() override {
         return VARS_TO_STR6(ne, with_w, shared_limit, inplace_fill, inplace_sqr, limit_is_c);
     }
@@ -12273,6 +12291,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_depth_mix_fuse(ncols, 6, 1, 1, false));
         test_cases.emplace_back(new test_depth_mix_fuse(ncols, 7, 3, 3, true));
         test_cases.emplace_back(new test_depth_mix_fuse(ncols, 20, 3, 8, false));
+    }
+
     // MUL_MATs that share one src1: MMVQ (1-8 columns) and MMQ (64 columns), mixed weight types and q8_1 layouts
     for (int mode : { 0, 1, 2 }) {
         for (int64_t n : { 1, 2, 3, 4, 5, 8, 64 }) {
