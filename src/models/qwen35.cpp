@@ -246,7 +246,7 @@ public:
             const int64_t n_mask = n_coarse + mctx->get_attn()->get_n_kv();
             if (res && packed_small) {
                 res &= mask_attn.raw->ne[0] == n_mask;
-                res &= mask_attn.raw->ne[1] == gparams.ubatch.n_tokens/seqs.size();
+                res &= mask_attn.raw->ne[1] == (int64_t) (gparams.ubatch.n_tokens/seqs.size());
             }
             if (res && scratch && !scr_cells) {
                 res &= scr_rows == kvq_scr_rows(store, n_host, gparams.ubatch) && scr_r0 == kvq_scr_r0(p, n_host);

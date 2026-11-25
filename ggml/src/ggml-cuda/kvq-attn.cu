@@ -1856,7 +1856,7 @@ static void kvq_set_smem() {
     static bool done[GGML_CUDA_MAX_DEVICES] = { false };
     const int id = ggml_cuda_get_device();
     if (!done[id]) {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) ggml_cuda_info().devices[id].smpbo));
+        CUDA_CHECK(cudaFuncSetAttribute((const void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) ggml_cuda_info().devices[id].smpbo));
         done[id] = true;
     }
 }
