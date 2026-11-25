@@ -6,8 +6,6 @@ on:
       - Release
     types:
       - completed
-    branches:
-      - master
 
 run-name: "Publish ${{ github.event.workflow_run.display_title }}"
 
@@ -18,11 +16,11 @@ permissions:
 
 env:
   GH_TOKEN: ${{ github.token }}
-  BRANCH_NAME: master
+  BRANCH_NAME: ${{ github.event.workflow_run.head_branch }}
 
 jobs:
   publish:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure' }}
 
     # Fine-grained permission
     # https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
@@ -39,11 +37,28 @@ jobs:
       tag_name: ${{ steps.tag.outputs.name }}
 
     steps:
+      - name: Download release options
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: release-options.txt
+          path: ./options
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
       - id: check
         env:
           COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          EVENT: ${{ github.event.workflow_run.event }}
         run: |
           if echo "$COMMIT_MESSAGE" | grep -q '\[no release\]'; then
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          elif [[ "$EVENT" == "workflow_dispatch" ]] && ! grep -qx 'create_release=true' options/release-options.txt 2>/dev/null; then
+            echo "Manual run without create_release, skipping"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          elif [[ "$CONCLUSION" != "success" ]] && ! grep -qx 'publish_failed=true' options/release-options.txt 2>/dev/null; then
+            echo "Release run did not succeed and publish_failed is not set, skipping"
             echo "should_release=false" >> $GITHUB_OUTPUT
           else
             echo "should_release=true" >> $GITHUB_OUTPUT
@@ -78,6 +93,7 @@ jobs:
         if: ${{ steps.check.outputs.should_release == 'true' }}
         id: move_artifacts
         run: |
+          shopt -s nullglob
           mkdir -p release
 
           # the windows-cpu zip contains the full toolset (llama-server with the embedded
@@ -86,6 +102,10 @@ jobs:
           echo "Injecting windows-cpu binaries (llama-server + CPU backend) into the backend zips..."
           for arch in x64 arm64; do
             cpu_zip="artifact/llama-bin-win-cpu-${arch}.zip"
+            if [[ ! -f "$cpu_zip" ]]; then
+              echo "No windows-cpu-${arch} package, skipping"
+              continue
+            fi
             temp_dir=$(mktemp -d)
             echo "Extracting windows-cpu-${arch} package..."
             unzip "$cpu_zip" -d "$temp_dir"
@@ -113,12 +133,28 @@ jobs:
 
           echo "Moving other artifacts..."
           rm -f artifact/llama-ui.zip
-          mv -v artifact/*.zip release
-          mv -v artifact/*.tar.gz release
+          for f in artifact/*.zip artifact/*.tar.gz; do
+            mv -v "$f" release
+          done
+
+      - name: Collect failed jobs
+        if: ${{ steps.check.outputs.should_release == 'true' && github.event.workflow_run.conclusion != 'success' }}
+        id: failed
+        run: |
+          {
+            echo 'list<<EOF'
+            echo '> [!WARNING]'
+            echo '> Some builds failed, their binaries are missing from this release:'
+            echo
+            gh api --paginate "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs?per_page=100" \
+              --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | "- [\(.name)](\(.html_url))"'
+            echo EOF
+          } >> $GITHUB_OUTPUT
 
       - name: Download UI build
         if: ${{ steps.check.outputs.should_release == 'true' }}
         id: download_ui
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           name: llama-ui.zip
@@ -127,7 +163,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Package UI
-        if: ${{ steps.check.outputs.should_release == 'true' }}
+        if: ${{ steps.check.outputs.should_release == 'true' && steps.download_ui.outcome == 'success' }}
         id: package_ui
         run: |
           tar -czvf release/llama-${{ steps.tag.outputs.name }}-ui.tar.gz --transform "s,^\.,llama-${{ steps.tag.outputs.name }}," -C ./ui-dist .
@@ -150,6 +186,8 @@ jobs:
           commitish: ${{ github.event.workflow_run.head_sha }}
           prerelease: true
           body: |
+            ${{ steps.failed.outputs.list }}
+
             <details open>
 
             ${{ github.event.workflow_run.head_commit.message }}
