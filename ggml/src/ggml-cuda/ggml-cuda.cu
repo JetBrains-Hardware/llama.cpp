@@ -4751,8 +4751,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_loop_control_match match;
         const int n = loop_ctrl_disabled ? 0 : ggml_cuda_match_loop_control(cgraph, i, match);
         if (n > 0) {
-            ggml_cuda_op_loop_control(*cuda_ctx, match);
-            return n - 1;
+            // match.gate (n_down) is written before loop_ctrl_up_apply reads cur/msg and must not overlap any
+            // input or dst; match.dst may exact-alias cur or msg (elementwise per (d, t)), already checked in matcher.
+            const auto range_overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const int64_t a0 = (int64_t) a->data;
+                const int64_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+                const int64_t b0 = (int64_t) b->data;
+                const int64_t b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+                return (b0 <= a0 && a0 < b1) || (a0 <= b0 && b0 < a1);
+            };
+            const bool mem_safe =
+                !range_overlaps(match.gate, match.cur_norm) &&
+                !range_overlaps(match.gate, match.msg_norm) &&
+                !range_overlaps(match.gate, match.cur) &&
+                !range_overlaps(match.gate, match.msg) &&
+                !range_overlaps(match.gate, match.dst) &&
+                !range_overlaps(match.dst,  match.cur_norm) &&
+                !range_overlaps(match.dst,  match.msg_norm);
+            if (mem_safe) {
+                ggml_cuda_op_loop_control(*cuda_ctx, match);
+                return n - 1;
+            }
         }
     }
 
@@ -6091,6 +6110,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
                 }
                 i += match.node_count - 1;
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_CONCAT) {
+                ggml_cuda_loop_control_match lc_match;
+                const int n_lc = ggml_cuda_match_loop_control(cgraph, i, lc_match);
+                if (n_lc > 0) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(lc_match.cur_norm), lc_match.gate);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(lc_match.msg_norm), lc_match.gate);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(lc_match.cur),      lc_match.gate);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(lc_match.msg),      lc_match.gate);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(lc_match.cur),      lc_match.dst);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(lc_match.msg),      lc_match.dst);
+                    params->add_alloc_dep(params->user_data, lc_match.gate,                                lc_match.dst);
+                }
             }
 
             if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
