@@ -451,12 +451,16 @@ int ggml_cuda_match_loop_control(const ggml_cgraph * cgraph, int i, ggml_cuda_lo
 
 template <int TILE_T>
 static __global__ void loop_ctrl_down_f32(
-        const float * __restrict__ cur_norm,
-        const float * __restrict__ msg_norm,
-        const float * __restrict__ w_down,
-        float       * __restrict__ gate,
+        const float * cur_norm_ptr,
+        const float * msg_norm_ptr,
+        const float * w_down_ptr,
+        float       * gate_ptr,
         const int D, const int R, const int T,
         const int64_t s_cn, const int64_t s_mn) {
+    const float * GGML_CUDA_RESTRICT cur_norm = cur_norm_ptr;
+    const float * GGML_CUDA_RESTRICT msg_norm = msg_norm_ptr;
+    const float * GGML_CUDA_RESTRICT w_down   = w_down_ptr;
+    float       * GGML_CUDA_RESTRICT gate     = gate_ptr;
     constexpr int NTHREADS = 128;
     constexpr int NWARPS   = NTHREADS / WARP_SIZE;
 
@@ -478,10 +482,13 @@ static __global__ void loop_ctrl_down_f32(
     const int D4 = D / 4;
     const float4 * wd_a4 = (const float4 *) wd_a;
     const float4 * wd_b4 = (const float4 *) wd_b;
+    const bool aligned_w  = ((uintptr_t) w_down % 16 == 0);
     const bool aligned_cn = ((uintptr_t) cur_norm % 16 == 0) && ((s_cn % 4) == 0);
     const bool aligned_mn = ((uintptr_t) msg_norm % 16 == 0) && ((s_mn % 4) == 0);
 
-    if (aligned_cn && aligned_mn) {
+    ggml_cuda_pdl_sync();
+
+    if (aligned_w && aligned_cn && aligned_mn) {
         for (int k4 = tid; k4 < D4; k4 += NTHREADS) {
             const float4 wa = wd_a4[k4];
             const float4 wb = wd_b4[k4];
@@ -531,23 +538,32 @@ static __global__ void loop_ctrl_down_f32(
             gate[t * R + r] = sum;
         }
     }
+    ggml_cuda_pdl_lc();
 }
 
 template <int TILE_T>
 static __global__ void loop_ctrl_up_apply_f32(
-        const float * __restrict__ gate,
-        const float * __restrict__ w_forget,
-        const float * __restrict__ w_gain,
-        const float * __restrict__ cur,
-        const float * __restrict__ msg,
-        float       * __restrict__ dst,
+        const float * gate_ptr,
+        const float * w_forget_ptr,
+        const float * w_gain_ptr,
+        const float * cur_ptr,
+        const float * msg_ptr,
+        float       * dst_ptr,
         const int D, const int R, const int T,
         const int64_t s_cur, const int64_t s_msg, const int64_t s_dst) {
+    const float * GGML_CUDA_RESTRICT gate     = gate_ptr;
+    const float * GGML_CUDA_RESTRICT w_forget = w_forget_ptr;
+    const float * GGML_CUDA_RESTRICT w_gain   = w_gain_ptr;
+    const float * GGML_CUDA_RESTRICT cur      = cur_ptr;
+    const float * GGML_CUDA_RESTRICT msg      = msg_ptr;
+    float       * GGML_CUDA_RESTRICT dst      = dst_ptr;
     constexpr int NWARPS = 4;
     const int d    = blockIdx.x * NWARPS + threadIdx.y;
     const int t0   = blockIdx.y * TILE_T;
     const int lane = threadIdx.x;
     const int tid  = threadIdx.y * WARP_SIZE + lane;
+
+    ggml_cuda_pdl_sync();
 
     __shared__ float s_gate[TILE_T][128];
     const int total_g = TILE_T * R;
@@ -596,6 +612,7 @@ static __global__ void loop_ctrl_up_apply_f32(
             dst[t * s_dst + d] = c - tanhf(f) * c + tanhf(g) * m;
         }
     }
+    ggml_cuda_pdl_lc();
 }
 
 void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_cuda_loop_control_match & match) {
@@ -613,14 +630,14 @@ void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_cuda_
     float * gate = (float *) match.gate->data;
     cudaStream_t stream = ctx.stream();
 
-    if (T == 1) {
+    if (T <= 8) {
         constexpr int TILE_T = 1;
         ggml_cuda_kernel_launch(loop_ctrl_down_f32<TILE_T>,
-            ggml_cuda_kernel_launch_params(dim3(R, 1, 1), dim3(128, 1, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3(R, T, 1), dim3(128, 1, 1), 0, stream),
             (const float *) match.cur_norm->data, (const float *) match.msg_norm->data,
             (const float *) match.w_down->data, gate, D, R, T, s_cn, s_mn);
         ggml_cuda_kernel_launch(loop_ctrl_up_apply_f32<TILE_T>,
-            ggml_cuda_kernel_launch_params(dim3((D + 3) / 4, 1, 1), dim3(WARP_SIZE, 4, 1), 0, stream),
+            ggml_cuda_kernel_launch_params(dim3((D + 3) / 4, T, 1), dim3(WARP_SIZE, 4, 1), 0, stream),
             gate, (const float *) match.w_forget->data, (const float *) match.w_gain->data,
             (const float *) match.cur->data, (const float *) match.msg->data, (float *) match.dst->data,
             D, R, T, s_cur, s_msg, s_dst);
