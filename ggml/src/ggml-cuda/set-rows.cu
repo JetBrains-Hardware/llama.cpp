@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 
@@ -80,6 +81,82 @@ static __global__ void k_set_rows_quant(const src_t * __restrict__ src0,
     GGML_UNUSED(ne13);
 }
 
+static bool fast_set_rows_q8_0_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("GGML_CUDA_DISABLE_FAST_SET_ROWS_Q8_0");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+// Warp-per-block Q8_0 set_rows: 1 warp (32 lanes) quantizes one 32-element block_q8_0
+// with 100% coalesced 128-byte loads and 32-byte stores, 4 warps/block for high SM occupancy.
+template<typename src_t, typename idx_t>
+static __global__ void __launch_bounds__(128) k_set_rows_q8_0_warp(
+        const src_t * __restrict__ src0,
+        const idx_t * __restrict__ src1,
+        block_q8_0 * __restrict__ dst,
+        const int64_t ne_total,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const int64_t s10,
+        const int64_t s11,
+        const int64_t s12,
+        const int64_t s1,
+        const int64_t s2,
+        const int64_t s3,
+        const uint3   ne00,
+        const uint3   ne01,
+        const uint3   ne02,
+        const uint3   ne11_fd,
+        const uint3   ne12_fd) {
+    const int lane = threadIdx.x;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (i >= ne_total) {
+        return;
+    }
+
+    const int64_t i_base = i * QK8_0;
+    uint32_t      tmp    = (uint32_t) i_base;
+    uint2         div_mod;
+
+    div_mod           = fast_div_modulo(tmp, ne00);
+    const int64_t i00 = div_mod.y;
+    tmp               = div_mod.x;
+
+    div_mod           = fast_div_modulo(tmp, ne01);
+    const int64_t i01 = div_mod.y;
+    tmp               = div_mod.x;
+
+    div_mod           = fast_div_modulo(tmp, ne02);
+    const int64_t i02 = div_mod.y;
+    const int64_t i03 = div_mod.x;
+
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+    const int64_t i10 = i01;
+
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+
+    const src_t * src_block = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
+    block_q8_0  * dst_block = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_q8_0) + i00 / QK8_0;
+
+    const float v = ggml_cuda_cast<float>(src_block[lane]);
+    float amax = fabsf(v);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, offset, 32));
+    }
+    const float d  = amax / 127.0f;
+    const float id = d ? 1.0f / d : 0.0f;
+    if (lane == 0) {
+        dst_block->d = d;
+    }
+    dst_block->qs[lane] = (int8_t) roundf(v * id);
+}
+
 // Template dispatch function for quantized set_rows
 template<typename src_t, typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*)>
 static void set_rows_cuda_quant(
@@ -113,6 +190,19 @@ static void set_rows_cuda_quant(
         const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
+
+        if constexpr (std::is_same_v<block_type, block_q8_0> && qk == QK8_0) {
+            const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+            if (warp_size == 32 && !fast_set_rows_q8_0_disabled()) {
+                constexpr int warps_per_block = 4;
+                const dim3 w_block(32, warps_per_block, 1);
+                const dim3 w_grid((ne_total + warps_per_block - 1) / warps_per_block, 1, 1);
+                k_set_rows_q8_0_warp<src_t, idx_t><<<w_grid, w_block, 0, stream>>>(
+                    src0_d, src1_d, dst_d, ne_total, s01, s02, s03, s10, s11, s12, s1, s2, s3,
+                    ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+                return;
+            }
+        }
 
         k_set_rows_quant<src_t, idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,

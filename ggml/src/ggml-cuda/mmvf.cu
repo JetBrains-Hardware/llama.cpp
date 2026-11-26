@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ggml.h"
 #include "common.cuh"
 #include "unary.cuh"
@@ -472,6 +473,63 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool fast_bf16_mmvf_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("GGML_CUDA_DISABLE_FAST_BF16_MMVF");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+// Fast single-token BF16 matvec for K == 256 (e.g. DSpark Markov W2 [256, 200058]):
+// 4 warps/block = 4 output rows/block; each lane loads 8 BF16 weights via one 128-bit uint4 load
+// (32 lanes * 8 = 256 weights = full row) + 8 F32 activations (L1-cached 1 KB), zero __syncthreads.
+static __global__ void __launch_bounds__(128)
+mul_mat_vec_bf16_k256_kernel(
+        const __nv_bfloat16 * __restrict__ x,
+        const float * __restrict__ y,
+        const float * __restrict__ x_bias,
+        float * __restrict__ dst,
+        const int64_t nrows) {
+    const int warp = threadIdx.y;
+    const int lane = threadIdx.x;
+    const int64_t row = (int64_t) blockIdx.x * 4 + warp;
+    if (row >= nrows) {
+        return;
+    }
+
+    const uint4 w = __ldg(reinterpret_cast<const uint4 *>(x + row * 256) + lane);
+    const float4 y0 = __ldg(reinterpret_cast<const float4 *>(y) + 2 * lane + 0);
+    const float4 y1 = __ldg(reinterpret_cast<const float4 *>(y) + 2 * lane + 1);
+
+    // Unpack 8 BF16 -> 8 F32 (bit-shift left by 16 for exact IEEE BF16 -> F32).
+    const float w0 = __uint_as_float((w.x & 0x0000FFFFu) << 16);
+    const float w1 = __uint_as_float( w.x & 0xFFFF0000u);
+    const float w2 = __uint_as_float((w.y & 0x0000FFFFu) << 16);
+    const float w3 = __uint_as_float( w.y & 0xFFFF0000u);
+    const float w4 = __uint_as_float((w.z & 0x0000FFFFu) << 16);
+    const float w5 = __uint_as_float( w.z & 0xFFFF0000u);
+    const float w6 = __uint_as_float((w.w & 0x0000FFFFu) << 16);
+    const float w7 = __uint_as_float( w.w & 0xFFFF0000u);
+
+    float sum = w0 * y0.x + w1 * y0.y + w2 * y0.z + w3 * y0.w
+              + w4 * y1.x + w5 * y1.y + w6 * y1.z + w7 * y1.w;
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += ggml_cuda_shfl_xor(sum, offset, WARP_SIZE);
+    }
+
+    if (lane == 0) {
+        if (x_bias != nullptr) {
+            sum += __ldg(x_bias + row);
+        }
+        dst[row] = sum;
+    }
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -508,6 +566,23 @@ void launch_mul_mat_vec_f_cuda(
     }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (std::is_same_v<T, __nv_bfloat16> && ncols_dst == 1 && !is_multi_token_id) {
+        if (warp_size == 32 && ncols == 256 && stride_row == 256 && nrows >= 16384 &&
+                ids == nullptr && nchannels_x == 1 && nchannels_dst == 1 &&
+                nsamples_x == 1 && nsamples_dst == 1 && nsamples_or_ntokens == 1 &&
+                fusion.gate == nullptr && fusion.gate_bias == nullptr &&
+                ((uintptr_t) x % 16 == 0) && ((uintptr_t) y % 16 == 0) &&
+                !fast_bf16_mmvf_disabled()) {
+            const dim3 grid((nrows + 3) / 4, 1, 1);
+            const dim3 block(32, 4, 1);
+            mul_mat_vec_bf16_k256_kernel<<<grid, block, 0, stream>>>(
+                x, y, (const float *) fusion.x_bias, dst, nrows);
+            return;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     // short rows (one warp each): pack several rows per block, each warp computes its row exactly as a single-warp block
     int64_t rows_per_block = 1;
