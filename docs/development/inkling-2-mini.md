@@ -5,12 +5,23 @@ No loader changes were needed for the Unsloth `UD-Q3_K_XL` file.
 
 ## Recommended default settings (`llama-server`)
 
-Best tested configuration for **Inkling-2-Mini `UD-Q3_K_XL` + DSpark** on a 16 GB card (`15.5 GiB` usable VRAM):
+Best tested configuration for **Inkling-2-Mini `UD-Q3_K_XL` + DSpark** on a 16 GB card (`15.5 GiB` usable VRAM).
+
+GGUF files (Hugging Face):
+
+| Role | File | Size | SHA-256 (first 12) |
+|---|---|---:|---|
+| Target (`-m`) | [unsloth/Inkling-2-Mini-GGUF: `Inkling-2-Mini-UD-Q3_K_XL.gguf`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/Inkling-2-Mini-UD-Q3_K_XL.gguf) | 13,631,779,296 B | `e2d03e8c92ac` |
+| DSpark drafter (`-md`) | [Ninnix96/Inkling-2-Mini-DSpark-GGUF: `Inkling-2-Mini-DSpark-333M.gguf`](https://huggingface.co/Ninnix96/Inkling-2-Mini-DSpark-GGUF/blob/main/Inkling-2-Mini-DSpark-333M.gguf) | 333,053,536 B | `89cddd423e0b` |
+| Vision projector (`-mm`, optional) | [unsloth/Inkling-2-Mini-GGUF: `mmproj-F16.gguf`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/mmproj-F16.gguf) | 639,348,160 B | `3bff75ffeb2d` |
+| Previous drafter (fallback) | [unsloth/Inkling-2-Mini-GGUF: `dspark-Inkling-2-Mini-Q8_0.gguf`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/dspark-Inkling-2-Mini-Q8_0.gguf) (same file as `Mainline_Support/dspark-Inkling-2-Mini-Q8_0.gguf_file`) | 503,889,952 B | `3da00cf7c31b` |
+
+The target file in the repo root is the same file as `Mainline_Support/Inkling-2-Mini-UD-Q3_K_XL.gguf_file`. Do not use the `Old_Support/` files or `dspark-Inkling-2-Mini-Q8_0_Old.gguf` (old drafter layout, `markov_w1` shape error).
 
 ```sh
 llama-server \
   -m Inkling-2-Mini-UD-Q3_K_XL.gguf \
-  -md dspark-Inkling-2-Mini-Q8_0-mainline.gguf \
+  -md Inkling-2-Mini-DSpark-333M.gguf \
   --spec-type draft-dspark --spec-draft-n-max 4 --spec-draft-n-ubatch 512 \
   -ngl 99 -ngld 99 -fa on -c 98304 -b 2048 -ub 2048 -np 1 \
   --kvq --kvq-prefill-free-codes --kvq-resident-cap 4096 \
@@ -23,14 +34,16 @@ Long context (up to `500k`) with vision, tested at `-c 500000` with a 490k promp
 ```sh
 LLAMA_DSPARK_KV_CAP=8192 llama-server \
   -m Inkling-2-Mini-UD-Q3_K_XL.gguf \
-  -md dspark-Inkling-2-Mini-Q8_0-mainline.gguf \
+  -md Inkling-2-Mini-DSpark-333M.gguf \
   --spec-type draft-dspark --spec-draft-n-max 4 --spec-draft-n-ubatch 512 \
   -ngl 99 -ngld 99 -fa on -c 500000 -b 2048 -ub 2048 -np 1 \
   --kvq --kvq-prefill-free-codes --kvq-resident-cap 4096 \
-  -mm mmproj-Inkling-2-Mini-F16.gguf --mmproj-vram-swap --image-max-tokens 5184 \
+  -mm mmproj-F16.gguf --mmproj-vram-swap --image-max-tokens 5184 \
   -lm none --cache-ram 2048 \
   --port 8765 --jinja
 ```
+
+The 500k numbers were measured with the previous `Q8_0` drafter; the Ninnix96 drafter needs `~160 MiB` less VRAM.
 
 - **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.87-14.90 GiB` peak PP / `14.51-14.54 GiB` TG process VRAM, `3,060 / 2,974 t/s` prefill, `108.5 / 113.6 t/s` decode (`61.1% / 62.3%` acceptance).
 - **Max context in `15.5 GiB` (`15,872 MiB`, 16 GB card):**
@@ -41,7 +54,7 @@ LLAMA_DSPARK_KV_CAP=8192 llama-server \
   - `--kvq-prefill-free-codes`: frees KVQ `codes + tables` during prefill and re-uploads from pinned host RAM (`~5-15 ms`), offsetting the `-ub 2048` compute buffer at PP peak.
   - `--kvq-resident-cap 4096`: halves KVQ `resident` from `137.1` to `69.1 MiB` (`-68 MiB` VRAM, `-70 MiB` host RAM) with `<1%` speed impact and unchanged acceptance.
   - `-b 2048 -ub 2048`: raises MoE utilization from `32` to `128` tokens/expert (`+32%` faster prefill vs `-ub 512`).
-  - `-md dspark-Inkling-2-Mini-Q8_0-mainline.gguf`: full `Q8_0` drafter saves `188 MiB` vs `BF16-w2q8` with zero acceptance loss.
+  - `-md Inkling-2-Mini-DSpark-333M.gguf` (Ninnix96, the official DSpark drafter requantized: Q6_K FFN and Markov head, Q8_0 projections): `~160 MiB` less VRAM than the Unsloth `Q8_0` drafter, the same speed or better (see [Drafter comparison](#drafter-comparison-2026-11-26)). There is only one official DSpark drafter (Thinking Machines); all GGUFs on Hugging Face are conversions of it.
   - `--spec-draft-n-max 4`: `K=4` gives `n_rep * (K+1) = 15` query columns per KV head, filling `15/16` of `kvq-attn`'s `N=16` MMA tile.
   - `--spec-draft-n-ubatch 512`: bit-exact; saves `134 MiB` PP / `24 MiB` TG with no speed loss.
   - `layer_inp_dev` is `F16` by default in this branch (saves `36 MiB` PP at `-b 2048`, zero acceptance loss).
@@ -49,7 +62,7 @@ LLAMA_DSPARK_KV_CAP=8192 llama-server \
 - **Long context (`256k-500k` on 16 GB):** main default stays uncapped (best acceptance up to `~230k`); for long contexts up to `~500k`, add `LLAMA_DSPARK_KV_CAP=8192` in the environment to cap DSpark's global layer-1 KV to an 8k sliding window (`+16 MiB` over `4096`, recovers `+4.6%` 76k acceptance to `58.8%`, unaffected PP).
 - **`-lm none` (Windows, host RAM):** loads the GGUFs without mmap. With mmap the mapped files (`13.0 GiB`) stay in the process working set after the weights are copied to VRAM, because `unmap_fragment` is a no-op on Windows (`src/llama-mmap.cpp`; Linux munmaps the offloaded ranges). Same prefill speed and VRAM; peak working set at 385k drops from `22.8` to `10.1 GiB`. There is no `--no-mmap` in this build. See [Host RAM](#host-ram-windows--lm-none) for the 500k numbers.
 - **`--cache-ram 2048` (host RAM):** the default `8192` lets the server keep up to `8 GiB` of saved conversation states in RAM (`~25 KiB/tok` with `--kvq`). `2048` keeps one ~80k conversation for a fast switch back; use `0` to turn it off (a switched-back conversation is processed again).
-- **Vision (optional):** add `-mm mmproj-Inkling-2-Mini-F16.gguf --mmproj-vram-swap` for GPU-accelerated vision with `0 MiB` permanent VRAM and `0 MiB` host RAM (reads the weights from the mmproj file at each image, `~0.3 s` from the OS file cache, and borrows the freed LLM compute + KVQ `buf_codes` window during encode; add `--image-max-tokens 5184` for unscaled native `3840x2160` 4K). Use `--no-mmproj-offload` for CPU-only fallback.
+- **Vision (optional):** add `-mm mmproj-F16.gguf --mmproj-vram-swap` for GPU-accelerated vision with `0 MiB` permanent VRAM and `0 MiB` host RAM (reads the weights from the mmproj file at each image, `~0.3 s` from the OS file cache, and borrows the freed LLM compute + KVQ `buf_codes` window during encode; add `--image-max-tokens 5184` for unscaled native `3840x2160` 4K). Use `--no-mmproj-offload` for CPU-only fallback.
 
 ## Support in ggml-org/llama.cpp
 
@@ -435,6 +448,24 @@ Measured on RTX 5090 / Windows 11, commit `cff196458`, recommended settings abov
   | image (`48 MiB` embeddings, `~95 MiB` f32 preprocessed image, rest not traced; `~535` stays) | `~634` |
 - **Prompt cache (`--cache-ram`, default `8192 MiB`) is not in the numbers above:** with `--kvq` the server still saves the whole slot state when a request does not continue the cached prompt (a different conversation). 50k conversation -> unrelated 20k one: `1,248 MiB` saved (`~25 KiB/tok`) and kept in RAM. In real use with several conversations, add up to `8 GiB`. Use `--cache-ram 0` (or e.g. `2048`) on a 32 GB machine; the cost is a new prefill when the user goes back to an older conversation.
 - Without `-lm none` add `13.0 GiB` to every working set row above (clean file pages, the OS can trim them under pressure, but they show as used).
+
+### Drafter comparison (2026-11-26)
+
+Recommended settings (`-c 98304`, uncapped draft KV, `--spec-draft-n-ubatch 512`), greedy, `cache_prompt=false`, 2 reps; decode speedup over no drafter. Junie = the two replayed requests (short generations, 120-180 tokens ending in a tool call); book = Moby Dick 32k / War and Peace 76k summary prompts, 2,500 generated tokens (`x` = "chapter-by-chapter, at least 1500 words").
+
+| Drafter (file size) | Junie 32k / 76k | book32 / book32x | book76 / book76x | Peak VRAM 76k |
+|---|---|---|---|---:|
+| none (`102` / `95` t/s) | - | - | - | `14,581 MiB` |
+| **Ninnix96 DSpark (333 MB)** | `1.61x / 1.51x` | `1.24x / 1.56x` | `1.31x / 1.19x` | **`15,449 MiB`** |
+| Unsloth DSpark `Q8_0` (504 MB) | `1.57x / 1.64x` | `1.21x / 1.56x` | `1.11x / 1.15x` | `15,611 MiB` |
+| Unsloth DSpark `BF16` mainline (749 MB) | `1.54x / 1.45x` | | | `15,837 MiB` |
+| DSpark `BF16-w2q8` (701 MB, local) | `1.55x / 1.53x` | | | `15,791 MiB` |
+| DFlash2 `K=4` (notfakerv, 538 MB, needs the port on `erokhins/inkling-dflash2`) | `1.85x / 1.33x` | `1.06x / 1.18x` | `1.22x / 1.22x` | `15,283 MiB` |
+| DFlash2 `K=7` | `1.91x / -` | `0.95x / 1.10x` | `1.05x / 0.91x` | `15,235 MiB` |
+
+- AtomicChat `Q8_0` behaves exactly like the Unsloth `Q8_0`. IsValorum `Q4_0` and InterpreticAI `Q8_0` use the old layout and do not load (`markov_w1` shape `201024`).
+- Ninnix96 and Unsloth `Q8_0` are within rep noise (up to `23 t/s` between two reps of one config); Ninnix96 is chosen for the lower VRAM. DFlash2 is not worth it: it trails DSpark on the book prompts at 32k and `K=7` is slower than no drafter on some prompts.
+- With a drafter the greedy output moves away from the no-drafter output within the first `~60-220` characters (also with the standard KV cache, so not a `--kvq` effect), and drafter reps differ from each other; each config is timed on a slightly different text. Raw data: `tmp/inkling/drafters/` (`RESULTS.md`, `RESEARCH.md`).
 
 ## Local tools (not committed)
 
