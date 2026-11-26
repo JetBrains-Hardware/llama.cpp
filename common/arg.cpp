@@ -2735,7 +2735,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--mmproj-vram-swap"},
         {"--no-mmproj-vram-swap"},
-        string_format("keep multimodal projector weights in host RAM and upload transiently to GPU during encode (default: %s)", params.mmproj_vram_swap ? "enabled" : "disabled"),
+        string_format("no resident multimodal projector weights: read them from the mmproj file into a transient GPU buffer at each encode (default: %s)", params.mmproj_vram_swap ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.mmproj_vram_swap = value;
         }

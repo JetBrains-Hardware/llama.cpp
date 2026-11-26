@@ -14,6 +14,21 @@ llama-server \
   --spec-type draft-dspark --spec-draft-n-max 4 --spec-draft-n-ubatch 512 \
   -ngl 99 -ngld 99 -fa on -c 98304 -b 2048 -ub 2048 -np 1 \
   --kvq --kvq-prefill-free-codes --kvq-resident-cap 4096 \
+  -lm none --cache-ram 2048 \
+  --port 8765 --jinja
+```
+
+Long context (up to `500k`) with vision, tested at `-c 500000` with a 490k prompt and a native 4K image (`15.4 GiB` process VRAM, `12.7 GiB` peak host RAM, see [Host RAM](#host-ram-windows--lm-none)):
+
+```sh
+LLAMA_DSPARK_KV_CAP=8192 llama-server \
+  -m Inkling-2-Mini-UD-Q3_K_XL.gguf \
+  -md dspark-Inkling-2-Mini-Q8_0-mainline.gguf \
+  --spec-type draft-dspark --spec-draft-n-max 4 --spec-draft-n-ubatch 512 \
+  -ngl 99 -ngld 99 -fa on -c 500000 -b 2048 -ub 2048 -np 1 \
+  --kvq --kvq-prefill-free-codes --kvq-resident-cap 4096 \
+  -mm mmproj-Inkling-2-Mini-F16.gguf --mmproj-vram-swap --image-max-tokens 5184 \
+  -lm none --cache-ram 2048 \
   --port 8765 --jinja
 ```
 
@@ -32,7 +47,9 @@ llama-server \
   - `layer_inp_dev` is `F16` by default in this branch (saves `36 MiB` PP at `-b 2048`, zero acceptance loss).
   - **Do NOT pass `-ctkd` / `-ctvd` (`q8_0`/`q4_0`):** DSpark block-8 decode selects `MMA_F16`, which dequantizes the entire draft KV cache into `384 MiB` of TG compute buffer on every step (more VRAM and slower).
 - **Long context (`256k-500k` on 16 GB):** main default stays uncapped (best acceptance up to `~230k`); for long contexts up to `~500k`, add `LLAMA_DSPARK_KV_CAP=8192` in the environment to cap DSpark's global layer-1 KV to an 8k sliding window (`+16 MiB` over `4096`, recovers `+4.6%` 76k acceptance to `58.8%`, unaffected PP).
-- **Vision (optional):** add `-mm mmproj-Inkling-2-Mini-F16.gguf --mmproj-vram-swap` for GPU-accelerated vision with `0 MiB` permanent VRAM (keeps weights in host RAM and borrows the freed LLM compute + KVQ `buf_codes` window during encode; add `--image-max-tokens 5184` for unscaled native `3840x2160` 4K). Use `--no-mmproj-offload` for CPU-only fallback.
+- **`-lm none` (Windows, host RAM):** loads the GGUFs without mmap. With mmap the mapped files (`13.0 GiB`) stay in the process working set after the weights are copied to VRAM, because `unmap_fragment` is a no-op on Windows (`src/llama-mmap.cpp`; Linux munmaps the offloaded ranges). Same prefill speed and VRAM; peak working set at 385k drops from `22.8` to `10.1 GiB`. There is no `--no-mmap` in this build. See [Host RAM](#host-ram-windows--lm-none) for the 500k numbers.
+- **`--cache-ram 2048` (host RAM):** the default `8192` lets the server keep up to `8 GiB` of saved conversation states in RAM (`~25 KiB/tok` with `--kvq`). `2048` keeps one ~80k conversation for a fast switch back; use `0` to turn it off (a switched-back conversation is processed again).
+- **Vision (optional):** add `-mm mmproj-Inkling-2-Mini-F16.gguf --mmproj-vram-swap` for GPU-accelerated vision with `0 MiB` permanent VRAM and `0 MiB` host RAM (reads the weights from the mmproj file at each image, `~0.3 s` from the OS file cache, and borrows the freed LLM compute + KVQ `buf_codes` window during encode; add `--image-max-tokens 5184` for unscaled native `3840x2160` 4K). Use `--no-mmproj-offload` for CPU-only fallback.
 
 ## Support in ggml-org/llama.cpp
 
@@ -364,8 +381,8 @@ Re-tested `LLAMA_DSPARK_KV_CAP` under the adopted defaults (`-c 98304 -b 2048 -u
 
 Implemented `--mmproj-vram-swap` (env `LLAMA_ARG_MMPROJ_VRAM_SWAP`) across `llama-context`, `mtmd`, `common`, and `llama-server` (and lifted the blanket `--kvq` multimodal rejection in `tools/server/server.cpp`):
 
-- Keeps `mmproj` weights in host RAM (`0 MiB` permanent GPU VRAM, skips GPU warmup and `mtmd_backends` CUDA init at load).
-- Inside `encode_mtmd_chunk`, calls `llama_context_release_transient_vram(ctx_tgt)` (frees LLM device compute buffers and `--kvq-prefill-free-codes` `buf_codes`), transiently creates `mtmd`'s GPU backend, uploads `mmproj` weights (`609.7 MiB` `F16` in `~47-48 ms`), runs FlashAttention ViT encode, and immediately frees weights, compute buffers, and the GPU backend (`~6-8 ms`, releasing its cuBLAS workspace / CUDA pool so TG VRAM stays minimal) before LLM prefill resumes.
+- No resident `mmproj` weights (`0 MiB` permanent GPU VRAM, skips GPU warmup and `mtmd_backends` CUDA init at load). Since 2026-11-26 also no host copy: after load the weights are freed and only their file offsets are kept (`mtmd_context::vram_swap_models`); each encode reads them from the GGUF into the transient GPU buffer. Before that the host copy cost `610 MiB` of RAM and the upload took `~47-100 ms`; now the read takes `~320 ms` from the OS file cache (a cold read from the SSD is slower), same output.
+- Inside `encode_mtmd_chunk`, calls `llama_context_release_transient_vram(ctx_tgt)` (frees LLM device compute buffers and `--kvq-prefill-free-codes` `buf_codes`), transiently creates `mtmd`'s GPU backend, reads `mmproj` weights from the file into it (`609.7 MiB` `F16`), runs FlashAttention ViT encode, and immediately frees weights, compute buffers, and the GPU backend (`~6-8 ms`, releasing its cuBLAS workspace / CUDA pool so TG VRAM stays minimal) before LLM prefill resumes.
 
 Measured on RTX 5090 at `-c 475000 -b 2048 -ub 2048 -np 1 -fa on --kvq --kvq-prefill-free-codes --kvq-resident-cap 4096`, `LLAMA_DSPARK_KV_CAP=8192`, `Q8_0` DSpark `K=4`, `dub=512`, `mmproj-Inkling-2-Mini-F16.gguf` (`609.7 MiB`), `--mmproj-vram-swap`, greedy `temp=0`, running a `3840x2160` 4K PNG -> `req_76k` text -> second 4K PNG:
 
@@ -375,6 +392,49 @@ Measured on RTX 5090 at `-c 475000 -b 2048 -ub 2048 -np 1 -fa on --kvq --kvq-pre
 | Native 4K (`--image-max-tokens 5184`, `3840x2160`, `5,226` tok) | `14,673 MiB` (`14.33 GiB`) | `609.7 + 500.1 MiB` (`1.08 GiB`) | `47.1 / ~579 / 7.9 ms` | **`15,812 / 15,840 / 15,840 MiB` (`15.44-15.47 GiB`)** | `1,804-1,971` / `133.5-136.8 t/s` | `3,180.4 t/s` |
 
 - Both default 4K and native `3840x2160` 4K fit cleanly under `15.5 GiB` (`15.44-15.47 GiB` peak) at `-c 475000` with zero LLM or drafter weight eviction, read all shapes and verbatim text (including small `36pt` text) accurately, and produced identical deterministic outputs before and after the 76k text turn.
+
+### Host RAM (Windows, `-lm none`)
+
+Measured on RTX 5090 / Windows 11, commit `cff196458`, recommended settings above plus `LLAMA_DSPARK_KV_CAP=8192 -lm none -mm mmproj-Inkling-2-Mini-F16.gguf --mmproj-vram-swap --image-max-tokens 5184`. Requests: War and Peace text prefill (max_tokens 1), then the same text + a native `3840x2160` PNG (`5,203` tokens) + a question (cache reuse, only the image is new). Working set of `llama-server` (`PeakWorkingSet64` for peaks):
+
+| | `-c 409600`, 385k text | `-c 500000`, 490k text |
+|---|---:|---:|
+| After load (incl. `610 MiB` mmproj weights in host RAM) | `1.9 GiB` | `1.9 GiB` |
+| End of text prefill | `10.7 GiB` | `12.7 GiB` |
+| kvq pinned pool | `7.7 GiB` (48 pages) | `9.8 GiB` (61 of 62 pages) |
+| 4K image (encode + `5,203` image tokens), peak | **`11.2 GiB`** (`+0.5 GiB`) | **`13.4 GiB`** (`+0.7 GiB`) |
+| After the image | `11.1 GiB` | `13.3 GiB` |
+| Commit charge (private bytes), peak | `27.6 GiB` | `30.3 GiB` |
+| GPU (whole card, incl. `441 MiB` desktop), peak in decode | `15,853 MiB` | `16,253 MiB` (process `~15.4 GiB`) |
+| Prefill text / image tokens | `3,941 / 1,501 t/s` | `3,486 / 1,334 t/s` |
+
+- Where the RAM goes: `~1.3 GiB` process + CUDA, `0.6 GiB` mmproj, the pinned pool (`164.2 MiB` per 8192-row page = `20.5 KiB/tok`, the q8_0 rows of the 8 global layers, allocated on demand), `~1 GiB` prompt-path overhead (`~0.3 GiB` on the first request, context checkpoints `~90 MiB`, rest grows slowly with the prompt), and the image (`+0.5-0.7 GiB`, most of it stays).
+- **Formula (recommended settings, `-lm none`, mmproj read from the file), peak working set of `llama-server`:**
+
+  `RAM ~= 2.6 GiB + 20.5 KiB x n_tok` (+ `0.5 GiB` for each image turn, + the prompt cache up to `--cache-ram`)
+
+  - `n_tok` = tokens in the context (the pool pages are allocated on demand); worst case `n_tok = -c`. `20.5 KiB/tok` = one `164.2 MiB` page per 8192 tokens (q8_0 rows of the 8 global layers + host copy of the codes and tables), rounded up to whole pages, one page ahead.
+  - `2.6 GiB` = `1.3 GiB` after load + `~0.3 GiB` on the first request + `~0.5-0.9 GiB` prompt path + context checkpoints (`~0.1-0.2 GiB`) + page rounding. It is `~2.4 GiB` at 100k and `~2.7 GiB` at 490k.
+  - Check: 385k -> `2.6 + 7.5 = 10.1 GiB` (measured `10.1`); 490k -> `2.6 + 9.6 = 12.2 GiB` (measured `12.2`), with the image `12.7` (measured `12.7`). 500k worst case with images: `~12.9 GiB`.
+  - Commit charge (private bytes) ~= process VRAM + working set + `~0.7 GiB`.
+- **Host RAM for a full 500k context with images: `~12.8 GiB` for `llama-server`** (`~13.5 GiB` before the mmproj file read; text only, no `-mm`: `~12.1 GiB`). A machine with 32 GB RAM is fine; 16 GB is not enough.
+- Commit charge is not RAM: under WDDM the device allocations count toward the process commit (private bytes = VRAM + private working set + `~0.5-0.9 GiB` in every sample). The commit limit (RAM + page file) must cover `~31 GiB` for `llama-server` alone at 500k, so do not disable or cap the page file.
+- **mmproj read from the file (no host copy, see the 4K vision section):** same 500k + image run, identical reply: after load `1.3 GiB` (`1.9` during load, the loader still reads the weights once), end of prefill `12.2 GiB`, **image peak `12.7 GiB` (`13,046 MiB`, `-631 MiB`)**, after the image `12.6 GiB`, commit peak `29.6 GiB`, GPU unchanged (`16,253 MiB`). Image read + upload `319 ms` (was `50-101 ms`), image prefill `1,253 t/s` (was `1,334`).
+- Breakdown of the `13,677 MiB` peak (500k + image, before the mmproj change; now the mmproj row is `0`), from the load log, the kvq pool lines and the sampler:
+
+  | Item | MiB |
+  |---|---:|
+  | CUDA runtime / driver, DLLs, process heap (after load, not traced) | `~850` |
+  | mmproj `F16` weights in host RAM (`--mmproj-vram-swap`) | `610` |
+  | `token_embd.weight` (`CUDA_Host`, the embedding lookup runs on the CPU) | `304` |
+  | kvq ring (`72`) + staging and resident mirrors (`81`) | `153` |
+  | host compute / output buffers (target + drafter) | `~55` |
+  | **kvq pool, 61 pages:** q8_0 rows `136.0 MiB`/page (`8,296`), host copy of the codes `26.0`/page (`1,587`), tables `2.2`/page (`134`) | **`10,015`** |
+  | context checkpoints (`3.8 + 4 x 43.8`) | `179` |
+  | prompt path (`~330` on the first request + `~550` with a long prompt, fixed, not traced) | `~877` |
+  | image (`48 MiB` embeddings, `~95 MiB` f32 preprocessed image, rest not traced; `~535` stays) | `~634` |
+- **Prompt cache (`--cache-ram`, default `8192 MiB`) is not in the numbers above:** with `--kvq` the server still saves the whole slot state when a request does not continue the cached prompt (a different conversation). 50k conversation -> unrelated 20k one: `1,248 MiB` saved (`~25 KiB/tok`) and kept in RAM. In real use with several conversations, add up to `8 GiB`. Use `--cache-ram 0` (or e.g. `2048`) on a 32 GB machine; the cost is a new prefill when the user goes back to an older conversation.
+- Without `-lm none` add `13.0 GiB` to every working set row above (clean file pages, the OS can trim them under pressure, but they show as used).
 
 ## Local tools (not committed)
 

@@ -893,16 +893,26 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
-    // transient GPU residency: weights stay in buf_host and are uploaded only during encode
+    // transient GPU residency: no host copy of the weights, they are read from the mmproj file into the GPU buffer at each encode
     struct vram_swap_model {
         mtmd_model * model = nullptr;
-        ggml_backend_buffer_ptr buf_host;
-        std::vector<std::pair<ggml_tensor *, void *>> host_ptrs;
+        std::vector<std::pair<ggml_tensor *, size_t>> file_offs; // weight -> offset of its data in the mmproj file
     };
     bool vram_swap = false;
     bool vram_swap_on_dev = false;
     ggml_backend_dev_t vram_swap_dev = nullptr;
+    std::string vram_swap_fname;
     std::vector<vram_swap_model> vram_swap_models;
+
+    void vram_swap_free_dev() {
+        for (auto & sm : vram_swap_models) {
+            sm.model->buf.reset();
+            for (auto & [t, _] : sm.file_offs) {
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
+        }
+    }
 
     bool vram_swap_acquire() {
         if (!vram_swap || vram_swap_on_dev) {
@@ -912,37 +922,40 @@ struct mtmd_context {
         if (backends && !backends->acquire_gpu(vram_swap_dev)) {
             return false;
         }
+        auto fail = [&](const char * what) {
+            LOG_ERR("%s: %s\n", __func__, what);
+            vram_swap_free_dev();
+            if (backends) {
+                backends->release_gpu();
+            }
+            return false;
+        };
+        std::ifstream fin = open_ifstream_binary(vram_swap_fname);
+        if (!fin) {
+            return fail("failed to open the mmproj file");
+        }
         ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(vram_swap_dev);
+        std::vector<uint8_t> read_buf;
         size_t total_bytes = 0;
         for (auto & sm : vram_swap_models) {
-            for (auto & [t, _] : sm.host_ptrs) {
-                t->buffer = nullptr;
-                t->data   = nullptr;
-            }
             sm.model->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(sm.model->ctx_data.get(), dev_buft));
             if (!sm.model->buf) {
-                LOG_ERR("%s: failed to allocate transient GPU buffer for mmproj weights\n", __func__);
-                for (auto & sm2 : vram_swap_models) {
-                    sm2.model->buf.reset();
-                    for (auto & [t, ptr] : sm2.host_ptrs) {
-                        t->buffer = sm2.buf_host.get();
-                        t->data   = ptr;
-                    }
-                }
-                if (backends) {
-                    backends->release_gpu();
-                }
-                return false;
+                return fail("failed to allocate transient GPU buffer for mmproj weights");
             }
             ggml_backend_buffer_set_usage(sm.model->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            for (auto & [t, ptr] : sm.host_ptrs) {
+            for (auto & [t, offs] : sm.file_offs) {
                 const size_t nbytes = ggml_nbytes(t);
-                ggml_backend_tensor_set(t, ptr, 0, nbytes);
+                read_buf.resize(nbytes);
+                fin.seekg((std::streamoff) offs, std::ios::beg);
+                if (!fin.read((char *) read_buf.data(), (std::streamsize) nbytes)) {
+                    return fail("failed to read mmproj weights from the file");
+                }
+                ggml_backend_tensor_set(t, read_buf.data(), 0, nbytes);
                 total_bytes += nbytes;
             }
         }
         vram_swap_on_dev = true;
-        LOG_INF("%s: uploaded %.1f MiB mmproj weights to %s in %.2f ms\n", __func__,
+        LOG_INF("%s: read %.1f MiB mmproj weights from the file into %s in %.2f ms\n", __func__,
                 total_bytes / 1048576.0, ggml_backend_dev_name(vram_swap_dev), (ggml_time_us() - t0) / 1000.0);
         return true;
     }
@@ -967,13 +980,9 @@ struct mtmd_context {
         for (auto & sm : vram_swap_models) {
             if (sm.model->buf) {
                 wt_bytes += ggml_backend_buffer_get_size(sm.model->buf.get());
-                sm.model->buf.reset();
-            }
-            for (auto & [t, ptr] : sm.host_ptrs) {
-                t->buffer = sm.buf_host.get();
-                t->data   = ptr;
             }
         }
+        vram_swap_free_dev();
         vram_swap_on_dev = false;
         LOG_INF("%s: released %.1f MiB mmproj weights + %.1f MiB compute buffers + GPU backend in %.2f ms\n", __func__,
                 wt_bytes / 1048576.0, comp_bytes / 1048576.0, (ggml_time_us() - t0) / 1000.0);
@@ -1039,21 +1048,33 @@ struct mtmd_context {
         models = mtmd_model_load(mmproj_fname, model_params, buft);
 
         if (use_vram_swap) {
+            gguf_init_params gparams = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+            gguf_context_ptr gf(gguf_init_from_file(mmproj_fname, gparams));
+            if (!gf) {
+                throw std::runtime_error(mtmd_format("failed to read %s", mmproj_fname));
+            }
+            vram_swap_fname = mmproj_fname;
             for (mtmd_model * m : { models.v.get(), models.a.get(), models.gen_a.get() }) {
                 if (!m || !m->buf || !m->ctx_data) {
                     continue;
                 }
                 vram_swap_model sm;
-                sm.model    = m;
-                sm.buf_host = std::move(m->buf);
+                sm.model = m;
                 for (ggml_tensor * t = ggml_get_first_tensor(m->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(m->ctx_data.get(), t)) {
-                    if (t->buffer != nullptr && t->view_src == nullptr) {
-                        sm.host_ptrs.emplace_back(t, t->data);
+                    if (t->buffer == nullptr || t->view_src != nullptr) {
+                        continue;
                     }
+                    const int64_t i = gguf_find_tensor(gf.get(), t->name);
+                    if (i < 0) {
+                        throw std::runtime_error(mtmd_format("--mmproj-vram-swap: tensor %s is not in %s", t->name, mmproj_fname));
+                    }
+                    sm.file_offs.emplace_back(t, gguf_get_data_offset(gf.get()) + gguf_get_tensor_offset(gf.get(), i));
                 }
                 vram_swap_models.push_back(std::move(sm));
             }
-            LOG_INF("%s: mmproj vram_swap enabled (weights kept in host RAM, transient GPU %s)\n",
+            // the host copy that the loader made is not needed any more
+            vram_swap_free_dev();
+            LOG_INF("%s: mmproj vram_swap enabled (weights read from the file at each encode, transient GPU %s)\n",
                     __func__, ggml_backend_dev_name(device));
         }
 

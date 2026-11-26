@@ -645,7 +645,7 @@ struct common_params {
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;                 // use GPU for multimodal model
-    bool mmproj_vram_swap = false;              // keep mmproj weights in host RAM and upload transiently on GPU during encode
+    bool mmproj_vram_swap = false;              // read mmproj weights from the file into a transient GPU buffer at each encode
     ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
     bool no_mmproj = false;                     // explicitly disable multimodal model
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
