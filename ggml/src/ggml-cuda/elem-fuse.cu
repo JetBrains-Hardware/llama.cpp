@@ -318,8 +318,8 @@ int ggml_cuda_match_loop_control(const ggml_cgraph * cgraph, int i, ggml_cuda_lo
         return 0;
     }
 
-    const ggml_tensor * n_down = cgraph->nodes[i + 1];
-    if (n_down->op != GGML_OP_MUL_MAT || n_down->src[1] != n_cat) {
+    ggml_tensor * n_down = cgraph->nodes[i + 1];
+    if (n_down->op != GGML_OP_MUL_MAT || n_down->src[1] != n_cat || n_down->type != GGML_TYPE_F32 || !ggml_is_contiguous(n_down)) {
         return 0;
     }
     const ggml_tensor * w_down = n_down->src[0];
@@ -444,6 +444,7 @@ int ggml_cuda_match_loop_control(const ggml_cgraph * cgraph, int i, ggml_cuda_lo
     match.w_down   = w_down;
     match.w_forget = w_forget;
     match.w_gain   = w_gain;
+    match.gate     = n_down;
     match.dst      = n_add;
     return n;
 }
@@ -608,8 +609,8 @@ void ggml_cuda_op_loop_control(ggml_backend_cuda_context & ctx, const ggml_cuda_
     const int64_t s_msg = match.msg->nb[1]      / sizeof(float);
     const int64_t s_dst = match.dst->nb[1]      / sizeof(float);
 
-    ggml_cuda_pool_alloc<float> gate_alloc(ctx.pool(), (size_t) T * R);
-    float * gate = gate_alloc.get();
+    // Reuse graph-allocated n_down->data [R, T] instead of ctx.pool() so captured CUDA graphs stay pointer-stable.
+    float * gate = (float *) match.gate->data;
     cudaStream_t stream = ctx.stream();
 
     if (T == 1) {
