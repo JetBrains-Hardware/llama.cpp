@@ -4752,7 +4752,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n = loop_ctrl_disabled ? 0 : ggml_cuda_match_loop_control(cgraph, i, match);
         if (n > 0) {
             // match.gate (n_down) is written before loop_ctrl_up_apply reads cur/msg and must not overlap any
-            // input or dst; match.dst may exact-alias cur or msg (elementwise per (d, t)), already checked in matcher.
+            // input or dst; match.dst is only written in loop_ctrl_up_apply (after loop_ctrl_down finishes reading
+            // cur_norm/msg_norm) and may exact-alias cur or msg (checked in matcher).
             const auto range_overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
                 const int64_t a0 = (int64_t) a->data;
                 const int64_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -4765,9 +4766,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 !range_overlaps(match.gate, match.msg_norm) &&
                 !range_overlaps(match.gate, match.cur) &&
                 !range_overlaps(match.gate, match.msg) &&
-                !range_overlaps(match.gate, match.dst) &&
-                !range_overlaps(match.dst,  match.cur_norm) &&
-                !range_overlaps(match.dst,  match.msg_norm);
+                !range_overlaps(match.gate, match.dst);
             if (mem_safe) {
                 ggml_cuda_op_loop_control(*cuda_ctx, match);
                 return n - 1;
