@@ -49,6 +49,7 @@ struct ggml_cuda_loop_control_match {
     const ggml_tensor * w_down   = nullptr;
     const ggml_tensor * w_forget = nullptr;
     const ggml_tensor * w_gain   = nullptr;
+    ggml_tensor       * gate     = nullptr; // pre-allocated n_down tensor [R, T] (graph-safe scratch)
     ggml_tensor       * dst      = nullptr;
 };
 
