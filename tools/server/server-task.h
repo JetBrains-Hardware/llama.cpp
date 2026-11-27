@@ -98,6 +98,8 @@ struct task_params {
 
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
+    std::vector<llama_token> force_tokens;
+    std::string dump_logprobs_path;
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;

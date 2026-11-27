@@ -287,7 +287,9 @@ static bool kvq_check_segment(const llama_vocab * vocab, const std::vector<llama
     const std::string p_start = common_token_to_piece(vocab, ids[s]);
     const std::string p_asst  = common_token_to_piece(vocab, ids[s + 1]);
     const std::string p_end   = common_token_to_piece(vocab, ids[e]);
-    if (p_start != "<|im_start|>" || p_asst != "assistant" || p_end != "<|im_end|>") {
+    // Inkling-2: a model turn starts with <|message_model|> and every message ends with <|end_message|>
+    const bool inkling = p_start == "<|message_model|>" && p_end == "<|end_message|>";
+    if (!inkling && (p_start != "<|im_start|>" || p_asst != "assistant" || p_end != "<|im_end|>")) {
         LOG_ERR("%s: unexpected segment tokens: ids[s] = %d, ids[s+1] = %d, ids[e] = %d\n", __func__, ids[s], ids[s + 1], ids[e]);
         return false;
     }
