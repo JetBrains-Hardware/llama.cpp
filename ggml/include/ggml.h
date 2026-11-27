@@ -2650,6 +2650,7 @@ extern "C" {
         GGML_KVQ_SCORE      = 2,
         GGML_KVQ_ATTN_LSE   = 3,
         GGML_KVQ_SCORE_TOPK = 4,
+        GGML_KVQ_NO_VGAIN   = 0x100, // flag: vc has no trailing per-row f16 gain word (gain = 1)
     };
 
     #define GGML_KVQ_MAX_STREAM 8

@@ -6764,11 +6764,13 @@ static struct ggml_tensor * ggml_kvq_attn_impl(
         int                   mode,
         int                   n_top,
         int                   n_sink) {
-    GGML_ASSERT(mode == GGML_KVQ_ATTN || mode == GGML_KVQ_SCORE || mode == GGML_KVQ_ATTN_LSE || mode == GGML_KVQ_SCORE_TOPK);
-    const bool lse   = mode == GGML_KVQ_ATTN_LSE;
-    const bool attn  = mode == GGML_KVQ_ATTN || lse;
-    const bool topk  = mode == GGML_KVQ_SCORE_TOPK;
-    const bool score = mode == GGML_KVQ_SCORE || topk;
+    const bool no_vgain  = (mode & GGML_KVQ_NO_VGAIN) != 0;
+    const int  base_mode = mode & ~GGML_KVQ_NO_VGAIN;
+    GGML_ASSERT(base_mode == GGML_KVQ_ATTN || base_mode == GGML_KVQ_SCORE || base_mode == GGML_KVQ_ATTN_LSE || base_mode == GGML_KVQ_SCORE_TOPK);
+    const bool lse   = base_mode == GGML_KVQ_ATTN_LSE;
+    const bool attn  = base_mode == GGML_KVQ_ATTN || lse;
+    const bool topk  = base_mode == GGML_KVQ_SCORE_TOPK;
+    const bool score = base_mode == GGML_KVQ_SCORE || topk;
     GGML_ASSERT(!score || kc);
     GGML_ASSERT(k || kc);
 
@@ -6820,7 +6822,7 @@ static struct ggml_tensor * ggml_kvq_attn_impl(
         GGML_ASSERT(tab->nb[1] % sizeof(float) == 0 && tab->nb[2] % sizeof(float) == 0);
         if (attn) {
             GGML_ASSERT(vc && vc->type == GGML_TYPE_I32);
-            GGML_ASSERT(vc->ne[0] >= 2 && vc->ne[1] == n_chunk_rows && vc->ne[2] == G && vc->ne[3] == kc->ne[3]);
+            GGML_ASSERT(vc->ne[0] >= (no_vgain ? 1 : 2) && vc->ne[1] == n_chunk_rows && vc->ne[2] == G && vc->ne[3] == kc->ne[3]);
         }
     }
 

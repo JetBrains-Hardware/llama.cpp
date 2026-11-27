@@ -350,7 +350,7 @@ static int kvq_popcount(uint64_t x) {
 
 llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
         int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate, size_t shared_min, bool host_prealloc, size_t host_max_bytes, size_t host_keep_bytes,
-        const std::vector<int32_t> & layer_order, int32_t scr_block, int32_t scr_rel_keep) :
+        const std::vector<int32_t> & layer_order, int32_t scr_block, int32_t scr_rel_keep, bool v_gain) :
     n_rows_(n_rows), n_crow(n_chunk_rows),
     D(head_dim), ROW((size_t) (head_dim/32)*34), TAB_SLOT((size_t) head_dim*head_dim + (size_t) 3*head_dim*sizeof(float)) {
     if (D != 128 && D != 256) {
@@ -373,6 +373,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, in
     n_chunk = (n_rows + n_chunk_rows - 1)/n_chunk_rows;
     nwk     = (bits_k*(int32_t) D + 31)/32;
     nwv     = (bits_v*(int32_t) D + 31)/32;
+    v_gain_ = v_gain;
+    nwv_row = nwv + (v_gain_ ? 1 : 0);
     cap     = resident_cap;
     cap_tot = n_sink + cap + 1;
     n_bmw   = (n_rows + 63)/64;
@@ -535,7 +537,7 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, in
     for (auto & l : layers) {
         layer_tensors & t = l.t;
         t.kc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwk, n_crow, G, n_pg);
-        t.vc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwv + 1, n_crow, G, n_pg);
+        t.vc   = ggml_new_tensor_4d(ctx_codes.get(), GGML_TYPE_I32, nwv_row, n_crow, G, n_pg);
         t.tab  = ggml_new_tensor_3d(ctx_codes.get(), GGML_TYPE_I8, TAB_SLOT, 2*G, n_pg);
         t.rkv_h = bufs[l.buf].rkv_h;
         ggml_format_name(t.kc,    "kvq_kc-%d",    l.il);
@@ -751,8 +753,8 @@ llama_kvq_store::llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, in
         }
     }
 
-    LLAMA_LOG_INFO("%s: n_coarse = %d of %d rows, %d chunks of %d rows, K %d / V %d bits (%d / %d words), resident slots %d + %d sinks\n", __func__,
-            seqs[0].n_coarse, n_rows, n_chunk, n_crow, bits_k, bits_v, nwk, nwv, cap, n_sink);
+    LLAMA_LOG_INFO("%s: n_coarse = %d of %d rows, %d chunks of %d rows, K %d / V %d bits (%d / %d words, v_gain=%d), resident slots %d + %d sinks\n", __func__,
+            seqs[0].n_coarse, n_rows, n_chunk, n_crow, bits_k, bits_v, nwk, nwv_row, (int) v_gain_, cap, n_sink);
     LLAMA_LOG_INFO("%s: device: codes %.1f MiB, tables %.1f MiB (%s), resident %.1f MiB, ring %.1f MiB, scratch %.1f MiB (%s), other %.1f MiB; host: store %.1f MiB (%s), codes and tables %.1f MiB, ring %.1f MiB, other %.1f MiB\n", __func__,
             mi.codes/1048576.0, mi.tables/1048576.0, "freed in a prompt only with --kvq-prefill-free-codes", mi.resident/1048576.0, mi.ring/1048576.0, mi.scratch/1048576.0, scr_ok ? "used" : "not used", mi.other_dev/1048576.0,
             mi.host_store/1048576.0, mi.pinned ? "pinned" : "pageable", mi.host_codes/1048576.0, mi.host_ring/1048576.0, mi.host_other/1048576.0);
@@ -907,7 +909,7 @@ void llama_kvq_store::set_n_coarse(int32_t seq, int32_t n) {
 void llama_kvq_store::state_write_meta(int32_t seq, llama_io_write_i & io) const {
     const layer_tensors & t = layers[0].t;
     const int32_t v[13] = {
-        (int32_t) layers.size(), G, (int32_t) D, (int32_t) ROW, n_crow, nwk, nwv, seqs[seq].n_coarse,
+        (int32_t) layers.size(), G, (int32_t) D, (int32_t) ROW, n_crow, nwk, nwv_row, seqs[seq].n_coarse,
         (int32_t) GGML_TYPE_I8, (int32_t) (D*D), (int32_t) GGML_TYPE_F32, (int32_t) (D*3*sizeof(float)), seqs[seq].n_host,
     };
     io.write(v, sizeof(v));
@@ -924,9 +926,9 @@ void llama_kvq_store::state_read_meta(int32_t seq, llama_io_read_i & io, int32_t
         throw std::runtime_error(format("kvq state of %d attention layers with %d kv heads of %d, this context: %d, %d, %d",
                 v[0], v[1], v[2], (int) layers.size(), G, (int) D));
     }
-    if (v[4] != n_crow || v[5] != nwk || v[6] != nwv) {
+    if (v[4] != n_crow || v[5] != nwk || v[6] != nwv_row) {
         throw std::runtime_error(format("kvq state with chunks of %d rows and %d / %d words per K / V row, this context: %d, %d / %d",
-                v[4], v[5], v[6], n_crow, nwk, nwv));
+                v[4], v[5], v[6], n_crow, nwk, nwv_row));
     }
     if (v[8] != (int32_t) GGML_TYPE_I8 || v[9] != (int32_t) (D*D) || v[10] != (int32_t) GGML_TYPE_F32 || v[11] != (int32_t) (D*3*sizeof(float))) {
         throw std::runtime_error(format("kvq state with tables of type %d / %d (%d / %d bytes), this context: %d / %d (%d / %d bytes)",

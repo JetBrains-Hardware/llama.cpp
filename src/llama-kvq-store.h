@@ -107,7 +107,7 @@ public:
     llama_kvq_store(const llama_kv_cache & kv, int64_t head_dim, int32_t n_rows, int32_t n_chunk_rows, int32_t bits_k, int32_t bits_v,
             int32_t resident_cap, int32_t n_sink, int32_t layer_bufs, int32_t n_gate = 0, size_t shared_min = 0,
             bool host_prealloc = false, size_t host_max_bytes = 0, size_t host_keep_bytes = 0,
-            const std::vector<int32_t> & layer_order = {}, int32_t scr_block = 0, int32_t scr_rel_keep = 0);
+            const std::vector<int32_t> & layer_order = {}, int32_t scr_block = 0, int32_t scr_rel_keep = 0, bool v_gain = true);
     ~llama_kvq_store();
 
     // fit mode: the table (llama_kvq_pack_table) of chunk c, for (il, g, K or V)
@@ -305,6 +305,8 @@ public:
     int32_t n_chunk_rows() const { return n_crow; }
     int32_t n_head_kv()    const { return G; }
     int32_t n_words(bool is_v) const { return is_v ? nwv : nwk; }
+    int32_t n_words_vc() const { return nwv_row; }
+    bool    has_v_gain() const { return v_gain_; }
     int64_t n_ring()       const { return n_cell; } // cells of the ring cache
 
     std::vector<int32_t> layer_ids() const;
@@ -357,6 +359,8 @@ private:
     int32_t G         = 0;
     int32_t nwk       = 0;
     int32_t nwv       = 0;
+    int32_t nwv_row   = 0;
+    bool    v_gain_   = true;
     int32_t cap       = 0; // evictable slots
     int32_t n_sink    = 0;
     int32_t cap_tot   = 0;
@@ -477,7 +481,7 @@ private:
     uint8_t * hcode_ptr(int32_t s, size_t li, bool is_v, int32_t g, int32_t pos) const {
         const int32_t pg = seqs[s].page_tab[pos/n_crow];
         GGML_ASSERT(pg >= 0 && "kvq: a row of a chunk without a page");
-        const size_t  nb = (size_t) (is_v ? nwv + 1 : nwk)*sizeof(int32_t);
+        const size_t  nb = (size_t) (is_v ? nwv_row : nwk)*sizeof(int32_t);
         return (is_v ? pages->vc_ptr(pg, (int32_t) li) : pages->kc_ptr(pg, (int32_t) li)) + ((size_t) g*pages->rows(pg) + pos%n_crow)*nb;
     }
     const int64_t D;

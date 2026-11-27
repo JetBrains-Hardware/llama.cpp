@@ -49,6 +49,7 @@ struct kvq_args {
     // logical numbers of the stream of a block (kvq_sview)
     int s, ncs, nck, cbpc, rows, tiles, cblk;
     int nwk, nwv, nrk, nrv; // words per packed K/V row, word rows of the K/V staging
+    bool no_vgain;
     float scale2;           // scale*log2(e)
 
     const float * q; int64_t q_nb1, q_nb2;          // in elements
@@ -662,7 +663,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
     uint32_t * s_st   = (uint32_t *) (s_red + 2*KVQ_WARPS*N);   // [NBUF][ld_st]
     half     * s_mask = (half *) (s_st + KVQ_NBUF*ld_st);       // [NBUF][L][T]
 
-    const int nwv1 = a.nwv + 1;
+    const int nwv_load = a.no_vgain ? a.nwv : a.nwv + 1;
     auto stage = [&](const int64_t tr, const int buf) {
         uint32_t * sk = s_st + buf*ld_st;
         const int nr = (int) min((int64_t) KVQ_T, r1 - tr);
@@ -684,17 +685,17 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
         }
         if (ATTN) {
             uint32_t * sv = sk + a.nrk*KVQ_LDR;
-            const int dr = KVQ_NTHREADS / nwv1;
-            const int di = KVQ_NTHREADS % nwv1;
-            int r = tid / nwv1;
-            int i = tid % nwv1;
+            const int dr = KVQ_NTHREADS / nwv_load;
+            const int di = KVQ_NTHREADS % nwv_load;
+            int r = tid / nwv_load;
+            int i = tid % nwv_load;
             const char * src = a.vc + (tr - (int64_t) t*a.n_crow)*a.vc_nb1 + g*a.vc_nb2 + (int64_t) a.pt[t]*a.vc_nb3;
             while (r < nr) {
                 kvq_cp4(sv + (i + 1)*KVQ_LDR + r, src + r*a.vc_nb1 + 4*i);
                 i += di;
                 r += dr;
-                if (i >= nwv1) {
-                    i -= nwv1;
+                if (i >= nwv_load) {
+                    i -= nwv_load;
                     r++;
                 }
             }
@@ -916,8 +917,8 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
         if (ATTN) {
             const bool rescale = kvq_tile_update<NT>(s, m_a, z_a, alpha, s_red, lane);
 
-            const float gaina = va ? __half2float(__ushort_as_half((unsigned short) (sv[(a.nwv + 1)*KVQ_LDR + la] & 0xFFFF))) : 0.0f;
-            const float gainb = vb ? __half2float(__ushort_as_half((unsigned short) (sv[(a.nwv + 1)*KVQ_LDR + la + 8] & 0xFFFF))) : 0.0f;
+            const float gaina = va ? (a.no_vgain ? 1.0f : __half2float(__ushort_as_half((unsigned short) (sv[(a.nwv + 1)*KVQ_LDR + la] & 0xFFFF)))) : 0.0f;
+            const float gainb = vb ? (a.no_vgain ? 1.0f : __half2float(__ushort_as_half((unsigned short) (sv[(a.nwv + 1)*KVQ_LDR + la + 8] & 0xFFFF)))) : 0.0f;
 
 #pragma unroll
             for (int j = 0; j < NT; ++j) {
@@ -2101,7 +2102,9 @@ static void ggml_cuda_op_kvq_attn_d(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_tensor * mask = dst->src[8];
     const ggml_tensor * pt   = dst->src[9];
 
-    const int  mode  = ggml_get_op_params_i32(dst, 2);
+    const int  mode_raw = ggml_get_op_params_i32(dst, 2);
+    const bool no_vgain = (mode_raw & GGML_KVQ_NO_VGAIN) != 0;
+    const int  mode     = mode_raw & ~GGML_KVQ_NO_VGAIN;
     const bool lse   = mode == GGML_KVQ_ATTN_LSE;
     const bool attn  = mode == GGML_KVQ_ATTN || lse;
     const bool topk  = mode == GGML_KVQ_SCORE_TOPK;
@@ -2142,7 +2145,8 @@ static void ggml_cuda_op_kvq_attn_d(ggml_backend_cuda_context & ctx, ggml_tensor
     a.n_tblk   = (a.n_tail + KVQ_PROWS - 1)/KVQ_PROWS;
     a.n_part   = a.n_cblk + a.n_rblk + a.n_tblk;
     a.nwk      = kc ? (int) kc->ne[0] : 1;
-    a.nwv      = attn && kc ? (int) vc->ne[0] - 1 : 1;
+    a.nwv      = attn && kc ? (no_vgain ? (int) vc->ne[0] : (int) vc->ne[0] - 1) : 1;
+    a.no_vgain = no_vgain;
     a.nrk      = a.nwk + 2;
     a.nrv      = a.nwv + 2;
     a.scale2   = ggml_get_op_params_f32(dst, 0)*KVQ_LOG2E;
