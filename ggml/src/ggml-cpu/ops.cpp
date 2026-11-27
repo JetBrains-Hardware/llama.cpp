@@ -11995,8 +11995,18 @@ void ggml_compute_forward_kvq_attn(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    const bool mask_tail_only = mask && n_tail > 0 && mask->ne[0] == n_tail;
     auto mask_at = [&](int64_t row, int64_t l) -> double {
-        return mask ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) mask->data + row*mask->nb[0] + l*mask->nb[1] + s_cur*mask->nb[3])) : 0.0;
+        if (!mask) {
+            return 0.0;
+        }
+        if (mask_tail_only) {
+            if (row < n_coarse) {
+                return 0.0;
+            }
+            row -= n_coarse;
+        }
+        return GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) ((const char *) mask->data + row*mask->nb[0] + l*mask->nb[1] + s_cur*mask->nb[3]));
     };
     auto aux_at = [&](int64_t i, int64_t r, int64_t m, int64_t t) -> float {
         return *(const float *) ((const char *) tab->data + D*D + (i + r*D)*sizeof(float) + m*tab->nb[1] + page_of(t)*tab->nb[2]);

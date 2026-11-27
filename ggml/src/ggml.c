@@ -6824,8 +6824,11 @@ struct ggml_tensor * ggml_kvq_attn_streams(
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
         GGML_ASSERT(mask->ne[1] >= L && mask->ne[2] == 1 && mask->ne[3] == S);
-        for (int64_t s = 0; s < S; s++) {
-            GGML_ASSERT(mask->ne[0] >= n_coarse_v[s] + n_tail);
+        const bool tail_only = n_tail > 0 && mask->ne[0] == n_tail;
+        if (!tail_only) {
+            for (int64_t s = 0; s < S; s++) {
+                GGML_ASSERT(mask->ne[0] >= n_coarse_v[s] + n_tail);
+            }
         }
     }
 
