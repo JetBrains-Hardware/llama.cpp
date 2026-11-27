@@ -480,6 +480,34 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_json("force_tokens"))
+        ->set_desc("Array of token IDs to force during generation instead of sampling")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto & arr = data.at("force_tokens");
+            if (!arr.is_array()) {
+                throw std::invalid_argument("force_tokens must be an array of token IDs");
+            }
+            const int32_t n_vocab = llama_vocab_n_tokens(ctx.vocab);
+            ctx.params.force_tokens.clear();
+            ctx.params.force_tokens.reserve(arr.size());
+            for (const auto & el : arr) {
+                if (!el.is_number_integer()) {
+                    throw std::invalid_argument("force_tokens elements must be integer token IDs");
+                }
+                const llama_token tok = el.get<llama_token>();
+                if (tok < 0 || tok >= n_vocab) {
+                    throw std::invalid_argument("force_tokens element out of vocab range");
+                }
+                ctx.params.force_tokens.push_back(tok);
+            }
+        }));
+
+    add((new field_str("dump_logprobs_path"))
+        ->set_desc("Optional binary file path to write full-vocab float32 log-softmax vectors for each generated token")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.dump_logprobs_path = data.at("dump_logprobs_path").get<std::string>();
+        }));
+
     return fields;
 }
 

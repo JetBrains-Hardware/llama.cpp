@@ -596,7 +596,7 @@ struct server_slot {
     int get_n_draft_max() const {
         GGML_ASSERT(task);
 
-        if (!can_speculate()) {
+        if (!can_speculate() || !task->params.force_tokens.empty() || !task->params.dump_logprobs_path.empty()) {
             return 0;
         }
 
@@ -2103,7 +2103,9 @@ private:
                 return false;
             }
 
-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
+            const bool need_pre_sample_logits = (task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs) ||
+                                                !task.params.dump_logprobs_path.empty() ||
+                                                !task.params.force_tokens.empty();
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
 
@@ -5042,7 +5044,11 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                if (slot.stats.n_gen >= 0 && static_cast<size_t>(slot.stats.n_gen) < slot.task->params.force_tokens.size()) {
+                    id = slot.task->params.force_tokens[slot.stats.n_gen];
+                } else {
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                }
             }
 
             slot.i_batch = -1;
@@ -5069,6 +5075,31 @@ private:
 
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+            }
+
+            if (!slot.task->params.dump_logprobs_path.empty()) {
+                const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
+                const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+                if (logits && n_vocab > 0) {
+                    double max_l = logits[0];
+                    for (int32_t i = 1; i < n_vocab; ++i) {
+                        if (logits[i] > max_l) max_l = logits[i];
+                    }
+                    double sum_e = 0.0;
+                    for (int32_t i = 0; i < n_vocab; ++i) {
+                        sum_e += std::exp((double) logits[i] - max_l);
+                    }
+                    const double log_z = max_l + std::log(sum_e);
+                    std::vector<float> lp(n_vocab);
+                    for (int32_t i = 0; i < n_vocab; ++i) {
+                        lp[i] = (float) ((double) logits[i] - log_z);
+                    }
+                    FILE * fp = std::fopen(slot.task->params.dump_logprobs_path.c_str(), slot.stats.n_gen == 1 ? "wb" : "ab");
+                    if (fp) {
+                        std::fwrite(lp.data(), sizeof(float), (size_t) n_vocab, fp);
+                        std::fclose(fp);
+                    }
+                }
             }
 
             if (!process_token(result, slot)) {
