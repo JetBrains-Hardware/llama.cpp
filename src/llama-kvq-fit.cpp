@@ -298,7 +298,7 @@ void llama_kvq_fitter::dev_init() {
         ctx_shr.reset(ggml_init(sp));
         stage  = ggml_new_tensor_4d(ctx_shr.get(), GGML_TYPE_Q8_0, KVQ_D, 2, n_stage, G);
         cst[0] = ggml_new_tensor_3d(ctx_shr.get(), GGML_TYPE_I32, store.n_words(false), n_stage, G);
-        cst[1] = ggml_new_tensor_3d(ctx_shr.get(), GGML_TYPE_I32, store.n_words(true) + 1, n_stage, G);
+        cst[1] = ggml_new_tensor_3d(ctx_shr.get(), GGML_TYPE_I32, store.n_words_vc(), n_stage, G);
         tab    = ggml_new_tensor_3d(ctx_shr.get(), GGML_TYPE_F32, KVQ_D, 2*KVQ_D + 3, 2*G*ng);
         ggml_set_name(stage,  "kvq_fit_stage");
         ggml_set_name(cst[0], "kvq_fit_kc");
@@ -583,7 +583,7 @@ ggml_cgraph * llama_kvq_fitter::build_tables(const job & jb, int32_t n_lay, ggml
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16, false);
     ggml_tensor * t    = ggml_view_3d(ctx, tab, KVQ_D, 2*KVQ_D + 3, B, tab->nb[1], tab->nb[2], 0);
     ggml_tensor * work = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, ggml_kvq_fit_table_work_size(KVQ_D, B));
-    ggml_tensor * tb   = ggml_kvq_fit_table(ctx, t, work, (int) jb.n(), (int) (n_lay*G));
+    ggml_tensor * tb   = ggml_kvq_fit_table(ctx, t, work, (int) jb.n(), store.has_v_gain() ? (int) (n_lay*G) : (int) B);
     ggml_tensor * res  = ggml_cont(ctx, ggml_view_3d(ctx, tb, KVQ_D, 1, B, tb->nb[1], tb->nb[2], (2*KVQ_D + 2)*tb->nb[1]));
     ggml_set_output(res);
     ggml_set_name(res, "kvq_fit_res");
@@ -604,7 +604,7 @@ ggml_cgraph * llama_kvq_fitter::build_codes(const job & jb, int32_t li, int32_t 
         ggml_tensor * gp  = tab_view(kv, j, n_lay, 2*KVQ_D - 1, 4, ctx);
         ggml_tensor * mu  = tab_view(kv, j, n_lay, 2*KVQ_D, 1, ctx);
         ggml_tensor * y   = ggml_kvq_fit(ctx, GGML_KVQ_FIT_ROT, ggml_sub(ctx, kvq_fit_rows(ctx, stage, idx, kv, n), mu), fwd, nullptr);
-        ggml_tensor * sig = kv ? ggml_kvq_fit(ctx, GGML_KVQ_FIT_GAIN, y, gp, nullptr) : tab_view(kv, j, n_lay, 2*KVQ_D + 1, 1, ctx);
+        ggml_tensor * sig = (kv && store.has_v_gain()) ? ggml_kvq_fit(ctx, GGML_KVQ_FIT_GAIN, y, gp, nullptr) : tab_view(kv, j, n_lay, 2*KVQ_D + 1, 1, ctx);
         ggml_tensor * p4  = ggml_kvq_fit_bits(ctx, sig, gp, (float) (kv ? fparams.bits_v : fparams.bits_k));
 
         ggml_tensor * xi  = tab_view(kv, j, n_lay, KVQ_D, KVQ_D + 1, ctx);

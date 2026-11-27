@@ -11962,7 +11962,9 @@ void ggml_compute_forward_kvq_attn(
 
     const float   scale  = ggml_get_op_params_f32(dst, 0);
     const int32_t n_crow = ggml_get_op_params_i32(dst, 1);
-    const int32_t mode   = ggml_get_op_params_i32(dst, 2);
+    const int32_t mode_raw = ggml_get_op_params_i32(dst, 2);
+    const bool    no_vgain = (mode_raw & GGML_KVQ_NO_VGAIN) != 0;
+    const int32_t mode     = mode_raw & ~GGML_KVQ_NO_VGAIN;
 
     const bool do_lse   = mode == GGML_KVQ_ATTN_LSE;
     const bool do_attn  = mode == GGML_KVQ_ATTN || do_lse;
@@ -12207,7 +12209,7 @@ void ggml_compute_forward_kvq_attn(
             }
 
             // coarse V in the code domain: sum_j w_j v_j = ((sum_j w_j g_j (code_j + 0.5))*step) inv + (sum_j w_j) mu
-            const int64_t nwv = vc ? vc->ne[0] - 1 : 0;
+            const int64_t nwv = vc ? (no_vgain ? vc->ne[0] : vc->ne[0] - 1) : 0;
             for (int64_t t = 0; t < n_chunk; t++) {
                 const int64_t m = 2*g + 1;
                 load_bits(m, t);
@@ -12220,7 +12222,7 @@ void ggml_compute_forward_kvq_attn(
                         continue;
                     }
                     const int32_t * row  = (const int32_t *) ((const char *) vc->data + (j - t*n_crow)*vc->nb[1] + g*vc->nb[2] + page_of(t)*vc->nb[3]);
-                    const double    gain = GGML_CPU_FP16_TO_FP32((ggml_fp16_t) (row[nwv] & 0xFFFF));
+                    const double    gain = no_vgain ? 1.0 : GGML_CPU_FP16_TO_FP32((ggml_fp16_t) (row[nwv] & 0xFFFF));
                     wsum += w;
                     for (int64_t c = 0; c < D; c++) {
                         if (bits[c] > 0) {

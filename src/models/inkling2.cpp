@@ -866,13 +866,14 @@ ggml_tensor * llama_model_inkling2::graph::build_attn_kvq_packed(
 
     // 1. Coarse + resident attention (all coarse rows have dist >= 1024 -> raw bias is 0, no mask needed)
     ggml_tensor * fa_c = nullptr;
+    const int attn_mode = GGML_KVQ_ATTN_LSE | (store->has_v_gain() ? 0 : GGML_KVQ_NO_VGAIN);
     if (S == 1) {
         fa_c = ggml_kvq_attn(ctx0, q_cur, kc, vc, t.tab, store->get_pt(inp_kvq->seq), nullptr, nullptr, rkv, ridx, nullptr,
-                kq_scale, inp_kvq->n_coarse, store->n_chunk_rows(), GGML_KVQ_ATTN_LSE);
+                kq_scale, inp_kvq->n_coarse, store->n_chunk_rows(), attn_mode);
     } else {
         ggml_tensor * q4 = ggml_reshape_4d(ctx0, q_cur, D, n_head, L, S);
         fa_c = ggml_kvq_attn_streams(ctx0, q4, kc, vc, t.tab, inp_kvq->pt_s, nullptr, nullptr, rkv, ridx, nullptr,
-                kq_scale, inp_kvq->n_coarse_s.data(), store->n_chunk_rows(), GGML_KVQ_ATTN_LSE);
+                kq_scale, inp_kvq->n_coarse_s.data(), store->n_chunk_rows(), attn_mode);
     }
 
     // 2. Ring tail attention with relative-position bias (per-stream when S > 1 since flash_attn_ext_lse requires ne[3] == 1)
