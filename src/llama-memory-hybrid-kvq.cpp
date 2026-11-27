@@ -1189,19 +1189,22 @@ llama_memory_status llama_memory_hybrid_kvq_context::get_status() const {
 }
 
 void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggml_tensor * early, const llama_ubatch * ubatch, const std::vector<int32_t> & n_coarse_s) const {
-    if (mask == nullptr || mask->buffer == nullptr) {
+    const bool has_mask  = mask  != nullptr && mask->buffer  != nullptr;
+    const bool has_early = early != nullptr && early->buffer != nullptr;
+    if (!has_mask && !has_early) {
         return;
     }
+    const ggml_tensor * ref = has_mask ? mask : early;
     // the sequences of the ubatch are the streams of the mask [n_coarse_max + n_kv, L, 1, S]; stream s: the coarse rows [0, n_coarse[s]),
     // then the ring cells (tail row r of the stream is cache row n_coarse[s] + r)
     const int64_t S = ubatch->n_seqs_unq;
     const int64_t L = ubatch->n_tokens/S;
-    GGML_ASSERT((int64_t) n_coarse_s.size() == S && ggml_backend_buffer_is_host(mask->buffer));
+    GGML_ASSERT((int64_t) n_coarse_s.size() == S && ggml_backend_buffer_is_host(ref->buffer));
     const int32_t n_coarse_max = *std::max_element(n_coarse_s.begin(), n_coarse_s.end());
-    GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[0] > n_coarse_max && mask->ne[1] == L && mask->ne[3] == S);
-    GGML_ASSERT(early == nullptr || (ggml_backend_buffer_is_host(early->buffer) && ggml_are_same_shape(early, mask) && ggml_is_contiguous(early)));
+    GGML_ASSERT(ref->type == GGML_TYPE_F16 && ggml_is_contiguous(ref) && ref->ne[0] > n_coarse_max && ref->ne[1] == L && ref->ne[3] == S);
+    GGML_ASSERT(!has_mask || !has_early || (ggml_backend_buffer_is_host(early->buffer) && ggml_are_same_shape(early, mask) && ggml_is_contiguous(early)));
 
-    const int64_t n_kv = mask->ne[0] - n_coarse_max;
+    const int64_t n_kv = ref->ne[0] - n_coarse_max;
 
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
@@ -1220,7 +1223,7 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggm
         }
 
         // the positions before the ubatch, and the cells at or after it
-        std::vector<ggml_fp16_t> row(mask->ne[0], ninf);
+        std::vector<ggml_fp16_t> row(ref->ne[0], ninf);
         std::fill(row.begin(), row.begin() + n_coarse, zero);
         std::vector<std::pair<int64_t, llama_pos>> late;
         for (int64_t j = 0; j < n_kv; ++j) {
@@ -1238,17 +1241,18 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggm
             }
         }
 
-        ggml_fp16_t * dst = (ggml_fp16_t *) mask->data + st*L*mask->ne[0];
         for (int64_t i = 0; i < L; ++i) {
-            ggml_fp16_t * d = dst + i*mask->ne[0];
-            memcpy(d, row.data(), row.size()*sizeof(ggml_fp16_t));
-            for (const auto & c : late) {
-                if (c.second <= pos[i]) {
-                    d[c.first] = zero;
+            if (has_mask) {
+                ggml_fp16_t * d = (ggml_fp16_t *) mask->data + (st*L + i)*ref->ne[0];
+                memcpy(d, row.data(), row.size()*sizeof(ggml_fp16_t));
+                for (const auto & c : late) {
+                    if (c.second <= pos[i]) {
+                        d[c.first] = zero;
+                    }
                 }
             }
-            if (early) {
-                memcpy((ggml_fp16_t *) early->data + (st*L + i)*mask->ne[0], row.data(), row.size()*sizeof(ggml_fp16_t));
+            if (has_early) {
+                memcpy((ggml_fp16_t *) early->data + (st*L + i)*ref->ne[0], row.data(), row.size()*sizeof(ggml_fp16_t));
             }
         }
     }
