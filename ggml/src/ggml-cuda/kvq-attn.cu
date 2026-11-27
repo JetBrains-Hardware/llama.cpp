@@ -1,4 +1,5 @@
 #include "kvq-attn.cuh"
+#include "top-k.cuh"
 #include "cp-async.cuh"
 
 #include <cstdlib>
@@ -72,8 +73,9 @@ struct kvq_args {
     float * pmc; float * pzc;           // coarse score normalizers [G][n_cblk][N]
     float * cy;                         // merged coarse partials y = O*step [G][n_chunk][N][D]
     float * co; float * cm; float * cz; // chunks [G][n_chunk][N][D], [G][n_chunk][N]
-    half  * scp; float * scm;           // score weights [G][n_coarse][N], tile max [G][n_cblk*n_tiles_blk][cols]
+    half  * scp; float * scm;           // score weights [G][scp_rows][N], tile max [G][scm_cblk*n_tiles_blk][cols]
     float * scs;                        // score normalizers [G][2][N]
+    int scp_rows, scm_cblk, score_rows, n_sink;
 
     float * dst_attn;
     float * dst_lse;
@@ -125,12 +127,12 @@ static __device__ __forceinline__ kvq_args kvq_sview(const kvq_args & a0, const 
     a.co  = a0.co  + s*G*a0.n_chunk*N*KVQ_D;
     a.cm  = a0.cm  + s*G*a0.n_chunk*N;
     a.cz  = a0.cz  + s*G*a0.n_chunk*N;
-    a.scp = a0.scp + s*G*a0.n_coarse*N;
-    a.scm = a0.scm + s*G*a0.n_cblk*a0.n_tiles_blk*a0.cols;
+    a.scp = a0.scp ? a0.scp + s*G*a0.scp_rows*N : nullptr;
+    a.scm = a0.scm ? a0.scm + s*G*a0.scm_cblk*a0.n_tiles_blk*a0.cols : nullptr;
     a.scs = a0.scs + s*G*2*N;
     a.dst_attn  = a0.dst_attn  ? a0.dst_attn  + s*a0.dst_nb3 : nullptr;
     a.dst_lse   = a0.dst_lse   ? a0.dst_lse   + s*a0.dst_nb3 : nullptr;
-    a.dst_score = a0.dst_score ? a0.dst_score + s*(int64_t) a0.n_coarse*G*a0.L : nullptr;
+    a.dst_score = a0.dst_score ? a0.dst_score + s*(int64_t) a0.score_rows*G*a0.L : nullptr;
     return a;
 }
 
@@ -619,15 +621,16 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_prep_c(const kvq_args a0, co
 // n0 + (x % n_grp)*N (NA > N: column groups, fewer registers per thread)
 // staging of a tile: packed rows word-major, word i of row r at [i*LDR + r], so that rows r and r + 8 share the address computation
 template <int KVQ_D, int N, int NA, bool ATTN, bool SCORE, bool MS>
-static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args a0, const int n0_launch, const int n_grp) {
+static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args a0, const int n0_launch, const int n_grp, const int c0) {
 #ifdef AMPERE_MMA_AVAILABLE
     constexpr int NT = N/8;
     constexpr int KVQ_LDT = KVQ_D + 8;
     constexpr int KVQ_MI  = KVQ_D/(16*KVQ_WARPS);
 
-    const int bx   = NA == N ? blockIdx.x : blockIdx.x / n_grp;
-    const int n0   = NA == N ? 0 : n0_launch + (blockIdx.x % n_grp)*N;
-    const int t    = blockIdx.y;
+    const int bx      = NA == N ? blockIdx.x : blockIdx.x / n_grp;
+    const int n0      = NA == N ? 0 : n0_launch + (blockIdx.x % n_grp)*N;
+    const int t_local = blockIdx.y;
+    const int t       = c0 + t_local;
     kvq_args a_v;
     const kvq_args & a = kvq_view<KVQ_D, MS>(a0, blockIdx.z / a0.G, a_v);
     const int g    = MS ? blockIdx.z % a0.G : blockIdx.z;
@@ -642,6 +645,8 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
     const int t4   = lane % 4;
     const int tab  = t*a.G + g;
     const int blk  = t*a.cbpc + bx;
+    const int blk_local = t_local*a.cbpc + bx;
+    const int64_t r_base = (int64_t) c0*a.n_crow;
 
     const int64_t c1 = min((int64_t) a.ncs, (int64_t) (t + 1)*a.n_crow);
     const int64_t r0 = (int64_t) t*a.n_crow + (int64_t) bx*a.rows;
@@ -890,17 +895,19 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
 
         if (SCORE) {
             kvq_tile_update<NT>(sc, m_c, z_c, alpha, s_red + KVQ_WARPS*N, lane);
-            const int tile = blk*a.tiles + it;
+            if (a.scp) {
+                const int tile = blk_local*a.tiles + it;
 #pragma unroll
-            for (int j = 0; j < NT; ++j) {
+                for (int j = 0; j < NT; ++j) {
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const int n = n0 + 8*j + 2*t4 + (e & 1);
-                    if ((e < 2 ? va : vb) && ln[j][e & 1] >= 0) {
-                        a.scp[((int64_t) g*a.n_coarse + ra + (e < 2 ? 0 : 8))*NA + n] = __float2half_rn(sc[j][e]);
-                    }
-                    if (e < 2 && w == 0 && gid == 0 && ln[j][e] >= 0) {
-                        a.scm[((int64_t) g*a.n_cblk*a.n_tiles_blk + tile)*a.cols + n] = m_c[j][e];
+                    for (int e = 0; e < 4; ++e) {
+                        const int n = n0 + 8*j + 2*t4 + (e & 1);
+                        if ((e < 2 ? va : vb) && ln[j][e & 1] >= 0) {
+                            a.scp[((int64_t) g*a.scp_rows + (ra - r_base) + (e < 2 ? 0 : 8))*NA + n] = __float2half_rn(sc[j][e]);
+                        }
+                        if (e < 2 && w == 0 && gid == 0 && ln[j][e] >= 0) {
+                            a.scm[((int64_t) g*a.scm_cblk*a.n_tiles_blk + tile)*a.cols + n] = m_c[j][e];
+                        }
                     }
                 }
             }
@@ -980,7 +987,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
     }
     cp_async_wait_all();
 
-    if (SCORE) {
+    if (SCORE && a.pmc) {
         kvq_write_mz<NT>(m_c, z_c, s_red, a.pmc + ((int64_t) g*a.n_cblk + blk)*NA + n0, a.pzc + ((int64_t) g*a.n_cblk + blk)*NA + n0, w, lane);
     }
     if (ATTN) {
@@ -1797,29 +1804,30 @@ static __global__ void __launch_bounds__(KVQ_D) kvq_final(const kvq_args a0) {
 // grid (ceil(n_coarse/256), G), 256 threads; a thread reads the weights of its row (stride N) in 16-byte loads,
 // so no thread depends on L1 keeping its row between loads (2-byte loads of rows 96 bytes apart thrash L1 at 48 columns)
 template <int KVQ_D, bool MS>
-static __global__ void kvq_score(const kvq_args a0) {
+static __global__ void kvq_score(const kvq_args a0, const int c0, const int n_rows_st, const bool mask_sinks) {
     kvq_args a_v;
     const kvq_args & a = kvq_view<KVQ_D, MS>(a0, blockIdx.z, a_v);
-    const int64_t j = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    const int     g = blockIdx.y;
-    if (j >= a.n_coarse) {
+    const int64_t j_local = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int     g       = blockIdx.y;
+    if (j_local >= n_rows_st) {
         return;
     }
-    if (MS && j >= a.ncs) {
-        // a row the stream does not have
+    const int64_t j = (int64_t) c0*a.n_crow + j_local;
+    if ((mask_sinks && j < a.n_sink) || j >= a.ncs) {
+        const float fill = mask_sinks ? -INFINITY : 0.0f;
         for (int l = 0; l < a.L; ++l) {
-            a.dst_score[j + (int64_t) a.n_coarse*(g + (int64_t) a.G*l)] = 0.0f;
+            a.dst_score[j_local + (int64_t) a.score_rows*(g + (int64_t) a.G*l)] = fill;
         }
         return;
     }
-    const int t    = (int) (j / a.n_crow);
-    const int jj   = (int) (j - (int64_t) t*a.n_crow);
-    const int b    = jj / a.rows;
-    const int tile = (t*a.cbpc + b)*a.tiles + (jj - b*a.rows)/KVQ_T;
+    const int t_local = (int) (j_local / a.n_crow);
+    const int jj      = (int) (j_local - (int64_t) t_local*a.n_crow);
+    const int b       = jj / a.rows;
+    const int tile    = (t_local*a.cbpc + b)*a.tiles + (jj - b*a.rows)/KVQ_T;
 
-    const uint4 * p  = (const uint4 *) (a.scp + ((int64_t) g*a.n_coarse + j)*a.N);
-    const float * mt = a.scm + ((int64_t) g*a.n_cblk*a.n_tiles_blk + tile)*a.cols;
-    float       * ds = a.dst_score + j + (int64_t) a.n_coarse*g;
+    const uint4 * p  = (const uint4 *) (a.scp + ((int64_t) g*a.scp_rows + j_local)*a.N);
+    const float * mt = a.scm + ((int64_t) g*a.scm_cblk*a.n_tiles_blk + tile)*a.cols;
+    float       * ds = a.dst_score + j_local + (int64_t) a.score_rows*g;
 
     // n = r + n_rep*l in ascending order: the same sums as a loop over r per l
     float s = 0.0f;
@@ -1840,13 +1848,48 @@ static __global__ void kvq_score(const kvq_args a0) {
                 s += __half2float(h[i])*kvq_exp2(mt[n] - mx)/zs;
             }
             if (++r == a.n_rep) {
-                ds[(int64_t) a.n_coarse*a.G*l] = s;
+                ds[(int64_t) a.score_rows*a.G*l] = s;
                 s = 0.0f;
                 r = 0;
                 l++;
             }
         }
     }
+}
+
+static __global__ void kvq_topk_gather_stripe(
+        const int32_t * __restrict__ tmp_ids,
+        const float   * __restrict__ stripe_scores,
+        int32_t       * __restrict__ cand_ids,
+        float         * __restrict__ cand_vals,
+        const int r_base, const int n_rows_st, const int k_st, const int cand_off, const int n_cand_total, const int nrows_gl) {
+    const int i   = blockIdx.x*blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (i >= k_st || row >= nrows_gl) {
+        return;
+    }
+    const int local_id = tmp_ids[(int64_t) row*k_st + i];
+    cand_ids[(int64_t) row*n_cand_total + cand_off + i]  = r_base + local_id;
+    cand_vals[(int64_t) row*n_cand_total + cand_off + i] = stripe_scores[(int64_t) row*n_rows_st + local_id];
+}
+
+static __global__ void kvq_topk_gather_final(
+        const int32_t * __restrict__ final_pos,
+        const int32_t * __restrict__ cand_ids,
+        const float   * __restrict__ cand_vals,
+        int32_t       * __restrict__ dst_ids,
+        float         * __restrict__ dst_vals,
+        const int n_cand_total, const int n_top, const int nrows_gl) {
+    const int i   = blockIdx.x*blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (i >= n_top || row >= nrows_gl) {
+        return;
+    }
+    const int pos = final_pos[(int64_t) row*n_top + i];
+    if (cand_ids) {
+        dst_ids[(int64_t) row*n_top + i] = cand_ids[(int64_t) row*n_cand_total + pos];
+    }
+    dst_vals[(int64_t) row*n_top + i] = cand_vals[(int64_t) row*n_cand_total + pos];
 }
 
 // coarse rows per block: 1024, halved down to 256 while the grid has fewer than 2 blocks per SM
@@ -1895,24 +1938,24 @@ static void kvq_launch_precise(const kvq_args & a, const kvq_src & src, const in
 }
 
 template <int KVQ_D, int NG, int NA, bool ATTN, bool SCORE, bool MS>
-static void kvq_launch_coarse_n(const kvq_args & a, const int n0, const int n_grp, cudaStream_t stream) {
+static void kvq_launch_coarse_n(const kvq_args & a, const int n0, const int n_grp, const int c0, const int n_chunk_launch, cudaStream_t stream) {
     const int ld_st = (a.nrk + (ATTN ? a.nrv : 0))*KVQ_LDR;
     kvq_set_smem<kvq_coarse<KVQ_D, NG, NA, ATTN, SCORE, MS>>();
-    kvq_coarse<KVQ_D, NG, NA, ATTN, SCORE, MS><<<dim3(a.n_cbpc*n_grp, a.n_chunk, a.G*a.S), KVQ_NTHREADS, kvq_coarse_smem<KVQ_D>(NG, ld_st, a.L), stream>>>(a, n0, n_grp);
+    kvq_coarse<KVQ_D, NG, NA, ATTN, SCORE, MS><<<dim3(a.n_cbpc*n_grp, n_chunk_launch, a.G*a.S), KVQ_NTHREADS, kvq_coarse_smem<KVQ_D>(NG, ld_st, a.L), stream>>>(a, n0, n_grp, c0);
 }
 
 // column groups by measurement (RTX 5090, 100k rows, test-kvq-attn): at 48 columns the ATTN kernel spills (255 registers),
 // 3 groups of 16 take half the time of one launch, the SCORE kernel is fastest with 2 groups of 24; at 32 columns SCORE with 2 of 16
 template <int KVQ_D, int N, bool ATTN, bool SCORE, bool MS>
-static void kvq_launch_coarse(const kvq_args & a, cudaStream_t stream) {
+static void kvq_launch_coarse(const kvq_args & a, const int c0, const int n_chunk_launch, cudaStream_t stream) {
     if constexpr (N == 48 && ATTN) {
-        kvq_launch_coarse_n<KVQ_D, 16, 48, ATTN, SCORE, MS>(a, 0, 3, stream);
+        kvq_launch_coarse_n<KVQ_D, 16, 48, ATTN, SCORE, MS>(a, 0, 3, c0, n_chunk_launch, stream);
     } else if constexpr (N == 48) {
-        kvq_launch_coarse_n<KVQ_D, 24, 48, ATTN, SCORE, MS>(a, 0, 2, stream);
+        kvq_launch_coarse_n<KVQ_D, 24, 48, ATTN, SCORE, MS>(a, 0, 2, c0, n_chunk_launch, stream);
     } else if constexpr (N == 32 && !ATTN) {
-        kvq_launch_coarse_n<KVQ_D, 16, 32, ATTN, SCORE, MS>(a, 0, 2, stream);
+        kvq_launch_coarse_n<KVQ_D, 16, 32, ATTN, SCORE, MS>(a, 0, 2, c0, n_chunk_launch, stream);
     } else {
-        kvq_launch_coarse_n<KVQ_D, N, N, ATTN, SCORE, MS>(a, 0, 1, stream);
+        kvq_launch_coarse_n<KVQ_D, N, N, ATTN, SCORE, MS>(a, 0, 1, c0, n_chunk_launch, stream);
     }
 }
 
@@ -1937,8 +1980,8 @@ static void kvq_launch_prep(const kvq_args & a, const bool attn, cudaStream_t st
 
 // the precise rows run on a side stream, concurrently with the coarse rows
 template <int KVQ_D, int N, bool MS>
-static void kvq_launch(const kvq_args & a, const bool attn, const bool score,
-        const kvq_src & src_res, const kvq_src & src_tail, cudaStream_t stream, cudaStream_t side) {
+static void kvq_launch(const kvq_args & a, const bool attn, const bool score, const bool topk, const int n_top, const int stripe_chunks,
+        const kvq_src & src_res, const kvq_src & src_tail, ggml_cuda_pool & pool, float * dst_d, cudaStream_t stream, cudaStream_t side) {
     static cudaEvent_t ev_fork[GGML_CUDA_MAX_DEVICES] = { nullptr };
     static cudaEvent_t ev_join[GGML_CUDA_MAX_DEVICES] = { nullptr };
     const int id = ggml_cuda_get_device();
@@ -1961,12 +2004,18 @@ static void kvq_launch(const kvq_args & a, const bool attn, const bool score,
     }
     CUDA_CHECK(cudaEventRecord(ev_join[id], side));
 
+    const bool striped = topk && a.n_chunk > stripe_chunks;
     if (a.n_chunk > 0) {
         kvq_launch_prep<KVQ_D, N, MS>(a, attn, stream);
         if (attn) {
-            kvq_launch_coarse<KVQ_D, N, true, false, MS>(a, stream);
+            kvq_launch_coarse<KVQ_D, N, true, false, MS>(a, 0, a.n_chunk, stream);
+        } else if (striped) {
+            kvq_args a1 = a;
+            a1.scp = nullptr;
+            a1.scm = nullptr;
+            kvq_launch_coarse<KVQ_D, N, false, true, MS>(a1, 0, a.n_chunk, stream);
         } else {
-            kvq_launch_coarse<KVQ_D, N, false, true, MS>(a, stream);
+            kvq_launch_coarse<KVQ_D, N, false, true, MS>(a, 0, a.n_chunk, stream);
         }
     }
 
@@ -1983,8 +2032,59 @@ static void kvq_launch(const kvq_args & a, const bool attn, const bool score,
         kvq_final<KVQ_D, false, true, MS><<<grid_f, KVQ_D, 0, stream>>>(a);
     }
 
-    if (score) {
-        kvq_score<KVQ_D, MS><<<dim3((a.n_coarse + 255)/256, a.G, a.S), 256, 0, stream>>>(a);
+    if (score && !topk) {
+        kvq_score<KVQ_D, MS><<<dim3((a.n_coarse + 255)/256, a.G, a.S), 256, 0, stream>>>(a, 0, a.n_coarse, false);
+    } else if (topk) {
+        const int nrows_gl = a.G*a.L*a.S;
+        int32_t * dst_ids  = (int32_t *) dst_d;
+        float   * dst_vals = dst_d + (int64_t) nrows_gl*n_top;
+        if (!striped) {
+            ggml_cuda_pool_alloc<float> sc_a(pool, (size_t) nrows_gl*a.n_coarse);
+            kvq_args a2 = a;
+            a2.dst_score = sc_a.get();
+            kvq_score<KVQ_D, MS><<<dim3((a.n_coarse + 255)/256, a.G, a.S), 256, 0, stream>>>(a2, 0, a.n_coarse, true);
+            ggml_cuda_top_k_f32(pool, sc_a.get(), dst_ids, a.n_coarse, nrows_gl, n_top, stream);
+            kvq_topk_gather_final<<<dim3((n_top + 255)/256, nrows_gl), 256, 0, stream>>>(
+                    dst_ids, nullptr, sc_a.get(), dst_ids, dst_vals, a.n_coarse, n_top, nrows_gl);
+        } else {
+            const int stripe_rows = std::min(a.n_coarse, stripe_chunks*a.n_crow);
+            int n_cand_total = 0;
+            for (int c0 = 0; c0 < a.n_chunk; c0 += stripe_chunks) {
+                const int n_rows_st = std::min(stripe_chunks*a.n_crow, a.n_coarse - c0*a.n_crow);
+                n_cand_total += std::min(n_top, n_rows_st);
+            }
+            ggml_cuda_pool_alloc<float>   sc_a(pool, (size_t) nrows_gl*stripe_rows);
+            ggml_cuda_pool_alloc<int32_t> tmp_ids_a(pool, (size_t) nrows_gl*n_top);
+            ggml_cuda_pool_alloc<int32_t> cand_ids_a(pool, (size_t) nrows_gl*n_cand_total);
+            ggml_cuda_pool_alloc<float>   cand_vals_a(pool, (size_t) nrows_gl*n_cand_total);
+
+            int cand_off = 0;
+            for (int c0 = 0; c0 < a.n_chunk; c0 += stripe_chunks) {
+                const int nc_st     = std::min(stripe_chunks, a.n_chunk - c0);
+                const int r_base    = c0*a.n_crow;
+                const int n_rows_st = std::min(nc_st*a.n_crow, a.n_coarse - r_base);
+                const int k_st      = std::min(n_top, n_rows_st);
+
+                kvq_args a2 = a;
+                a2.pmc        = nullptr;
+                a2.pzc        = nullptr;
+                a2.scp_rows   = n_rows_st;
+                a2.scm_cblk   = nc_st*a.n_cbpc;
+                a2.score_rows = n_rows_st;
+                a2.dst_score  = sc_a.get();
+
+                kvq_launch_coarse<KVQ_D, N, false, true, MS>(a2, c0, nc_st, stream);
+                kvq_score<KVQ_D, MS><<<dim3((n_rows_st + 255)/256, a.G, a.S), 256, 0, stream>>>(a2, c0, n_rows_st, true);
+                ggml_cuda_top_k_f32(pool, sc_a.get(), tmp_ids_a.get(), n_rows_st, nrows_gl, k_st, stream);
+                kvq_topk_gather_stripe<<<dim3((k_st + 255)/256, nrows_gl), 256, 0, stream>>>(
+                        tmp_ids_a.get(), sc_a.get(), cand_ids_a.get(), cand_vals_a.get(),
+                        r_base, n_rows_st, k_st, cand_off, n_cand_total, nrows_gl);
+                cand_off += k_st;
+            }
+            ggml_cuda_top_k_f32(pool, cand_vals_a.get(), tmp_ids_a.get(), n_cand_total, nrows_gl, n_top, stream);
+            kvq_topk_gather_final<<<dim3((n_top + 255)/256, nrows_gl), 256, 0, stream>>>(
+                    tmp_ids_a.get(), cand_ids_a.get(), cand_vals_a.get(), dst_ids, dst_vals, n_cand_total, n_top, nrows_gl);
+        }
     }
 }
 
@@ -2004,7 +2104,10 @@ static void ggml_cuda_op_kvq_attn_d(ggml_backend_cuda_context & ctx, ggml_tensor
     const int  mode  = ggml_get_op_params_i32(dst, 2);
     const bool lse   = mode == GGML_KVQ_ATTN_LSE;
     const bool attn  = mode == GGML_KVQ_ATTN || lse;
-    const bool score = mode == GGML_KVQ_SCORE;
+    const bool topk  = mode == GGML_KVQ_SCORE_TOPK;
+    const bool score = mode == GGML_KVQ_SCORE || topk;
+    const int  n_top  = topk ? ggml_get_op_params_i32(dst, 5 + KVQ_MAX_STREAM) : 0;
+    const int  n_sink = topk ? ggml_get_op_params_i32(dst, 6 + KVQ_MAX_STREAM) : 0;
     GGML_ASSERT(attn != score);
 
     cudaStream_t stream = ctx.stream();
@@ -2093,8 +2196,16 @@ static void ggml_cuda_op_kvq_attn_d(ggml_backend_cuda_context & ctx, ggml_tensor
     ggml_cuda_pool_alloc<float>    co_a(pool, attn ? (size_t) S*G*nc*N*KVQ_D : 1);
     ggml_cuda_pool_alloc<float>    cm_a(pool, (size_t) S*G*nc*N);
     ggml_cuda_pool_alloc<float>    cz_a(pool, (size_t) S*G*nc*N);
-    ggml_cuda_pool_alloc<half>     scp_a(pool, score ? (size_t) S*G*a.n_coarse*N : 1);
-    ggml_cuda_pool_alloc<float>    scm_a(pool, score ? (size_t) S*G*a.n_cblk*a.n_tiles_blk*a.cols : 1);
+    const int stripe_chunks = 12;
+    const int scp_rows = topk ? std::min(a.n_coarse, stripe_chunks*a.n_crow) : a.n_coarse;
+    const int scm_cblk = topk ? std::min(a.n_chunk, stripe_chunks)*a.n_cbpc : a.n_cblk;
+    a.scp_rows   = scp_rows;
+    a.scm_cblk   = scm_cblk;
+    a.score_rows = a.n_coarse;
+    a.n_sink     = n_sink;
+
+    ggml_cuda_pool_alloc<half>     scp_a(pool, score ? (size_t) S*G*scp_rows*N : 1);
+    ggml_cuda_pool_alloc<float>    scm_a(pool, score ? (size_t) S*G*scm_cblk*a.n_tiles_blk*a.cols : 1);
     ggml_cuda_pool_alloc<float>    scs_a(pool, (size_t) S*G*2*N);
 
     a.qtf = qtf_a.get(); a.kmax = kmax_a.get(); a.kmu = kmu_a.get();
@@ -2108,7 +2219,7 @@ static void ggml_cuda_op_kvq_attn_d(ggml_backend_cuda_context & ctx, ggml_tensor
     a.dst_attn  = attn ? dst_d : nullptr;
     a.dst_lse   = lse ? (float *) ((char *) dst->data + a.L*dst->nb[2]) : nullptr;
     a.dst_nb3   = dst->nb[3]/sizeof(float);
-    a.dst_score = score ? dst_d : nullptr;
+    a.dst_score = (score && !topk) ? dst_d : nullptr;
 
     kvq_src src_res = {};
     if (a.cap > 0) {
@@ -2131,7 +2242,7 @@ static void ggml_cuda_op_kvq_attn_d(ggml_backend_cuda_context & ctx, ggml_tensor
     if (a.S == 1) {
         a.s = 0; a.ncs = a.n_coarse; a.nck = a.n_chunk; a.cbpc = a.n_cbpc; a.rows = a.rows_blk; a.tiles = a.n_tiles_blk; a.cblk = a.n_cblk;
     }
-#define KVQ_CASE(n) case n: if (a.S > 1) { kvq_launch<KVQ_D, n, true>(a, attn, score, src_res, src_tail, stream, side); } else { kvq_launch<KVQ_D, n, false>(a, attn, score, src_res, src_tail, stream, side); } break;
+#define KVQ_CASE(n) case n: if (a.S > 1) { kvq_launch<KVQ_D, n, true>(a, attn, score, topk, n_top, stripe_chunks, src_res, src_tail, pool, dst_d, stream, side); } else { kvq_launch<KVQ_D, n, false>(a, attn, score, topk, n_top, stripe_chunks, src_res, src_tail, pool, dst_d, stream, side); } break;
     switch (N) {
         KVQ_CASE( 8)
         KVQ_CASE(16)

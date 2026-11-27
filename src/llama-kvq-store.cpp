@@ -1607,6 +1607,18 @@ void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_bac
     const kind k = KIND_PREFETCH;
     const layer_tensors & t = get_layer(il);
 
+    if (score->op == GGML_OP_KVQ_ATTN && score->op_params[2] == GGML_KVQ_SCORE_TOPK) {
+        GGML_ASSERT(score->ne[0] == n_top && score->ne[2] == 2);
+        GGML_ASSERT(n_top <= n_coarse_min - n_sink);
+        ggml_set_output(score);
+
+        ggml_tensor * trig = ggml_add(ctx, ggml_view_1d(ctx, score, 1, 0), t.trig[k]);
+        ggml_format_name(trig, "kvq_trig%d-%d", (int) k, il);
+        ggml_backend_sched_set_tensor_backend(sched, trig, kvq_backend(sched, dev));
+        ggml_build_forward_expand(gf, trig);
+        return;
+    }
+
     // the largest coarse region of the streams
     const int64_t n_coarse_ = score->ne[0];
     const int64_t L = score->ne[2];
@@ -1709,6 +1721,16 @@ void llama_kvq_store::select(const layer & l, const ggml_tensor * dst, ggml_cgra
     }
     GGML_ASSERT(trig != nullptr);
     *anchor = trig->src[0]->view_src;
+    if (*anchor != nullptr && (*anchor)->op == GGML_OP_KVQ_ATTN && (*anchor)->op_params[2] == GGML_KVQ_SCORE_TOPK) {
+        *ids = *anchor;
+        for (int i = 0; i < n_nodes; ++i) {
+            if (ggml_graph_node(gr, i) == *ids) {
+                GGML_ABORT("the selection of layer %d is computed in the same split as its trigger", l.il);
+            }
+        }
+        GGML_ASSERT(ggml_is_contiguous(*ids) && (*ids)->type == GGML_TYPE_F32 && (*ids)->ne[2] == 2);
+        return;
+    }
     GGML_ASSERT(*anchor != nullptr && (*anchor)->op == GGML_OP_GET_ROWS);
     *ids = (*anchor)->src[1]->view_src ? (*anchor)->src[1]->view_src : (*anchor)->src[1];
     GGML_ASSERT((*ids)->op == GGML_OP_TOP_K);
@@ -2116,10 +2138,18 @@ bool llama_kvq_store::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
         ggml_backend_t cp = backend_cp.get();
         ggml_backend_event_record(l.ev_sel.get(), backend);
         ggml_backend_event_wait(cp, l.ev_sel.get());
-        ggml_backend_tensor_get_async(cp, ids, l.h_sel, 0, ggml_nbytes(ids));
-        if (pf_scores(n_top, L)) {
-            GGML_ASSERT(ggml_nelements(anchor) == ggml_nelements(ids));
-            ggml_backend_tensor_get_async(cp, anchor, l.h_val, 0, ggml_nbytes(anchor));
+        if (ids == anchor) {
+            const size_t plane_bytes = (size_t) n_top*ids->ne[1]*sizeof(int32_t);
+            ggml_backend_tensor_get_async(cp, ids, l.h_sel, 0, plane_bytes);
+            if (pf_scores(n_top, L)) {
+                ggml_backend_tensor_get_async(cp, ids, l.h_val, plane_bytes, plane_bytes);
+            }
+        } else {
+            ggml_backend_tensor_get_async(cp, ids, l.h_sel, 0, ggml_nbytes(ids));
+            if (pf_scores(n_top, L)) {
+                GGML_ASSERT(ggml_nelements(anchor) == ggml_nelements(ids));
+                ggml_backend_tensor_get_async(cp, anchor, l.h_val, 0, ggml_nbytes(anchor));
+            }
         }
         ggml_backend_event_record(l.ev_read.get(), cp);
         // the first layers of a round whose base uploads the jobs of the previous round did not queue (after a reset): now,

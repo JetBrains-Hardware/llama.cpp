@@ -6746,7 +6746,7 @@ struct ggml_tensor * ggml_kvq_attn(
     return ggml_kvq_attn_streams(ctx, q, kc, vc, tab, pt, k, v, rkv, ridx, mask, scale, &n_coarse, n_chunk_rows, mode);
 }
 
-struct ggml_tensor * ggml_kvq_attn_streams(
+static struct ggml_tensor * ggml_kvq_attn_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * kc,
@@ -6761,11 +6761,14 @@ struct ggml_tensor * ggml_kvq_attn_streams(
         float                 scale,
         const int           * n_coarse_s,
         int                   n_chunk_rows,
-        int                   mode) {
-    GGML_ASSERT(mode == GGML_KVQ_ATTN || mode == GGML_KVQ_SCORE || mode == GGML_KVQ_ATTN_LSE);
+        int                   mode,
+        int                   n_top,
+        int                   n_sink) {
+    GGML_ASSERT(mode == GGML_KVQ_ATTN || mode == GGML_KVQ_SCORE || mode == GGML_KVQ_ATTN_LSE || mode == GGML_KVQ_SCORE_TOPK);
     const bool lse   = mode == GGML_KVQ_ATTN_LSE;
     const bool attn  = mode == GGML_KVQ_ATTN || lse;
-    const bool score = mode == GGML_KVQ_SCORE;
+    const bool topk  = mode == GGML_KVQ_SCORE_TOPK;
+    const bool score = mode == GGML_KVQ_SCORE || topk;
     GGML_ASSERT(!score || kc);
     GGML_ASSERT(k || kc);
 
@@ -6797,6 +6800,12 @@ struct ggml_tensor * ggml_kvq_attn_streams(
             GGML_ASSERT(n_coarse_s[s] >= 0);
             n_coarse_v[s] = n_coarse_s[s];
             n_coarse = n_coarse_v[s] > n_coarse ? n_coarse_v[s] : n_coarse;
+        }
+    }
+    if (topk) {
+        GGML_ASSERT(n_top >= 1 && n_sink >= 0);
+        for (int64_t s = 0; s < S; s++) {
+            GGML_ASSERT(n_top <= n_coarse_v[s] - n_sink);
         }
     }
     if (kc) {
@@ -6833,12 +6842,17 @@ struct ggml_tensor * ggml_kvq_attn_streams(
     }
 
     const int64_t n_lse = lse ? (L + D - 1)/D : 0;
-    struct ggml_tensor * result = attn ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head, L + n_lse, S) : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_coarse, G, L, S);
+    struct ggml_tensor * result = attn
+        ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head, L + n_lse, S)
+        : (topk ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_top, G*L*S, 2, 1)
+                : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_coarse, G, L, S));
 
-    int32_t params[5 + GGML_KVQ_MAX_STREAM] = { 0, n_chunk_rows, mode, n_coarse, (int32_t) S };
+    int32_t params[7 + GGML_KVQ_MAX_STREAM] = { 0, n_chunk_rows, mode, n_coarse, (int32_t) S };
     for (int64_t s = 0; s < S; s++) {
         params[5 + s] = n_coarse_v[s];
     }
+    params[5 + GGML_KVQ_MAX_STREAM] = n_top;
+    params[6 + GGML_KVQ_MAX_STREAM] = n_sink;
     ggml_set_op_params(result, params, sizeof(params));
     ggml_set_op_params_f32(result, 0, scale);
 
@@ -6855,6 +6869,58 @@ struct ggml_tensor * ggml_kvq_attn_streams(
     result->src[9] = kc ? pt : NULL;
 
     return result;
+}
+
+struct ggml_tensor * ggml_kvq_attn_streams(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kc,
+        struct ggml_tensor  * vc,
+        struct ggml_tensor  * tab,
+        struct ggml_tensor  * pt,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * rkv,
+        struct ggml_tensor  * ridx,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        const int           * n_coarse_s,
+        int                   n_chunk_rows,
+        int                   mode) {
+    return ggml_kvq_attn_impl(ctx, q, kc, vc, tab, pt, k, v, rkv, ridx, mask, scale, n_coarse_s, n_chunk_rows, mode, 0, 0);
+}
+
+struct ggml_tensor * ggml_kvq_score_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kc,
+        struct ggml_tensor  * tab,
+        struct ggml_tensor  * pt,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        int                   n_coarse,
+        int                   n_chunk_rows,
+        int                   n_top,
+        int                   n_sink) {
+    GGML_ASSERT(q->ne[3] == 1);
+    return ggml_kvq_attn_impl(ctx, q, kc, NULL, tab, pt, k, NULL, NULL, NULL, mask, scale, &n_coarse, n_chunk_rows, GGML_KVQ_SCORE_TOPK, n_top, n_sink);
+}
+
+struct ggml_tensor * ggml_kvq_score_topk_streams(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kc,
+        struct ggml_tensor  * tab,
+        struct ggml_tensor  * pt,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        const int           * n_coarse_s,
+        int                   n_chunk_rows,
+        int                   n_top,
+        int                   n_sink) {
+    return ggml_kvq_attn_impl(ctx, q, kc, NULL, tab, pt, k, NULL, NULL, NULL, mask, scale, n_coarse_s, n_chunk_rows, GGML_KVQ_SCORE_TOPK, n_top, n_sink);
 }
 
 // ggml_kvq_fit

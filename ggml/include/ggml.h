@@ -2640,12 +2640,16 @@ extern "C" {
     //                         vc, v, rkv, ridx are unused; the rows of a stream at or after its n_coarse are 0
     // mode GGML_KVQ_ATTN_LSE: same as GGML_KVQ_ATTN, with ne[2] = L + ceil(L/D); log-sum-exp [n_head, L] f32 per stream starts at L*nb[2]
     //
+    // mode GGML_KVQ_SCORE_TOPK: fused top-k over GGML_KVQ_SCORE, excluding [0, n_sink) and [n_coarse[s], n_coarse_max);
+    //                           res [n_top, G*L*S, 2] f32: plane 0 holds int32 row ids, plane 1 holds f32 scores
+    //
     // an all -inf row of weights gives 0
     //
     enum ggml_kvq_mode {
-        GGML_KVQ_ATTN     = 1,
-        GGML_KVQ_SCORE    = 2,
-        GGML_KVQ_ATTN_LSE = 3,
+        GGML_KVQ_ATTN       = 1,
+        GGML_KVQ_SCORE      = 2,
+        GGML_KVQ_ATTN_LSE   = 3,
+        GGML_KVQ_SCORE_TOPK = 4,
     };
 
     #define GGML_KVQ_MAX_STREAM 8
@@ -2684,6 +2688,34 @@ extern "C" {
             const int           * n_coarse,
             int                   n_chunk_rows,
             int                   mode);
+
+    GGML_API struct ggml_tensor * ggml_kvq_score_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kc,
+            struct ggml_tensor  * tab,
+            struct ggml_tensor  * pt,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            int                   n_coarse,
+            int                   n_chunk_rows,
+            int                   n_top,
+            int                   n_sink);
+
+    GGML_API struct ggml_tensor * ggml_kvq_score_topk_streams(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * kc,
+            struct ggml_tensor  * tab,
+            struct ggml_tensor  * pt,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            const int           * n_coarse,
+            int                   n_chunk_rows,
+            int                   n_top,
+            int                   n_sink);
 
     // device steps of the kvq codec fit (src/llama-kvq-codec.cpp): B tasks of n rows of D values, f32, rows contiguous
     //

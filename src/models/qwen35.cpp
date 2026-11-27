@@ -609,13 +609,13 @@ void llama_model_qwen35::graph::build_kvq_prefetch(
 
     ggml_tensor * score = nullptr;
     if (S == 1) {
-        score = ggml_kvq_attn(ctx0, q, store->get_kc(ctx0, il), nullptr, t.tab, store->get_pt(inp_kvq->seq), k, nullptr, nullptr, nullptr,
-                inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse, store->n_chunk_rows(), GGML_KVQ_SCORE);
+        score = ggml_kvq_score_topk(ctx0, q, store->get_kc(ctx0, il), t.tab, store->get_pt(inp_kvq->seq), k,
+                inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse, store->n_chunk_rows(), inp_kvq->params.prefetch_n, inp_kvq->params.n_sink);
     } else {
         // the tokens of a stream are contiguous
         ggml_tensor * q4 = ggml_reshape_4d(ctx0, q, q->ne[0], q->ne[1], n_tokens/S, S);
-        score = ggml_kvq_attn_streams(ctx0, q4, store->get_kc(ctx0, il), nullptr, t.tab, inp_kvq->pt_s, k, nullptr, nullptr, nullptr,
-                inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse_s.data(), store->n_chunk_rows(), GGML_KVQ_SCORE);
+        score = ggml_kvq_score_topk_streams(ctx0, q4, store->get_kc(ctx0, il), t.tab, inp_kvq->pt_s, k,
+                inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse_s.data(), store->n_chunk_rows(), inp_kvq->params.prefetch_n, inp_kvq->params.n_sink);
     }
     cb(score, "kvq_eq_score", il);
 
