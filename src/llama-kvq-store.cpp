@@ -1619,9 +1619,9 @@ void llama_kvq_store::build_fetch(ggml_context * ctx, ggml_cgraph * gf, ggml_bac
     ggml_tensor * sc = nullptr;
     if (S > 1) {
         GGML_ASSERT(bias_s != nullptr && bias_s->ne[0] == n_coarse_ && bias_s->ne[3] == S);
-        sc = ggml_reshape_2d(ctx, ggml_add(ctx, score, bias_s), n_coarse_, G*L*S);
+        sc = ggml_reshape_2d(ctx, ggml_add_inplace(ctx, score, bias_s), n_coarse_, G*L*S);
     } else {
-        sc = ggml_add(ctx, ggml_reshape_2d(ctx, score, n_coarse_, G*L), ggml_view_1d(ctx, bias, n_coarse_, 0));
+        sc = ggml_add_inplace(ctx, ggml_reshape_2d(ctx, score, n_coarse_, G*L), ggml_view_1d(ctx, bias, n_coarse_, 0));
     }
 
     ggml_tensor * ids = ggml_top_k(ctx, sc, n_top); // [n_top, G*L]

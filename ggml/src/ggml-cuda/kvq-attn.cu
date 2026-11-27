@@ -58,6 +58,7 @@ struct kvq_args {
     const float * taux; int64_t taux_nb2, taux_nb3; // in elements
     const int32_t * ridx; int64_t ridx_nb1;         // in elements
     const half  * mask; int64_t mask_nb1;           // in elements
+    bool          mask_tail_only;
 
     float    * qtf;   // [n_chunk*G][N][D] qt in f32
     float    * kmax;  // [n_chunk*G][D/32][N] max |qt| per slice of 32 components
@@ -704,7 +705,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS) kvq_coarse(const kvq_args
             const int l = e / KVQ_T;
             const int r = e % KVQ_T;
             mpre[k] = 0;
-            if (a.mask && l < a.L && tr + r < r1) {
+            if (a.mask && !a.mask_tail_only && l < a.L && tr + r < r1) {
                 mpre[k] = __half_as_ushort(a.mask[tr + r + l*a.mask_nb1]);
             }
         }
@@ -1036,7 +1037,7 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const 
     if (!src.res && a.mask) {
         bool live = false;
         for (int e = tid; e < (r1 - r0)*a.L; e += NTH) {
-            const int64_t row = a.ncs + r0 + e / a.L;
+            const int64_t row = (a.mask_tail_only ? 0 : a.ncs) + r0 + e / a.L;
             live = live || __half2float(a.mask[row + (int64_t) (e % a.L)*a.mask_nb1]) != -INFINITY;
         }
         if (!__syncthreads_or(live)) {
@@ -1196,7 +1197,10 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise(const 
             const int row = e < 2 ? rowa : rowb;
             float x = -INFINITY;
             if (row >= 0 && n < a.cols) {
-                x = s[j][e]*a.scale2 + (a.mask ? KVQ_LOG2E*__half2float(a.mask[row + (n / a.n_rep)*a.mask_nb1]) : 0.0f);
+                const float m = a.mask && (!a.mask_tail_only || !src.res)
+                    ? KVQ_LOG2E*__half2float(a.mask[(a.mask_tail_only ? row - a.ncs : row) + (n / a.n_rep)*a.mask_nb1])
+                    : 0.0f;
+                x = s[j][e]*a.scale2 + m;
             }
             s[j][e] = x;
         }
@@ -1454,7 +1458,10 @@ static __global__ void __launch_bounds__(KVQ_NTHREADS*(N/NG)) kvq_precise_m(cons
                 const int row = e < 2 ? rowa : rowb;
                 float x = -INFINITY;
                 if (row >= 0 && n < a.cols) {
-                    x = s[j][e]*a.scale2 + (a.mask ? KVQ_LOG2E*__half2float(a.mask[row + (n / a.n_rep)*a.mask_nb1]) : 0.0f);
+                    const float m = a.mask && (!a.mask_tail_only || !src.res)
+                        ? KVQ_LOG2E*__half2float(a.mask[(a.mask_tail_only ? row - a.ncs : row) + (n / a.n_rep)*a.mask_nb1])
+                        : 0.0f;
+                    x = s[j][e]*a.scale2 + m;
                 }
                 s[j][e] = x;
             }
@@ -2061,6 +2068,7 @@ static void ggml_cuda_op_kvq_attn_d(ggml_backend_cuda_context & ctx, ggml_tensor
         a.mask = (const half *) mask->data;
         a.mask_nb1 = mask->nb[1]/sizeof(half);
         a.mask_nb3 = mask->nb[3]/sizeof(half);
+        a.mask_tail_only = a.n_tail > 0 && mask->ne[0] == a.n_tail;
     }
 
     const int N  = a.N;

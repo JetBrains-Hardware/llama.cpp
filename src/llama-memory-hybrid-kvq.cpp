@@ -1258,7 +1258,7 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring(ggml_tensor * mask, ggm
     }
 }
 
-void llama_memory_hybrid_kvq_context::set_input_kvq_ring_tail(ggml_tensor * mask, ggml_tensor * kpos, const llama_ubatch * ubatch, const std::vector<int32_t> & n_coarse_s) const {
+void llama_memory_hybrid_kvq_context::set_input_kvq_ring_tail(ggml_tensor * mask, ggml_tensor * early, ggml_tensor * kpos, const llama_ubatch * ubatch, const std::vector<int32_t> & n_coarse_s) const {
     const int64_t S = ubatch->n_seqs_unq;
     const int64_t L = ubatch->n_tokens/S;
     GGML_ASSERT((int64_t) n_coarse_s.size() == S);
@@ -1266,10 +1266,14 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring_tail(ggml_tensor * mask
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
 
-    if (mask && mask->buffer) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
-        GGML_ASSERT(mask->type == GGML_TYPE_F16 && ggml_is_contiguous(mask) && mask->ne[1] == L && mask->ne[3] == S);
-        const int64_t n_kv = mask->ne[0];
+    const bool has_mask  = mask  != nullptr && mask->buffer  != nullptr;
+    const bool has_early = early != nullptr && early->buffer != nullptr;
+    if (has_mask || has_early) {
+        const ggml_tensor * ref = has_mask ? mask : early;
+        GGML_ASSERT(ggml_backend_buffer_is_host(ref->buffer));
+        GGML_ASSERT(ref->type == GGML_TYPE_F16 && ggml_is_contiguous(ref) && ref->ne[1] == L && ref->ne[3] == S);
+        GGML_ASSERT(!has_mask || !has_early || (ggml_backend_buffer_is_host(early->buffer) && ggml_are_same_shape(early, mask) && ggml_is_contiguous(early)));
+        const int64_t n_kv = ref->ne[0];
 
         for (int64_t st = 0; st < S; ++st) {
             const int32_t n_coarse = n_coarse_s[st];
@@ -1300,14 +1304,18 @@ void llama_memory_hybrid_kvq_context::set_input_kvq_ring_tail(ggml_tensor * mask
                 }
             }
 
-            ggml_fp16_t * dst = (ggml_fp16_t *) mask->data + st*L*n_kv;
             for (int64_t i = 0; i < L; ++i) {
-                ggml_fp16_t * d = dst + i*n_kv;
-                memcpy(d, row.data(), n_kv*sizeof(ggml_fp16_t));
-                for (const auto & c : late) {
-                    if (c.second <= pos[i]) {
-                        d[c.first] = zero;
+                if (has_mask) {
+                    ggml_fp16_t * d = (ggml_fp16_t *) mask->data + (st*L + i)*n_kv;
+                    memcpy(d, row.data(), n_kv*sizeof(ggml_fp16_t));
+                    for (const auto & c : late) {
+                        if (c.second <= pos[i]) {
+                            d[c.first] = zero;
+                        }
                     }
+                }
+                if (has_early) {
+                    memcpy((ggml_fp16_t *) early->data + (st*L + i)*n_kv, row.data(), n_kv*sizeof(ggml_fp16_t));
                 }
             }
         }

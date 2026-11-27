@@ -114,8 +114,7 @@ public:
             ggml_backend_tensor_set(q_pos, ubatch->pos, 0, ubatch->n_tokens*sizeof(int32_t));
         }
         if (packed_small) {
-            mctx->set_input_kvq_ring(mask_attn.raw, mask_early.raw, ubatch, n_coarse_s);
-            mctx->set_input_kvq_ring_tail(mask_tail.raw, kpos_tail, ubatch, n_coarse_s);
+            mctx->set_input_kvq_ring_tail(mask_tail.raw, mask_early.raw, kpos_tail, ubatch, n_coarse_s);
             if (pt_s && pt_s->buffer) {
                 const int64_t n_chunk = pt_s->ne[0];
                 const int64_t S = seqs.size();
@@ -224,8 +223,8 @@ public:
             return false;
         }
         if (packed_small) {
-            if (cur_nc != n_coarse_s || mask_attn.raw->ne[0] != n_coarse + mc->get_attn()->get_n_kv() ||
-                    mask_attn.raw->ne[1] != (int64_t) (p.ubatch.n_tokens/seqs.size())) {
+            if (cur_nc != n_coarse_s || mask_tail.raw->ne[0] != mc->get_attn()->get_n_kv() ||
+                    mask_tail.raw->ne[1] != (int64_t) (p.ubatch.n_tokens/seqs.size())) {
                 return false;
             }
         }
@@ -279,7 +278,6 @@ public:
     ggml_tensor * q_pos      = nullptr;
 
     // KVQ packed and scratch inputs
-    llm_attn_mask mask_attn;
     llm_attn_mask mask_early;
     llm_attn_mask mask_tail;
     ggml_tensor * kpos_tail = nullptr;
@@ -689,9 +687,8 @@ llama_model_inkling2::llm_graph_input_kvq * llama_model_inkling2::graph::build_i
     if (packed_small) {
         const int64_t S = seqs.size();
         const int64_t n_kv = mctx_kvq->get_attn()->get_n_kv();
-        inp_q->mask_attn.raw = inkling_build_kq_mask_raw(ctx0, inp_q->n_coarse + n_kv, n_tokens, S, "kvq_mask");
         if (pr.lead > 0) {
-            inp_q->mask_early.raw = inkling_build_kq_mask_raw(ctx0, inp_q->n_coarse + n_kv, n_tokens, S, "kvq_mask_early");
+            inp_q->mask_early.raw = inkling_build_kq_mask_raw(ctx0, n_kv, n_tokens, S, "kvq_mask_early");
         }
         inp_q->mask_tail.raw = inkling_build_kq_mask_raw(ctx0, n_kv, n_tokens, S, "kvq_mask_tail");
         inp_q->kpos_tail = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, S);
