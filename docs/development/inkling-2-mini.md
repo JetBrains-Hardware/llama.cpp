@@ -45,6 +45,17 @@ LLAMA_DSPARK_KV_CAP=8192 llama-server \
 
 The 500k numbers were measured with the previous `Q8_0` drafter; the Ninnix96 drafter needs `~160 MiB` less VRAM.
 
+**`LLAMA_DSPARK_KV_CAP=8192` is required at 500k.** Without it the drafter's global-layer KV grows at `4.0 KiB/tok` (`384 MiB` at `-c 98304`, `1,954 MiB` at `-c 500000`) and the card does not fit. Measured on `0a9f9219c` with the command above, a 485k text prompt and a 300-token answer (RTX 5090; "process" = `nvidia-smi` total minus the `441 MiB` measured right after the server starts):
+
+| `-c 500000`, 485k prompt | Drafter KV | Prefill peak | Decode peak (process) | Decode peak (`nvidia-smi` total) | Decode |
+|---|---:|---:|---:|---:|---:|
+| Uncapped | `1,954 MiB` | `17,073 MiB` total | `17,564 MiB` (over budget) | `18,005 MiB` | `79 t/s` |
+| **`LLAMA_DSPARK_KV_CAP=8192`** | **`34 MiB`** | - | **`15,644 MiB`** (`228 MiB` under `15,872 MiB`) | `16,085 MiB` | **`103 t/s`** |
+
+- Decode sets the peak: at the end of the prompt the `966 MiB` target compute buffer is freed and the `1,748 MiB` of kvq codes and tables (`3.5 KiB/tok`) are uploaded back to the device.
+- The cap also makes long-context decode faster (`103` vs `79 t/s`): the drafter reads an 8k window instead of the whole context.
+- Uncapped at `-c 98304` (32k prompt) the same build peaks at `14,914 MiB` process (`384 MiB` drafter KV), so the default command without the cap is right for contexts up to `~230k`.
+
 - **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.87-14.90 GiB` peak PP / `14.51-14.54 GiB` TG process VRAM, `3,060 / 2,974 t/s` prefill, `108.5 / 113.6 t/s` decode (`61.1% / 62.3%` acceptance).
 - **Max context in `15.5 GiB` (`15,872 MiB`, 16 GB card):**
   - Default (`-ub 2048`, uncapped draft KV): **`~230k-235k`** (`4.00 KiB/tok` PP / `7.52 KiB/tok` TG; `-c 131072` fits at `~15.01 GiB` PP / `~14.75 GiB` TG).
