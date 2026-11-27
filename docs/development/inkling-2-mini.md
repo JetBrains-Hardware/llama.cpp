@@ -29,7 +29,7 @@ llama-server \
   --port 8765 --jinja
 ```
 
-Long context (up to `500k`) with vision, tested at `-c 500000` with a 490k prompt and a native 4K image (`15.4 GiB` process VRAM, `12.7 GiB` peak host RAM, see [Host RAM](#host-ram-windows--lm-none)):
+Long context with vision (tested at `-c 500000` with a 485k-490k prompt and a native 4K image, `12.7 GiB` peak host RAM, see [Host RAM](#host-ram-windows--lm-none)); **note:** on a 16 GB card (RTX 5070 Ti, `~15.4-15.9 GiB` usable), `-c 500000` filled to 478k overflows physical VRAM at decode by `~578 MiB` on the CI CUDA 13.5 build - use `-c 380000`-`400000` to stay strictly in physical VRAM (see [16 GB (RTX 5070 Ti) verification and VRAM measurement](#16-gb-rtx-5070-ti-verification-and-vram-measurement-2026-11-27)):
 
 ```sh
 LLAMA_DSPARK_KV_CAP=8192 llama-server \
@@ -45,7 +45,7 @@ LLAMA_DSPARK_KV_CAP=8192 llama-server \
 
 The 500k numbers were measured with the previous `Q8_0` drafter; the Ninnix96 drafter needs `~160 MiB` less VRAM.
 
-**`LLAMA_DSPARK_KV_CAP=8192` is required at 500k.** Without it the drafter's global-layer KV grows at `4.0 KiB/tok` (`384 MiB` at `-c 98304`, `1,954 MiB` at `-c 500000`) and the card does not fit. Measured on `0a9f9219c` with the command above, a 485k text prompt and a 300-token answer (RTX 5090; "process" = `nvidia-smi` total minus the `441 MiB` measured right after the server starts):
+**`LLAMA_DSPARK_KV_CAP=8192` is required at 500k.** Without it the drafter's global-layer KV grows at `4.0 KiB/tok` (`384 MiB` at `-c 98304`, `1,954 MiB` at `-c 500000`) and the card does not fit. Measured on `0a9f9219c` with the command above, a 485k text prompt and a 300-token answer (RTX 5090; **caveat:** the "process" column below subtracted `441 MiB` measured *after* `llama-server` started, which hid the server's own CUDA context - true server VRAM delta above idle is `16,075 MiB` on local CUDA 12.9 and `16,189 MiB` on CI CUDA 13.5, see [16 GB verification](#16-gb-rtx-5070-ti-verification-and-vram-measurement-2026-11-27)):
 
 | `-c 500000`, 485k prompt | Drafter KV | Prefill peak | Decode peak (process) | Decode peak (`nvidia-smi` total) | Decode |
 |---|---:|---:|---:|---:|---:|
@@ -59,7 +59,7 @@ The 500k numbers were measured with the previous `Q8_0` drafter; the Ninnix96 dr
 - **Measured on RTX 5090 (`-c 98304`, greedy 32k / 76k):** `14.87-14.90 GiB` peak PP / `14.51-14.54 GiB` TG process VRAM, `3,060 / 2,974 t/s` prefill, `108.5 / 113.6 t/s` decode (`61.1% / 62.3%` acceptance).
 - **Max context in `15.5 GiB` (`15,872 MiB`, 16 GB card):**
   - Default (`-ub 2048`, uncapped draft KV): **`~230k-235k`** (`4.00 KiB/tok` PP / `7.52 KiB/tok` TG; `-c 131072` fits at `~15.01 GiB` PP / `~14.75 GiB` TG).
-  - With `LLAMA_DSPARK_KV_CAP=8192` (`-ub 2048`, recommended for long context up to `~500k`): **`~475k-480k`** (`0 B/tok` PP / `3.52 KiB/tok` TG; `+16 MiB` vs `4096`, recovers `+4.6%` acceptance on `76k`; `4096` reaches `~480k-485k`, measured `-c 500000` at `14.31 GiB` loaded / `15.55 GiB` TG).
+  - With `LLAMA_DSPARK_KV_CAP=8192` (`-ub 2048`): **`~380k-400k`** strictly in physical VRAM on an RTX 5070 Ti with the CI CUDA 13.5 build (`~350k-380k` with `LLAMA_DSPARK_KV_CAP=32768`; earlier `~475k-480k` estimates were based on the `441 MiB` post-startup baseline subtraction and shorter 76k fill depth - see [16 GB verification](#16-gb-rtx-5070-ti-verification-and-vram-measurement-2026-11-27)).
 - **Why each knob:**
   - `--kvq`: two-tier KV cache for the 8 full-attention slots (`3.52 KiB/tok` TG, `0 B/tok` PP with tiled `80.2 MiB` `kvq_scr` vs `32 KiB/tok` FP16), plus compact `1,280`-cell SWA cache (`106.25 MiB`) using per-layer SWA prefill scratch so `-ub 2048` adds zero permanent SWA VRAM.
   - `--kvq-prefill-free-codes`: frees KVQ `codes + tables` during prefill and re-uploads from pinned host RAM (`~5-15 ms`), offsetting the `-ub 2048` compute buffer at PP peak.
@@ -477,6 +477,35 @@ Recommended settings (`-c 98304`, uncapped draft KV, `--spec-draft-n-ubatch 512`
 - AtomicChat `Q8_0` behaves exactly like the Unsloth `Q8_0`. IsValorum `Q4_0` and InterpreticAI `Q8_0` use the old layout and do not load (`markov_w1` shape `201024`).
 - Ninnix96 and Unsloth `Q8_0` are within rep noise (up to `23 t/s` between two reps of one config); Ninnix96 is chosen for the lower VRAM. DFlash2 is not worth it: it trails DSpark on the book prompts at 32k and `K=7` is slower than no drafter on some prompts.
 - With a drafter the greedy output moves away from the no-drafter output within the first `~60-220` characters (also with the standard KV cache, so not a `--kvq` effect), and drafter reps differ from each other; each config is timed on a slightly different text. Raw data: `tmp/inkling/drafters/` (`RESULTS.md`, `RESEARCH.md`).
+
+### 16 GB (RTX 5070 Ti) verification and VRAM measurement (2026-11-27)
+
+Re-tested `-c 500000` on `6d775739d` with `Inkling-2-Mini-UD-Q3_K_XL.gguf`, `Inkling-2-Mini-DSpark-333M.gguf` (Ninnix96), and `mmproj-Inkling-2-Mini-F16.gguf` (`--mmproj-vram-swap`), using a `~478k`-token `war_and_peace.txt` prompt + 64 generated tokens on RTX 5090 (`10 MiB` idle baseline measured *before* starting `llama-server`, `0.25 s` `nvidia-smi` polling):
+
+| Build / Config | Loaded (delta) | 21-tok (delta) | 12k TG (delta) | 478k PP (delta) | 478k TG (delta / total) |
+|---|---:|---:|---:|---:|---:|
+| Local CUDA 12.9 (`120a-real`), `-c 500000`, `CAP=8192` | `14,871 MiB` | `14,883 MiB` | `15,785 MiB` | - | **`16,075 MiB`** (`16,085` total) |
+| CI CUDA 13.5 (multi-arch `b12774-6d77573`), `-c 500000`, `CAP=8192` | `14,925 MiB` | `14,995 MiB` | `15,897 MiB` | `15,259 MiB` | **`16,189 MiB`** (`16,199` total) |
+| CI CUDA 13.5 (`b12774-6d77573`), `-c 510000`, `CAP=32768`, `-ctk/-ctv q8_0` | `14,973 MiB` | `15,043 MiB` | `16,021 MiB` | `15,351 MiB` | **`16,307 MiB`** (`16,317` total) |
+
+Key findings:
+
+- **Why the earlier 500k `"process"` figure (`15,644 MiB`) was `~431 MiB` too low:** the `0a9f9219c` measurement subtracted `441 MiB` taken *right after* `llama-server` started, when the server had already created its own `~430 MiB` CUDA context. Both runs hit the exact same `16,085 MiB` `nvidia-smi` total on local CUDA 12.9; the true VRAM added by `llama-server` above idle is **`16,075 MiB`** (not `15,644 MiB`).
+- **CI CUDA 13.5 multi-arch vs local CUDA 12.9 single-arch (`+114 MiB`):** explicit `CUDA0` buffers from `-lv 4` are identical (`15,045 MiB` at `-c 500000`, `CAP=8192`). The flat `+112-114 MiB` gap is CUDA 13.5 context init (`+54 MiB` at load) plus `cublasLt64_13` workspace/kernels on the first request (`+58 MiB` at 21 tok; also `+3.6%` PP / `+5.0%` TG at 12k), **not** multi-arch fatbins (`CUDA_MODULE_LOADING=LAZY` is active by default; forcing `EAGER` adds `+422 MiB` on single-arch local and `+506 MiB` on CI multi-arch).
+- **Why filled depth matters (`+290 MiB` from 12k to 478k):** on prompts `<8k` (`n_coarse == 0`), `codes_alloc()` is never called. Any prompt `>8k` allocates the full `-c` `buf_codes` (`1,748 MiB` at `-c 500000`, `1,776 MiB` at `-c 510000`), and filling from 12k to 478k adds another `~290 MiB` in decode (`kvq-attn` scratch `scp_a`/`po_a`, masks/scores, and `ggml_cuda_pool` VMM retention). Raising `LLAMA_DSPARK_KV_CAP` from `8192` to `32768` adds `+96 MiB` (`24k x 4 KiB/tok`).
+- **RTX 5070 Ti (16 GB) physical VRAM test:** `nvidia-smi memory.total` on an RTX 5070 Ti is **`16,303 MiB`** (`15.92 GiB`), minus NVIDIA driver `memory.reserved` (`~330-417 MiB`) -> **`~15,886-15,974 MiB` usable headless** (`~15.6 GiB` on Windows), or **`~15,400-15,600 MiB`** with Windows DWM/desktop. Simulating this cap on the RTX 5090 (`..\occupy.ps1 15.6` -> `16,415 MiB` held, `15,776 MiB` free) with the CI CUDA 13.5 binary (`-c 500000`, `CAP=8192`, 478k prompt):
+  - Load (`+14,925 MiB`) and prefill (`+15,259 MiB`, `3,654 t/s`) stayed in physical VRAM.
+  - Decode hit the physical ceiling at `32,026 MiB` total (`+15,611 MiB` on GPU) and **silently spilled `~578 MiB` into Windows Shared GPU Memory**, slowing `codes_alloc` by **10.9x** (`17.2 -> 187.6 ms`) and cutting TG speed by **`~19%`** (`64.2-65.6 -> 52.9 t/s`). On Linux (no WDDM Shared GPU Memory fallback), this fails with a hard CUDA OOM.
+  - To stay strictly inside physical VRAM on an RTX 5070 Ti with the CI CUDA 13.5 build, use **`-c 380000`-`400000`** with `LLAMA_DSPARK_KV_CAP=8192` (or **`-c 350000`-`380000`** with `LLAMA_DSPARK_KV_CAP=32768`).
+
+#### How to measure VRAM correctly
+
+1. **Take the baseline before starting `llama-server`:** query `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits` while the GPU is idle (or with only the desktop/occupier running) *before* launching `llama-server`. Never take the baseline after the server has started, as that hides `~430-550 MiB` of `llama-server`'s own CUDA context and library allocations.
+2. **Compare against real usable VRAM, not `16,384 MiB`:** check `nvidia-smi --query-gpu=memory.total,memory.reserved,memory.used,memory.free --format=csv`. On a 16 GB RTX 5070 Ti, usable VRAM is `memory.total (16,303) - memory.reserved (~330-417) - desktop` (`~15,400-15,900 MiB`).
+3. **Fill the context to `~95%` of `-c` and run decode:** short prompts (`<8k`) skip `codes_alloc()`, and medium prompts (`12k-76k`) miss `~250-290 MiB` of full-depth decode scratch/pool growth. Always send a prompt near `-c` and generate at least 32-64 tokens.
+4. **Poll continuously across the whole request:** sample `nvidia-smi` every `0.25 s` from request start until `1-3 s` after the reply so both the prefill peak and the post-`codes_alloc` decode peak are captured.
+5. **Measure unconstrained first, then verify under an occupier (Windows WDDM spill trap):** on Windows, WDDM silently spills VRAM overflow into Shared GPU Memory and caps `nvidia-smi memory.used` near `memory.total - memory.reserved`, making an overflowing run look like it "fit". Always confirm `unconstrained_peak - baseline <= target_usable_vram`, and when testing under a VRAM occupier, check that `codes_alloc` latency (`-lv 4`) and TG tok/s do not regress vs the unconstrained run (or verify on Linux where overflow hard-OOMs).
+6. **Measure the actual release binary:** CI CUDA 13.5 builds use `~114 MiB` more VRAM than local CUDA 12.9 builds on the same commit, so budget against the binary you ship.
 
 ## Local tools (not committed)
 
