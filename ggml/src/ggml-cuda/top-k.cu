@@ -317,22 +317,7 @@ static void top_k_argsort_cuda(
     }
 }
 
-void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0   = dst->src[0];
-    const float *       src0_d = (const float *) src0->data;
-    int *               dst_d  = (int *) dst->data;
-    cudaStream_t        stream = ctx.stream();
-
-    // are these asserts truly necessary?
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(src0));
-
-    const int64_t    ncols = src0->ne[0];
-    const int64_t    nrows = ggml_nrows(src0);
-    const int64_t    k     = dst->ne[0];
-    ggml_cuda_pool & pool  = ctx.pool();
-
+void ggml_cuda_top_k_f32(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
     const int device = ggml_cuda_get_device();
 
 #ifdef CUB_TOP_K_AVAILABLE
@@ -349,28 +334,46 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         // the padded row must fit in shared memory
         const int ncols_pad = next_power_of_2(ncols);
         if (ncols_pad * sizeof(int) <= ggml_cuda_info().devices[device].smpb) {
-            top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, false, stream);
+            top_k_argsort_cuda(pool, src, dst, ncols, nrows, k, false, stream);
             return;
         }
     }
 
     if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        top_k_radix_cuda(pool, src, dst, ncols, nrows, k, stream);
         return;
     }
 
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Assess perf of `DeviceBatchedTopK` for multi-row TopK & CCCL >= 3.5.0, re-running perf sweep of https://github.com/ggml-org/llama.cpp/pull/28713
     for (int64_t i = 0; i < nrows; i++) {
-        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+        top_k_cub(pool, src + i * ncols, dst + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
     if (ncols <= GGML_CUDA_TOP_K_NCOLS_THRESHOLD_ARGSORT) {
-        top_k_argsort_cuda(pool, src0_d, dst_d, ncols, nrows, k, true, stream);
+        top_k_argsort_cuda(pool, src, dst, ncols, nrows, k, true, stream);
     } else {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        top_k_radix_cuda(pool, src, dst, ncols, nrows, k, stream);
     }
 #else                             // GGML_CUDA_USE_CUB
-    top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+    top_k_radix_cuda(pool, src, dst, ncols, nrows, k, stream);
 #endif                            // CUB_TOP_K_AVAILABLE
+}
+
+void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0   = dst->src[0];
+    const float *       src0_d = (const float *) src0->data;
+    int *               dst_d  = (int *) dst->data;
+    cudaStream_t        stream = ctx.stream();
+
+    // are these asserts truly necessary?
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    const int64_t    ncols = src0->ne[0];
+    const int64_t    nrows = ggml_nrows(src0);
+    const int64_t    k     = dst->ne[0];
+
+    ggml_cuda_top_k_f32(ctx.pool(), src0_d, dst_d, (int) ncols, nrows, (int) k, stream);
 }

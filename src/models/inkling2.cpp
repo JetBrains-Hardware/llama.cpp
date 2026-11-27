@@ -774,12 +774,12 @@ void llama_model_inkling2::graph::build_kvq_prefetch(int il_tgt, ggml_tensor * c
     ggml_tensor * k_rg = store->get_ring(ctx0, il_tgt, false, n_kv, S);
     ggml_tensor * score = nullptr;
     if (S == 1) {
-        score = ggml_kvq_attn(ctx0, q, store->get_kc(ctx0, il_tgt), nullptr, t.tab, store->get_pt(inp_kvq->seq), k_rg,
-                nullptr, nullptr, nullptr, inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse, store->n_chunk_rows(), GGML_KVQ_SCORE);
+        score = ggml_kvq_score_topk(ctx0, q, store->get_kc(ctx0, il_tgt), t.tab, store->get_pt(inp_kvq->seq), k_rg,
+                inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse, store->n_chunk_rows(), inp_kvq->params.prefetch_n, inp_kvq->params.n_sink);
     } else {
         ggml_tensor * q4 = ggml_reshape_4d(ctx0, q, n_embd_head, n_head, L, S);
-        score = ggml_kvq_attn_streams(ctx0, q4, store->get_kc(ctx0, il_tgt), nullptr, t.tab, inp_kvq->pt_s, k_rg,
-                nullptr, nullptr, nullptr, inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse_s.data(), store->n_chunk_rows(), GGML_KVQ_SCORE);
+        score = ggml_kvq_score_topk_streams(ctx0, q4, store->get_kc(ctx0, il_tgt), t.tab, inp_kvq->pt_s, k_rg,
+                inp_kvq->mask_early.raw, kq_scale, inp_kvq->n_coarse_s.data(), store->n_chunk_rows(), inp_kvq->params.prefetch_n, inp_kvq->params.n_sink);
     }
     cb(score, "kvq_eq_score", il_tgt);
 

@@ -11966,7 +11966,10 @@ void ggml_compute_forward_kvq_attn(
 
     const bool do_lse   = mode == GGML_KVQ_ATTN_LSE;
     const bool do_attn  = mode == GGML_KVQ_ATTN || do_lse;
-    const bool do_score = mode == GGML_KVQ_SCORE;
+    const bool do_topk  = mode == GGML_KVQ_SCORE_TOPK;
+    const bool do_score = mode == GGML_KVQ_SCORE || do_topk;
+    const int64_t n_top  = do_topk ? ggml_get_op_params_i32(dst, 5 + GGML_KVQ_MAX_STREAM) : 0;
+    const int64_t n_sink = do_topk ? ggml_get_op_params_i32(dst, 6 + GGML_KVQ_MAX_STREAM) : 0;
 
     const int64_t D        = q->ne[0];
     const int64_t n_head   = q->ne[1];
@@ -11990,7 +11993,9 @@ void ggml_compute_forward_kvq_attn(
     };
 
     float * out_attn  = do_attn  ? (float *) dst->data : nullptr;
-    float * out_score = do_score ? (float *) dst->data : nullptr;
+    float * out_score = mode == GGML_KVQ_SCORE ? (float *) dst->data : nullptr;
+    std::vector<float> row_score(do_topk ? n_coarse_max : 0);
+    std::vector<int32_t> row_order(do_topk ? n_coarse_max : 0);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -12056,8 +12061,12 @@ void ggml_compute_forward_kvq_attn(
         }
 
         if (do_score) {
-            for (int64_t j = 0; j < n_coarse_max; j++) {
-                out_score[j + n_coarse_max*(g + G*(l + L*st))] = 0.0f;
+            if (do_topk) {
+                std::fill(row_score.begin(), row_score.end(), 0.0f);
+            } else {
+                for (int64_t j = 0; j < n_coarse_max; j++) {
+                    out_score[j + n_coarse_max*(g + G*(l + L*st))] = 0.0f;
+                }
             }
         }
 
@@ -12139,7 +12148,12 @@ void ggml_compute_forward_kvq_attn(
                         z += std::exp(lt[r] - mx);
                     }
                     for (int64_t j = 0; j < n_coarse; j++) {
-                        out_score[j + n_coarse_max*(g + G*(l + L*st))] += (float) (std::exp(lc[j] - mx)/z);
+                        const float w = (float) (std::exp(lc[j] - mx)/z);
+                        if (do_topk) {
+                            row_score[j] += w;
+                        } else {
+                            out_score[j + n_coarse_max*(g + G*(l + L*st))] += w;
+                        }
                     }
                 }
             }
@@ -12235,6 +12249,29 @@ void ggml_compute_forward_kvq_attn(
             }
             if (lh) {
                 *lh = z > 0.0 ? (float) (mx + std::log(z)) : -INFINITY;
+            }
+        }
+
+        if (do_topk) {
+            for (int64_t j = 0; j < std::min(n_sink, n_coarse_max); j++) {
+                row_score[j] = -INFINITY;
+            }
+            for (int64_t j = n_coarse; j < n_coarse_max; j++) {
+                row_score[j] = -INFINITY;
+            }
+            for (int64_t j = 0; j < n_coarse_max; j++) {
+                row_order[j] = (int32_t) j;
+            }
+            std::partial_sort(row_order.begin(), row_order.begin() + n_top, row_order.end(), [&](int32_t a, int32_t b) {
+                return row_score[a] != row_score[b] ? row_score[a] > row_score[b] : a < b;
+            });
+            const int64_t row_idx = g + G*(l + L*st);
+            const int64_t n_rows_all = G*L*S;
+            int32_t * dst_ids  = (int32_t *) dst->data + row_idx*n_top;
+            float   * dst_vals = (float *) dst->data + (n_rows_all + row_idx)*n_top;
+            for (int64_t i = 0; i < n_top; i++) {
+                dst_ids[i]  = row_order[i];
+                dst_vals[i] = row_score[row_order[i]];
             }
         }
     }
