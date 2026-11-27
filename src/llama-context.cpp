@@ -1984,6 +1984,23 @@ bool llama_context::ubatch_tg(const llama_ubatch & ubatch, const llama_memory_co
     return kctx == nullptr || !kctx->prompt_path(ubatch);
 }
 
+static size_t llama_trim_backend_pools(const std::vector<ggml_backend_t> & backends) {
+    using trim_fn_t = size_t (*)(ggml_backend_t);
+    size_t freed = 0;
+    for (auto * backend : backends) {
+        auto * dev = ggml_backend_get_device(backend);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg) {
+            continue;
+        }
+        auto * trim_fn = (trim_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_trim_pools");
+        if (trim_fn) {
+            freed += trim_fn(backend);
+        }
+    }
+    return freed;
+}
+
 void llama_context::phase_set(bool tg) {
     if (tg == phase_tg && !phase_released) {
         return;
@@ -2011,6 +2028,7 @@ void llama_context::phase_set(bool tg) {
     if (!ggml_backend_sched_resize_buffers(sched.get(), tg ? phase_size_tg.data() : phase_size_pp.data())) {
         LLAMA_LOG_WARN("%s: a compute buffer of the %s phase was not allocated, the next graph reserves it\n", __func__, tg ? "tg" : "pp");
     }
+    const size_t pool_freed = tg ? llama_trim_backend_pools(backend_ptrs) : 0;
     gf_res_prev_active = nullptr;
     phase_tg       = tg;
     phase_released = false;
@@ -2022,8 +2040,8 @@ void llama_context::phase_set(bool tg) {
     const double ms = (ggml_time_us() - t0)/1000.0;
     n_phase_switch++;
     t_phase_switch += ms;
-    LLAMA_LOG_INFO("%s: %s phase, device compute buffers %.2f -> %.2f MiB in %.2f ms (%.2f ms of it the wait for the queued work)\n", __func__,
-            tg ? "tg" : "pp", size0/1048576.0, size1/1048576.0, ms, (t1 - t0)/1000.0);
+    LLAMA_LOG_INFO("%s: %s phase, device compute buffers %.2f -> %.2f MiB (pool trimmed %.2f MiB) in %.2f ms (%.2f ms of it the wait for the queued work)\n", __func__,
+            tg ? "tg" : "pp", size0/1048576.0, size1/1048576.0, pool_freed/1048576.0, ms, (t1 - t0)/1000.0);
 }
 
 void llama_context::release_transient_vram() {
@@ -2042,16 +2060,18 @@ void llama_context::release_transient_vram() {
             sizes[i] = 0;
         }
     }
-    if (size0 == 0) {
-        return;
-    }
     for (auto * backend : backend_ptrs) {
         ggml_backend_synchronize(backend);
     }
-    ggml_backend_sched_resize_buffers(sched.get(), sizes.data());
-    gf_res_prev_active = nullptr;
-    phase_released     = true;
-    LLAMA_LOG_INFO("%s: released %.2f MiB device compute buffers\n", __func__, size0/1048576.0);
+    if (size0 > 0) {
+        ggml_backend_sched_resize_buffers(sched.get(), sizes.data());
+        gf_res_prev_active = nullptr;
+        phase_released     = true;
+    }
+    const size_t pool_freed = llama_trim_backend_pools(backend_ptrs);
+    if (size0 > 0 || pool_freed > 0) {
+        LLAMA_LOG_INFO("%s: released %.2f MiB device compute buffers, trimmed %.2f MiB backend pools\n", __func__, size0/1048576.0, pool_freed/1048576.0);
+    }
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {

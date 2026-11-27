@@ -661,6 +661,16 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         pool_size -= size;
         invalidate_cuda_graphs();
     }
+
+    size_t trim() override {
+        const size_t before = pool_size;
+        clear_pool();
+        const size_t freed = before - pool_size;
+        if (freed > 0) {
+            invalidate_cuda_graphs();
+        }
+        return freed;
+    }
 };
 
 // pool with virtual memory
@@ -820,6 +830,23 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+    }
+
+    size_t trim() override {
+        if (pool_addr == 0 || pool_size == 0 || pool_used != 0) {
+            return 0;
+        }
+        const size_t freed = pool_size;
+#if defined(GGML_USE_HIP)
+        for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
+            CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+        }
+        mappings.clear();
+#else
+        CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+#endif
+        pool_size = 0;
+        return freed;
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -7392,6 +7419,25 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static size_t ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->src1_cache.release();
+    size_t freed = 0;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (cuda_ctx->pools[d][s]) {
+                freed += cuda_ctx->pools[d][s]->trim();
+            }
+        }
+    }
+#ifdef USE_CUDA_GRAPH
+    if (freed > 0) {
+        cuda_ctx->cuda_graphs.clear();
+    }
+#endif
+    return freed;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -7416,6 +7462,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_trim_pools") == 0) {
+        return (void *)ggml_backend_cuda_trim_pools;
     }
     return nullptr;
 }
