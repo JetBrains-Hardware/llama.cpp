@@ -1148,13 +1148,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        static const bool kvq_force_decode_stat = []() {
-            const char * env = std::getenv("LLAMA_KVQ_FORCE_DECODE_STAT");
-            return env != nullptr && std::atoi(env) != 0;
-        }();
-        const bool do_kvq_stat = !is_swa && inp_kvq && inp_kvq->fit &&
-            (kvq_force_decode_stat || n_tokens > 32 || inp_kvq->n_coarse == 0);
-        if (do_kvq_stat) {
+        if (!is_swa && inp_kvq && inp_kvq->fit) {
             build_kvq_qstat(Qcur, il);
         }
 
@@ -1245,7 +1239,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         }
 
         ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0]));
-        if (do_kvq_stat) {
+        if (!is_swa && inp_kvq && inp_kvq->fit) {
             build_kvq_gstat(gate_sigmoid, il);
         }
         cur = ggml_mul(ctx0, cur, gate_sigmoid);
