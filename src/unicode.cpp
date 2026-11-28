@@ -1221,11 +1221,228 @@ static std::vector<size_t> unicode_regex_split_custom_newlines(const std::string
     return bpe_offsets;
 }
 
+// GPT-4o / o200k_base / Inkling-2-Mini regex (src/llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O):
+//   [^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?
+//   |[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?
+//   |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// Hand-written O(N) splitter avoids MSVC std::regex stack overflows (regex_error(error_stack))
+// on long unbroken strings (e.g. inline base64, minified JS) and speeds up tokenization.
+static std::vector<size_t> unicode_regex_split_custom_gpt4o(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        static const uint32_t OUT_OF_RANGE = 0xFFFFFFFF;
+        auto _get_cpt = [&] (const size_t pos) -> uint32_t {
+            return (offset_ini <= pos && pos < offset_end) ? cpts[pos] : OUT_OF_RANGE;
+        };
+
+        auto _get_flags = [&] (const size_t pos) -> unicode_cpt_flags {
+            return (offset_ini <= pos && pos < offset_end) ? unicode_cpt_flags_from_cpt(cpts[pos]) : unicode_cpt_flags{};
+        };
+
+        // Match collapsed std::regex semantics exactly:
+        //   U = (?=[\p{L}\p{M}])([^a-z])  -> ASCII 'A'..'Z' or non-ASCII \p{L}/\p{M}
+        //   L = (?=[\p{L}\p{M}])([^A-Z])  -> ASCII 'a'..'z' or non-ASCII \p{L}/\p{M}
+        auto _is_u = [&] (const size_t pos) -> bool {
+            if (pos >= offset_end) {
+                return false;
+            }
+            const uint32_t c = cpts[pos];
+            const auto f = unicode_cpt_flags_from_cpt(c);
+            return (f.is_letter || f.is_accent_mark) && !(c >= 'a' && c <= 'z');
+        };
+
+        auto _is_l = [&] (const size_t pos) -> bool {
+            if (pos >= offset_end) {
+                return false;
+            }
+            const uint32_t c = cpts[pos];
+            const auto f = unicode_cpt_flags_from_cpt(c);
+            return (f.is_letter || f.is_accent_mark) && !(c >= 'A' && c <= 'Z');
+        };
+
+        auto _is_lead = [&] (const size_t pos) -> bool {
+            if (pos >= offset_end) {
+                return false;
+            }
+            const uint32_t c = cpts[pos];
+            const auto f = unicode_cpt_flags_from_cpt(c);
+            return c != '\r' && c != '\n' && !f.is_letter && !f.is_number;
+        };
+
+        auto _match_contraction = [&] (const size_t pos) -> size_t {
+            if (_get_cpt(pos) == '\'' && pos + 1 < offset_end) {
+                const uint32_t c1 = _get_cpt(pos + 1);
+                if (c1 == 's' || c1 == 'S' || c1 == 't' || c1 == 'T' || c1 == 'm' || c1 == 'M' || c1 == 'd' || c1 == 'D') {
+                    return pos + 2;
+                }
+                if (pos + 2 < offset_end) {
+                    const uint32_t c2 = _get_cpt(pos + 2);
+                    if (((c1 == 'r' || c1 == 'R') && (c2 == 'e' || c2 == 'E')) ||
+                        ((c1 == 'v' || c1 == 'V') && (c2 == 'e' || c2 == 'E')) ||
+                        ((c1 == 'l' || c1 == 'L') && (c2 == 'l' || c2 == 'L'))) {
+                        return pos + 3;
+                    }
+                }
+            }
+            return pos;
+        };
+
+        auto _try_branch1 = [&] (const size_t p0) -> size_t {
+            // [^\r\n\p{L}\p{N}]? U* L+ [contraction]?
+            for (int take_lead = _is_lead(p0) ? 1 : 0; take_lead >= 0; --take_lead) {
+                size_t q = p0 + (size_t) take_lead;
+                size_t last_l = SIZE_MAX;
+                while (_is_u(q)) {
+                    if (_is_l(q)) {
+                        last_l = q;
+                    }
+                    ++q;
+                }
+                if (_is_l(q)) {
+                    while (_is_l(q)) {
+                        ++q;
+                    }
+                    return _match_contraction(q);
+                }
+                if (last_l != SIZE_MAX) {
+                    return _match_contraction(last_l + 1);
+                }
+            }
+            return SIZE_MAX;
+        };
+
+        auto _try_branch2 = [&] (const size_t p0) -> size_t {
+            // [^\r\n\p{L}\p{N}]? U+ L* [contraction]?
+            for (int take_lead = _is_lead(p0) ? 1 : 0; take_lead >= 0; --take_lead) {
+                size_t q = p0 + (size_t) take_lead;
+                if (_is_u(q)) {
+                    while (_is_u(q)) {
+                        ++q;
+                    }
+                    while (_is_l(q)) {
+                        ++q;
+                    }
+                    return _match_contraction(q);
+                }
+            }
+            return SIZE_MAX;
+        };
+
+        size_t _prev_end = offset_ini;
+        auto _add_token = [&] (const size_t end) -> size_t {
+            assert(_prev_end <= end && end <= offset_end);
+            size_t len = end - _prev_end;
+            if (len > 0) {
+                bpe_offsets.push_back(len);
+            }
+            _prev_end = end;
+            return len;
+        };
+
+        for (size_t pos = offset_ini; pos < offset_end; ) {
+            // Branch 1 & Branch 2: word runs with optional leading non-letter/number & English contractions
+            const size_t b1 = _try_branch1(pos);
+            if (b1 != SIZE_MAX) {
+                pos = b1;
+                _add_token(pos);
+                continue;
+            }
+            const size_t b2 = _try_branch2(pos);
+            if (b2 != SIZE_MAX) {
+                pos = b2;
+                _add_token(pos);
+                continue;
+            }
+
+            const uint32_t cpt = _get_cpt(pos);
+            const auto flags = _get_flags(pos);
+
+            // Branch 3: \p{N}{1,3}
+            if (flags.is_number) {
+                size_t ini = pos;
+                while (_get_flags(pos).is_number) {
+                    if (++pos - ini >= 3) {
+                        _add_token(pos);
+                        ini = pos;
+                    }
+                }
+                _add_token(pos);
+                continue;
+            }
+
+            // Branch 4:  ?[^\s\p{L}\p{N}]+[\r\n/]*
+            auto flags2 = (cpt == ' ' ? _get_flags(pos + 1) : flags);
+            if (!(flags2.is_whitespace || flags2.is_letter || flags2.is_number) && flags2.as_uint()) {
+                pos += (cpt == ' ');
+                while (!(flags2.is_whitespace || flags2.is_letter || flags2.is_number) && flags2.as_uint()) {
+                    flags2 = _get_flags(++pos);
+                }
+                uint32_t cpt2 = _get_cpt(pos);
+                while (cpt2 == '\r' || cpt2 == '\n' || cpt2 == '/') {
+                    cpt2 = _get_cpt(++pos);
+                }
+                _add_token(pos);
+                continue;
+            }
+
+            // Whitespace branches
+            size_t num_whitespaces = 0;
+            size_t last_end_r_or_n = 0;
+            while (_get_flags(pos + num_whitespaces).is_whitespace) {
+                uint32_t cpt2 = _get_cpt(pos + num_whitespaces);
+                if (cpt2 == '\r' || cpt2 == '\n') {
+                    last_end_r_or_n = pos + num_whitespaces + 1;
+                }
+                num_whitespaces++;
+            }
+
+            // Branch 5: \s*[\r\n]+
+            if (last_end_r_or_n > 0) {
+                pos = last_end_r_or_n;
+                _add_token(pos);
+                continue;
+            }
+
+            // Branch 6: \s+(?!\S)
+            if (num_whitespaces > 1 && _get_cpt(pos + num_whitespaces) != OUT_OF_RANGE) {
+                pos += num_whitespaces - 1;
+                _add_token(pos);
+                continue;
+            }
+
+            // Branch 7: \s+
+            if (num_whitespaces > 0) {
+                pos += num_whitespaces;
+                _add_token(pos);
+                continue;
+            }
+
+            // No matches
+            _add_token(++pos);
+        }
+    }
+
+    return bpe_offsets;
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
     if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
         bpe_offsets = unicode_regex_split_custom_gpt2(text, offsets);
+    } else if (
+            regex_expr == "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))*((?=[\\p{L}\\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}\\p{M}])([^a-z]))+((?=[\\p{L}\\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_gpt4o(text, offsets);
     } else if (
             regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
             regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
