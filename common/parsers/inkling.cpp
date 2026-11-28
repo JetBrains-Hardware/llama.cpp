@@ -147,16 +147,21 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
         auto body  = tool_body(p.string_content('"'));
         auto next  = p.rule("tool-call", header + p.tool(name + tool_json + body));
         auto more  = inputs.parallel_tool_calls ? p.zero_or_more(next) : p.eps();
-        auto calls = header + name + p.trigger_rule("tool-calls", tool_json, body + more);
+        auto calls = header + name + p.trigger_rule("tool-calls", tool_json + body + more);
 
         return blocks + p.optional(calls);
     });
 
     if (has_response_format || use_tools) {
-        data.grammar_lazy = false;
+        data.grammar_lazy = !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            data.parser.build_grammar(builder, !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
+        if (data.grammar_lazy) {
+            data.grammar_triggers = {
+                { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TOOL_JSON }
+            };
+        }
     }
 
     return data;

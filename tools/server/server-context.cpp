@@ -2107,7 +2107,7 @@ private:
                                                 !task.params.dump_logprobs_path.empty() ||
                                                 !task.params.force_tokens.empty();
 
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
+            bool use_backend_sampling = common_sampler_backend_sampling_ready(slot.smpl.get());
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
@@ -5055,6 +5055,10 @@ private:
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
+            if (slot.smpl && !common_sampler_backend_sampling_ready(slot.smpl.get())) {
+                llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
+            }
+
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
@@ -5162,6 +5166,14 @@ private:
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+
+                // If a lazy grammar just triggered during speculative acceptance, disable backend sampling
+                // immediately — including before any checkpoint-restore replay so the replay computes full
+                // CPU logits for the newly constrained bonus token.
+                const bool grammar_just_triggered = !common_sampler_backend_sampling_ready(slot.smpl.get());
+                if (grammar_just_triggered) {
+                    llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
+                }
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {

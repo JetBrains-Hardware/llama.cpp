@@ -893,6 +893,19 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
     return chain->n_nodes;
 }
 
+void llama_sampler_backend_detach(llama_sampler * sampler) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i || !sampler->ctx) {
+        return;
+    }
+
+    auto * chain = (llama_sampler_chain *) sampler->ctx;
+    chain->is_init = false;
+    chain->n_nodes = 0;
+    for (auto & smpl : chain->samplers) {
+        smpl.is_backend = false;
+    }
+}
+
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
@@ -2822,6 +2835,14 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens) {
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
+}
+
+bool llama_sampler_is_grammar_awaiting_trigger(const struct llama_sampler * smpl) {
+    if (!smpl || smpl->iface != &llama_sampler_grammar_i || !smpl->ctx) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    return ctx->grammar != nullptr && ctx->grammar->lazy && ctx->grammar->awaiting_trigger;
 }
 
 // penalties

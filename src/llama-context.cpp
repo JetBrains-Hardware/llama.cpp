@@ -1910,7 +1910,11 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         return false;
     }
 
-    sampling.samplers.erase(seq_id);
+    auto it = sampling.samplers.find(seq_id);
+    if (it != sampling.samplers.end()) {
+        llama_sampler_backend_detach(it->second);
+        sampling.samplers.erase(it);
+    }
 
     sched_need_reserve = true;
 
@@ -2821,6 +2825,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+        } else if (n_outputs > 0) {
+            // Clear stale backend-sampling outputs when a sequence switches off backend sampling (e.g. lazy grammar triggered)
+            for (int64_t r = n_outputs_prev; r < n_outputs_prev + n_outputs; ++r) {
+                if (sampling.sampled.has_data() && (size_t) r < sampling.sampled.size) {
+                    sampling.sampled.data[r] = LLAMA_TOKEN_NULL;
+                }
+                if ((size_t) r < sampling.logits_count.size())     { sampling.logits_count[r]     = 0; }
+                if ((size_t) r < sampling.probs_count.size())      { sampling.probs_count[r]      = 0; }
+                if ((size_t) r < sampling.candidates_count.size()) { sampling.candidates_count[r] = 0; }
+            }
         }
 
         n_outputs_prev += n_outputs;
