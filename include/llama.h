@@ -1465,6 +1465,10 @@ extern "C" {
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
 
+    // Temporarily bypass backend sampling for seq_id without rebuilding/recapturing the compute graph.
+    // When bypass is true, raw logits are copied to host and backend-sampled outputs are ignored for seq_id.
+    LLAMA_API void llama_set_sampler_bypass(struct llama_context * ctx, llama_seq_id seq_id, bool bypass);
+
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
@@ -1572,6 +1576,9 @@ extern "C" {
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
+
+    /// Returns true if smpl is a lazy grammar sampler still awaiting its trigger (apply is a no-op).
+    LLAMA_API bool llama_sampler_is_grammar_awaiting_trigger(const struct llama_sampler * smpl);
 
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.

@@ -684,7 +684,7 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
 
     time_meas tm(chain->t_sample_us, chain->params.no_perf);
 
-    bool is_backend = chain->is_init;
+    bool is_backend = chain->is_init && !chain->cpu_bypass;
 
     for (auto & smpl : chain->samplers) {
         if (is_backend && smpl.is_backend) {
@@ -874,6 +874,7 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
         /* .ctx   = */ new llama_sampler_chain {
             /* .params               = */ params,
             /* .is_init              = */ false,
+            /* .cpu_bypass           = */ false,
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
@@ -891,6 +892,29 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
     GGML_ASSERT(chain->is_init);
 
     return chain->n_nodes;
+}
+
+void llama_sampler_backend_detach(llama_sampler * sampler) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i || !sampler->ctx) {
+        return;
+    }
+
+    auto * chain = (llama_sampler_chain *) sampler->ctx;
+    chain->is_init = false;
+    chain->cpu_bypass = false;
+    chain->n_nodes = 0;
+    for (auto & smpl : chain->samplers) {
+        smpl.is_backend = false;
+    }
+}
+
+void llama_sampler_backend_set_bypass(llama_sampler * sampler, bool bypass) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i || !sampler->ctx) {
+        return;
+    }
+
+    auto * chain = (llama_sampler_chain *) sampler->ctx;
+    chain->cpu_bypass = bypass;
 }
 
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
@@ -2822,6 +2846,14 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens) {
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
+}
+
+bool llama_sampler_is_grammar_awaiting_trigger(const struct llama_sampler * smpl) {
+    if (!smpl || smpl->iface != &llama_sampler_grammar_i || !smpl->ctx) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    return ctx->grammar != nullptr && ctx->grammar->lazy && ctx->grammar->awaiting_trigger;
 }
 
 // penalties

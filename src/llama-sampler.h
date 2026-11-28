@@ -15,6 +15,9 @@ struct llama_sampler_chain {
     // has .backend_init() been called?
     bool is_init = false;
 
+    // temporarily run all chain samplers on CPU while keeping backend graph intact
+    bool cpu_bypass = false;
+
     uint32_t n_nodes = 0;
 
     struct info {
@@ -37,6 +40,8 @@ struct llama_sampler_chain {
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
+void llama_sampler_backend_detach(llama_sampler * sampler);
+void llama_sampler_backend_set_bypass(llama_sampler * sampler, bool bypass);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
