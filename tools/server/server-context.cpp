@@ -5056,7 +5056,7 @@ private:
             common_sampler_accept(slot.smpl.get(), id, true);
 
             if (slot.smpl && !common_sampler_backend_sampling_ready(slot.smpl.get())) {
-                llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
+                llama_set_sampler_bypass(slot.ctx_tgt, slot.id, true);
             }
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
@@ -5167,12 +5167,12 @@ private:
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
 
-                // If a lazy grammar just triggered during speculative acceptance, disable backend sampling
-                // immediately — including before any checkpoint-restore replay so the replay computes full
-                // CPU logits for the newly constrained bonus token.
+                // If a lazy grammar just triggered during speculative acceptance, bypass backend sampling
+                // immediately without mutating/recapturing the CUDA graph — including before any
+                // checkpoint-restore replay so the replay computes full CPU logits for the newly constrained bonus token.
                 const bool grammar_just_triggered = !common_sampler_backend_sampling_ready(slot.smpl.get());
                 if (grammar_just_triggered) {
-                    llama_set_sampler(slot.ctx_tgt, slot.id, nullptr);
+                    llama_set_sampler_bypass(slot.ctx_tgt, slot.id, true);
                 }
 
                 // check for partial draft acceptance

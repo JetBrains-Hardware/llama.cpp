@@ -292,6 +292,7 @@ public:
         bool embd = false);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    void set_sampler_bypass(llama_seq_id seq_id, bool bypass);
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -381,6 +382,8 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        std::set<llama_seq_id>                  bypassed;
+        std::vector<uint8_t>                    row_bypassed;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};

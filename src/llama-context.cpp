@@ -1388,6 +1388,9 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
 
     try {
         const int64_t row = output_resolve_row(idx);
+        if ((size_t) row < sampling.row_bypassed.size() && sampling.row_bypassed[row]) {
+            return LLAMA_TOKEN_NULL;
+        }
         GGML_ASSERT(row < (int64_t) sampling.sampled.size);
         return sampling.sampled.data[row];
     } catch (const std::exception & err) {
@@ -1405,6 +1408,9 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
 
     try {
         const int64_t row = output_resolve_row(idx);
+        if ((size_t) row < sampling.row_bypassed.size() && sampling.row_bypassed[row]) {
+            return nullptr;
+        }
         if ((size_t) row >= sampling.probs_count.size() || sampling.probs_count[row] == 0) {
             return nullptr;
         }
@@ -1424,6 +1430,9 @@ float * llama_context::get_sampled_logits_ith(int32_t idx) {
 
     try {
         const int64_t row = output_resolve_row(idx);
+        if ((size_t) row < sampling.row_bypassed.size() && sampling.row_bypassed[row]) {
+            return nullptr;
+        }
         if ((size_t) row >= sampling.logits_count.size() || sampling.logits_count[row] == 0) {
             return nullptr;
         }
@@ -1892,6 +1901,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
         sampling.samplers[seq_id] = sampler;
+        sampling.bypassed.erase(seq_id);
+        llama_sampler_backend_set_bypass(sampler, false);
 
         sched_need_reserve = true;
 
@@ -1915,10 +1926,23 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         llama_sampler_backend_detach(it->second);
         sampling.samplers.erase(it);
     }
+    sampling.bypassed.erase(seq_id);
 
     sched_need_reserve = true;
 
     return true;
+}
+
+void llama_context::set_sampler_bypass(llama_seq_id seq_id, bool bypass) {
+    if (bypass) {
+        sampling.bypassed.insert(seq_id);
+    } else {
+        sampling.bypassed.erase(seq_id);
+    }
+    auto it = sampling.samplers.find(seq_id);
+    if (it != sampling.samplers.end()) {
+        llama_sampler_backend_set_bypass(it->second, bypass);
+    }
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -2412,16 +2436,16 @@ static void copy_tensor_async_rows(
     }
 }
 
-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers, const std::set<llama_seq_id> & bypassed) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
             continue;
         }
 
-        // Check if the output token has at least one sequence without a backend sampler.
+        // Check if the output token has at least one sequence without an active backend sampler.
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
+            if (samplers.find(seq_id) == samplers.end() || bypassed.count(seq_id) > 0) {
                 return true;
             }
         }
@@ -2712,7 +2736,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers, sampling.bypassed)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -2815,6 +2839,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
             const auto & batch_idxs = ubatch.data->batch_idxs;
             embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
+        }
+
+        if (n_outputs > 0) {
+            if (sampling.row_bypassed.size() < (size_t) (n_outputs_prev + n_outputs)) {
+                sampling.row_bypassed.resize((size_t) (n_outputs_prev + n_outputs), 0);
+            }
+            int64_t out_r = n_outputs_prev;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (!ubatch.output[i]) {
+                    continue;
+                }
+                uint8_t byp = 0;
+                for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                    if (sampling.bypassed.count(ubatch.seq_id[i][j]) > 0) {
+                        byp = 1;
+                        break;
+                    }
+                }
+                sampling.row_bypassed[out_r++] = byp;
+            }
         }
 
         if (has_samplers) {
@@ -5147,6 +5191,10 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+void llama_set_sampler_bypass(llama_context * ctx, llama_seq_id seq_id, bool bypass) {
+    ctx->set_sampler_bypass(seq_id, bypass);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

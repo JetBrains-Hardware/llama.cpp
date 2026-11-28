@@ -684,7 +684,7 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
 
     time_meas tm(chain->t_sample_us, chain->params.no_perf);
 
-    bool is_backend = chain->is_init;
+    bool is_backend = chain->is_init && !chain->cpu_bypass;
 
     for (auto & smpl : chain->samplers) {
         if (is_backend && smpl.is_backend) {
@@ -874,6 +874,7 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
         /* .ctx   = */ new llama_sampler_chain {
             /* .params               = */ params,
             /* .is_init              = */ false,
+            /* .cpu_bypass           = */ false,
             /* .n_nodes              = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
@@ -900,10 +901,20 @@ void llama_sampler_backend_detach(llama_sampler * sampler) {
 
     auto * chain = (llama_sampler_chain *) sampler->ctx;
     chain->is_init = false;
+    chain->cpu_bypass = false;
     chain->n_nodes = 0;
     for (auto & smpl : chain->samplers) {
         smpl.is_backend = false;
     }
+}
+
+void llama_sampler_backend_set_bypass(llama_sampler * sampler, bool bypass) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i || !sampler->ctx) {
+        return;
+    }
+
+    auto * chain = (llama_sampler_chain *) sampler->ctx;
+    chain->cpu_bypass = bypass;
 }
 
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
